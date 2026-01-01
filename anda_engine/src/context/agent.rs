@@ -1003,7 +1003,7 @@ impl CompletionRunner {
                             .ctx
                             .agents
                             .select_resources(&tool.name, &mut self.resources),
-                        meta: None,
+                        ..Default::default()
                     })
                     .await
                 {

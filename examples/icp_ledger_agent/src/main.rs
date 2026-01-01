@@ -163,13 +163,10 @@ async fn main() -> Result<(), BoxError> {
     let engine = EngineBuilder::new()
         .with_info(AgentInfo {
             handle: "icp_ledger_agent".to_string(),
-            handle_canister: None,
             name: "ICP Agent".to_string(),
             description: "Test ICP Agent".to_string(),
             endpoint: "https://localhost:8443/default".to_string(),
-            protocols: BTreeMap::new(),
-            payments: BTreeSet::new(),
-            provider: None,
+            ..Default::default()
         })
         .with_cancellation_token(global_cancel_token.clone())
         .with_web3_client(Arc::new(Web3SDK::from_web3(Arc::new(web3.clone()))))

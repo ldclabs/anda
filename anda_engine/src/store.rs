@@ -35,7 +35,7 @@ use futures::TryStreamExt;
 use object_store::PutOptions;
 use std::sync::Arc;
 
-pub use object_store::{ObjectStore, local::LocalFileSystem, memory::InMemory};
+pub use object_store::{ObjectStore, ObjectStoreExt, local::LocalFileSystem, memory::InMemory};
 
 pub const MAX_STORE_OBJECT_SIZE: usize = 1024 * 1024 * 2; // 2 MB
 

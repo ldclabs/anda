@@ -27,7 +27,7 @@ use ic_object_store::{
     client::{Client, ObjectStoreClient},
 };
 use ic_tee_agent::setting::decrypt_payload;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use structured_logger::{Builder, async_json::new_writer, get_env_level, unix_ms};
 use tokio::net::TcpStream;
@@ -297,9 +297,7 @@ async fn bootstrap_tee(
             name: "Anda ICP".to_string(),
             description: "Anda Engine for managing agents and tools".to_string(),
             endpoint: "https://localhost:8443/default".to_string(),
-            protocols: BTreeMap::new(),
-            payments: BTreeSet::new(),
-            provider: None,
+            ..Default::default()
         })
         .with_cancellation_token(global_cancel_token.clone())
         .with_web3_client(Arc::new(Web3SDK::from_tee(tee.clone())))
@@ -412,9 +410,7 @@ async fn bootstrap_local(
             name: "Anda ICP".to_string(),
             description: "Anda Engine for managing agents and tools".to_string(),
             endpoint: "https://localhost:8443/default".to_string(),
-            protocols: BTreeMap::new(),
-            payments: BTreeSet::new(),
-            provider: None,
+            ..Default::default()
         })
         .with_cancellation_token(global_cancel_token.clone())
         .with_web3_client(Arc::new(Web3SDK::from_web3(Arc::new(web3.clone()))))

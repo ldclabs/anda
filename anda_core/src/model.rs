@@ -37,6 +37,10 @@ pub struct AgentInput {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub resources: Vec<Resource>,
 
+    /// The topics for the agent request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topics: Option<Vec<String>>,
+
     /// The metadata for the agent request
     #[serde(skip_serializing_if = "Option::is_none")]
     pub meta: Option<RequestMeta>,
@@ -49,6 +53,7 @@ impl AgentInput {
             name,
             prompt,
             resources: Vec::new(),
+            topics: None,
             meta: None,
         }
     }

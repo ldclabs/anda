@@ -474,13 +474,10 @@ impl EngineBuilder {
         EngineBuilder {
             info: AgentInfo {
                 handle: "anda".to_string(),
-                handle_canister: None,
                 name: "Anda Engine".to_string(),
                 description: "Anda Engine for managing agents and tools".to_string(),
                 endpoint: "https://localhost:8443/default".to_string(),
-                protocols: BTreeMap::new(),
-                payments: BTreeSet::new(),
-                provider: None,
+                ..Default::default()
             },
             tools: ToolSet::new(),
             agents: AgentSet::new(),

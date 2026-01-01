@@ -117,13 +117,10 @@ async fn main() -> Result<(), BoxError> {
     let tools_name = tools.names();
     let info = AgentInfo {
         handle: "icp_ledger_agent".to_string(),
-        handle_canister: None,
         name: "ICP Agent".to_string(),
         description: "Test ICP Agent".to_string(),
         endpoint: "https://localhost:8443/default".to_string(),
-        protocols: BTreeMap::new(),
-        payments: BTreeSet::new(),
-        provider: None,
+        ..Default::default()
     };
     let agent = EchoEngineInfo::new(info.clone());
     let agent_name = agent.name();

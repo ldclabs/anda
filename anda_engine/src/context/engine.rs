@@ -447,6 +447,7 @@ impl Agent<AgentCtx> for RemoteAgent {
                 prompt,
                 resources,
                 meta: Some(ctx.base.self_meta(self.engine)),
+                ..Default::default()
             },
         )
         .await
