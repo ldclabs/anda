@@ -293,10 +293,6 @@ pub struct RequestMeta {
     /// The target engine principal for the request.
     pub engine: Option<Principal>,
 
-    /// The target threaded conversation for the request.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub thread: Option<Xid>,
-
     /// Gets the username from request context.
     /// Note: This is not verified and should not be used as a trusted identifier.
     /// For example, if triggered by a bot of X platform, this might be the username

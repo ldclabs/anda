@@ -193,7 +193,6 @@ impl BaseCtx {
     pub(crate) fn self_meta(&self, target: Principal) -> RequestMeta {
         RequestMeta {
             engine: Some(target),
-            thread: None,
             user: Some(self.name.clone()),
         }
     }
