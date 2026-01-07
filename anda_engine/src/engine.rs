@@ -227,7 +227,11 @@ impl Engine {
         meta: RequestMeta,
     ) -> Result<AgentCtx, BoxError> {
         let name = agent_name.to_ascii_lowercase();
-        if !self.export_agents.contains(&name) || !self.ctx.agents.contains(&name) {
+
+        // manager can access any agent
+        if (!self.export_agents.contains(&name) && !self.management.is_manager(&caller))
+            || !self.ctx.agents.contains(&name)
+        {
             return Err(format!("agent {} not found", name).into());
         }
 
@@ -296,9 +300,11 @@ impl Engine {
             .into());
         }
 
-        if !self.export_tools.contains(&input.name) || !self.ctx.tools.contains(&input.name) {
+        // manager can call any tool
+        if !self.export_tools.contains(&input.name) && !self.management.is_manager(&caller) {
             return Err(format!("tool {} not found", &input.name).into());
         }
+
         let tool = self
             .ctx
             .tools
