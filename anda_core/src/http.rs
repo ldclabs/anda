@@ -20,10 +20,9 @@
 use candid::{CandidType, Principal, decode_args, encode_args, utils::ArgumentEncoder};
 use ciborium::from_reader;
 use http::header;
-use ic_cose_types::to_cbor_bytes;
+use ic_auth_types::{ByteBufB64, deterministic_cbor_into_vec};
 use reqwest::Client;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use serde_bytes::ByteBuf;
 use std::fmt::Display;
 
 pub static CONTENT_TYPE_CBOR: &str = "application/cbor";
@@ -42,7 +41,7 @@ pub struct RPCRequest {
     /// - `()`: No arguments;
     /// - `(1,)`: Single argument;
     /// - `(1, "hello", 3.14)`: Three arguments.
-    pub params: ByteBuf,
+    pub params: ByteBufB64,
 }
 
 /// Represents an RPC request with method name and CBOR-encoded parameters.
@@ -56,7 +55,7 @@ pub struct RPCRequestRef<'a> {
     /// - `()`: No arguments;
     /// - `(1,)`: Single argument;
     /// - `(1, "hello", 3.14)`: Three arguments.
-    pub params: &'a ByteBuf,
+    pub params: &'a ByteBufB64,
 }
 
 /// Represents a request to an ICP canister with canister ID, method name, and Candid-encoded parameters
@@ -72,13 +71,13 @@ pub struct CanisterRequestRef<'a> {
     /// - `()`: No arguments;
     /// - `(1,)`: Single argument;
     /// - `(1, "hello", 3.14)`: Three arguments.
-    pub params: &'a ByteBuf,
+    pub params: &'a ByteBufB64,
 }
 
 /// Represents an RPC response that can be either:
-/// - Ok(ByteBuf): CBOR or Candid encoded successful response;
+/// - Ok(ByteBufB64): CBOR or Candid encoded successful response;
 /// - Err(String): Error message as a string.
-pub type RPCResponse = Result<ByteBuf, String>;
+pub type RPCResponse = Result<ByteBufB64, String>;
 
 // #[derive(Debug, Deserialize, Serialize)]
 // pub struct ListPagination {
@@ -144,13 +143,22 @@ pub async fn http_rpc<T>(
 where
     T: DeserializeOwned,
 {
-    let args = to_cbor_bytes(args);
+    let args = deterministic_cbor_into_vec(args).map_err(|e| HttpRPCError::RequestError {
+        endpoint: endpoint.to_string(),
+        path: method.to_string(),
+        error: format!("{e:?}"),
+    })?;
     let req = RPCRequestRef {
         method,
         params: &args.into(),
     };
+    let req = deterministic_cbor_into_vec(&req).map_err(|e| HttpRPCError::RequestError {
+        endpoint: endpoint.to_string(),
+        path: method.to_string(),
+        error: format!("{e:?}"),
+    })?;
 
-    let res = cbor_rpc(client, endpoint, method, None, to_cbor_bytes(&req)).await?;
+    let res = cbor_rpc(client, endpoint, method, None, req).await?;
     from_reader(&res[..]).map_err(|e| HttpRPCError::ResultError {
         endpoint: endpoint.to_string(),
         path: method.to_string(),
@@ -185,18 +193,17 @@ where
         path: method.to_string(),
         error: format!("{e:?}"),
     })?;
-    let res = cbor_rpc(
-        client,
-        endpoint,
+    let req = deterministic_cbor_into_vec(&CanisterRequestRef {
         canister,
-        None,
-        to_cbor_bytes(&CanisterRequestRef {
-            canister,
-            method,
-            params: &ByteBuf::from(args),
-        }),
-    )
-    .await?;
+        method,
+        params: &ByteBufB64::from(args),
+    })
+    .map_err(|e| HttpRPCError::RequestError {
+        endpoint: endpoint.to_string(),
+        path: method.to_string(),
+        error: format!("{e:?}"),
+    })?;
+    let res = cbor_rpc(client, endpoint, canister, None, req).await?;
     let res: (Out,) = decode_args(&res).map_err(|e| HttpRPCError::ResultError {
         endpoint: format!("{endpoint}/{canister}"),
         path: method.to_string(),
@@ -222,7 +229,7 @@ pub async fn cbor_rpc(
     path: impl Display,
     headers: Option<http::HeaderMap>,
     body: Vec<u8>,
-) -> Result<ByteBuf, HttpRPCError> {
+) -> Result<ByteBufB64, HttpRPCError> {
     let mut headers = headers.unwrap_or_default();
     let ct: http::HeaderValue = CONTENT_TYPE_CBOR.parse().unwrap();
     headers.insert(header::CONTENT_TYPE, ct.clone());

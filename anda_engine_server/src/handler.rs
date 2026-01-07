@@ -1,4 +1,4 @@
-use anda_core::{AgentInput, Json, ToolInput};
+use anda_core::{AgentInput, Json, RPCRequest, ToolInput};
 use anda_engine::engine::Engine;
 use axum::{
     extract::{Path, State},
@@ -7,13 +7,13 @@ use axum::{
 };
 use candid::Principal;
 use ciborium::from_reader;
+use ic_auth_types::deterministic_cbor_into_vec;
 use ic_auth_verifier::{
     envelope::{ANONYMOUS_PRINCIPAL, SignedEnvelope},
     unix_timestamp,
 };
-use ic_cose_types::to_cbor_bytes;
 use ic_tee_agent::{
-    RPCRequest, RPCResponse,
+    RPCResponse,
     http::{Content, ContentWithSHA3},
 };
 use std::collections::BTreeMap;
@@ -162,7 +162,7 @@ async fn engine_run(
                 .agent_run(caller, args.0)
                 .await
                 .map_err(|err| format!("failed to run agent: {err:?}"))?;
-            Ok(to_cbor_bytes(&res).into())
+            Ok(deterministic_cbor_into_vec(&res)?.into())
         }
         "tool_call" => {
             let args: (ToolInput<Json>,) = from_reader(req.params.as_slice())
@@ -171,11 +171,11 @@ async fn engine_run(
                 .tool_call(caller, args.0)
                 .await
                 .map_err(|err| format!("failed to call tool: {err:?}"))?;
-            Ok(to_cbor_bytes(&res).into())
+            Ok(deterministic_cbor_into_vec(&res)?.into())
         }
         "information" => {
             let res = engine.information();
-            Ok(to_cbor_bytes(&res).into())
+            Ok(deterministic_cbor_into_vec(&res)?.into())
         }
         method => Err(format!(
             "{method} on engine {} not implemented",

@@ -29,7 +29,7 @@ use anda_core::BoxError;
 use anda_core::context::CacheExpiry;
 use bytes::Bytes;
 use ciborium::from_reader;
-use ic_cose_types::to_cbor_bytes;
+use ic_auth_types::deterministic_cbor_into_vec;
 use moka::{future::Cache, policy::Expiry};
 use object_store::path::Path;
 use serde::{Serialize, de::DeserializeOwned};
@@ -150,7 +150,7 @@ impl CacheService {
             .try_get_with_by_ref(key, async move {
                 match init.await {
                     Ok((val, expiry)) => {
-                        let data = to_cbor_bytes(&val);
+                        let data = deterministic_cbor_into_vec(&val)?;
                         Ok(Arc::new((data.into(), expiry)))
                     }
                     Err(e) => Err(e),
@@ -173,7 +173,7 @@ impl CacheService {
     where
         T: Sized + Serialize + Send,
     {
-        let data = to_cbor_bytes(&value.0);
+        let data = deterministic_cbor_into_vec(&value.0).unwrap();
         self.cache_store
             .get(path)
             .expect("CacheService: cache not found")
@@ -196,7 +196,7 @@ impl CacheService {
     where
         T: Sized + Serialize + Send,
     {
-        let data = to_cbor_bytes(&value.0);
+        let data = deterministic_cbor_into_vec(&value.0).unwrap();
         let entry = self
             .cache_store
             .get(path)
@@ -229,9 +229,7 @@ impl CacheService {
         &self,
         path: &Path,
     ) -> impl Iterator<Item = (Arc<String>, Arc<(Bytes, Option<CacheExpiry>)>)> {
-        
-        self
-            .cache_store
+        self.cache_store
             .get(path)
             .expect("CacheService: cache not found")
             .iter()

@@ -6,6 +6,7 @@ use candid::{
 };
 use ciborium::from_reader;
 use ic_agent::identity::{AnonymousIdentity, BasicIdentity, Secp256k1Identity};
+use ic_auth_types::deterministic_cbor_into_vec;
 use ic_auth_verifier::envelope::SignedEnvelope;
 use ic_cose::client::CoseSDK;
 use ic_cose_types::{
@@ -15,7 +16,6 @@ use ic_cose_types::{
         k256::{secp256k1_verify_bip340, secp256k1_verify_ecdsa},
         sha3_256,
     },
-    to_cbor_bytes,
 };
 use ic_tee_gateway_sdk::crypto;
 use serde::{Serialize, de::DeserializeOwned};
@@ -513,7 +513,7 @@ impl Web3ClientFeatures for Client {
             method: &method,
             params: &args.into(),
         };
-        let body = to_cbor_bytes(&req);
+        let body = deterministic_cbor_into_vec(&req).unwrap();
         let digest: [u8; 32] = sha3_256(&body);
         let se = match SignedEnvelope::sign_digest(&self.identity, digest.into()) {
             Ok(se) => se,
@@ -612,12 +612,12 @@ impl HttpFeatures for Client {
         if !self.allow_http && !endpoint.starts_with("https://") {
             return Err("Invalid endpoint, must start with https://".into());
         }
-        let args = to_cbor_bytes(&args);
+        let args = deterministic_cbor_into_vec(&args)?;
         let req = RPCRequestRef {
             method,
             params: &args.into(),
         };
-        let body = to_cbor_bytes(&req);
+        let body = deterministic_cbor_into_vec(&req)?;
         let digest: [u8; 32] = sha3_256(&body);
         let se = SignedEnvelope::sign_digest(&self.identity, digest.into())?;
         let mut headers = http::HeaderMap::new();

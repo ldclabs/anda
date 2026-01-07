@@ -21,6 +21,7 @@ serde = { workspace = true }
 ic-agent = { workspace = true }
 ic_cose = { workspace = true }
 ic_cose_types = { workspace = true }
+ic_auth_types = { workspace = true }
 ic_auth_verifier = { workspace = true, features = ["full"] }
 ic_tee_gateway_sdk = { workspace = true }
 reqwest = { workspace = true }

@@ -23,6 +23,7 @@ tokio-util = { workspace = true }
 structured-logger = { workspace = true }
 tokio = { workspace = true }
 log = { workspace = true }
+ic_auth_types = { workspace = true }
 ic_auth_verifier = { workspace = true, features = ["full"] }
 
 [dev-dependencies]

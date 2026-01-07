@@ -4,8 +4,8 @@ use candid::{
     utils::{ArgumentEncoder, encode_args},
 };
 use ciborium::from_reader;
+use ic_auth_types::deterministic_cbor_into_vec;
 use ic_auth_verifier::envelope::SignedEnvelope;
-use ic_cose_types::to_cbor_bytes;
 use serde::{Serialize, de::DeserializeOwned};
 use std::sync::Arc;
 
@@ -466,7 +466,7 @@ impl HttpFeatures for &Web3SDK {
         match self {
             Web3SDK::Tee(cli) => cli.https_signed_rpc(endpoint, method, args).await,
             Web3SDK::Web3(Web3Client { client: cli }) => {
-                let args = to_cbor_bytes(&args);
+                let args = deterministic_cbor_into_vec(&args)?;
                 let res = cli
                     .https_signed_rpc_raw(endpoint.to_string(), method.to_string(), args)
                     .await?;

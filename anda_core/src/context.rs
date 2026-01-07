@@ -35,7 +35,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use ciborium::from_reader;
-use ic_cose_types::to_cbor_bytes;
+use ic_auth_types::deterministic_cbor_into_vec;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{future::Future, sync::Arc, time::Duration};
 
@@ -514,7 +514,7 @@ pub trait CacheStoreFeatures: StoreFeatures + CacheFeatures + Send + Sync + 'sta
             }
             Err(_) => {
                 let val: T = init.await?;
-                let data = to_cbor_bytes(&val);
+                let data = deterministic_cbor_into_vec(&val)?;
                 let res = self.store_put(&p, PutMode::Create, data.into()).await?;
                 self.cache_set(
                     key,
@@ -570,7 +570,7 @@ pub trait CacheStoreFeatures: StoreFeatures + CacheFeatures + Send + Sync + 'sta
     where
         T: DeserializeOwned + Serialize + Send,
     {
-        let data = to_cbor_bytes(&val);
+        let data = deterministic_cbor_into_vec(&val)?;
         let p = Path::from(key);
         if let Some(ver) = version {
             // atomic update
