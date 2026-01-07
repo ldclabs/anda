@@ -10,8 +10,8 @@ categories.workspace = true
 license.workspace = true
 
 [dependencies]
-anda_core = { path = "../anda_core", version = "0.8" }
-anda_web3_client = { path = "../anda_web3_client", version = "0.8" }
+anda_core = { path = "../anda_core", version = "0.9" }
+anda_web3_client = { path = "../anda_web3_client", version = "0.9" }
 base64 = { workspace = true }
 clap = { workspace = true }
 dotenv = { workspace = true }

@@ -47,7 +47,7 @@ use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
 
 use crate::{
     context::{AgentCtx, BaseCtx, Web3Client, Web3SDK},
-    management::{BaseManagement, Management, SYSTEM_PATH, UserState, Visibility},
+    management::{BaseManagement, Management, SYSTEM_PATH, Visibility},
     model::Model,
     store::Store,
 };
@@ -73,12 +73,7 @@ pub struct Engine {
 #[async_trait]
 pub trait Hook: Send + Sync {
     /// Called before an agent is executed.
-    async fn on_agent_start(
-        &self,
-        _ctx: &AgentCtx,
-        _agent: &str,
-        _state: &UserState,
-    ) -> Result<(), BoxError> {
+    async fn on_agent_start(&self, _ctx: &AgentCtx, _agent: &str) -> Result<(), BoxError> {
         Ok(())
     }
 
@@ -93,12 +88,7 @@ pub trait Hook: Send + Sync {
     }
 
     /// Called before a tool is called.
-    async fn on_tool_start(
-        &self,
-        _ctx: &BaseCtx,
-        _tool: &str,
-        _state: &UserState,
-    ) -> Result<(), BoxError> {
+    async fn on_tool_start(&self, _ctx: &BaseCtx, _tool: &str) -> Result<(), BoxError> {
         Ok(())
     }
 
@@ -137,14 +127,9 @@ impl Hooks {
 
 #[async_trait]
 impl Hook for Hooks {
-    async fn on_agent_start(
-        &self,
-        ctx: &AgentCtx,
-        agent: &str,
-        state: &UserState,
-    ) -> Result<(), BoxError> {
+    async fn on_agent_start(&self, ctx: &AgentCtx, agent: &str) -> Result<(), BoxError> {
         for hook in &self.hooks {
-            hook.on_agent_start(ctx, agent, state).await?;
+            hook.on_agent_start(ctx, agent).await?;
         }
         Ok(())
     }
@@ -161,14 +146,9 @@ impl Hook for Hooks {
         Ok(output)
     }
 
-    async fn on_tool_start(
-        &self,
-        ctx: &BaseCtx,
-        tool: &str,
-        state: &UserState,
-    ) -> Result<(), BoxError> {
+    async fn on_tool_start(&self, ctx: &BaseCtx, tool: &str) -> Result<(), BoxError> {
         for hook in &self.hooks {
-            hook.on_tool_start(ctx, tool, state).await?;
+            hook.on_tool_start(ctx, tool).await?;
         }
         Ok(())
     }
@@ -284,31 +264,17 @@ impl Engine {
             .ok_or_else(|| format!("agent {} not found", input.name))?;
 
         let visibility = self.management.check_visibility(&caller)?;
-        let now_ms = unix_ms();
-        let user_state = self.management.load_user(&caller).await?;
-        let user_state = Arc::new(user_state);
-        if visibility == Visibility::Protected
-            && !self.management.is_manager(&caller)
-            && !user_state.has_permission(&caller, now_ms)
-        {
+        if visibility == Visibility::Protected && !self.management.is_manager(&caller) {
             return Err("caller does not have permission".into());
         }
 
         let ctx = self.ctx_with(caller, &input.name, meta)?;
-        self.hooks
-            .on_agent_start(&ctx, &input.name, user_state.as_ref())
-            .await?;
-
-        // Increment agent requests for the user
-        user_state.increment_agent_requests(now_ms);
-        // Save the user state after incrementing requests
-        self.management.update_user(user_state.as_ref()).await?;
+        self.hooks.on_agent_start(&ctx, &input.name).await?;
 
         let output = agent
             .run(ctx.clone(), input.prompt, input.resources)
             .await?;
         let mut output = self.hooks.on_agent_end(&ctx, &input.name, output).await?;
-        self.management.update_user(user_state.as_ref()).await?;
         output.raw_history.clear(); // clear raw history
         Ok(output)
     }
@@ -340,28 +306,15 @@ impl Engine {
             .ok_or_else(|| format!("tool {} not found", &input.name))?;
 
         let visibility = self.management.check_visibility(&caller)?;
-        let now_ms = unix_ms();
-        let user_state = self.management.load_user(&caller).await?;
-        let user_state = Arc::new(user_state);
-        if visibility == Visibility::Protected
-            && !self.management.is_manager(&caller)
-            && !user_state.has_permission(&caller, now_ms)
-        {
+        if visibility == Visibility::Protected && !self.management.is_manager(&caller) {
             return Err("caller does not have permission".into());
         }
 
         let ctx = self.ctx.child_base_with(caller, &input.name, meta)?;
-        self.hooks
-            .on_tool_start(&ctx, &input.name, user_state.as_ref())
-            .await?;
-        // Increment tool requests for the user
-        user_state.increment_tool_requests(now_ms);
-        // Save the user state after incrementing requests
-        self.management.update_user(user_state.as_ref()).await?;
+        self.hooks.on_tool_start(&ctx, &input.name).await?;
 
         let output = tool.call(ctx.clone(), input.args, input.resources).await?;
         let res = self.hooks.on_tool_end(&ctx, &input.name, output).await?;
-        self.management.update_user(user_state.as_ref()).await?;
         Ok(res)
     }
 

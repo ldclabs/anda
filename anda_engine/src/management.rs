@@ -4,12 +4,6 @@ use candid::Principal;
 use ic_auth_verifier::ANONYMOUS_PRINCIPAL;
 use std::collections::BTreeSet;
 
-mod db;
-mod user;
-
-pub use db::*;
-pub use user::*;
-
 pub static SYSTEM_PATH: &str = "_";
 
 #[async_trait]
@@ -17,16 +11,6 @@ pub trait Management: Send + Sync {
     fn is_controller(&self, caller: &Principal) -> bool;
     fn is_manager(&self, caller: &Principal) -> bool;
     fn check_visibility(&self, caller: &Principal) -> Result<Visibility, BoxError>;
-
-    async fn load_user(&self, _caller: &Principal) -> Result<UserState, BoxError> {
-        Err("`load_user` is not implemented".into())
-    }
-
-    async fn update_user(&self, _user: &UserState) -> Result<(), BoxError> {
-        Err("`save_user` is not implemented".into())
-    }
-
-    // TODO: more management methods
 }
 
 /// Represents system management tools for the Anda engine.
@@ -71,13 +55,5 @@ impl Management for BaseManagement {
         }
 
         Ok(self.visibility)
-    }
-
-    async fn load_user(&self, user: &Principal) -> Result<UserState, BoxError> {
-        Ok(UserState::new(*user))
-    }
-
-    async fn update_user(&self, _user: &UserState) -> Result<(), BoxError> {
-        Ok(())
     }
 }

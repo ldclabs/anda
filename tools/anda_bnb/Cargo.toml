@@ -10,9 +10,9 @@ categories.workspace = true
 license.workspace = true
 
 [dependencies]
-anda_core = { path = "../../anda_core", version = "0.8" }
-anda_engine = { path = "../../anda_engine", version = "0.8" }
-anda_web3_client = { path = "../../anda_web3_client", version = "0.8" }
+anda_core = { path = "../../anda_core", version = "0.9" }
+anda_engine = { path = "../../anda_engine", version = "0.9" }
+anda_web3_client = { path = "../../anda_web3_client", version = "0.9" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 schemars = { workspace = true }

@@ -10,7 +10,7 @@ categories.workspace = true
 license.workspace = true
 
 [dependencies]
-anda_core = { path = "../anda_core", version = "0.8" }
+anda_core = { path = "../anda_core", version = "0.9" }
 anda_cloud_cdk = { workspace = true }
 anda_cognitive_nexus = { workspace = true }
 anda_kip = { workspace = true }
