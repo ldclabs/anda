@@ -221,7 +221,7 @@ where
 
     /// Checks if a tool with the given name exists in the set
     pub fn contains(&self, name: &str) -> bool {
-        self.set.contains_key(name)
+        self.set.contains_key(&name.to_ascii_lowercase())
     }
 
     /// Returns the names of all tools in the set
@@ -231,7 +231,9 @@ where
 
     /// Retrieves definition for a specific agent.
     pub fn definition(&self, name: &str) -> Option<FunctionDefinition> {
-        self.set.get(name).map(|tool| tool.definition())
+        self.set
+            .get(&name.to_ascii_lowercase())
+            .map(|tool| tool.definition())
     }
 
     /// Returns definitions for all or specified tools.
@@ -242,11 +244,13 @@ where
     /// # Returns
     /// - Vec<[`FunctionDefinition`]>: Vector of agent definitions.
     pub fn definitions(&self, names: Option<&[&str]>) -> Vec<FunctionDefinition> {
+        let names: Option<Vec<String>> =
+            names.map(|names| names.iter().map(|n| n.to_ascii_lowercase()).collect());
         self.set
             .iter()
-            .filter_map(|(name, tool)| match names {
+            .filter_map(|(name, tool)| match &names {
                 Some(names) => {
-                    if names.contains(&name.as_str()) {
+                    if names.contains(name) {
                         Some(tool.definition())
                     } else {
                         None
@@ -265,11 +269,13 @@ where
     /// # Returns
     /// - Vec<[`Function`]>: Vector of tool functions.
     pub fn functions(&self, names: Option<&[&str]>) -> Vec<Function> {
+        let names: Option<Vec<String>> =
+            names.map(|names| names.iter().map(|n| n.to_ascii_lowercase()).collect());
         self.set
             .iter()
-            .filter_map(|(name, tool)| match names {
+            .filter_map(|(name, tool)| match &names {
                 Some(names) => {
-                    if names.contains(&name.as_str()) {
+                    if names.contains(name) {
                         Some(Function {
                             definition: tool.definition(),
                             supported_resource_tags: tool.supported_resource_tags(),
@@ -289,7 +295,7 @@ where
     /// Extracts resources from the provided list based on the tool's supported tags.
     pub fn select_resources(&self, name: &str, resources: &mut Vec<Resource>) -> Vec<Resource> {
         self.set
-            .get(name)
+            .get(&name.to_ascii_lowercase())
             .map(|tool| {
                 let supported_tags = tool.supported_resource_tags();
                 select_resources(resources, &supported_tags)
@@ -305,7 +311,7 @@ where
     where
         T: Tool<C> + Send + Sync + 'static,
     {
-        let name = tool.name();
+        let name = tool.name().to_ascii_lowercase();
         validate_function_name(&name)?;
         if self.set.contains_key(&name) {
             return Err(format!("tool {} already exists", name).into());
@@ -318,6 +324,6 @@ where
 
     /// Retrieves a tool by name
     pub fn get(&self, name: &str) -> Option<&dyn ToolDyn<C>> {
-        self.set.get(name).map(|v| &**v)
+        self.set.get(&name.to_ascii_lowercase()).map(|v| &**v)
     }
 }

@@ -161,7 +161,7 @@ let engine = Engine::builder()
    .with_tee_client(my_tee_client)
    .with_model(my_llm_model)
    .register_tool(my_tool)
-   .register_agent(my_agent)
+   .register_agent(my_agent, None)
    .build("default_agent")?;
 
 let output = engine.agent_run(caller, AgentInput{ prompt: "Hello".to_string(), ..Default::default() }).await?;

@@ -184,8 +184,7 @@ impl ClientBuilder {
                 .timeout(Duration::from_secs(120))
                 .gzip(true)
                 .user_agent(APP_USER_AGENT)
-                .build()
-                .expect("Anda reqwest client should build"),
+                .build()?,
         };
 
         Ok(Client {
@@ -513,7 +512,10 @@ impl Web3ClientFeatures for Client {
             method: &method,
             params: &args.into(),
         };
-        let body = deterministic_cbor_into_vec(&req).unwrap();
+        let body = match deterministic_cbor_into_vec(&req) {
+            Ok(body) => body,
+            Err(err) => return Box::pin(futures::future::ready(Err(err.into()))),
+        };
         let digest: [u8; 32] = sha3_256(&body);
         let se = match SignedEnvelope::sign_digest(&self.identity, digest.into()) {
             Ok(se) => se,

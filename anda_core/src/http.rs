@@ -231,7 +231,7 @@ pub async fn cbor_rpc(
     body: Vec<u8>,
 ) -> Result<ByteBufB64, HttpRPCError> {
     let mut headers = headers.unwrap_or_default();
-    let ct: http::HeaderValue = CONTENT_TYPE_CBOR.parse().unwrap();
+    let ct: http::HeaderValue = http::HeaderValue::from_static(CONTENT_TYPE_CBOR);
     headers.insert(header::CONTENT_TYPE, ct.clone());
     headers.insert(header::ACCEPT, ct);
     let res = client

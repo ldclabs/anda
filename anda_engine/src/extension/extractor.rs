@@ -301,7 +301,7 @@ mod tests {
             .with_model(Model::mock_implemented())
             .register_tool(tool)
             .unwrap()
-            .register_agent(agent)
+            .register_agent(agent, None)
             .unwrap()
             .mock_ctx();
 

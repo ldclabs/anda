@@ -135,7 +135,7 @@ async fn main() -> Result<(), BoxError> {
             visibility: Visibility::Public,
         }))
         .register_tools(tools)?
-        .register_agent(agent)?
+        .register_agent(agent, None)?
         .export_tools(tools_name);
 
     // Initialize and start the server

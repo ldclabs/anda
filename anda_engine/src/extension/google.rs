@@ -23,7 +23,7 @@
 //! let engine = Engine::builder()
 //!     .with_name("MyEngine".to_string())
 //!     .register_tool(google_search)?
-//!     .register_agent(my_agent)?
+//!     .register_agent(my_agent, None)?
 //!     .build("default_agent".to_string())?;
 //! ```
 

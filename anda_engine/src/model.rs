@@ -211,7 +211,7 @@ pub fn request_client_builder() -> reqwest::ClientBuilder {
         .user_agent(APP_USER_AGENT)
         .default_headers({
             let mut headers = reqwest::header::HeaderMap::new();
-            let ct: http::HeaderValue = CONTENT_TYPE_JSON.parse().unwrap();
+            let ct: http::HeaderValue = http::HeaderValue::from_static(CONTENT_TYPE_JSON);
             headers.insert(http::header::CONTENT_TYPE, ct.clone());
             headers.insert(http::header::ACCEPT, ct);
             headers

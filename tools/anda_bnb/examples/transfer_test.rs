@@ -80,7 +80,7 @@ pub async fn test_bnb_ledger_transfer() {
     // Create a context for testing
     let engine_ctx = EngineBuilder::new()
         .with_web3_client(Arc::new(Web3SDK::from_web3(Arc::new(web3))))
-        .register_agent(agent)
+        .register_agent(agent, None)
         .unwrap()
         .mock_ctx();
     let base_ctx = engine_ctx.base;

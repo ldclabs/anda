@@ -101,6 +101,7 @@ impl ServerBuilder {
         };
         let app = Router::new()
             .route("/", routing::get(get_information))
+            .route("/.well-known/information", routing::get(get_information))
             .route("/.well-known/agents", routing::get(get_information))
             .route(
                 "/.well-known/agents/{id}",

@@ -62,9 +62,10 @@ pub fn json_set_unix_ms_timestamp(mut vals: Vec<Json>, timestamp_ms: u64) -> Vec
 pub fn json_convert_rfc3339_timestamp(mut vals: Vec<Json>) -> Vec<Json> {
     for val in vals.iter_mut() {
         if let Some(obj) = val.as_object_mut()
-            && let Some(timestamp_ms) = obj.get("timestamp").and_then(Json::as_u64) {
-                obj.insert("timestamp".into(), rfc3339_datetime(timestamp_ms).into());
-            }
+            && let Some(timestamp_ms) = obj.get("timestamp").and_then(Json::as_u64)
+        {
+            obj.insert("timestamp".into(), rfc3339_datetime(timestamp_ms).into());
+        }
     }
     vals
 }

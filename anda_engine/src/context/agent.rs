@@ -37,6 +37,7 @@ use candid::{CandidType, Principal, utils::ArgumentEncoder};
 use futures_util::Stream;
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
+    collections::BTreeMap,
     future::Future,
     pin::Pin,
     sync::Arc,
@@ -54,8 +55,13 @@ pub static DYNAMIC_REMOTE_ENGINES: &str = "_engines";
 pub struct AgentCtx {
     /// Base context providing fundamental operations.
     pub base: BaseCtx,
+
+    /// Label of the agent.
+    pub(crate) label: String,
     /// AI model used for completions and embeddings.
     pub(crate) model: Model,
+    // label -> model
+    pub(crate) models: Arc<BTreeMap<String, Model>>,
     /// Set of available tools that can be called.
     pub(crate) tools: Arc<ToolSet<BaseCtx>>,
     /// Set of available agents that can be invoked.
@@ -73,12 +79,15 @@ impl AgentCtx {
     pub(crate) fn new(
         base: BaseCtx,
         model: Model,
+        models: Arc<BTreeMap<String, Model>>,
         tools: Arc<ToolSet<BaseCtx>>,
         agents: Arc<AgentSet<AgentCtx>>,
     ) -> Self {
         Self {
             base,
+            label: String::new(),
             model,
+            models,
             tools,
             agents,
         }
@@ -88,10 +97,12 @@ impl AgentCtx {
     ///
     /// # Arguments
     /// * `agent_name` - Name of the agent to create context for.
-    pub(crate) fn child(&self, agent_name: &str) -> Result<Self, BoxError> {
+    pub(crate) fn child(&self, agent_name: &str, agent_label: &str) -> Result<Self, BoxError> {
         Ok(Self {
             base: self.base.child(format!("A:{}", agent_name))?,
+            label: agent_label.to_string(),
             model: self.model.clone(),
+            models: self.models.clone(),
             tools: self.tools.clone(),
             agents: self.agents.clone(),
         })
@@ -115,13 +126,16 @@ impl AgentCtx {
         &self,
         caller: Principal,
         agent_name: &str,
+        agent_label: &str,
         meta: RequestMeta,
     ) -> Result<Self, BoxError> {
         Ok(Self {
             base: self
                 .base
                 .child_with(caller, format!("A:{}", agent_name), meta)?,
+            label: agent_label.to_string(),
             model: self.model.clone(),
+            models: self.models.clone(),
             tools: self.tools.clone(),
             agents: self.agents.clone(),
         })
@@ -149,8 +163,15 @@ impl AgentCtx {
         req: CompletionRequest,
         resources: Vec<Resource>,
     ) -> CompletionRunner {
+        let model = self
+            .models
+            .get(&self.label)
+            .cloned()
+            .unwrap_or_else(|| self.model.clone());
+
         CompletionRunner {
             ctx: self.clone(),
+            model,
             req,
             resources,
             chat_history: Vec::new(),
@@ -341,9 +362,16 @@ impl AgentContext for AgentCtx {
         &self,
         mut input: ToolInput<Json>,
     ) -> Result<(ToolOutput<Json>, Option<Principal>), BoxError> {
+        if input.name.starts_with("rt_") {
+            input.name.replace_range(..3, "RT_");
+        }
+
         if !input.name.starts_with("RT_") {
             let ctx = self.child_base(&input.name)?;
-            let tool = self.tools.get(&input.name).expect("tool not found");
+            let tool = self
+                .tools
+                .get(&input.name)
+                .ok_or_else(|| format!("tool {} not found", &input.name))?;
             return tool
                 .call(ctx, input.args, input.resources)
                 .await
@@ -390,11 +418,21 @@ impl AgentContext for AgentCtx {
         &self,
         mut input: AgentInput,
     ) -> Result<(AgentOutput, Option<Principal>), BoxError> {
+        if input.name.starts_with("la_") {
+            input.name.replace_range(..3, "LA_");
+        }
+        if input.name.starts_with("ra_") {
+            input.name.replace_range(..3, "RA_");
+        }
+
         if !input.name.starts_with("RA_") {
             let name = input.name.strip_prefix("LA_").unwrap_or(&input.name);
             let name = name.to_ascii_lowercase();
-            let ctx = self.child(&name)?;
-            let agent = self.agents.get(&name).expect("agent not found");
+            let agent = self
+                .agents
+                .get(&name)
+                .ok_or_else(|| format!("agent {} not found", name))?;
+            let ctx = self.child(&name, agent.label())?;
             return agent
                 .run(ctx, input.prompt, input.resources)
                 .await
@@ -493,8 +531,7 @@ impl CompletionFeatures for AgentCtx {
             last = Some(step);
         }
 
-        // 理论上一定有输出
-        Ok(last.expect("completion runner returned no output"))
+        last.ok_or_else(|| "completion runner returned no output".into())
     }
 }
 
@@ -883,6 +920,7 @@ impl HttpFeatures for AgentCtx {
 /// A iteration style executor for completion.
 pub struct CompletionRunner {
     ctx: AgentCtx,
+    model: Model,
     req: CompletionRequest,
     resources: Vec<Resource>,
     chat_history: Vec<Message>,
@@ -930,7 +968,7 @@ impl CompletionRunner {
 
     async fn inner_next(&mut self) -> Result<Option<AgentOutput>, BoxError> {
         self.step += 1;
-        let mut output = self.ctx.model.completion(self.req.clone()).await?;
+        let mut output = self.model.completion(self.req.clone()).await?;
         self.usage.accumulate(&output.usage);
         // 累计所有原始对话历史（包含初始的 req.raw_history 和 req.chat_history）
         self.req.raw_history.append(&mut output.raw_history);
@@ -944,7 +982,10 @@ impl CompletionRunner {
                 return Err("operation cancelled".into());
             }
 
-            if self.ctx.tools.contains(&tool.name) || tool.name.starts_with("RT_") {
+            if self.ctx.tools.contains(&tool.name)
+                || tool.name.starts_with("RT_")
+                || tool.name.starts_with("rt_")
+            {
                 match self
                     .ctx
                     .tool_call(ToolInput {
@@ -981,7 +1022,9 @@ impl CompletionRunner {
                 }
             } else if self.ctx.agents.contains(&tool.name)
                 || tool.name.starts_with("LA_")
+                || tool.name.starts_with("la_")
                 || tool.name.starts_with("RA_")
+                || tool.name.starts_with("ra_")
             {
                 // 代理调用
                 let args: AgentArgs = match serde_json::from_value(tool.args.clone()) {

@@ -144,6 +144,8 @@ pub trait AgentDyn<C>: Send + Sync
 where
     C: AgentContext + Send + Sync,
 {
+    fn label(&self) -> &str;
+
     fn name(&self) -> String;
 
     fn definition(&self) -> FunctionDefinition;
@@ -163,34 +165,43 @@ where
 }
 
 /// Adapter for converting static Agent to dynamic dispatch.
-struct AgentWrapper<T, C>(Arc<T>, PhantomData<C>)
+struct AgentWrapper<T, C>
 where
     T: Agent<C> + 'static,
-    C: AgentContext + Send + Sync + 'static;
+    C: AgentContext + Send + Sync + 'static,
+{
+    inner: Arc<T>,
+    label: String,
+    _phantom: PhantomData<C>,
+}
 
 impl<T, C> AgentDyn<C> for AgentWrapper<T, C>
 where
     T: Agent<C> + 'static,
     C: AgentContext + Send + Sync + 'static,
 {
+    fn label(&self) -> &str {
+        &self.label
+    }
+
     fn name(&self) -> String {
-        self.0.name()
+        self.inner.name()
     }
 
     fn definition(&self) -> FunctionDefinition {
-        self.0.definition()
+        self.inner.definition()
     }
 
     fn tool_dependencies(&self) -> Vec<String> {
-        self.0.tool_dependencies()
+        self.inner.tool_dependencies()
     }
 
     fn supported_resource_tags(&self) -> Vec<String> {
-        self.0.supported_resource_tags()
+        self.inner.supported_resource_tags()
     }
 
     fn init(&self, ctx: C) -> BoxPinFut<Result<(), BoxError>> {
-        let agent = self.0.clone();
+        let agent = self.inner.clone();
         Box::pin(async move { agent.init(ctx).await })
     }
 
@@ -200,7 +211,7 @@ where
         prompt: String,
         resources: Vec<Resource>,
     ) -> BoxPinFut<Result<AgentOutput, BoxError>> {
-        let agent = self.0.clone();
+        let agent = self.inner.clone();
         Box::pin(async move { agent.run(ctx, prompt, resources).await })
     }
 }
@@ -275,11 +286,13 @@ where
     /// # Returns
     /// - Vec<[`Function`]>: Vector of agent functions.
     pub fn functions(&self, names: Option<&[&str]>) -> Vec<Function> {
+        let names: Option<Vec<String>> =
+            names.map(|names| names.iter().map(|n| n.to_ascii_lowercase()).collect());
         self.set
             .iter()
-            .filter_map(|(name, agent)| match names {
+            .filter_map(|(name, agent)| match &names {
                 Some(names) => {
-                    if names.contains(&name.as_str()) {
+                    if names.contains(name) {
                         Some(Function {
                             definition: agent.definition(),
                             supported_resource_tags: agent.supported_resource_tags(),
@@ -299,7 +312,7 @@ where
     /// Extracts resources from the provided list based on the agent's supported tags.
     pub fn select_resources(&self, name: &str, resources: &mut Vec<Resource>) -> Vec<Resource> {
         self.set
-            .get(name)
+            .get(&name.to_ascii_lowercase())
             .map(|agent| {
                 let supported_tags = agent.supported_resource_tags();
                 select_resources(resources, &supported_tags)
@@ -311,7 +324,7 @@ where
     ///
     /// # Arguments
     /// - `agent`: The agent to register, must implement [`Agent`] trait.
-    pub fn add<T>(&mut self, agent: T) -> Result<(), BoxError>
+    pub fn add<T>(&mut self, agent: T, label: Option<String>) -> Result<(), BoxError>
     where
         T: Agent<C> + Send + Sync + 'static,
     {
@@ -321,13 +334,17 @@ where
         }
 
         validate_function_name(&name)?;
-        let agent_dyn = AgentWrapper(Arc::new(agent), PhantomData);
+        let agent_dyn = AgentWrapper {
+            inner: Arc::new(agent),
+            label: label.unwrap_or_else(|| name.clone()),
+            _phantom: PhantomData,
+        };
         self.set.insert(name, Box::new(agent_dyn));
         Ok(())
     }
 
     /// Retrieves an agent by name.
     pub fn get(&self, name: &str) -> Option<&dyn AgentDyn<C>> {
-        self.set.get(name).map(|v| &**v)
+        self.set.get(&name.to_ascii_lowercase()).map(|v| &**v)
     }
 }

@@ -260,7 +260,7 @@ mod tests {
                 ..Default::default()
             })
             .with_web3_client(Arc::new(Web3SDK::from_web3(Arc::new(web3))))
-            .register_agent(agent)
+            .register_agent(agent, None)
             .unwrap()
             .mock_ctx();
         let ctx = engine_ctx.base;

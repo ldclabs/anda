@@ -37,5 +37,5 @@ hex = { workspace = true }
 
 [dev-dependencies]
 
-[patch.crates-io]
-candid = { git = "https://github.com/ldclabs/candid.git", rev = "4cf7d02bad9530172cb4cafe733cb1e80689b793" } # remove check_recursion on stack for TEE
+# [patch.crates-io]
+# candid = { git = "https://github.com/ldclabs/candid.git", rev = "4cf7d02bad9530172cb4cafe733cb1e80689b793" } # remove check_recursion on stack for TEE

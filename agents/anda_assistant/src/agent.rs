@@ -1,8 +1,7 @@
 use anda_cognitive_nexus::{CognitiveNexus, ConceptPK};
 use anda_core::{
-    Agent, AgentContext, AgentOutput, BoxError, CompletionRequest, Document, Documents,
-    Message, Principal, Resource, StateFeatures, Tool, ToolSet, Usage, evaluate_tokens,
-    update_resources,
+    Agent, AgentContext, AgentOutput, BoxError, CompletionRequest, Document, Documents, Message,
+    Principal, Resource, StateFeatures, Tool, ToolSet, Usage, evaluate_tokens, update_resources,
 };
 use anda_db::{database::AndaDB, index::BTree};
 use anda_engine::{
@@ -219,14 +218,36 @@ impl Agent<AgentCtx> for Assistant {
             ((evaluate_tokens(&instructions) + evaluate_tokens(&prompt)) as f64 * 1.2) as usize,
         ) * 3; // Rough estimate of bytes per token
         let mut writer: Vec<u8> = Vec::with_capacity(256);
-        let _ = serde_json::to_writer(&mut writer, &conversations);
-        let mut history_bytes = writer.len();
+        let mut history_bytes = if serde_json::to_writer(&mut writer, &conversations).is_ok() {
+            writer.len()
+        } else {
+            0
+        };
+
+        // Keep the most recent conversations; remove the oldest first.
         while history_bytes > max_history_bytes && !conversations.is_empty() {
+            let oldest_idx = conversations
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, c)| c.created_at)
+                .map(|(idx, _)| idx)
+                .unwrap_or(0);
+
             writer.clear();
-            let conv = conversations.remove(0);
-            cursor = BTree::to_cursor(&conv._id);
-            let _ = serde_json::to_writer(&mut writer, &conv);
-            history_bytes = history_bytes.saturating_sub(writer.len());
+            if serde_json::to_writer(&mut writer, &conversations[oldest_idx]).is_ok() {
+                history_bytes = history_bytes.saturating_sub(writer.len());
+            } else {
+                break;
+            }
+
+            conversations.remove(oldest_idx);
+        }
+
+        // Cursor should allow listing conversations older than the oldest one we kept.
+        if !conversations.is_empty()
+            && let Some(min_id) = conversations.iter().map(|c| c._id).min()
+        {
+            cursor = BTree::to_cursor(&min_id);
         }
 
         let mut history_docs: Vec<Document> = Vec::with_capacity(conversations.len() + 2);
@@ -257,7 +278,7 @@ impl Agent<AgentCtx> for Assistant {
             content: vec![
                 format!(
                     "Current Datetime: {}\n---\n{}",
-                    rfc3339_datetime(created_at).unwrap(),
+                    rfc3339_datetime(created_at).unwrap_or_else(|| format!("unix_ms:{created_at}")),
                     Documents::new("history".to_string(), history_docs)
                 )
                 .into(),
@@ -334,8 +355,16 @@ impl Agent<AgentCtx> for Assistant {
                                 conversation.messages.clear(); // clear the first pending message.
                                 conversation.append_messages(res.chat_history);
                             } else {
-                                res.chat_history.drain(0..conversation.messages.len());
-                                conversation.append_messages(res.chat_history);
+                                let existing_len = conversation.messages.len();
+                                if res.chat_history.len() >= existing_len {
+                                    res.chat_history.drain(0..existing_len);
+                                    conversation.append_messages(res.chat_history);
+                                } else {
+                                    // Unexpected: runner returned shorter full history.
+                                    // Fall back to replacing stored messages.
+                                    conversation.messages.clear();
+                                    conversation.append_messages(res.chat_history);
+                                }
                             }
 
                             conversation.artifacts = artifacts;

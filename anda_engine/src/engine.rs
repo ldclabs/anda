@@ -23,7 +23,7 @@
 //! let engine = Engine::builder()
 //!     .with_name("MyEngine".to_string())
 //!     .register_tool(my_tool)?
-//!     .register_agent(my_agent)?
+//!     .register_agent(my_agent, None)?
 //!     .build("default_agent".to_string())?;
 //!
 //! let output = engine.agent_run(None, "Hello".to_string(), None, None, None).await?;
@@ -224,6 +224,7 @@ impl Engine {
         &self,
         caller: Principal,
         agent_name: &str,
+        agent_label: &str,
         meta: RequestMeta,
     ) -> Result<AgentCtx, BoxError> {
         let name = agent_name.to_ascii_lowercase();
@@ -235,7 +236,7 @@ impl Engine {
             return Err(format!("agent {} not found", name).into());
         }
 
-        self.ctx.child_with(caller, &name, meta)
+        self.ctx.child_with(caller, &name, agent_label, meta)
     }
 
     /// Executes an agent with the specified parameters.
@@ -272,7 +273,7 @@ impl Engine {
             return Err("caller does not have permission".into());
         }
 
-        let ctx = self.ctx_with(caller, &input.name, meta)?;
+        let ctx = self.ctx_with(caller, &input.name, agent.label(), meta)?;
         self.hooks.on_agent_start(&ctx, &input.name).await?;
 
         let output = agent
@@ -411,6 +412,7 @@ pub struct EngineBuilder {
     agents: AgentSet<AgentCtx>,
     remote: BTreeMap<String, RemoteEngineArgs>,
     model: Model,
+    models: BTreeMap<String, Model>, // label -> Model
     store: Store,
     web3: Arc<Web3SDK>,
     hooks: Arc<Hooks>,
@@ -442,6 +444,7 @@ impl EngineBuilder {
             agents: AgentSet::new(),
             remote: BTreeMap::new(),
             model: Model::not_implemented(),
+            models: BTreeMap::new(),
             store: Store::new(mstore),
             web3: Arc::new(Web3SDK::Web3(Web3Client::not_implemented())),
             hooks: Arc::new(Hooks { hooks: Vec::new() }),
@@ -476,6 +479,12 @@ impl EngineBuilder {
         self
     }
 
+    /// Sets multiple models with labels for the engine.
+    pub fn with_models(mut self, models: BTreeMap<String, Model>) -> Self {
+        self.models = models;
+        self
+    }
+
     /// Sets the storage backend for the engine.
     pub fn with_store(mut self, store: Store) -> Self {
         self.store = store;
@@ -498,7 +507,7 @@ impl EngineBuilder {
         Ok(self)
     }
 
-    /// Registers multiple tools with the engine.
+    /// Registers multiple tools to the engine.
     /// Returns an error if any tool already exists.
     pub fn register_tools(mut self, tools: ToolSet<BaseCtx>) -> Result<Self, BoxError> {
         for (name, tool) in tools.set {
@@ -511,10 +520,10 @@ impl EngineBuilder {
         Ok(self)
     }
 
-    /// Registers a single agent with the engine.
+    /// Registers a single agent with optional label to the engine.
     /// Verifies that all required tools are registered before adding the agent.
     /// Returns an error if any dependency is missing or if the agent cannot be added.
-    pub fn register_agent<T>(mut self, agent: T) -> Result<Self, BoxError>
+    pub fn register_agent<T>(mut self, agent: T, label: Option<String>) -> Result<Self, BoxError>
     where
         T: Agent<AgentCtx> + Send + Sync + 'static,
     {
@@ -524,11 +533,11 @@ impl EngineBuilder {
             }
         }
 
-        self.agents.add(agent)?;
+        self.agents.add(agent, label)?;
         Ok(self)
     }
 
-    /// Registers multiple agents with the engine.
+    /// Registers multiple agents to the engine.
     /// Verifies that all required tools are registered for each agent.
     /// Returns an error if any agent already exists or if any dependency is missing.
     pub fn register_agents(mut self, agents: AgentSet<AgentCtx>) -> Result<Self, BoxError> {
@@ -600,7 +609,7 @@ impl EngineBuilder {
 
         let tools = Arc::new(ToolSet::new());
         let agents = Arc::new(AgentSet::new());
-        let ctx = AgentCtx::new(ctx, self.model, tools, agents);
+        let ctx = AgentCtx::new(ctx, self.model, Arc::new(self.models), tools, agents);
 
         Engine {
             id,
@@ -664,7 +673,13 @@ impl EngineBuilder {
 
         let tools = Arc::new(self.tools);
         let agents = Arc::new(self.agents);
-        let ctx = AgentCtx::new(ctx, self.model, tools.clone(), agents.clone());
+        let ctx = AgentCtx::new(
+            ctx,
+            self.model,
+            Arc::new(self.models),
+            tools.clone(),
+            agents.clone(),
+        );
 
         let meta = RequestMeta::default();
         for (name, tool) in &tools.set {
@@ -673,7 +688,7 @@ impl EngineBuilder {
         }
 
         for (name, agent) in &agents.set {
-            let ct = ctx.child_with(id, name, meta.clone())?;
+            let ct = ctx.child_with(id, name, agent.label(), meta.clone())?;
             agent.init(ct).await?;
         }
 
@@ -716,7 +731,13 @@ impl EngineBuilder {
             Arc::new(RemoteEngines::new()),
         );
 
-        AgentCtx::new(ctx, self.model, Arc::new(self.tools), Arc::new(self.agents))
+        AgentCtx::new(
+            ctx,
+            self.model,
+            Arc::new(self.models),
+            Arc::new(self.tools),
+            Arc::new(self.agents),
+        )
     }
 }
 

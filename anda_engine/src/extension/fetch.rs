@@ -18,7 +18,7 @@
 //! let engine = Engine::builder()
 //!     .with_name("MyEngine".to_string())
 //!     .register_tool(fetch_tool)?
-//!     .register_agent(my_agent)?
+//!     .register_agent(my_agent, None)?
 //!     .build("default_agent".to_string())?;
 //! ```
 
@@ -170,12 +170,13 @@ impl FetchWebResourcesTool {
         if let Some(encoding_name) = content_type
             .as_ref()
             .and_then(|mime| mime.get_param("charset").map(|charset| charset.as_str()))
-            && let Some(encoding) = Encoding::for_label(encoding_name.as_bytes()) {
-                let (text, _, had_errors) = encoding.decode(data);
-                if !had_errors {
-                    return Some(text.into_owned());
-                }
+            && let Some(encoding) = Encoding::for_label(encoding_name.as_bytes())
+        {
+            let (text, _, had_errors) = encoding.decode(data);
+            if !had_errors {
+                return Some(text.into_owned());
             }
+        }
         None
     }
 }

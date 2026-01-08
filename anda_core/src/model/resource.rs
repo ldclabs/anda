@@ -79,10 +79,7 @@ pub fn update_resources(user: &Principal, resources: Vec<Resource>) -> Vec<Resou
             }
 
             if r._id == 0 {
-                if r.metadata.is_none() {
-                    r.metadata = Some(Map::new());
-                }
-                let meta = r.metadata.as_mut().unwrap();
+                let meta = r.metadata.get_or_insert_with(Map::new);
                 meta.insert("user".to_string(), user.clone().into());
                 meta.insert("created_at".to_string(), utc.clone().into());
             }

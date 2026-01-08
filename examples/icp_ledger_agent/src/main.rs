@@ -178,7 +178,7 @@ async fn main() -> Result<(), BoxError> {
             visibility: Visibility::Public,
         }))
         .register_tools(agent.tools()?)?
-        .register_agent(agent)?
+        .register_agent(agent, None)?
         .export_tools(vec![BalanceOfTool::NAME.to_string()]);
 
     // Initialize and start the server
