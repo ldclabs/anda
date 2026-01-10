@@ -15,7 +15,8 @@ use anda_engine::{
     rfc3339_datetime, unix_ms,
 };
 use anda_kip::{
-    META_SELF_NAME, PERSON_SELF_KIP, PERSON_SYSTEM_KIP, PERSON_TYPE, SYSTEM_INSTRUCTIONS, parse_kml,
+    META_SELF_NAME, PERSON_SELF_KIP, PERSON_SYSTEM_KIP, PERSON_TYPE, SELF_INSTRUCTIONS,
+    SYSTEM_INSTRUCTIONS, parse_kml,
 };
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -60,7 +61,7 @@ impl Assistant {
 
         Ok(Self {
             max_input_tokens: 65535,
-            system_instructions: SYSTEM_INSTRUCTIONS.to_string(),
+            system_instructions: SELF_INSTRUCTIONS.to_string(),
             memory,
             tools: vec![
                 memory_name,
