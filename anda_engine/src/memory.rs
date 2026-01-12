@@ -244,6 +244,7 @@ pub struct MemoryManagement {
     conversations: Arc<Collection>,
     logs: Arc<Collection>,
     resources: Arc<Collection>,
+    enable_kip_logging: bool,
 }
 
 impl MemoryManagement {
@@ -322,7 +323,12 @@ impl MemoryManagement {
             conversations,
             logs,
             resources,
+            enable_kip_logging: true,
         })
+    }
+
+    pub fn disable_kip_logging(&mut self) {
+        self.enable_kip_logging = false;
     }
 
     pub fn nexus(&self) -> Arc<CognitiveNexus> {
@@ -350,22 +356,21 @@ impl MemoryManagement {
             .execute_meta(MetaCommand::Describe(DescribeTarget::Domains))
             .await?;
         Ok(json!({
-            "identity": system.attributes,
+            "identity": system.to_concept_node(),
             "domains": domains,
         }))
     }
 
     pub async fn describe_caller(&self, id: &Principal) -> Result<Json, KipError> {
-        let mut user = self
+        let user = self
             .nexus
             .get_concept(&ConceptPK::Object {
                 r#type: PERSON_TYPE.to_string(),
                 name: id.to_string(),
             })
             .await?;
-        user.attributes
-            .insert("id".to_string(), id.to_string().into());
-        Ok(user.attributes.into())
+
+        Ok(user.to_concept_node())
     }
 
     pub async fn add_resource(&self, resource: ResourceRef<'_>) -> Result<u64, DBError> {
@@ -601,19 +606,21 @@ impl Tool<BaseCtx> for Arc<MemoryManagement> {
         let conversation = ctx.get_state::<ConversationState>().map(|c| c._id);
 
         let (command, res) = request.execute(self.nexus.as_ref()).await;
-        let log = KIPLogs {
-            _id: 0, // This will be set by the database
-            user: *ctx.caller(),
-            command,
-            request,
-            response: res.clone(),
-            conversation,
-            period: timestamp / 3600 / 1000,
-            timestamp,
-        };
+        if self.enable_kip_logging {
+            let log = KIPLogs {
+                _id: 0, // This will be set by the database
+                user: *ctx.caller(),
+                command,
+                request,
+                response: res.clone(),
+                conversation,
+                period: timestamp / 3600 / 1000,
+                timestamp,
+            };
 
-        self.logs.add_from(&log).await?;
-        self.logs.flush(timestamp).await?;
+            self.logs.add_from(&log).await?;
+            self.logs.flush(timestamp).await?;
+        }
         Ok(ToolOutput::new(res))
     }
 }

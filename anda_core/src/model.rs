@@ -395,9 +395,25 @@ pub struct Document {
     pub content: Json,
 }
 
+impl Document {
+    /// Creates a new text document with the given ID and text content.
+    pub fn from_text(id: &str, text: &str) -> Self {
+        Self {
+            metadata: BTreeMap::from([
+                ("id".to_string(), id.into()),
+                ("type".to_string(), "Text".into()),
+            ]),
+            content: text.into(),
+        }
+    }
+}
+
 impl From<&Resource> for Document {
     fn from(res: &Resource) -> Self {
-        let mut metadata = BTreeMap::from([("type".to_string(), "Resource".into())]);
+        let mut metadata = BTreeMap::from([
+            ("id".to_string(), res._id.into()),
+            ("type".to_string(), "Resource".into()),
+        ]);
         if let Json::Object(mut val) = json!(res) {
             val.remove("blob");
             metadata.extend(val);
@@ -456,6 +472,11 @@ impl Documents {
             name: Some("$system".into()),
             ..Default::default()
         })
+    }
+
+    /// Appends a document to the collection.
+    pub fn append(&mut self, doc: Document) {
+        self.docs.push(doc);
     }
 }
 

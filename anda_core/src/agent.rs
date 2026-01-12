@@ -311,6 +311,10 @@ where
 
     /// Extracts resources from the provided list based on the agent's supported tags.
     pub fn select_resources(&self, name: &str, resources: &mut Vec<Resource>) -> Vec<Resource> {
+        if resources.is_empty() {
+            return Vec::new();
+        }
+
         self.set
             .get(&name.to_ascii_lowercase())
             .map(|agent| {

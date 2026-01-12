@@ -6,6 +6,7 @@ use rand::Rng;
 pub mod context;
 pub mod engine;
 pub mod extension;
+pub mod hook;
 pub mod management;
 pub mod memory;
 pub mod model;
