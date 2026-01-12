@@ -19,7 +19,7 @@ Studio: [https://x.com/AndaICP](https://x.com/AndaICP)
 Permalink: [https://dmsg.net/Anda](https://dmsg.net/Anda)
 
 ## License
-Copyright © 2025 [LDC Labs](https://github.com/ldclabs).
+Copyright © 2026 [LDC Labs](https://github.com/ldclabs).
 
 `ldclabs/anda` is licensed under the MIT License. See the [MIT license][license] for the full license text.
 

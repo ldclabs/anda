@@ -16,7 +16,7 @@ Additional features will be introduced in future releases.
 For more detailed information, please refer to the [crate documentation][docs].
 
 ## License
-Copyright © 2025 [LDC Labs](https://github.com/ldclabs).
+Copyright © 2026 [LDC Labs](https://github.com/ldclabs).
 
 `ldclabs/anda` is licensed under the MIT License. See the [MIT license][license] for the full license text.
 

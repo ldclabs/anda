@@ -90,7 +90,7 @@ Provides utilities for making RPC calls:
 - Caller verification
 
 ## License
-Copyright © 2025 [LDC Labs](https://github.com/ldclabs).
+Copyright © 2026 [LDC Labs](https://github.com/ldclabs).
 
 `ldclabs/anda` is licensed under the MIT License. See the [MIT license][license] for the full license text.
 

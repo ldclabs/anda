@@ -89,6 +89,6 @@ anda/
 
 ## 📝 ライセンス
 
-Copyright © 2025 [LDC Labs](https://github.com/ldclabs).
+Copyright © 2026 [LDC Labs](https://github.com/ldclabs).
 
 `ldclabs/anda` は MIT ライセンスの下でライセンスされています。完全なライセンステキストについては [LICENSE](./LICENSE-MIT) を参照してください。
