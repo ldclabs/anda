@@ -430,7 +430,7 @@ impl EngineBuilder {
         T: Agent<AgentCtx> + Send + Sync + 'static,
     {
         for tool in agent.tool_dependencies() {
-            if !self.tools.contains(&tool) {
+            if !self.tools.contains(&tool) && !self.agents.contains(&tool) {
                 return Err(format!("dependent tool {} not found", tool).into());
             }
         }
@@ -449,7 +449,7 @@ impl EngineBuilder {
             }
 
             for tool in agent.tool_dependencies() {
-                if !self.tools.contains(&tool) {
+                if !self.tools.contains(&tool) && !self.agents.contains(&tool) {
                     return Err(format!("dependent tool {} not found", tool).into());
                 }
             }

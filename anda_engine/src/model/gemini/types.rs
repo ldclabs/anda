@@ -3,12 +3,13 @@ use anda_core::{
     Usage as ModelUsage,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use std::{fmt, str::FromStr};
 
 use crate::unix_ms;
 
 // https://ai.google.dev/api/generate-content
+// https://googleapis.github.io/js-genai/release_docs/index.html
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct GenerateContentRequest {
@@ -210,7 +211,10 @@ impl From<ContentPart> for Part {
             } => Part {
                 data: PartKind::FunctionResponse {
                     name,
-                    response: output,
+                    response: FunctionResponseValue {
+                        output: Some(output),
+                        ..Default::default()
+                    },
                     id: call_id,
                     will_continue: None,
                     scheduling: None,
@@ -260,7 +264,7 @@ impl From<Part> for ContentPart {
                 name, response, id, ..
             } => ContentPart::ToolOutput {
                 name,
-                output: response,
+                output: response.to_output(),
                 call_id: id,
                 remote_id: None,
             },
@@ -294,7 +298,7 @@ pub enum PartKind {
     },
     FunctionResponse {
         name: String,
-        response: Value,
+        response: FunctionResponseValue,
         #[serde(skip_serializing_if = "Option::is_none")]
         id: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -307,6 +311,32 @@ pub enum PartKind {
         data: String,
     },
     Text(String),
+}
+
+// The function response in JSON object format. Use "output" key to specify function output and "error" key to specify error details (if any)
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct FunctionResponseValue {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<Value>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<Value>,
+
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+impl FunctionResponseValue {
+    pub fn to_output(&self) -> Value {
+        if let Some(output) = &self.output {
+            output.clone()
+        } else if self.error.is_some() {
+            json!(self)
+        } else {
+            Value::Object(self.extra.clone())
+        }
+    }
 }
 
 impl Default for PartKind {
@@ -813,7 +843,10 @@ mod tests {
             thought_signature: None,
             data: PartKind::FunctionResponse {
                 name: "get_weather".to_string(),
-                response: json!({"temperature": "25°C", "condition": "sunny"}),
+                response: FunctionResponseValue {
+                    output: Some(json!({"temperature": "25°C", "condition": "sunny"})),
+                    ..Default::default()
+                },
                 id: Some("call_123".to_string()),
                 will_continue: Some(false),
                 scheduling: None,
@@ -825,7 +858,7 @@ mod tests {
             json!({
                 "functionResponse": {
                     "name": "get_weather",
-                    "response": {"temperature": "25°C", "condition": "sunny"},
+                    "response": {"output":{"temperature": "25°C", "condition": "sunny"}},
                     "id": "call_123",
                     "willContinue": false
                 }
