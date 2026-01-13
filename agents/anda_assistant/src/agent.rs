@@ -1,7 +1,8 @@
 use anda_cognitive_nexus::{CognitiveNexus, ConceptPK};
 use anda_core::{
-    Agent, AgentContext, AgentOutput, BoxError, CompletionRequest, Document, Documents, Message,
-    Principal, Resource, StateFeatures, Tool, ToolSet, Usage, evaluate_tokens, update_resources,
+    Agent, AgentContext, AgentOutput, BoxError, CacheExpiry, CacheFeatures, CompletionRequest,
+    Document, Documents, Message, Principal, Resource, StateFeatures, Tool, ToolSet, Usage,
+    evaluate_tokens, update_resources,
 };
 use anda_db::{database::AndaDB, index::BTree};
 use anda_engine::{
@@ -18,7 +19,7 @@ use anda_kip::{
     META_SELF_NAME, PERSON_SELF_KIP, PERSON_SYSTEM_KIP, PERSON_TYPE, SELF_INSTRUCTIONS,
     SYSTEM_INSTRUCTIONS, parse_kml,
 };
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 #[derive(Clone)]
 pub struct Assistant {
@@ -188,19 +189,27 @@ impl Agent<AgentCtx> for Assistant {
             return Err("anonymous caller not allowed".into());
         }
 
-        let user_name = ctx
-            .meta()
-            .user
-            .clone()
-            .unwrap_or_else(|| caller.to_string());
+        let caller_key = format!("Running:{}", caller);
+        let created_at = unix_ms();
+        let ok = ctx
+            .cache_set_if_not_exists(
+                &caller_key,
+                (created_at, Some(CacheExpiry::TTL(Duration::from_secs(300)))),
+            )
+            .await;
+        if !ok {
+            return Err("Only one prompt can run at a time for you".into());
+        }
+
         let caller_info = self
             .memory
             .describe_caller(caller)
             .await
             .unwrap_or_else(|_| {
                 serde_json::json!({
-                    "id": caller.to_string(),
-                    "name": user_name
+                    "type": "Person",
+                    "name": caller.to_string(),
+                    "attributes": {},
                 })
             });
 
@@ -208,9 +217,8 @@ impl Agent<AgentCtx> for Assistant {
         let primer = self.memory.describe_primer().await?;
         let instructions = format!(
             "{}\n---\n# Your Identity & Knowledge Domain Map\n{}\n",
-            SYSTEM_INSTRUCTIONS, primer
+            self.system_instructions, primer
         );
-
         let (mut conversations, mut cursor) = self
             .memory
             .list_conversations_by_user(caller, None, Some(7))
@@ -280,7 +288,7 @@ impl Agent<AgentCtx> for Assistant {
                 format!(
                     "Current Datetime: {}\n---\n{}",
                     rfc3339_datetime(created_at).unwrap_or_else(|| format!("unix_ms:{created_at}")),
-                    Documents::new("history".to_string(), history_docs)
+                    Documents::new("user_context".to_string(), history_docs)
                 )
                 .into(),
             ],
@@ -424,6 +432,7 @@ impl Agent<AgentCtx> for Assistant {
                 Ok::<(), BoxError>(())
             };
 
+            ctx.cache_delete(&caller_key).await;
             match rt().await {
                 Ok(_) => {}
                 Err(err) => {
