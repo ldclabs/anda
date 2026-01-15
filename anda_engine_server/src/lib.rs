@@ -22,6 +22,7 @@ pub struct ServerBuilder {
     origin: String,
     engines: BTreeMap<Principal, Engine>,
     default_engine: Option<Principal>,
+    api_key: Option<String>,
 }
 
 impl Default for ServerBuilder {
@@ -42,6 +43,7 @@ impl ServerBuilder {
             origin: "https://localhost:8443".to_string(),
             engines: BTreeMap::new(),
             default_engine: None,
+            api_key: None,
         }
     }
 
@@ -62,6 +64,11 @@ impl ServerBuilder {
 
     pub fn with_origin(mut self, origin: String) -> Self {
         self.origin = origin;
+        self
+    }
+
+    pub fn with_api_key(mut self, api_key: String) -> Self {
+        self.api_key = Some(api_key);
         self
     }
 
@@ -98,6 +105,7 @@ impl ServerBuilder {
             engines: Arc::new(self.engines),
             default_engine,
             start_time_ms: unix_ms(),
+            api_key: self.api_key,
         };
         let app = Router::new()
             .route("/", routing::get(get_information))

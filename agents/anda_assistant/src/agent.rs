@@ -210,6 +210,7 @@ impl Agent<AgentCtx> for Assistant {
                     "type": "Person",
                     "name": caller.to_string(),
                     "attributes": {},
+                    "metadata": {},
                 })
             });
 

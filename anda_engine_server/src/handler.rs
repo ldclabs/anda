@@ -26,6 +26,20 @@ pub struct AppState {
     pub(crate) engines: Arc<BTreeMap<Principal, Engine>>,
     pub(crate) default_engine: Principal,
     pub(crate) start_time_ms: u64,
+    pub(crate) api_key: Option<String>,
+}
+
+impl AppState {
+    pub fn check_api_key(&self, headers: &http::HeaderMap) -> Result<(), String> {
+        if let Some(expected_key) = &self.api_key {
+            match headers.get("x-api-key") {
+                Some(provided_key) if provided_key == expected_key => Ok(()),
+                _ => Err("missing or invalid x-api-key in headers".to_string()),
+            }
+        } else {
+            Ok(())
+        }
+    }
 }
 
 /// GET /.well-known/information
@@ -98,6 +112,10 @@ pub async fn anda_engine(
     Path(id): Path<String>,
     ct: ContentWithSHA3<RPCRequest>,
 ) -> impl IntoResponse {
+    if let Err(err) = app.check_api_key(&headers) {
+        return (StatusCode::UNAUTHORIZED, err).into_response();
+    }
+
     let id = if &id == "default" {
         app.default_engine
     } else if let Ok(id) = Principal::from_text(&id) {
