@@ -8,9 +8,11 @@ use tokio::signal;
 use tokio_util::sync::CancellationToken;
 
 mod handler;
+mod middleware;
 mod types;
 
 use handler::*;
+pub use middleware::{ApiKeyMiddleware, HttpMiddleware};
 
 const APP_NAME: &str = env!("CARGO_PKG_NAME");
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -22,7 +24,7 @@ pub struct ServerBuilder {
     origin: String,
     engines: BTreeMap<Principal, Engine>,
     default_engine: Option<Principal>,
-    api_key: Option<String>,
+    middlewares: Vec<Arc<dyn HttpMiddleware>>,
 }
 
 impl Default for ServerBuilder {
@@ -43,7 +45,7 @@ impl ServerBuilder {
             origin: "https://localhost:8443".to_string(),
             engines: BTreeMap::new(),
             default_engine: None,
-            api_key: None,
+            middlewares: Vec::new(),
         }
     }
 
@@ -67,11 +69,6 @@ impl ServerBuilder {
         self
     }
 
-    pub fn with_api_key(mut self, api_key: String) -> Self {
-        self.api_key = Some(api_key);
-        self
-    }
-
     pub fn with_engines(
         mut self,
         mut engines: BTreeMap<Principal, Engine>,
@@ -84,6 +81,67 @@ impl ServerBuilder {
         self.engines = engines;
         self.default_engine = default_engine;
         self
+    }
+
+    /// Register a router middleware.
+    ///
+    /// This is the low-level API. The middleware will be applied to the internal
+    /// axum `Router` (typically via `router.layer(...)`). Middlewares are applied
+    /// in the order they are added.
+    ///
+    /// More details: https://docs.rs/axum/latest/axum/middleware/index.html#ordering
+    ///
+    /// If you want a middleware that looks like `axum::middleware::from_fn`
+    /// (i.e. can operate on `(req, next)`), prefer [`with_request_middleware`].
+    ///
+    /// Example:
+    /// ```ignore
+    /// let server = ServerBuilder::new()
+    ///   .with_middleware(|router| {
+    ///     router.layer(axum::middleware::from_fn(|req, next| async move {
+    ///       // custom auth / param checks here
+    ///       next.run(req).await
+    ///     }))
+    ///   });
+    /// ```
+    pub fn with_middleware<M>(mut self, middleware: M) -> Self
+    where
+        M: HttpMiddleware,
+    {
+        self.middlewares.push(Arc::new(middleware));
+        self
+    }
+
+    /// Register a request middleware like `axum::middleware::from_fn`.
+    ///
+    /// The middleware function runs for every incoming request, and can decide
+    /// to short-circuit with a response or call `next.run(req)`.
+    ///
+    /// Example:
+    /// ```ignore
+    /// use axum::http::StatusCode;
+    /// use axum::response::IntoResponse;
+    ///
+    /// let server = ServerBuilder::new()
+    ///   .with_request_middleware(|req, next| async move {
+    ///     // custom auth / param checks here
+    ///     if req.headers().get("x-allow").is_none() {
+    ///       return (StatusCode::UNAUTHORIZED, "missing x-allow").into_response();
+    ///     }
+    ///
+    ///     next.run(req).await
+    ///   });
+    /// ```
+    pub fn with_request_middleware<F, Fut>(self, f: F) -> Self
+    where
+        F: Fn(axum::extract::Request, axum::middleware::Next) -> Fut
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+        Fut: Future<Output = axum::response::Response> + Send + 'static,
+    {
+        self.with_middleware(middleware::RequestFnMiddleware::new(f))
     }
 
     pub async fn serve(
@@ -105,9 +163,12 @@ impl ServerBuilder {
             engines: Arc::new(self.engines),
             default_engine,
             start_time_ms: unix_ms(),
-            api_key: self.api_key,
         };
-        let app = Router::new()
+
+        // Build a router that is still "missing" an `AppState`.
+        // We'll provide the state at the end (after applying middlewares) so we
+        // end up with a `Router<()>` that can be passed to `axum::serve`.
+        let mut app: Router<AppState> = Router::new()
             .route("/", routing::get(get_information))
             .route("/.well-known/information", routing::get(get_information))
             .route("/.well-known/agents", routing::get(get_information))
@@ -115,8 +176,13 @@ impl ServerBuilder {
                 "/.well-known/agents/{id}",
                 routing::get(get_engine_information),
             )
-            .route("/{*id}", routing::post(anda_engine))
-            .with_state(state);
+            .route("/{*id}", routing::post(anda_engine));
+
+        for middleware in &self.middlewares {
+            app = middleware.apply(app);
+        }
+
+        let app = app.with_state(state);
 
         let addr: SocketAddr = self.addr.parse()?;
         let listener = create_reuse_port_listener(addr).await?;
