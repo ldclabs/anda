@@ -194,6 +194,7 @@ impl BaseCtx {
         RequestMeta {
             engine: Some(target),
             user: Some(self.name.clone()),
+            extra: Default::default(),
         }
     }
 

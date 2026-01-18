@@ -130,16 +130,15 @@ pub async fn anda_engine(
         ANONYMOUS_PRINCIPAL
     };
 
-    log::info!(
-        method = req.method.as_str(),
-        agent = id.to_text(),
-        caller = caller.to_text();
-        "anda_engine",
-    );
-    let res = engine_run(req, &app, caller, id).await;
     match &ct {
-        ContentWithSHA3::CBOR(_, _) => Content::CBOR(res, None).into_response(),
-        ContentWithSHA3::JSON(_, _) => Content::JSON(res, None).into_response(),
+        ContentWithSHA3::CBOR(_, _) => {
+            let res = engine_run(req, &app, caller, id).await;
+            Content::CBOR(res, None).into_response()
+        }
+        ContentWithSHA3::JSON(_, _) => {
+            let res = engine_run_in_json(req, &app, caller, id).await;
+            Content::JSON(res, None).into_response()
+        }
     }
 }
 
@@ -158,6 +157,13 @@ async fn engine_run(
         "agent_run" => {
             let args: (AgentInput,) = from_reader(req.params.as_slice())
                 .map_err(|err| format!("failed to decode params: {err:?}"))?;
+            log::info!(
+                method = req.method.as_str(),
+                agent = id.to_text(),
+                caller = caller.to_text(),
+                name = args.0.name;
+                "",
+            );
             let res = engine
                 .agent_run(caller, args.0)
                 .await
@@ -167,6 +173,13 @@ async fn engine_run(
         "tool_call" => {
             let args: (ToolInput<Json>,) = from_reader(req.params.as_slice())
                 .map_err(|err| format!("failed to decode params: {err:?}"))?;
+            log::info!(
+                method = req.method.as_str(),
+                agent = id.to_text(),
+                caller = caller.to_text(),
+                name = args.0.name;
+                "",
+            );
             let res = engine
                 .tool_call(caller, args.0)
                 .await
@@ -176,6 +189,67 @@ async fn engine_run(
         "information" => {
             let res = engine.information();
             Ok(deterministic_cbor_into_vec(&res)?.into())
+        }
+        method => Err(format!(
+            "{method} on engine {} not implemented",
+            id.to_text()
+        )),
+    }
+}
+
+async fn engine_run_in_json(
+    req: &RPCRequest,
+    app: &AppState,
+    caller: Principal,
+    id: Principal,
+) -> RPCResponse {
+    let engine = app
+        .engines
+        .get(&id)
+        .ok_or_else(|| format!("engine {} not found", id.to_text()))?;
+
+    match req.method.as_str() {
+        "agent_run" => {
+            let args: (AgentInput,) = serde_json::from_slice(req.params.as_slice())
+                .map_err(|err| format!("failed to decode params: {err:?}"))?;
+            log::info!(
+                method = req.method.as_str(),
+                agent = id.to_text(),
+                caller = caller.to_text(),
+                name = args.0.name;
+                "",
+            );
+            let res = engine
+                .agent_run(caller, args.0)
+                .await
+                .map_err(|err| format!("failed to run agent: {err:?}"))?;
+            Ok(serde_json::to_vec(&res)
+                .map_err(|err| format!("{:?}", err))?
+                .into())
+        }
+        "tool_call" => {
+            let args: (ToolInput<Json>,) = serde_json::from_slice(req.params.as_slice())
+                .map_err(|err| format!("failed to decode params: {err:?}"))?;
+            log::info!(
+                method = req.method.as_str(),
+                agent = id.to_text(),
+                caller = caller.to_text(),
+                name = args.0.name;
+                "",
+            );
+            let res = engine
+                .tool_call(caller, args.0)
+                .await
+                .map_err(|err| format!("failed to call tool: {err:?}"))?;
+            Ok(serde_json::to_vec(&res)
+                .map_err(|err| format!("{:?}", err))?
+                .into())
+        }
+        "information" => {
+            let res = engine.information();
+            Ok(serde_json::to_vec(&res)
+                .map_err(|err| format!("{:?}", err))?
+                .into())
         }
         method => Err(format!(
             "{method} on engine {} not implemented",

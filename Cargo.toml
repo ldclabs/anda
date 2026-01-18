@@ -12,7 +12,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.9.2"
+version = "0.9.5"
 description = "Anda is an AI agent framework built with Rust, powered by ICP and TEEs."
 repository = "https://github.com/ldclabs/anda"
 homepage = "https://github.com/ldclabs/anda"

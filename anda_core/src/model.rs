@@ -10,7 +10,7 @@
 
 use candid::Principal;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Map, json};
 use std::collections::BTreeMap;
 
 use crate::Json;
@@ -291,6 +291,7 @@ impl<T> ToolOutput<T> {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct RequestMeta {
     /// The target engine principal for the request.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub engine: Option<Principal>,
 
     /// Gets the username from request context.
@@ -299,6 +300,11 @@ pub struct RequestMeta {
     /// of the user interacting with the bot.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
+
+    /// Extra metadata key-value pairs.
+    #[serde(flatten)]
+    #[serde(skip_serializing_if = "Map::is_empty")]
+    pub extra: Map<String, Json>,
 }
 
 /// Represents the usage statistics for the agent or tool execution.
@@ -741,5 +747,66 @@ mod tests {
         assert_eq!(calls[0].args, serde_json::json!({"x":1, "y":2}));
         assert_eq!(calls[1].name, "echo");
         assert_eq!(calls[1].args, serde_json::json!({"text":"hi"}));
+    }
+
+    #[test]
+    fn test_request_meta_extra_flatten_serde() {
+        // empty extra should not serialize
+        let meta = RequestMeta {
+            engine: None,
+            user: None,
+            extra: Map::new(),
+        };
+        let v = serde_json::to_value(&meta).unwrap();
+        assert_eq!(v, serde_json::json!({}));
+
+        // extra should be flattened into the top-level object
+        let mut extra = Map::new();
+        extra.insert("foo".into(), serde_json::json!("bar"));
+        extra.insert("n".into(), serde_json::json!(1));
+        extra.insert("obj".into(), serde_json::json!({"x": true}));
+
+        let meta2 = RequestMeta {
+            engine: Some(Principal::from_text("aaaaa-aa").unwrap()),
+            user: Some("alice".into()),
+            extra,
+        };
+
+        let v2 = serde_json::to_value(&meta2).unwrap();
+        assert_eq!(v2.get("engine").unwrap(), "aaaaa-aa");
+        assert_eq!(v2.get("user").unwrap(), "alice");
+        assert_eq!(v2.get("foo").unwrap(), "bar");
+        assert_eq!(v2.get("n").unwrap(), 1);
+        assert_eq!(v2.get("obj").unwrap(), &serde_json::json!({"x": true}));
+        assert!(v2.get("extra").is_none());
+
+        // deserialization: unknown fields go into extra
+        let input = serde_json::json!({
+            "engine": "aaaaa-aa",
+            "user": "bob",
+            "k1": "v1",
+            "k2": 2,
+            "nested": {"a": 1}
+        });
+        let back: RequestMeta = serde_json::from_value(input).unwrap();
+        assert_eq!(back.engine.unwrap().to_text(), "aaaaa-aa");
+        assert_eq!(back.user.as_deref(), Some("bob"));
+        assert_eq!(back.extra.get("k1").unwrap(), "v1");
+        assert_eq!(back.extra.get("k2").unwrap(), 2);
+        assert_eq!(
+            back.extra.get("nested").unwrap(),
+            &serde_json::json!({"a": 1})
+        );
+
+        // round-trip (field-by-field)
+        let back2: RequestMeta = serde_json::from_value(v2).unwrap();
+        assert_eq!(back2.engine.unwrap().to_text(), "aaaaa-aa");
+        assert_eq!(back2.user.as_deref(), Some("alice"));
+        assert_eq!(back2.extra.get("foo").unwrap(), "bar");
+        assert_eq!(back2.extra.get("n").unwrap(), 1);
+        assert_eq!(
+            back2.extra.get("obj").unwrap(),
+            &serde_json::json!({"x": true})
+        );
     }
 }
