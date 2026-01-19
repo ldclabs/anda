@@ -145,6 +145,7 @@ pub struct Content {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<Role>,
 
+    #[serde(default)]
     pub parts: Vec<Part>,
 }
 
@@ -218,6 +219,7 @@ impl From<ContentPart> for Part {
                     id: call_id,
                     will_continue: None,
                     scheduling: None,
+                    parts: None,
                 },
                 ..Default::default()
             },
@@ -305,6 +307,8 @@ pub enum PartKind {
         will_continue: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
         scheduling: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parts: Option<Vec<Part>>,
     },
     InlineData {
         mime_type: String,
@@ -850,6 +854,7 @@ mod tests {
                 id: Some("call_123".to_string()),
                 will_continue: Some(false),
                 scheduling: None,
+                parts: None,
             },
         };
         let json_value = serde_json::to_value(&function_response_part).unwrap();
