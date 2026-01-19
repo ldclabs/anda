@@ -13,7 +13,7 @@ use anda_db::{
 use anda_db_schema::{AndaDBSchema, FieldEntry, FieldType, Ft, Fv, Json, Schema, SchemaError};
 use anda_db_tfs::jieba_tokenizer;
 use anda_kip::{
-    CommandType, DescribeTarget, KIP_FUNCTION_DEFINITION, KipError, META_SYSTEM_NAME, MetaCommand,
+    CommandType, DescribeTarget, KipError, META_SYSTEM_NAME, MetaCommand,
     PERSON_TYPE, Request, Response,
 };
 use candid::Principal;
@@ -33,8 +33,37 @@ use crate::{
     rfc3339_datetime, rfc3339_datetime_now, unix_ms,
 };
 
-pub static FUNCTION_DEFINITION: LazyLock<FunctionDefinition> =
-    LazyLock::new(|| serde_json::from_value(KIP_FUNCTION_DEFINITION.clone()).unwrap());
+pub static FUNCTION_DEFINITION: LazyLock<FunctionDefinition> = LazyLock::new(|| {
+    serde_json::from_value(json!({
+        "name": "execute_kip",
+        "description": "Executes one or more KIP (Knowledge Interaction Protocol) commands against the Cognitive Nexus to interact with your persistent memory.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "A complete, multi-line KIP command (KQL, KML or META) string to be executed. Mutually exclusive with 'commands'."
+                },
+                "commands": {
+                    "type": "array",
+                    "description": "An array of KIP commands for batch execution (reduces round-trips). Mutually exclusive with 'command'. Each element can be a string (uses shared 'parameters') or an object with 'command' and optional 'parameters' (overrides shared parameters). Commands are executed sequentially; execution stops on first error.",
+                    "items": {
+                    "type": "string"
+                    }
+                },
+                "parameters": {
+                    "type": "object",
+                    "description": "An optional JSON object of key-value pairs used for safe substitution of placeholders in the command string(s). Placeholders should start with ':' (e.g., :name, :limit). IMPORTANT: A placeholder must represent a complete JSON value token (e.g., name: :name). Do not embed placeholders inside quoted strings (e.g., \"Hello :name\"), because substitution uses JSON serialization."
+                },
+                "dry_run": {
+                    "type": "boolean",
+                    "description": "If set to true, the command(s) will only be validated for syntactical and logical correctness without being executed.",
+                    "default": false
+                }
+            }
+        }
+    })).unwrap()
+});
 
 #[derive(Debug, Clone, Deserialize, Serialize, AndaDBSchema)]
 pub struct Conversation {
@@ -665,7 +694,7 @@ impl Tool<BaseCtx> for GetResourceContentTool {
             name: self.name(),
             description: self.description(),
             parameters: self.schema.clone(),
-            strict: Some(true),
+            strict: None,
         }
     }
 
@@ -733,7 +762,7 @@ impl Tool<BaseCtx> for ListConversationsTool {
             name: self.name(),
             description: self.description(),
             parameters: self.schema.clone(),
-            strict: Some(true),
+            strict: None,
         }
     }
 
@@ -804,7 +833,7 @@ impl Tool<BaseCtx> for SearchConversationsTool {
             name: self.name(),
             description: self.description(),
             parameters: self.schema.clone(),
-            strict: Some(true),
+            strict: None,
         }
     }
 
@@ -910,7 +939,7 @@ impl Tool<BaseCtx> for MemoryTool {
             name: self.name(),
             description: self.description(),
             parameters: self.schema.clone(),
-            strict: Some(true),
+            strict: None,
         }
     }
 

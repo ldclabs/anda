@@ -238,7 +238,7 @@ impl From<ContentPart> for Part {
 }
 
 impl From<Part> for ContentPart {
-    fn from(value: Part) -> Self {
+    fn from(mut value: Part) -> Self {
         match value.data {
             PartKind::Text(text) if value.thought == Some(true) => ContentPart::Reasoning { text },
             PartKind::Text(text) => ContentPart::Text { text },
@@ -270,7 +270,10 @@ impl From<Part> for ContentPart {
                 call_id: id,
                 remote_id: None,
             },
-            _ => ContentPart::Any(json!(value.data)),
+            _ => {
+                value.thought_signature = None;
+                ContentPart::Any(json!(value.data))
+            }
         }
     }
 }
@@ -308,7 +311,7 @@ pub enum PartKind {
         #[serde(skip_serializing_if = "Option::is_none")]
         scheduling: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        parts: Option<Vec<Part>>,
+        parts: Option<Vec<Value>>,
     },
     InlineData {
         mime_type: String,
@@ -634,11 +637,14 @@ pub enum BlockReason {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageMetadata {
+    #[serde(default)]
     pub prompt_token_count: u32,
 
-    pub candidates_token_count: u32,
-
+    #[serde(default)]
     pub total_token_count: u32,
+
+    #[serde(default)]
+    pub candidates_token_count: u32,
 
     #[serde(default)]
     pub thoughts_token_count: u32,
@@ -654,6 +660,20 @@ pub struct ThinkingConfig {
     /// The number of thoughts tokens that the model should generate.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking_budget: Option<u32>,
+    /// Controls the maximum depth of the model's internal reasoning process before it produces a response. If not specified, the default is HIGH. Recommended for Gemini 3 or later models. Use with earlier models results in an error.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_level: Option<ThinkingLevel>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ThinkingLevel {
+    #[default]
+    ThinkingLevelUnspecified,
+    Minimal,
+    Low,
+    Medium,
+    High,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
