@@ -190,11 +190,11 @@ impl Agent<AgentCtx> for Assistant {
         }
 
         let caller_key = format!("Running:{}", caller);
-        let created_at = unix_ms();
+        let now_ms = unix_ms();
         let ok = ctx
             .cache_set_if_not_exists(
                 &caller_key,
-                (created_at, Some(CacheExpiry::TTL(Duration::from_secs(300)))),
+                (now_ms, Some(CacheExpiry::TTL(Duration::from_secs(300)))),
             )
             .await;
         if !ok {
@@ -214,7 +214,6 @@ impl Agent<AgentCtx> for Assistant {
                 })
             });
 
-        let created_at = unix_ms();
         let primer = self.memory.describe_primer().await?;
         let instructions = format!(
             "{}\n---\n# Your Identity & Knowledge Domain Map\n{}\n",
@@ -260,17 +259,9 @@ impl Agent<AgentCtx> for Assistant {
             cursor = BTree::to_cursor(&min_id);
         }
 
-        let mut history_docs: Vec<Document> = Vec::with_capacity(conversations.len() + 2);
-        history_docs.push(Document {
-            content: caller_info,
-            metadata: BTreeMap::from([
-                ("type".to_string(), "User".into()),
-                ("description".to_string(), "User identity".into()),
-            ]),
-        });
-        history_docs.extend(conversations.into_iter().map(Document::from));
+        let mut user_conversations: Vec<Document> = Vec::with_capacity(conversations.len() + 1);
         if let Some(cursor) = cursor {
-            history_docs.push(Document {
+            user_conversations.push(Document {
                 content: cursor.into(),
                 metadata: BTreeMap::from([
                     ("type".to_string(), "Cursor".into()),
@@ -281,23 +272,48 @@ impl Agent<AgentCtx> for Assistant {
                 ]),
             })
         }
+        user_conversations.extend(conversations.into_iter().map(Document::from));
 
-        let mut chat_history: Vec<Message> = vec![];
-        chat_history.push(Message {
+        let mut msg = Message {
             role: "user".into(),
-            content: vec![
-                format!(
-                    "Current Datetime: {}\n---\n{}",
-                    rfc3339_datetime(created_at).unwrap_or_else(|| format!("unix_ms:{created_at}")),
-                    Documents::new("user_context".to_string(), history_docs)
-                )
-                .into(),
-            ],
+            content: vec![],
             name: Some("$system".into()),
-            timestamp: Some(created_at),
+            timestamp: Some(now_ms),
             ..Default::default()
-        });
+        };
+        if !user_conversations.is_empty() {
+            msg.content.push(
+                Documents::new("user_conversations".to_string(), user_conversations.clone())
+                    .to_string()
+                    .into(),
+            );
+        }
+        msg.content.push(
+            Documents::new(
+                "user_profile".to_string(),
+                vec![Document {
+                    content: caller_info,
+                    metadata: BTreeMap::from([
+                        ("type".to_string(), "Person".into()),
+                        (
+                            "description".to_string(),
+                            "The latest user's profile".into(),
+                        ),
+                    ]),
+                }],
+            )
+            .to_string()
+            .into(),
+        );
+        msg.content.push(
+            format!(
+                "Current Datetime: {}",
+                rfc3339_datetime(now_ms).unwrap_or_else(|| format!("{now_ms} in unix ms"))
+            )
+            .into(),
+        );
 
+        let chat_history = vec![msg];
         let resources = update_resources(caller, resources);
         let rs = self.memory.try_add_resources(&resources).await?;
         let resource_docs: Vec<Document> = rs.iter().map(Document::from).collect();
@@ -309,16 +325,16 @@ impl Agent<AgentCtx> for Assistant {
             messages: vec![serde_json::json!(Message {
                 role: "user".into(),
                 content: vec![prompt.clone().into()],
-                timestamp: Some(created_at),
+                timestamp: Some(now_ms),
                 ..Default::default()
             })],
             resources: rs,
             artifacts: vec![],
             status: ConversationStatus::Submitted,
             failed_reason: None,
-            period: created_at / 3600 / 1000,
-            created_at,
-            updated_at: created_at,
+            period: now_ms / 3600 / 1000,
+            created_at: now_ms,
+            updated_at: now_ms,
             usage: Usage::default(),
         };
 
@@ -378,10 +394,10 @@ impl Agent<AgentCtx> for Assistant {
                             }
 
                             conversation.artifacts = artifacts;
-                            conversation.status = if runner.is_done() {
-                                ConversationStatus::Completed
-                            } else if res.failed_reason.is_some() {
+                            conversation.status = if res.failed_reason.is_some() {
                                 ConversationStatus::Failed
+                            } else if runner.is_done() {
+                                ConversationStatus::Completed
                             } else {
                                 ConversationStatus::Working
                             };
@@ -393,11 +409,11 @@ impl Agent<AgentCtx> for Assistant {
                             }
 
                             let old = assistant.memory.get_conversation(conversation._id).await?;
-                            if old.status == ConversationStatus::Canceled
+                            if old.status == ConversationStatus::Cancelled
                                 && (conversation.status == ConversationStatus::Submitted
                                     || conversation.status == ConversationStatus::Working)
                             {
-                                conversation.status = ConversationStatus::Canceled;
+                                conversation.status = ConversationStatus::Cancelled;
                             }
 
                             let _ = assistant
@@ -407,7 +423,7 @@ impl Agent<AgentCtx> for Assistant {
 
                             ctx.base.set_state(ConversationState::from(&conversation));
 
-                            if conversation.status == ConversationStatus::Canceled
+                            if conversation.status == ConversationStatus::Cancelled
                                 || conversation.status == ConversationStatus::Failed
                             {
                                 break;

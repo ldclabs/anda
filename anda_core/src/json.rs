@@ -16,7 +16,10 @@ pub fn root_schema_for<T: JsonSchema>() -> Schema {
 
 /// Generate JSON schema for a given type T. Returns as serde_json::Value.
 pub fn gen_schema_for<T: JsonSchema>() -> serde_json::Value {
-    root_schema_for::<T>().to_value()
+    let mut schema = root_schema_for::<T>();
+    schema.remove("title");
+    schema.remove("description");
+    schema.to_value()
 }
 
 #[cfg(test)]
@@ -32,12 +35,12 @@ mod tests {
 
     #[test]
     fn test_root_schema_for() {
-        let schema = root_schema_for::<TestStruct>();
+        let schema = gen_schema_for::<TestStruct>();
         let s = serde_json::to_string(&schema).unwrap();
         println!("{}", s);
         assert_eq!(
-            s,
-            r#"{"title":"TestStruct","type":"object","properties":{"age":{"type":["integer","null"],"maximum":255,"minimum":0},"name":{"type":"string"}},"required":["name"]}"#
+            schema,
+            serde_json::json!({"type":"object","properties":{"age":{"type":["integer","null"],"maximum":255,"minimum":0},"name":{"type":"string"}},"required":["name"]})
         );
     }
 }

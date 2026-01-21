@@ -1,5 +1,3 @@
-use std::future::Future;
-
 use axum::{
     Router,
     extract::Request,
@@ -7,6 +5,7 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
+use std::{future::Future, sync::Arc};
 
 use crate::handler::AppState;
 
@@ -28,7 +27,6 @@ where
 }
 
 /// Middleware built from a function like axum::middleware::from_fn.
-#[derive(Clone)]
 pub struct RequestFnMiddleware<F> {
     f: F,
 }
@@ -52,22 +50,23 @@ where
 /// A simple API key middleware that validates `x-api-key` on every request.
 ///
 /// Use `exempt_path` to allow unauthenticated endpoints (e.g. health/info routes).
-#[derive(Clone, Default)]
 pub struct ApiKeyMiddleware {
-    expected_key: String,
-    exempt_paths: Vec<String>,
+    expected_key: Arc<String>,
+    exempt_paths: Arc<Vec<String>>,
 }
 
 impl ApiKeyMiddleware {
     pub fn new(expected_key: impl Into<String>) -> Self {
         Self {
-            expected_key: expected_key.into(),
-            exempt_paths: Vec::new(),
+            expected_key: Arc::new(expected_key.into()),
+            exempt_paths: Arc::new(Vec::new()),
         }
     }
 
     pub fn exempt_path(mut self, path: impl Into<String>) -> Self {
-        self.exempt_paths.push(path.into());
+        Arc::get_mut(&mut self.exempt_paths)
+            .unwrap()
+            .push(path.into());
         self
     }
 }
@@ -89,7 +88,9 @@ impl HttpMiddleware for ApiKeyMiddleware {
                     }
 
                     match req.headers().get("x-api-key") {
-                        Some(provided_key) if provided_key == &expected_key => next.run(req).await,
+                        Some(provided_key) if provided_key == expected_key.as_str() => {
+                            next.run(req).await
+                        }
                         _ => (
                             StatusCode::UNAUTHORIZED,
                             "missing or invalid x-api-key in headers",

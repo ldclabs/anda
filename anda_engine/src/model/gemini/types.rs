@@ -79,19 +79,25 @@ impl GenerateContentResponse {
             output.failed_reason = serde_json::to_string(&feedback).ok();
         } else {
             let candidate = self.candidates.pop().ok_or("No completion choice")?;
-            output.raw_history.push(json!(&candidate.content));
-            let mut msg: Message = candidate.content.into();
-            msg.timestamp = Some(timestamp);
-            match candidate.finish_reason {
-                Some(FinishReason::Stop) => {
-                    output.content = msg.text().unwrap_or_default();
-                    output.tool_calls = msg.tool_calls();
+
+            if candidate.content.parts.is_empty() {
+                output.failed_reason = serde_json::to_string(&candidate.finish_reason).ok();
+            } else {
+                output.raw_history.push(json!(&candidate.content));
+                let mut msg: Message = candidate.content.into();
+                msg.timestamp = Some(timestamp);
+
+                match candidate.finish_reason {
+                    Some(FinishReason::Stop) => {
+                        output.content = msg.text().unwrap_or_default();
+                        output.tool_calls = msg.tool_calls();
+                    }
+                    v => {
+                        output.failed_reason = serde_json::to_string(&v).ok();
+                    }
                 }
-                v => {
-                    output.failed_reason = serde_json::to_string(&v).ok();
-                }
+                output.chat_history.push(msg);
             }
-            output.chat_history.push(msg);
         }
 
         Ok(output)
@@ -417,8 +423,8 @@ impl From<Vec<FunctionDefinition>> for Tool {
                 .map(|v| FunctionDeclaration {
                     name: v.name,
                     description: v.description,
-                    parameters_json_schema: Some(v.parameters),
-                    response_json_schema: None,
+                    parameters: Some(v.parameters),
+                    response: None,
                 })
                 .collect(),
         }
@@ -600,10 +606,10 @@ pub struct FunctionDeclaration {
     pub description: String,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub parameters_json_schema: Option<Value>,
+    pub parameters: Option<Value>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub response_json_schema: Option<Value>,
+    pub response: Option<Value>,
 }
 
 /// A set of the feedback metadata the prompt specified in [GenerateContentRequest.contents](GenerateContentRequest).

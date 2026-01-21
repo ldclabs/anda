@@ -474,7 +474,9 @@ impl Documents {
 
         Some(Message {
             role: "user".into(),
-            content: vec![format!("Current Datetime: {}\n---\n{}", rfc3339_datetime, self).into()],
+            content: vec![
+                format!("Current Datetime: {}\n\n---\n\n{}", rfc3339_datetime, self).into(),
+            ],
             name: Some("$system".into()),
             ..Default::default()
         })

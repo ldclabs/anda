@@ -3,7 +3,7 @@ name = "anda_assistant"
 description = "Anda -- an AI Assistant powered by the Knowledge Interaction Protocol (KIP)."
 repository = "https://github.com/ldclabs/anda/tree/main/agents/anda_assistant"
 publish = true
-version = "0.4.4"
+version = "0.4.5"
 edition.workspace = true
 keywords.workspace = true
 categories.workspace = true
@@ -20,4 +20,10 @@ log = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
+candid = { workspace = true }
 object_store = { workspace = true }
+dotenv = { workspace = true }
+clap = { workspace = true }
+hex = { workspace = true }
+ic-agent = { workspace = true }
+anda_web3_client = { path = "../../anda_web3_client", version = "0.9" }

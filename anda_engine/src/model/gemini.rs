@@ -177,6 +177,7 @@ impl CompletionFeaturesDyn for CompletionModel {
                 greq.contents.push(msg);
             }
 
+            greq.generation_config.top_p = Some(0.95);
             if let Some(temperature) = req.temperature {
                 greq.generation_config.temperature = Some(temperature);
             }
@@ -205,6 +206,11 @@ impl CompletionFeaturesDyn for CompletionModel {
                 log::debug!(request = val; "Gemini completions request");
             }
 
+            println!(
+                "\n\nSending Gemini completion request:\n{}",
+                serde_json::to_string_pretty(&greq).unwrap()
+            );
+
             let response = client
                 .post(&format!("/{}:generateContent", model))
                 .json(&greq)
@@ -218,13 +224,15 @@ impl CompletionFeaturesDyn for CompletionModel {
                         if log_enabled!(Debug) {
                             log::debug!(
                                 request:serde = greq,
+                                messages:serde = raw_history,
                                 response:serde = res;
                                 "Gemini completions response");
                         } else if res.maybe_failed() {
                             log::warn!(
                                 request:serde = greq,
+                                messages:serde = raw_history,
                                 response:serde = res;
-                                "completions maybe failed");
+                                "Gemini completions maybe failed");
                         }
 
                         res.try_into(raw_history, chat_history)
@@ -237,8 +245,9 @@ impl CompletionFeaturesDyn for CompletionModel {
                 let status = response.status();
                 let msg = response.text().await?;
                 log::error!(
-                    request:serde = greq;
-                    "completions request failed: {status}, body: {msg}",
+                    request:serde = greq,
+                    messages:serde = raw_history;
+                    "Gemini completions request failed: {status}, body: {msg}",
                 );
                 Err(format!("Gemini completions error: {}", msg).into())
             }

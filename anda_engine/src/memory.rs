@@ -13,8 +13,8 @@ use anda_db::{
 use anda_db_schema::{AndaDBSchema, FieldEntry, FieldType, Ft, Fv, Json, Schema, SchemaError};
 use anda_db_tfs::jieba_tokenizer;
 use anda_kip::{
-    CommandType, DescribeTarget, KipError, META_SYSTEM_NAME, MetaCommand,
-    PERSON_TYPE, Request, Response,
+    CommandType, DescribeTarget, KipError, META_SYSTEM_NAME, MetaCommand, PERSON_TYPE, Request,
+    Response,
 };
 use candid::Principal;
 use ciborium::cbor;
@@ -42,14 +42,7 @@ pub static FUNCTION_DEFINITION: LazyLock<FunctionDefinition> = LazyLock::new(|| 
             "properties": {
                 "command": {
                     "type": "string",
-                    "description": "A complete, multi-line KIP command (KQL, KML or META) string to be executed. Mutually exclusive with 'commands'."
-                },
-                "commands": {
-                    "type": "array",
-                    "description": "An array of KIP commands for batch execution (reduces round-trips). Mutually exclusive with 'command'. Each element can be a string (uses shared 'parameters') or an object with 'command' and optional 'parameters' (overrides shared parameters). Commands are executed sequentially; execution stops on first error.",
-                    "items": {
-                    "type": "string"
-                    }
+                    "description": "A complete, multi-line KIP command (KQL, KML or META) string to be executed."
                 },
                 "parameters": {
                     "type": "object",
@@ -57,10 +50,10 @@ pub static FUNCTION_DEFINITION: LazyLock<FunctionDefinition> = LazyLock::new(|| 
                 },
                 "dry_run": {
                     "type": "boolean",
-                    "description": "If set to true, the command(s) will only be validated for syntactical and logical correctness without being executed.",
-                    "default": false
+                    "description": "If set to true, the command(s) will only be validated for syntactical and logical correctness without being executed."
                 }
-            }
+            },
+            "required": ["command"]
         }
     })).unwrap()
 });
@@ -227,7 +220,7 @@ pub enum ConversationStatus {
     Submitted,
     Working,
     Completed,
-    Canceled,
+    Cancelled,
     Failed,
 }
 
@@ -237,7 +230,7 @@ impl fmt::Display for ConversationStatus {
             ConversationStatus::Submitted => write!(f, "submitted"),
             ConversationStatus::Working => write!(f, "working"),
             ConversationStatus::Completed => write!(f, "completed"),
-            ConversationStatus::Canceled => write!(f, "canceled"),
+            ConversationStatus::Cancelled => write!(f, "cancelled"),
             ConversationStatus::Failed => write!(f, "failed"),
         }
     }
@@ -724,9 +717,11 @@ impl Tool<BaseCtx> for GetResourceContentTool {
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 pub struct ListConversationsArgs {
     /// The cursor for pagination
-    pub cursor: Option<String>,
-    /// The limit for pagination, default to 10
-    pub limit: Option<usize>,
+    #[serde(default)]
+    pub cursor: String,
+    /// The limit for pagination, max 100
+    #[serde(default)]
+    pub limit: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -774,11 +769,23 @@ impl Tool<BaseCtx> for ListConversationsTool {
     ) -> Result<ToolOutput<Self::Output>, BoxError> {
         let (conversations, next_cursor) = self
             .memory
-            .list_conversations_by_user(ctx.caller(), args.cursor, args.limit)
+            .list_conversations_by_user(
+                ctx.caller(),
+                if args.cursor.is_empty() {
+                    None
+                } else {
+                    Some(args.cursor)
+                },
+                if args.limit == 0 {
+                    None
+                } else {
+                    Some(args.limit)
+                },
+            )
             .await?;
         let docs: Vec<Document> = conversations.into_iter().map(Document::from).collect();
         let result = format!(
-            "Current Datetime: {}\n---\n{}",
+            "Current Datetime: {}\n\n---\n\n{}",
             rfc3339_datetime_now(),
             Documents::from(docs)
         );
@@ -796,8 +803,9 @@ impl Tool<BaseCtx> for ListConversationsTool {
 pub struct SearchConversationsArgs {
     /// The query string to search
     pub query: String,
-    /// The max number of conversations to return, default to 10
-    pub limit: Option<usize>,
+    /// The max number of conversations to return, max 100
+    #[serde(default)]
+    pub limit: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -845,12 +853,20 @@ impl Tool<BaseCtx> for SearchConversationsTool {
     ) -> Result<ToolOutput<Self::Output>, BoxError> {
         let conversations = self
             .memory
-            .search_conversations(ctx.caller(), args.query, args.limit)
+            .search_conversations(
+                ctx.caller(),
+                args.query,
+                if args.limit == 0 {
+                    None
+                } else {
+                    Some(args.limit)
+                },
+            )
             .await?;
 
         let docs: Vec<Document> = conversations.into_iter().map(Document::from).collect();
         let result = format!(
-            "Current Datetime: {}\n---\n{}",
+            "Current Datetime: {}\n\n---\n\n{}",
             rfc3339_datetime_now(),
             Documents::from(docs)
         );
@@ -990,7 +1006,7 @@ impl Tool<BaseCtx> for MemoryTool {
                 if conversation.status == ConversationStatus::Working
                     || conversation.status == ConversationStatus::Submitted
                 {
-                    conversation.status = ConversationStatus::Canceled;
+                    conversation.status = ConversationStatus::Cancelled;
                     conversation.updated_at = unix_ms();
                     let changes = BTreeMap::from([
                         (

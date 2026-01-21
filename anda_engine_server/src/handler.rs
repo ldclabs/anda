@@ -153,38 +153,54 @@ async fn engine_run(
         .get(&id)
         .ok_or_else(|| format!("engine {} not found", id.to_text()))?;
 
+    let start = std::time::Instant::now();
     match req.method.as_str() {
         "agent_run" => {
             let args: (AgentInput,) = from_reader(req.params.as_slice())
                 .map_err(|err| format!("failed to decode params: {err:?}"))?;
+            let name = args.0.name.clone();
+            let res = engine
+                .agent_run(caller, args.0)
+                .await
+                .map_err(|err| format!("failed to run agent: {err:?}"));
+
             log::info!(
                 method = req.method.as_str(),
                 agent = id.to_text(),
                 caller = caller.to_text(),
-                name = args.0.name;
+                elapsed = start.elapsed().as_millis(),
+                name = name,
+                error = match &res {
+                    Ok(_) => None,
+                    Err(e) => Some(e.as_str()),
+                };
                 "",
             );
-            let res = engine
-                .agent_run(caller, args.0)
-                .await
-                .map_err(|err| format!("failed to run agent: {err:?}"))?;
-            Ok(deterministic_cbor_into_vec(&res)?.into())
+
+            Ok(deterministic_cbor_into_vec(&res?)?.into())
         }
         "tool_call" => {
             let args: (ToolInput<Json>,) = from_reader(req.params.as_slice())
                 .map_err(|err| format!("failed to decode params: {err:?}"))?;
+
+            let name = args.0.name.clone();
+            let res = engine
+                .tool_call(caller, args.0)
+                .await
+                .map_err(|err| format!("failed to call tool: {err:?}"));
             log::info!(
                 method = req.method.as_str(),
                 agent = id.to_text(),
                 caller = caller.to_text(),
-                name = args.0.name;
+                elapsed = start.elapsed().as_millis(),
+                name = name,
+                error = match &res {
+                    Ok(_) => None,
+                    Err(e) => Some(e.as_str()),
+                };
                 "",
             );
-            let res = engine
-                .tool_call(caller, args.0)
-                .await
-                .map_err(|err| format!("failed to call tool: {err:?}"))?;
-            Ok(deterministic_cbor_into_vec(&res)?.into())
+            Ok(deterministic_cbor_into_vec(&res?)?.into())
         }
         "information" => {
             let res = engine.information();
