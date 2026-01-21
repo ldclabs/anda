@@ -62,6 +62,11 @@ pub struct AgentCtx {
     pub(crate) model: Model,
     // label -> model
     pub(crate) models: Arc<BTreeMap<String, Model>>,
+
+    /// Global fallback model used when the primary model returns `failed_reason`.
+    pub(crate) fallback_model: Option<Model>,
+    /// label -> fallback model
+    pub(crate) fallback_models: Arc<BTreeMap<String, Model>>,
     /// Set of available tools that can be called.
     pub(crate) tools: Arc<ToolSet<BaseCtx>>,
     /// Set of available agents that can be invoked.
@@ -80,6 +85,8 @@ impl AgentCtx {
         base: BaseCtx,
         model: Model,
         models: Arc<BTreeMap<String, Model>>,
+        fallback_model: Option<Model>,
+        fallback_models: Arc<BTreeMap<String, Model>>,
         tools: Arc<ToolSet<BaseCtx>>,
         agents: Arc<AgentSet<AgentCtx>>,
     ) -> Self {
@@ -88,6 +95,8 @@ impl AgentCtx {
             label: String::new(),
             model,
             models,
+            fallback_model,
+            fallback_models,
             tools,
             agents,
         }
@@ -103,6 +112,8 @@ impl AgentCtx {
             label: agent_label.to_string(),
             model: self.model.clone(),
             models: self.models.clone(),
+            fallback_model: self.fallback_model.clone(),
+            fallback_models: self.fallback_models.clone(),
             tools: self.tools.clone(),
             agents: self.agents.clone(),
         })
@@ -136,6 +147,8 @@ impl AgentCtx {
             label: agent_label.to_string(),
             model: self.model.clone(),
             models: self.models.clone(),
+            fallback_model: self.fallback_model.clone(),
+            fallback_models: self.fallback_models.clone(),
             tools: self.tools.clone(),
             agents: self.agents.clone(),
         })
@@ -169,9 +182,16 @@ impl AgentCtx {
             .cloned()
             .unwrap_or_else(|| self.model.clone());
 
+        let fallback_model = self
+            .fallback_models
+            .get(&self.label)
+            .cloned()
+            .or_else(|| self.fallback_model.clone());
+
         CompletionRunner {
             ctx: self.clone(),
             model,
+            fallback_model,
             req,
             resources,
             chat_history: Vec::new(),
@@ -921,6 +941,7 @@ impl HttpFeatures for AgentCtx {
 pub struct CompletionRunner {
     ctx: AgentCtx,
     model: Model,
+    fallback_model: Option<Model>,
     req: CompletionRequest,
     resources: Vec<Resource>,
     chat_history: Vec<Message>,
@@ -968,8 +989,35 @@ impl CompletionRunner {
 
     async fn inner_next(&mut self) -> Result<Option<AgentOutput>, BoxError> {
         self.step += 1;
+
         let mut output = self.model.completion(self.req.clone()).await?;
         self.usage.accumulate(&output.usage);
+
+        // If the primary model returns a failed result (failed_reason exists),
+        // and a fallback model is configured, switch to the fallback model and retry.
+        // After switching, subsequent steps will keep using the fallback model.
+        if output.failed_reason.is_some()
+            && let Some(fallback) = self.fallback_model.take() {
+                let primary_reason = output
+                    .failed_reason
+                    .clone()
+                    .unwrap_or_else(|| "unknown error".to_string());
+
+                self.model = fallback;
+                let mut output2 = self.model.completion(self.req.clone()).await?;
+                self.usage.accumulate(&output2.usage);
+
+                if let Some(fallback_reason) = output2.failed_reason.clone() {
+                    output2.failed_reason = Some(format!(
+                        "primary model failed: {}; fallback model failed: {}",
+                        primary_reason, fallback_reason
+                    ));
+                    return Ok(Some(self.final_output(output2)));
+                }
+
+                output = output2;
+            }
+
         // 累计所有原始对话历史（包含初始的 req.raw_history 和 req.chat_history）
         self.req.raw_history.append(&mut output.raw_history);
         // 累计所有对话历史（不包含初始的 req.chat_history）
@@ -1143,9 +1191,13 @@ impl Stream for CompletionStream {
 
 #[cfg(test)]
 mod tests {
+    use anda_core::{AgentOutput, BoxError, CompletionFeatures, CompletionRequest, Resource};
     use ciborium::from_reader;
     use ic_cose_types::to_cbor_bytes;
     use serde_json::json;
+    use std::sync::Arc;
+
+    use crate::{engine::EngineBuilder, model::CompletionFeaturesDyn, model::Model};
 
     #[test]
     fn json_in_cbor_works() {
@@ -1162,5 +1214,55 @@ mod tests {
         let data = to_cbor_bytes(&json);
         let val: serde_json::Value = from_reader(&data[..]).unwrap();
         assert_eq!(json, val);
+    }
+
+    #[derive(Clone, Debug)]
+    struct AlwaysFailCompleter;
+
+    impl CompletionFeaturesDyn for AlwaysFailCompleter {
+        fn completion(
+            &self,
+            _req: CompletionRequest,
+        ) -> anda_core::BoxPinFut<Result<AgentOutput, BoxError>> {
+            Box::pin(futures::future::ready(Ok(AgentOutput {
+                failed_reason: Some("primary failed".to_string()),
+                ..Default::default()
+            })))
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct AlwaysOkCompleter;
+
+    impl CompletionFeaturesDyn for AlwaysOkCompleter {
+        fn completion(
+            &self,
+            _req: CompletionRequest,
+        ) -> anda_core::BoxPinFut<Result<AgentOutput, BoxError>> {
+            Box::pin(futures::future::ready(Ok(AgentOutput {
+                content: "from_fallback".to_string(),
+                ..Default::default()
+            })))
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn completion_falls_back_on_failed_reason() {
+        let primary = Model::with_completer(Arc::new(AlwaysFailCompleter));
+        let fallback = Model::with_completer(Arc::new(AlwaysOkCompleter));
+
+        let ctx = EngineBuilder::new()
+            .with_model(primary)
+            .with_fallback_model(fallback)
+            .mock_ctx();
+
+        let req = CompletionRequest {
+            prompt: "hello".to_string(),
+            ..Default::default()
+        };
+
+        let out = ctx.completion(req, Vec::<Resource>::new()).await.unwrap();
+        assert!(out.failed_reason.is_none());
+        assert_eq!(out.content, "from_fallback");
     }
 }
