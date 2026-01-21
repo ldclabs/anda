@@ -206,16 +206,13 @@ impl CompletionFeaturesDyn for CompletionModel {
                 log::debug!(request = val; "Gemini completions request");
             }
 
-            println!(
-                "\n\nSending Gemini completion request:\n{}",
-                serde_json::to_string_pretty(&greq).unwrap()
-            );
-
             let response = client
                 .post(&format!("/{}:generateContent", model))
                 .json(&greq)
                 .send()
                 .await?;
+
+            greq.system_instruction = None; // avoid logging tedious instructions
             if response.status().is_success() {
                 let text = response.text().await?;
 
@@ -223,12 +220,14 @@ impl CompletionFeaturesDyn for CompletionModel {
                     Ok(res) => {
                         if log_enabled!(Debug) {
                             log::debug!(
+                                model = model,
                                 request:serde = greq,
                                 messages:serde = raw_history,
                                 response:serde = res;
                                 "Gemini completions response");
                         } else if res.maybe_failed() {
                             log::warn!(
+                                model = model,
                                 request:serde = greq,
                                 messages:serde = raw_history,
                                 response:serde = res;
@@ -237,19 +236,22 @@ impl CompletionFeaturesDyn for CompletionModel {
 
                         res.try_into(raw_history, chat_history)
                     }
-                    Err(err) => {
-                        Err(format!("Gemini completions error: {}, body: {}", err, text).into())
-                    }
+                    Err(err) => Err(format!(
+                        "Gemini {} completions error: {}, body: {}",
+                        model, err, text
+                    )
+                    .into()),
                 }
             } else {
                 let status = response.status();
                 let msg = response.text().await?;
                 log::error!(
+                    model = model,
                     request:serde = greq,
                     messages:serde = raw_history;
                     "Gemini completions request failed: {status}, body: {msg}",
                 );
-                Err(format!("Gemini completions error: {}", msg).into())
+                Err(format!("Gemini {} completions error: {}", model, msg).into())
             }
         })
     }
