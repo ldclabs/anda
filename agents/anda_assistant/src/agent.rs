@@ -203,17 +203,8 @@ impl Agent<AgentCtx> for Assistant {
 
         let caller_info = self
             .memory
-            .describe_caller(caller)
-            .await
-            .unwrap_or_else(|_| {
-                serde_json::json!({
-                    "type": "Person",
-                    "name": caller.to_string(),
-                    "attributes": {},
-                    "metadata": {},
-                })
-            });
-
+            .get_or_init_caller(caller, ctx.meta().user.clone())
+            .await?;
         let primer = self.memory.describe_primer().await?;
         let instructions = format!(
             "{}\n---\n# Your Identity & Knowledge Domain Map\n{}\n",

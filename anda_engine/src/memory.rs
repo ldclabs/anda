@@ -21,7 +21,7 @@ use ciborium::cbor;
 use ic_auth_types::ByteBufB64;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Map, json};
 use std::{
     collections::BTreeMap,
     fmt,
@@ -390,6 +390,33 @@ impl MemoryManagement {
                 r#type: PERSON_TYPE.to_string(),
                 name: id.to_string(),
             })
+            .await?;
+
+        Ok(user.to_concept_node())
+    }
+
+    pub async fn get_or_init_caller(
+        &self,
+        id: &Principal,
+        name: Option<String>,
+    ) -> Result<Json, KipError> {
+        let mut attributes = Map::new();
+        let mut metadata = Map::new();
+        attributes.insert("id".to_string(), id.to_string().into());
+        attributes.insert("person_class".to_string(), "Human".into());
+        if let Some(name) = name {
+            attributes.insert("name".to_string(), name.into());
+        }
+        metadata.insert("author".to_string(), "$system".into());
+        metadata.insert("status".to_string(), "active".into());
+        let user = self
+            .nexus
+            .get_or_init_concept(
+                PERSON_TYPE.to_string(),
+                id.to_string(),
+                attributes,
+                metadata,
+            )
             .await?;
 
         Ok(user.to_concept_node())

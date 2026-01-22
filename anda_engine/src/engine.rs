@@ -158,6 +158,12 @@ impl Engine {
             )
             .into());
         }
+        if let Some(user) = &meta.user {
+            let u = user.trim();
+            if u.is_empty() || u != user || u.len() > 32 {
+                return Err(format!("invalid user name {:?}", user).into());
+            }
+        }
 
         input.name = if input.name.is_empty() {
             self.default_agent.clone()
@@ -201,6 +207,12 @@ impl Engine {
                 meta.engine.unwrap().to_text()
             )
             .into());
+        }
+        if let Some(user) = &meta.user {
+            let u = user.trim();
+            if u.is_empty() || u != user || u.len() > 32 {
+                return Err(format!("invalid user name {:?}", user).into());
+            }
         }
 
         // manager can call any tool
