@@ -26,6 +26,7 @@ pub struct AppState {
     pub(crate) engines: Arc<BTreeMap<Principal, Engine>>,
     pub(crate) default_engine: Principal,
     pub(crate) start_time_ms: u64,
+    pub(crate) extra_info: Arc<BTreeMap<String, Json>>,
 }
 
 /// GET /.well-known/information
@@ -49,6 +50,7 @@ pub async fn get_information(
         default_engine: app.default_engine,
         start_time_ms: app.start_time_ms,
         caller,
+        extra_info: app.extra_info.as_ref().clone(),
     };
 
     match Content::from(&headers) {

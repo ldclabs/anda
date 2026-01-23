@@ -1,4 +1,4 @@
-use anda_core::BoxError;
+use anda_core::{BoxError, Json};
 use anda_engine::engine::Engine;
 use axum::{Router, routing};
 use candid::Principal;
@@ -25,6 +25,7 @@ pub struct ServerBuilder {
     engines: BTreeMap<Principal, Engine>,
     default_engine: Option<Principal>,
     middlewares: Vec<Arc<dyn HttpMiddleware>>,
+    extra_info: BTreeMap<String, Json>,
 }
 
 impl Default for ServerBuilder {
@@ -46,6 +47,7 @@ impl ServerBuilder {
             engines: BTreeMap::new(),
             default_engine: None,
             middlewares: Vec::new(),
+            extra_info: BTreeMap::new(),
         }
     }
 
@@ -66,6 +68,11 @@ impl ServerBuilder {
 
     pub fn with_origin(mut self, origin: String) -> Self {
         self.origin = origin;
+        self
+    }
+
+    pub fn with_extra_info(mut self, extra_info: BTreeMap<String, Json>) -> Self {
+        self.extra_info = extra_info;
         self
     }
 
@@ -163,6 +170,7 @@ impl ServerBuilder {
             engines: Arc::new(self.engines),
             default_engine,
             start_time_ms: unix_ms(),
+            extra_info: Arc::new(self.extra_info),
         };
 
         // Build a router that is still "missing" an `AppState`.
