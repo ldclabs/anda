@@ -94,6 +94,10 @@ pub struct AgentOutput {
     /// The conversation ID.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conversation: Option<u64>,
+
+    /// The model used by the agent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 /// Represents a message send to LLM for completion.

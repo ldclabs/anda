@@ -13,6 +13,9 @@ pub trait CompletionFeatures: Sized {
         req: CompletionRequest,
         resources: Vec<Resource>,
     ) -> impl Future<Output = Result<AgentOutput, BoxError>> + Send;
+
+    /// Returns the name of the model.
+    fn model_name(&self) -> String;
 }
 
 /// Represents a general completion request that can be sent to a completion model provider.

@@ -326,6 +326,10 @@ impl CompletionModel {
 }
 
 impl CompletionFeatures for CompletionModel {
+    fn model_name(&self) -> String {
+        self.model.clone()
+    }
+
     async fn completion(
         &self,
         req: CompletionRequest,
@@ -336,6 +340,10 @@ impl CompletionFeatures for CompletionModel {
 }
 
 impl CompletionFeaturesDyn for CompletionModel {
+    fn model_name(&self) -> String {
+        self.model.clone()
+    }
+
     fn completion(&self, mut req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
         let model = self.model.clone();
         let client = self.client.clone();

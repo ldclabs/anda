@@ -36,6 +36,8 @@ use crate::APP_USER_AGENT;
 pub trait CompletionFeaturesDyn: Send + Sync + 'static {
     /// Performs a completion request and returns a future with the agent's output
     fn completion(&self, req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>>;
+
+    fn model_name(&self) -> String;
 }
 
 /// Trait for dynamic embedding features that can be used across threads
@@ -55,6 +57,10 @@ pub trait EmbeddingFeaturesDyn: Send + Sync + 'static {
 pub struct NotImplemented;
 
 impl CompletionFeaturesDyn for NotImplemented {
+    fn model_name(&self) -> String {
+        "not_implemented".to_string()
+    }
+
     fn completion(&self, _req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
         Box::pin(futures::future::ready(Err("not implemented".into())))
     }
@@ -79,6 +85,10 @@ impl EmbeddingFeaturesDyn for NotImplemented {
 pub struct MockImplemented;
 
 impl CompletionFeaturesDyn for MockImplemented {
+    fn model_name(&self) -> String {
+        "not_implemented".to_string()
+    }
+
     fn completion(&self, req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
         Box::pin(futures::future::ready(Ok(AgentOutput {
             content: req.prompt.clone(),
@@ -175,6 +185,10 @@ impl Model {
             completer: Arc::new(MockImplemented),
             embedder: Arc::new(MockImplemented),
         }
+    }
+
+    pub fn model_name(&self) -> String {
+        self.completer.model_name()
     }
 
     pub async fn completion(&self, req: CompletionRequest) -> Result<AgentOutput, BoxError> {

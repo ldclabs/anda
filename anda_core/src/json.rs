@@ -19,6 +19,9 @@ pub fn gen_schema_for<T: JsonSchema>() -> serde_json::Value {
     let mut schema = root_schema_for::<T>();
     schema.remove("title");
     schema.remove("description");
+    if schema.get("required").is_none() {
+        schema.insert("required".to_string(), serde_json::json!([]));
+    }
     schema.to_value()
 }
 

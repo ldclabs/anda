@@ -1125,4 +1125,11 @@ mod tests {
         let args1: MemoryToolArgs = serde_json::from_str(&rt).unwrap();
         assert_eq!(args, args1);
     }
+
+    #[test]
+    fn test_list_prev_conversations_schema() {
+        let schema = gen_schema_for::<ListConversationsArgs>();
+        println!("{}", serde_json::to_string_pretty(&schema).unwrap());
+        assert!(schema.get("required").is_some());
+    }
 }

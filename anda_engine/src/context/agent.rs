@@ -515,6 +515,10 @@ impl AgentContext for AgentCtx {
 }
 
 impl CompletionFeatures for AgentCtx {
+    fn model_name(&self) -> String {
+        self.model.model_name()
+    }
+
     /// Executes a completion request with automatic tool call handling.
     ///
     /// This method handles the completion request in a loop, automatically executing
@@ -991,32 +995,36 @@ impl CompletionRunner {
         self.step += 1;
 
         let mut output = self.model.completion(self.req.clone()).await?;
+        output.model = Some(self.model.model_name());
+
         self.usage.accumulate(&output.usage);
 
         // If the primary model returns a failed result (failed_reason exists),
         // and a fallback model is configured, switch to the fallback model and retry.
         // After switching, subsequent steps will keep using the fallback model.
         if output.failed_reason.is_some()
-            && let Some(fallback) = self.fallback_model.take() {
-                let primary_reason = output
-                    .failed_reason
-                    .clone()
-                    .unwrap_or_else(|| "unknown error".to_string());
+            && let Some(fallback) = self.fallback_model.take()
+        {
+            let primary_reason = output
+                .failed_reason
+                .clone()
+                .unwrap_or_else(|| "unknown error".to_string());
 
-                self.model = fallback;
-                let mut output2 = self.model.completion(self.req.clone()).await?;
-                self.usage.accumulate(&output2.usage);
+            self.model = fallback;
+            let mut output2 = self.model.completion(self.req.clone()).await?;
+            output2.model = Some(self.model.model_name());
+            self.usage.accumulate(&output2.usage);
 
-                if let Some(fallback_reason) = output2.failed_reason.clone() {
-                    output2.failed_reason = Some(format!(
-                        "primary model failed: {}; fallback model failed: {}",
-                        primary_reason, fallback_reason
-                    ));
-                    return Ok(Some(self.final_output(output2)));
-                }
-
-                output = output2;
+            if let Some(fallback_reason) = output2.failed_reason.clone() {
+                output2.failed_reason = Some(format!(
+                    "primary model failed: {}; fallback model failed: {}",
+                    primary_reason, fallback_reason
+                ));
+                return Ok(Some(self.final_output(output2)));
             }
+
+            output = output2;
+        }
 
         // 累计所有原始对话历史（包含初始的 req.raw_history 和 req.chat_history）
         self.req.raw_history.append(&mut output.raw_history);
@@ -1220,6 +1228,10 @@ mod tests {
     struct AlwaysFailCompleter;
 
     impl CompletionFeaturesDyn for AlwaysFailCompleter {
+        fn model_name(&self) -> String {
+            "always_fail".to_string()
+        }
+
         fn completion(
             &self,
             _req: CompletionRequest,
@@ -1235,6 +1247,10 @@ mod tests {
     struct AlwaysOkCompleter;
 
     impl CompletionFeaturesDyn for AlwaysOkCompleter {
+        fn model_name(&self) -> String {
+            "always_ok".to_string()
+        }
+
         fn completion(
             &self,
             _req: CompletionRequest,
