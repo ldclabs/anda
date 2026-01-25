@@ -404,7 +404,7 @@ impl fmt::Display for Role {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged, rename_all = "camelCase")]
+#[serde(untagged, rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum Tool {
     FunctionDeclaration {
         function_declarations: Vec<FunctionDeclaration>,
@@ -412,6 +412,21 @@ pub enum Tool {
 
     CodeExecution {
         code_execution: CodeExecution,
+    },
+
+    /// Enable Google Search grounding with (optional) dynamic retrieval settings.
+    GoogleSearchRetrieval {
+        google_search_retrieval: GoogleSearchRetrieval,
+    },
+
+    /// Enable Google Search tool.
+    GoogleSearch {
+        google_search: GoogleSearch,
+    },
+
+    /// Enable URL context tool.
+    UrlContext {
+        url_context: UrlContext,
     },
 }
 
@@ -434,6 +449,37 @@ impl From<Vec<FunctionDefinition>> for Tool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodeExecution {}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct GoogleSearch {}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct UrlContext {}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct GoogleSearchRetrieval {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dynamic_retrieval_config: Option<DynamicRetrievalConfig>,
+
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DynamicRetrievalConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dynamic_threshold: Option<f64>,
+
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -1027,5 +1073,149 @@ mod tests {
 
         // let val = into_parts(json!(vec![string_value, complex_value])).unwrap();
         // assert_eq!(val, vec![content_part, content_part2]);
+    }
+
+    #[test]
+    fn test_tool_serde() {
+        let tool = Tool::FunctionDeclaration {
+            function_declarations: vec![FunctionDeclaration {
+                name: "get_weather".to_string(),
+                description: "Get current weather".to_string(),
+                parameters: Some(json!({
+                    "type": "object",
+                    "properties": {
+                        "location": {"type": "string"}
+                    },
+                    "required": ["location"]
+                })),
+                response: None,
+            }],
+        };
+
+        let json_value = serde_json::to_value(&tool).unwrap();
+        assert_eq!(
+            json_value,
+            json!({
+                "functionDeclarations": [
+                    {
+                        "name": "get_weather",
+                        "description": "Get current weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "location": {"type": "string"}
+                            },
+                            "required": ["location"]
+                        }
+                    }
+                ]
+            })
+        );
+
+        let deserialized: Tool = serde_json::from_value(json_value).unwrap();
+        assert_eq!(
+            serde_json::to_value(deserialized).unwrap(),
+            serde_json::to_value(tool).unwrap()
+        );
+
+        let code_tool = Tool::CodeExecution {
+            code_execution: CodeExecution {},
+        };
+        let json_value = serde_json::to_value(&code_tool).unwrap();
+        assert_eq!(json_value, json!({ "codeExecution": {} }));
+        let deserialized: Tool = serde_json::from_value(json_value).unwrap();
+        assert_eq!(
+            serde_json::to_value(deserialized).unwrap(),
+            serde_json::to_value(code_tool).unwrap()
+        );
+
+        let search_retrieval_tool = Tool::GoogleSearchRetrieval {
+            google_search_retrieval: GoogleSearchRetrieval {
+                dynamic_retrieval_config: Some(DynamicRetrievalConfig {
+                    mode: Some("MODE_DYNAMIC".to_string()),
+                    dynamic_threshold: Some(0.3),
+                    extra: Map::new(),
+                }),
+                extra: Map::new(),
+            },
+        };
+        let json_value = serde_json::to_value(&search_retrieval_tool).unwrap();
+        assert_eq!(
+            json_value,
+            json!({
+                "googleSearchRetrieval": {
+                    "dynamicRetrievalConfig": {
+                        "mode": "MODE_DYNAMIC",
+                        "dynamicThreshold": 0.3
+                    }
+                }
+            })
+        );
+        let deserialized: Tool = serde_json::from_value(json_value).unwrap();
+        assert_eq!(
+            serde_json::to_value(deserialized).unwrap(),
+            serde_json::to_value(search_retrieval_tool).unwrap()
+        );
+
+        let search_tool = Tool::GoogleSearch {
+            google_search: GoogleSearch {},
+        };
+        let json_value = serde_json::to_value(&search_tool).unwrap();
+        assert_eq!(json_value, json!({ "googleSearch": {} }));
+        let deserialized: Tool = serde_json::from_value(json_value).unwrap();
+        assert_eq!(
+            serde_json::to_value(deserialized).unwrap(),
+            serde_json::to_value(search_tool).unwrap()
+        );
+
+        let url_context_tool = Tool::UrlContext {
+            url_context: UrlContext {},
+        };
+        let json_value = serde_json::to_value(&url_context_tool).unwrap();
+        assert_eq!(json_value, json!({ "urlContext": {} }));
+        let deserialized: Tool = serde_json::from_value(json_value).unwrap();
+        assert_eq!(
+            serde_json::to_value(deserialized).unwrap(),
+            serde_json::to_value(url_context_tool).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_tool_from_function_definitions() {
+        let defs = vec![FunctionDefinition {
+            name: "sum".to_string(),
+            description: "Sum two integers".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "a": {"type": "integer"},
+                    "b": {"type": "integer"}
+                },
+                "required": ["a", "b"]
+            }),
+            strict: None,
+        }];
+
+        let tool: Tool = defs.into();
+        let json_value = serde_json::to_value(&tool).unwrap();
+        assert_eq!(
+            json_value,
+            json!({
+                "functionDeclarations": [
+                    {
+                        "name": "sum",
+                        "description": "Sum two integers",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "a": {"type": "integer"},
+                                "b": {"type": "integer"}
+                            },
+                            "required": ["a", "b"]
+                        }
+                    }
+                ]
+            })
+        );
     }
 }

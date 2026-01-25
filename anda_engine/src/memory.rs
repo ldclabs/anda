@@ -46,7 +46,7 @@ pub static FUNCTION_DEFINITION: LazyLock<FunctionDefinition> = LazyLock::new(|| 
                 },
                 "parameters": {
                     "type": "object",
-                    "description": "An optional JSON object of key-value pairs used for safe substitution of placeholders in the command string(s). Placeholders should start with ':' (e.g., :name, :limit). IMPORTANT: A placeholder must represent a complete JSON value token (e.g., name: :name). Do not embed placeholders inside quoted strings (e.g., \"Hello :name\"), because substitution uses JSON serialization."
+                    "description": "JSON object of key-value pairs for safe placeholder substitution (placeholders start with ':', e.g., :name). Must be complete JSON tokens; do not embed in quoted strings."
                 }
             },
             "required": ["command", "parameters"]
