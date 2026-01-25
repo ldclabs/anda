@@ -18,6 +18,7 @@ use candid::Principal;
 use clap::Parser;
 use ic_agent::identity::BasicIdentity;
 use std::{collections::BTreeSet, sync::Arc};
+use structured_logger::{Builder, async_json::new_writer, get_env_level};
 use tokio::time::sleep;
 
 #[derive(Parser)]
@@ -54,6 +55,11 @@ struct Cli {
 async fn main() {
     dotenv::dotenv().ok();
     let cli = Cli::parse();
+
+    // Initialize structured logging with JSON format
+    Builder::with_level(&get_env_level().to_string())
+        .with_target_writer("*", new_writer(tokio::io::stdout()))
+        .init();
 
     let id_secret = hex::decode(&cli.id_secret).unwrap();
     let id_secret: [u8; 32] = id_secret

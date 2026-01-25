@@ -26,4 +26,5 @@ dotenv = { workspace = true }
 clap = { workspace = true }
 hex = { workspace = true }
 ic-agent = { workspace = true }
+structured-logger = { workspace = true }
 anda_web3_client = { path = "../../anda_web3_client", version = "0.9" }

@@ -9,6 +9,7 @@
 //! - Core AI capabilities traits ([`CompletionFeatures`], [`EmbeddingFeatures`]).
 
 use candid::Principal;
+use serde::ser::{SerializeMap, SerializeSeq, Serializer};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, json};
 use std::collections::BTreeMap;
@@ -375,11 +376,111 @@ pub struct FunctionDefinition {
     pub description: String,
 
     /// JSON schema defining the function's parameters.
+    #[serde(serialize_with = "serialize_openapi_schema_ordered")]
     pub parameters: Json,
 
     /// Whether to enable strict schema adherence when generating the function call. If set to true, the model will follow the exact schema defined in the parameters field. Only a subset of JSON Schema is supported when strict is true.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub strict: Option<bool>,
+}
+
+pub fn serialize_optional_openapi_schema_ordered<S>(
+    value: &Option<Json>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match value {
+        None => serializer.serialize_none(),
+        Some(v) => serialize_openapi_schema_ordered(v, serializer),
+    }
+}
+
+pub fn serialize_openapi_schema_ordered<S>(value: &Json, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    struct Ordered<'a>(&'a Json);
+
+    impl<'a> serde::Serialize for Ordered<'a> {
+        fn serialize<S2>(&self, serializer: S2) -> Result<S2::Ok, S2::Error>
+        where
+            S2: Serializer,
+        {
+            serialize_openapi_schema_ordered(self.0, serializer)
+        }
+    }
+
+    match value {
+        Json::Null => serializer.serialize_none(),
+        Json::Bool(b) => serializer.serialize_bool(*b),
+        Json::Number(n) => n.serialize(serializer),
+        Json::String(s) => serializer.serialize_str(s),
+        Json::Array(items) => {
+            let mut seq = serializer.serialize_seq(Some(items.len()))?;
+            for item in items {
+                seq.serialize_element(&Ordered(item))?;
+            }
+            seq.end()
+        }
+        Json::Object(map) => {
+            // Gemini preview models can be sensitive to schema key order.
+            // Emit a deterministic, schema-friendly ordering recursively:
+            // 1) common schema keys in a fixed order
+            // 2) remaining keys in lexical order
+
+            // https://ai.google.dev/api/caching#FunctionDeclaration
+            const FIXED_ORDER: [&str; 23] = [
+                "name",
+                "type",
+                "format",
+                "title",
+                "description",
+                "nullable",
+                "enum",
+                "maxItems",
+                "minItems",
+                "properties",
+                "required",
+                "minProperties",
+                "maxProperties",
+                "minLength",
+                "maxLength",
+                "pattern",
+                "example",
+                "anyOf",
+                "propertyOrdering",
+                "default",
+                "items",
+                "minimum",
+                "maximum",
+            ];
+
+            let mut out = serializer.serialize_map(Some(map.len()))?;
+
+            for key in FIXED_ORDER {
+                if let Some(v) = map.get(key) {
+                    out.serialize_entry(key, &Ordered(v))?;
+                }
+            }
+
+            let mut rest_keys: Vec<&str> = map
+                .keys()
+                .map(|k| k.as_str())
+                .filter(|k| !FIXED_ORDER.contains(k))
+                .collect();
+            rest_keys.sort_unstable();
+
+            for key in rest_keys {
+                if let Some(v) = map.get(key) {
+                    out.serialize_entry(key, &Ordered(v))?;
+                }
+            }
+
+            out.end()
+        }
+    }
 }
 
 impl FunctionDefinition {
@@ -582,15 +683,36 @@ mod tests {
         .into();
         // println!("{}", documents);
 
-        assert_eq!(
-            documents.to_string(),
-            "<documents>\n{\"content\":\"Test document 1.\",\"metadata\":{\"_id\":1}}\n{\"content\":\"Test document 2.\",\"metadata\":{\"_id\":2,\"a\":\"b\",\"key\":\"value\"}}\n</documents>"
-        );
+        let s = documents.to_string();
+        let lines: Vec<&str> = s.lines().collect();
+        assert_eq!(lines[0], "<documents>");
+        assert_eq!(lines[3], "</documents>");
+
+        let doc1: Json = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(doc1.get("content").unwrap(), "Test document 1.");
+        assert_eq!(doc1.get("metadata").unwrap().get("_id").unwrap(), 1);
+
+        let doc2: Json = serde_json::from_str(lines[2]).unwrap();
+        assert_eq!(doc2.get("content").unwrap(), "Test document 2.");
+        assert_eq!(doc2.get("metadata").unwrap().get("_id").unwrap(), 2);
+        assert_eq!(doc2.get("metadata").unwrap().get("key").unwrap(), "value");
+        assert_eq!(doc2.get("metadata").unwrap().get("a").unwrap(), "b");
+
         let documents = documents.with_tag("my_docs".to_string());
-        assert_eq!(
-            documents.to_string(),
-            "<my_docs>\n{\"content\":\"Test document 1.\",\"metadata\":{\"_id\":1}}\n{\"content\":\"Test document 2.\",\"metadata\":{\"_id\":2,\"a\":\"b\",\"key\":\"value\"}}\n</my_docs>"
-        );
+        let s = documents.to_string();
+        let lines: Vec<&str> = s.lines().collect();
+        assert_eq!(lines[0], "<my_docs>");
+        assert_eq!(lines[3], "</my_docs>");
+
+        let doc1: Json = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(doc1.get("content").unwrap(), "Test document 1.");
+        assert_eq!(doc1.get("metadata").unwrap().get("_id").unwrap(), 1);
+
+        let doc2: Json = serde_json::from_str(lines[2]).unwrap();
+        assert_eq!(doc2.get("content").unwrap(), "Test document 2.");
+        assert_eq!(doc2.get("metadata").unwrap().get("_id").unwrap(), 2);
+        assert_eq!(doc2.get("metadata").unwrap().get("key").unwrap(), "value");
+        assert_eq!(doc2.get("metadata").unwrap().get("a").unwrap(), "b");
     }
 
     #[test]
@@ -814,5 +936,71 @@ mod tests {
             back2.extra.get("obj").unwrap(),
             &serde_json::json!({"x": true})
         );
+    }
+
+    #[test]
+    fn test_function_definition_parameters_openapi_order() {
+        let def = FunctionDefinition {
+            name: "trigger_paywall".into(),
+            description: "Trigger payment".into(),
+            parameters: serde_json::json!({
+                // Intentionally not in the preferred order.
+                "properties": {
+                    "hook_text": {
+                        "description": "hook",
+                        "type": "string"
+                    },
+                    "reason": {
+                        "description": "reason",
+                        "type": "string"
+                    }
+                },
+                "description": "top",
+                "required": ["reason", "hook_text"],
+                "type": "object"
+            }),
+            strict: None,
+        };
+
+        let s = serde_json::to_string(&def).unwrap();
+        let start =
+            s.find("\"parameters\":{").expect("parameters should exist") + "\"parameters\":{".len();
+        let sub = &s[start..];
+        let i_type = sub.find("\"type\"").unwrap();
+        let i_props = sub.find("\"properties\"").unwrap();
+        let i_req = sub.find("\"required\"").unwrap();
+        let i_desc = sub.find("\"description\"").unwrap();
+        assert!(i_type < i_props);
+        assert!(i_props > i_desc);
+        assert!(i_props < i_req);
+    }
+
+    #[test]
+    fn test_function_definition_nested_schema_order_is_deterministic() {
+        let def = FunctionDefinition {
+            name: "trigger_paywall".into(),
+            description: "Trigger payment".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "hook_text": {
+                        // Intentionally reverse order.
+                        "description": "hook",
+                        "type": "string"
+                    }
+                },
+                "required": ["hook_text"],
+            }),
+            strict: None,
+        };
+
+        let s = serde_json::to_string(&def).unwrap();
+        // Ensure nested property schema emits type before description.
+        let needle = "\"hook_text\":{";
+        let start = s.find(needle).unwrap() + needle.len();
+        let sub = &s[start..];
+        let i_type = sub.find("\"type\"").unwrap();
+        let i_desc = sub.find("\"description\"").unwrap();
+        assert!(i_type < i_desc);
     }
 }

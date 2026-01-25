@@ -3,7 +3,7 @@ name = "anda_engine"
 description = "Agents engine for Anda -- an AI agent framework built with Rust, powered by ICP and TEEs."
 repository = "https://github.com/ldclabs/anda/tree/main/anda_engine"
 publish = true
-version = "0.9.14"
+version = "0.9.15"
 edition.workspace = true
 keywords.workspace = true
 categories.workspace = true
@@ -28,7 +28,7 @@ futures-util = { workspace = true }
 mime = { workspace = true }
 serde = { workspace = true }
 serde_bytes = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["preserve_order"] }
 http = { workspace = true }
 object_store = { workspace = true }
 ic_auth_types = { workspace = true, features = ["xid"] }

@@ -283,9 +283,9 @@ mod tests {
         assert_eq!(definition.name, "teststruct_extractor");
         let s = serde_json::to_string(&definition).unwrap();
         println!("{}", s);
-        // {"name":"teststruct_extractor","description":"Extract structured data from text using LLMs.","parameters":{"properties":{"prompt":{"description":"optimized prompt or message.","type":"string"}},"required":["prompt"],"type":"object"}}
+        // {"name":"teststruct_extractor","description":"Extract structured data from text using LLMs.","parameters":{"type":"object","properties":{"prompt":{"type":"string","description":"optimized prompt or message."}},"required":["prompt"]}}
         assert!(s.contains(
-            r#""parameters":{"properties":{"prompt":{"description":"optimized prompt or message.","type":"string"}},"required":["prompt"],"type":"object"}}"#
+            r#""parameters":{"type":"object","properties":{"prompt":{"type":"string","description":"optimized prompt or message."}},"required":["prompt"]}}"#
         ));
         assert!(!s.contains("$schema"));
     }
