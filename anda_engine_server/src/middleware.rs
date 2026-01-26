@@ -6,22 +6,25 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use std::{future::Future, sync::Arc};
+use tower_http::compression::CompressionLayer;
 
-use crate::handler::AppState;
+pub use crate::handler::AppState;
+
+pub type AppRouter = Router<AppState>;
 
 /// Object-safe middleware trait for applying HTTP middleware to the server `Router`.
 ///
 /// This is intentionally type-erased so callers can register arbitrary axum/tower
 /// middleware without turning `ServerBuilder` into a giant generic type.
 pub trait HttpMiddleware: Send + Sync + 'static {
-    fn apply(&self, router: Router<AppState>) -> Router<AppState>;
+    fn apply(&self, router: AppRouter) -> AppRouter;
 }
 
 impl<F> HttpMiddleware for F
 where
-    F: Fn(Router<AppState>) -> Router<AppState> + Send + Sync + 'static,
+    F: Fn(AppRouter) -> AppRouter + Send + Sync + 'static,
 {
-    fn apply(&self, router: Router<AppState>) -> Router<AppState> {
+    fn apply(&self, router: AppRouter) -> AppRouter {
         (self)(router)
     }
 }
@@ -42,8 +45,33 @@ where
     F: Fn(Request, Next) -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = Response> + Send + 'static,
 {
-    fn apply(&self, router: Router<AppState>) -> Router<AppState> {
+    fn apply(&self, router: AppRouter) -> AppRouter {
         router.layer(axum::middleware::from_fn(self.f.clone()))
+    }
+}
+
+/// Middleware that applies response compression using `tower-http`'s `CompressionLayer`.
+pub struct CompressionMiddleware {
+    layer: CompressionLayer,
+}
+
+impl CompressionMiddleware {
+    pub fn new(layer: CompressionLayer) -> Self {
+        Self { layer }
+    }
+}
+
+impl Default for CompressionMiddleware {
+    fn default() -> Self {
+        Self {
+            layer: CompressionLayer::new(),
+        }
+    }
+}
+
+impl HttpMiddleware for CompressionMiddleware {
+    fn apply(&self, router: AppRouter) -> AppRouter {
+        router.layer(self.layer.clone())
     }
 }
 
@@ -72,7 +100,7 @@ impl ApiKeyMiddleware {
 }
 
 impl HttpMiddleware for ApiKeyMiddleware {
-    fn apply(&self, router: Router<AppState>) -> Router<AppState> {
+    fn apply(&self, router: AppRouter) -> AppRouter {
         let expected_key = self.expected_key.clone();
         let exempt_paths = self.exempt_paths.clone();
 

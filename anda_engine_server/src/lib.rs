@@ -8,11 +8,11 @@ use tokio::signal;
 use tokio_util::sync::CancellationToken;
 
 mod handler;
-mod middleware;
+pub mod middleware;
 mod types;
 
 use handler::*;
-pub use middleware::{ApiKeyMiddleware, HttpMiddleware};
+use middleware::*;
 
 const APP_NAME: &str = env!("CARGO_PKG_NAME");
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
