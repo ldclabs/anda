@@ -46,10 +46,10 @@ pub static FUNCTION_DEFINITION: LazyLock<FunctionDefinition> = LazyLock::new(|| 
                 },
                 "parameters": {
                     "type": "object",
-                    "description": "JSON object of key-value pairs for safe placeholder substitution (placeholders start with ':', e.g., :name). Must be complete JSON tokens; do not embed in quoted strings."
+                    "description": "Optional JSON object of key-value pairs for safe placeholder substitution (placeholders start with ':', e.g., :name). Must be complete JSON tokens; do not embed in quoted strings. Only provide if placeholders are used in the command."
                 }
             },
-            "required": ["command", "parameters"]
+            "required": ["command"]
         }
     })).unwrap()
 });
@@ -263,6 +263,7 @@ pub struct MemoryManagement {
     logs: Arc<Collection>,
     resources: Arc<Collection>,
     enable_kip_logging: bool,
+    kip_function_definitions: FunctionDefinition,
 }
 
 impl MemoryManagement {
@@ -342,7 +343,13 @@ impl MemoryManagement {
             logs,
             resources,
             enable_kip_logging: true,
+            kip_function_definitions: FUNCTION_DEFINITION.clone(),
         })
+    }
+
+    pub fn with_kip_function_definitions(mut self, def: FunctionDefinition) -> Self {
+        self.kip_function_definitions = def;
+        self
     }
 
     pub fn disable_kip_logging(&mut self) {
@@ -630,15 +637,15 @@ impl Tool<BaseCtx> for Arc<MemoryManagement> {
     type Output = Response;
 
     fn name(&self) -> String {
-        FUNCTION_DEFINITION.name.clone()
+        self.kip_function_definitions.name.clone()
     }
 
     fn description(&self) -> String {
-        FUNCTION_DEFINITION.description.clone()
+        self.kip_function_definitions.description.clone()
     }
 
     fn definition(&self) -> FunctionDefinition {
-        FUNCTION_DEFINITION.clone()
+        self.kip_function_definitions.clone()
     }
 
     async fn call(

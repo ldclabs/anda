@@ -89,6 +89,8 @@ impl Client {
 pub struct CompletionModel {
     /// Gemini client instance
     client: Client,
+    /// Default request template
+    default_request: types::GenerateContentRequest,
     /// Model identifier
     pub model: String,
 }
@@ -100,10 +102,19 @@ impl CompletionModel {
     /// * `client` - Gemini client instance
     /// * `model` - Model identifier string
     pub fn new(client: Client, model: &str) -> Self {
+        let mut default_request = types::GenerateContentRequest::default();
+        default_request.generation_config.top_p = Some(0.95);
         Self {
             client,
+            default_request,
             model: model.to_string(),
         }
+    }
+
+    /// Sets a default request template for the model
+    pub fn with_default_request(mut self, greq: types::GenerateContentRequest) -> Self {
+        self.default_request = greq;
+        self
     }
 }
 
@@ -129,12 +140,12 @@ impl CompletionFeaturesDyn for CompletionModel {
     fn completion(&self, req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
         let model = self.model.clone();
         let client = self.client.clone();
+        let mut greq = self.default_request.clone();
 
         Box::pin(async move {
             let timestamp = unix_ms();
             let mut raw_history: Vec<Json> = Vec::new();
             let mut chat_history: Vec<Message> = Vec::new();
-            let mut greq = types::GenerateContentRequest::default();
 
             if !req.instructions.is_empty() {
                 greq.system_instruction = Some(types::Content {
@@ -185,7 +196,6 @@ impl CompletionFeaturesDyn for CompletionModel {
                 greq.contents.push(msg);
             }
 
-            greq.generation_config.top_p = Some(0.95);
             if let Some(temperature) = req.temperature {
                 greq.generation_config.temperature = Some(temperature);
             }
