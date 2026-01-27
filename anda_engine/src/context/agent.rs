@@ -26,11 +26,12 @@
 //! agents or tools while maintaining access to the core functionality.
 
 use anda_core::{
-    AgentArgs, AgentContext, AgentInput, AgentOutput, AgentSet, BaseContext, BoxError, CacheExpiry,
-    CacheFeatures, CacheStoreFeatures, CancellationToken, CanisterCaller, CompletionFeatures,
-    CompletionRequest, ContentPart, Embedding, EmbeddingFeatures, FunctionDefinition, HttpFeatures,
-    Json, KeysFeatures, Message, ObjectMeta, Path, PutMode, PutResult, RequestMeta, Resource,
-    StateFeatures, StoreFeatures, ToolCall, ToolInput, ToolOutput, ToolSet, Usage,
+    AgentArgs, AgentContext, AgentInput, AgentOutput, AgentSet, BaseContext, BoxError, BoxPinFut,
+    CacheExpiry, CacheFeatures, CacheStoreFeatures, CancellationToken, CanisterCaller,
+    CompletionFeatures, CompletionRequest, ContentPart, Embedding, EmbeddingFeatures,
+    FunctionDefinition, HttpFeatures, Json, KeysFeatures, Message, ObjectMeta, Path, PutMode,
+    PutResult, RequestMeta, Resource, StateFeatures, StoreFeatures, ToolCall, ToolInput,
+    ToolOutput, ToolSet, Usage,
 };
 use bytes::Bytes;
 use candid::{CandidType, Principal, utils::ArgumentEncoder};
@@ -1032,8 +1033,9 @@ impl CompletionRunner {
         self.chat_history.append(&mut output.chat_history);
 
         // 自动执行工具/代理调用
-        let mut tool_calls_continue: Vec<ContentPart> = Vec::new();
-        for tool in output.tool_calls.iter_mut() {
+        let mut tool_call_futs: Vec<BoxPinFut<(Option<ToolCall>, Option<String>)>> = Vec::new();
+        let tool_calls = std::mem::take(&mut output.tool_calls);
+        for mut tool in tool_calls.into_iter() {
             if self.ctx.cancellation_token().is_cancelled() {
                 return Err("operation cancelled".into());
             }
@@ -1042,40 +1044,26 @@ impl CompletionRunner {
                 || tool.name.starts_with("RT_")
                 || tool.name.starts_with("rt_")
             {
-                match self
-                    .ctx
-                    .tool_call(ToolInput {
-                        name: tool.name.clone(),
-                        args: tool.args.clone(),
-                        resources: self
-                            .ctx
-                            .select_tool_resources(&tool.name, &mut self.resources)
-                            .await,
-                        meta: None,
-                    })
-                    .await
-                {
-                    Ok((mut res, remote_id)) => {
-                        self.usage.accumulate(&res.usage);
-
-                        // We can not ignore some tool calls.
-                        // GPT-5: An assistant message with 'tool_calls' must be followed by tool messages responding to each 'tool_call_id'.
-                        tool_calls_continue.push(ContentPart::ToolOutput {
-                            name: tool.name.clone(),
-                            output: res.output.clone(),
-                            call_id: tool.call_id.clone(),
-                            remote_id,
-                        });
-
-                        self.artifacts.append(&mut res.artifacts);
-                        tool.remote_id = remote_id;
-                        tool.result = Some(res);
+                let ctx = self.ctx.clone();
+                let input = ToolInput {
+                    name: tool.name.clone(),
+                    args: tool.args.clone(),
+                    resources: self
+                        .ctx
+                        .select_tool_resources(&tool.name, &mut self.resources)
+                        .await,
+                    meta: None,
+                };
+                tool_call_futs.push(Box::pin(async move {
+                    match ctx.tool_call(input).await {
+                        Ok((res, remote_id)) => {
+                            tool.remote_id = remote_id;
+                            tool.result = Some(res);
+                            (Some(tool), None)
+                        }
+                        Err(err) => (None, Some(err.to_string())),
                     }
-                    Err(err) => {
-                        output.failed_reason = Some(err.to_string());
-                        return Ok(Some(self.final_output(output)));
-                    }
-                }
+                }));
             } else if self.ctx.agents.contains(&tool.name)
                 || tool.name.starts_with("LA_")
                 || tool.name.starts_with("la_")
@@ -1093,52 +1081,73 @@ impl CompletionRunner {
                         return Ok(Some(self.final_output(output)));
                     }
                 };
-                match self
-                    .ctx
-                    .agent_run(AgentInput {
-                        name: tool.name.clone(),
-                        prompt: args.prompt,
-                        resources: self
-                            .ctx
-                            .agents
-                            .select_resources(&tool.name, &mut self.resources),
-                        ..Default::default()
-                    })
-                    .await
-                {
-                    Ok((mut res, remote_id)) => {
-                        self.usage.accumulate(&res.usage);
-                        if res.failed_reason.is_some() {
-                            output.failed_reason = res.failed_reason;
-                            return Ok(Some(self.final_output(output)));
-                        }
 
-                        // TODO: remote agent id
+                let ctx = self.ctx.clone();
+                let input = AgentInput {
+                    name: tool.name.clone(),
+                    prompt: args.prompt,
+                    resources: self
+                        .ctx
+                        .select_agent_resources(&tool.name, &mut self.resources)
+                        .await,
+                    ..Default::default()
+                };
+                tool_call_futs.push(Box::pin(async move {
+                    match ctx.agent_run(input).await {
+                        Ok((res, remote_id)) => {
+                            tool.remote_id = remote_id;
+                            tool.result = Some(ToolOutput {
+                                output: res.content.clone().into(),
+                                artifacts: res.artifacts,
+                                usage: res.usage,
+                            });
+                            if let Some(reason) = res.failed_reason {
+                                (Some(tool), Some(reason))
+                            } else {
+                                (Some(tool), None)
+                            }
+                        }
+                        Err(err) => (None, Some(err.to_string())),
+                    }
+                }));
+            }
+        }
+
+        let mut tool_calls: Vec<ToolCall> = Vec::new();
+        let mut tool_calls_continue: Vec<ContentPart> = Vec::new();
+        let mut tool_call_errors: Vec<String> = Vec::new();
+        if !tool_call_futs.is_empty() {
+            let results = futures::future::join_all(tool_call_futs).await;
+            for (tool, err) in results {
+                if let Some(mut tool) = tool {
+                    if let Some(res) = &mut tool.result {
+                        self.usage.accumulate(&res.usage);
+                        // We can not ignore some tool calls.
+                        // GPT-5: An assistant message with 'tool_calls' must be followed by tool messages responding to each 'tool_call_id'.
                         tool_calls_continue.push(ContentPart::ToolOutput {
                             name: tool.name.clone(),
-                            output: res.content.clone().into(),
+                            output: res.output.clone(),
                             call_id: tool.call_id.clone(),
-                            remote_id,
+                            remote_id: tool.remote_id.clone(),
                         });
 
                         self.artifacts.append(&mut res.artifacts);
-                        tool.result = Some(ToolOutput {
-                            output: res.content.clone().into(),
-                            artifacts: vec![],
-                            usage: res.usage,
-                        });
-                    }
-                    Err(err) => {
-                        output.failed_reason = Some(err.to_string());
-                        return Ok(Some(self.final_output(output)));
+                        tool_calls.push(tool);
                     }
                 }
+                if let Some(err) = err {
+                    tool_call_errors.push(err);
+                }
             }
-            // 未知工具名，忽略
         }
 
         // 累计当前轮的 tool_calls
-        self.tool_calls.append(&mut output.tool_calls);
+        self.tool_calls.append(&mut tool_calls);
+
+        if !tool_call_errors.is_empty() {
+            output.failed_reason = Some(tool_call_errors.join("; "));
+            return Ok(Some(self.final_output(output)));
+        }
 
         // 若无需继续，返回最终结果并结束
         if tool_calls_continue.is_empty() {

@@ -6,10 +6,9 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use std::{future::Future, sync::Arc};
-use tower_http::compression::CompressionLayer;
 
 pub use crate::handler::AppState;
-
+pub use tower_http::compression::CompressionLayer;
 pub type AppRouter = Router<AppState>;
 
 /// Object-safe middleware trait for applying HTTP middleware to the server `Router`.
