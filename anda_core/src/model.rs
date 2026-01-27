@@ -9,7 +9,6 @@
 //! - Core AI capabilities traits ([`CompletionFeatures`], [`EmbeddingFeatures`]).
 
 use candid::Principal;
-use serde::ser::{SerializeMap, SerializeSeq, Serializer};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, json};
 use std::collections::BTreeMap;
@@ -376,111 +375,11 @@ pub struct FunctionDefinition {
     pub description: String,
 
     /// JSON schema defining the function's parameters.
-    #[serde(serialize_with = "serialize_openapi_schema_ordered")]
     pub parameters: Json,
 
     /// Whether to enable strict schema adherence when generating the function call. If set to true, the model will follow the exact schema defined in the parameters field. Only a subset of JSON Schema is supported when strict is true.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub strict: Option<bool>,
-}
-
-pub fn serialize_optional_openapi_schema_ordered<S>(
-    value: &Option<Json>,
-    serializer: S,
-) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    match value {
-        None => serializer.serialize_none(),
-        Some(v) => serialize_openapi_schema_ordered(v, serializer),
-    }
-}
-
-pub fn serialize_openapi_schema_ordered<S>(value: &Json, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    struct Ordered<'a>(&'a Json);
-
-    impl<'a> serde::Serialize for Ordered<'a> {
-        fn serialize<S2>(&self, serializer: S2) -> Result<S2::Ok, S2::Error>
-        where
-            S2: Serializer,
-        {
-            serialize_openapi_schema_ordered(self.0, serializer)
-        }
-    }
-
-    match value {
-        Json::Null => serializer.serialize_none(),
-        Json::Bool(b) => serializer.serialize_bool(*b),
-        Json::Number(n) => n.serialize(serializer),
-        Json::String(s) => serializer.serialize_str(s),
-        Json::Array(items) => {
-            let mut seq = serializer.serialize_seq(Some(items.len()))?;
-            for item in items {
-                seq.serialize_element(&Ordered(item))?;
-            }
-            seq.end()
-        }
-        Json::Object(map) => {
-            // Gemini preview models can be sensitive to schema key order.
-            // Emit a deterministic, schema-friendly ordering recursively:
-            // 1) common schema keys in a fixed order
-            // 2) remaining keys in lexical order
-
-            // https://ai.google.dev/api/caching#FunctionDeclaration
-            const FIXED_ORDER: [&str; 23] = [
-                "name",
-                "type",
-                "format",
-                "title",
-                "description",
-                "nullable",
-                "enum",
-                "maxItems",
-                "minItems",
-                "properties",
-                "required",
-                "minProperties",
-                "maxProperties",
-                "minLength",
-                "maxLength",
-                "pattern",
-                "example",
-                "anyOf",
-                "propertyOrdering",
-                "default",
-                "items",
-                "minimum",
-                "maximum",
-            ];
-
-            let mut out = serializer.serialize_map(Some(map.len()))?;
-
-            for key in FIXED_ORDER {
-                if let Some(v) = map.get(key) {
-                    out.serialize_entry(key, &Ordered(v))?;
-                }
-            }
-
-            let mut rest_keys: Vec<&str> = map
-                .keys()
-                .map(|k| k.as_str())
-                .filter(|k| !FIXED_ORDER.contains(k))
-                .collect();
-            rest_keys.sort_unstable();
-
-            for key in rest_keys {
-                if let Some(v) = map.get(key) {
-                    out.serialize_entry(key, &Ordered(v))?;
-                }
-            }
-
-            out.end()
-        }
-    }
 }
 
 impl FunctionDefinition {

@@ -1,6 +1,6 @@
 use anda_core::{
     AgentOutput, BoxError, ByteBufB64, ContentPart, FunctionDefinition, Message,
-    Usage as ModelUsage, model::serialize_optional_openapi_schema_ordered,
+    Usage as ModelUsage,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -652,11 +652,9 @@ pub struct FunctionDeclaration {
     pub description: String,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(serialize_with = "serialize_optional_openapi_schema_ordered")]
     pub parameters: Option<Value>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(serialize_with = "serialize_optional_openapi_schema_ordered")]
     pub response: Option<Value>,
 }
 

@@ -1,7 +1,4 @@
-use anda_core::{
-    AgentOutput, BoxError, ContentPart, Json, Message, Usage as ModelUsage,
-    model::serialize_openapi_schema_ordered,
-};
+use anda_core::{AgentOutput, BoxError, ContentPart, Json, Message, Usage as ModelUsage};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, json};
 
@@ -389,7 +386,6 @@ pub struct ToolDefinition {
     /// Tool name
     pub name: String,
     /// Parameters - this should be a JSON schema. Tools should additionally ensure an "additionalParameters" field has been added with the value set to false, as this is required if using OpenAI's strict mode (enabled by default).
-    #[serde(serialize_with = "serialize_openapi_schema_ordered")]
     pub parameters: Json,
     /// Whether to use strict mode. Enabled by default as it allows for improved efficiency.
     pub strict: bool,
