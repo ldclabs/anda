@@ -1119,8 +1119,8 @@ impl CompletionRunner {
         if !tool_call_futs.is_empty() {
             let results = futures::future::join_all(tool_call_futs).await;
             for (tool, err) in results {
-                if let Some(mut tool) = tool {
-                    if let Some(res) = &mut tool.result {
+                if let Some(mut tool) = tool
+                    && let Some(res) = &mut tool.result {
                         self.usage.accumulate(&res.usage);
                         // We can not ignore some tool calls.
                         // GPT-5: An assistant message with 'tool_calls' must be followed by tool messages responding to each 'tool_call_id'.
@@ -1128,13 +1128,12 @@ impl CompletionRunner {
                             name: tool.name.clone(),
                             output: res.output.clone(),
                             call_id: tool.call_id.clone(),
-                            remote_id: tool.remote_id.clone(),
+                            remote_id: tool.remote_id,
                         });
 
                         self.artifacts.append(&mut res.artifacts);
                         tool_calls.push(tool);
                     }
-                }
                 if let Some(err) = err {
                     tool_call_errors.push(err);
                 }

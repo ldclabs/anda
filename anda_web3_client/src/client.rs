@@ -156,13 +156,14 @@ impl ClientBuilder {
                 let agent = Agent::builder()
                     .with_url(self.ic_host.clone())
                     .with_arc_identity(identity.clone())
-                    .with_verify_query_signatures(false);
+                    .with_verify_query_signatures(false)
+                    .build()?;
 
-                let agent = if self.ic_host.starts_with("https://") {
-                    agent.with_background_dynamic_routing().build()?
-                } else {
-                    agent.build()?
-                };
+                // let agent = if self.ic_host.starts_with("https://") {
+                //     agent.with_background_dynamic_routing().build()?
+                // } else {
+                //     agent.build()?
+                // };
 
                 if self.ic_host.starts_with("http://") {
                     // ignore error
