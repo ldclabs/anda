@@ -494,6 +494,12 @@ impl MemoryManagement {
         self.conversations.get_as(id).await
     }
 
+    pub async fn delete_conversation(&self, id: u64) -> Result<bool, DBError> {
+        let doc = self.conversations.remove(id).await?;
+        self.conversations.flush(unix_ms()).await?;
+        Ok(doc.is_some())
+    }
+
     pub async fn list_conversations_by_user(
         &self,
         user: &Principal,
@@ -928,6 +934,10 @@ pub enum MemoryToolArgs {
         /// The ID of the conversation to stop
         _id: u64,
     },
+    DeleteConversation {
+        /// The ID of the conversation to delete
+        _id: u64,
+    },
     /// List previous conversations
     ListPrevConversations {
         /// The cursor for pagination
@@ -1050,6 +1060,19 @@ impl Tool<BaseCtx> for MemoryTool {
 
                 Ok(ToolOutput::new(Response::Ok {
                     result: json!(conversation),
+                    next_cursor: None,
+                    ignore: None,
+                }))
+            }
+            MemoryToolArgs::DeleteConversation { _id } => {
+                let conversation = self.memory.get_conversation(_id).await?;
+                if &conversation.user != ctx.caller() {
+                    return Err("permission denied".into());
+                }
+
+                let deleted = self.memory.delete_conversation(_id).await?;
+                Ok(ToolOutput::new(Response::Ok {
+                    result: json!({ "deleted": deleted }),
                     next_cursor: None,
                     ignore: None,
                 }))
