@@ -39,7 +39,7 @@ pub struct ResourceRef<'a> {
 
     /// The size of the resource in bytes.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub size: Option<usize>,
+    pub size: Option<u64>,
 
     /// The SHA3-256 hash of the resource.
     #[serde(skip_serializing_if = "Option::is_none")]
