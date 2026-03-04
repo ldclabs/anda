@@ -1,9 +1,9 @@
 name: Test
 on:
   push:
-    branches: ['main']
+    branches: ["main"]
   pull_request:
-    branches: ['main']
+    branches: ["main"]
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -11,7 +11,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Run tests
         run: |
-          sudo apt-get install -y protobuf-compiler
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends -o Acquire::Retries=3 protobuf-compiler
           rustup update --no-self-update stable
           cargo clippy --all-targets --all-features
           cargo test --workspace -- --nocapture
