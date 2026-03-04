@@ -23,6 +23,7 @@ use std::time::Duration;
 
 pub mod cohere;
 pub mod deepseek;
+pub mod doubao;
 pub mod gemini;
 pub mod kimi;
 pub mod openai;
