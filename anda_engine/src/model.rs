@@ -29,6 +29,7 @@ pub mod kimi;
 pub mod openai;
 pub mod xai;
 
+pub use reqwest;
 pub use reqwest::Proxy;
 
 use crate::APP_USER_AGENT;
@@ -212,11 +213,54 @@ impl Model {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct AnyHost;
+
+impl PartialEq<&str> for AnyHost {
+    fn eq(&self, _other: &&str) -> bool {
+        true
+    }
+}
+
 /// Creates a new reqwest client builder with default settings
 pub fn request_client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .use_rustls_tls()
         .https_only(true)
+        .retry(
+            reqwest::retry::for_host(AnyHost)
+                .max_retries_per_request(1)
+                .classify_fn(|req_rep| {
+                    let is_idempotent = matches!(
+                        req_rep.method(),
+                        &http::Method::GET
+                            | &http::Method::HEAD
+                            | &http::Method::OPTIONS
+                            | &http::Method::TRACE
+                            | &http::Method::PUT
+                            | &http::Method::DELETE
+                    );
+
+                    if !is_idempotent {
+                        return req_rep.success();
+                    }
+
+                    if req_rep.error().is_some() {
+                        return req_rep.retryable();
+                    }
+
+                    match req_rep.status() {
+                        Some(
+                            http::StatusCode::REQUEST_TIMEOUT
+                            | http::StatusCode::TOO_MANY_REQUESTS
+                            | http::StatusCode::BAD_GATEWAY
+                            | http::StatusCode::SERVICE_UNAVAILABLE
+                            | http::StatusCode::GATEWAY_TIMEOUT,
+                        ) => req_rep.retryable(),
+                        _ => req_rep.success(),
+                    }
+                }),
+        )
         .http2_keep_alive_interval(Some(Duration::from_secs(25)))
         .http2_keep_alive_timeout(Duration::from_secs(15))
         .http2_keep_alive_while_idle(true)
