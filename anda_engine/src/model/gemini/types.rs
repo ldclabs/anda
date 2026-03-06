@@ -85,6 +85,7 @@ impl GenerateContentResponse {
             } else {
                 output.raw_history.push(json!(&candidate.content));
                 let mut msg: Message = candidate.content.into();
+                msg.name = self.model_version;
                 msg.timestamp = Some(timestamp);
 
                 match candidate.finish_reason {

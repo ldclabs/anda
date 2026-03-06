@@ -93,6 +93,9 @@ pub struct Conversation {
 
     /// The timestamp when the conversation was updated, in milliseconds.
     pub updated_at: u64,
+
+    /// The ancestor conversation IDs, ordered from the closest to the farthest ancestor.
+    pub ancestors: Option<Vec<u64>>,
 }
 
 impl Conversation {
@@ -166,6 +169,7 @@ pub struct ConversationRef<'a> {
     pub period: u64,
     pub created_at: u64,
     pub updated_at: u64,
+    pub ancestors: &'a Option<Vec<u64>>,
 }
 
 impl<'a> From<&'a Conversation> for ConversationRef<'a> {
@@ -182,6 +186,7 @@ impl<'a> From<&'a Conversation> for ConversationRef<'a> {
             period: conversation.period,
             created_at: conversation.created_at,
             updated_at: conversation.updated_at,
+            ancestors: &conversation.ancestors,
         }
     }
 }
@@ -1136,6 +1141,7 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             usage: Usage::default(),
+            ancestors: None,
         };
         let rt = ConversationStatus::Completed;
         println!("{}", rt);

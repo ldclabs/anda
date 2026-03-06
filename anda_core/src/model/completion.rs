@@ -62,6 +62,9 @@ pub struct CompletionRequest {
 
     /// The stop sequence to be sent to the completion model provider.
     pub stop: Option<Vec<String>>,
+
+    /// The name of the model to be used for the completion request.
+    pub model: Option<String>,
 }
 
 impl CompletionRequest {

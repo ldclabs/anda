@@ -337,6 +337,7 @@ impl CompletionResponse {
             output.raw_history.push(json!(&choice.message));
             let timestamp = unix_ms();
             let mut msg: Message = choice.message.into();
+            msg.name = Some(self.model);
             msg.timestamp = Some(timestamp);
             output.content = msg.text().unwrap_or_default();
             output.tool_calls = msg.tool_calls();

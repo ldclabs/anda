@@ -190,11 +190,12 @@ impl BaseCtx {
         Ok(child)
     }
 
+    // Helper function to create RequestMeta for self calls to remote engines.
     pub(crate) fn self_meta(&self, target: Principal) -> RequestMeta {
         RequestMeta {
             engine: Some(target),
             user: Some(self.name.clone()),
-            extra: Default::default(),
+            ..Default::default()
         }
     }
 

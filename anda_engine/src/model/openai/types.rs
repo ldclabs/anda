@@ -131,6 +131,7 @@ impl CompletionResponse {
 
             let (msg, failed_reason) = message_from(self.output);
             if let Some(mut msg) = msg {
+                msg.name = Some(self.model);
                 msg.timestamp = Some(timestamp);
                 output.content = msg.text().unwrap_or_default();
                 output.tool_calls = msg.tool_calls();

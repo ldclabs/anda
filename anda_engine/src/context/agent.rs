@@ -177,15 +177,16 @@ impl AgentCtx {
         req: CompletionRequest,
         resources: Vec<Resource>,
     ) -> CompletionRunner {
+        let label = req.model.as_ref().unwrap_or(&self.label);
         let model = self
             .models
-            .get(&self.label)
+            .get(label)
             .cloned()
             .unwrap_or_else(|| self.model.clone());
 
         let fallback_model = self
             .fallback_models
-            .get(&self.label)
+            .get(label)
             .cloned()
             .or_else(|| self.fallback_model.clone());
 
@@ -1120,20 +1121,21 @@ impl CompletionRunner {
             let results = futures::future::join_all(tool_call_futs).await;
             for (tool, err) in results {
                 if let Some(mut tool) = tool
-                    && let Some(res) = &mut tool.result {
-                        self.usage.accumulate(&res.usage);
-                        // We can not ignore some tool calls.
-                        // GPT-5: An assistant message with 'tool_calls' must be followed by tool messages responding to each 'tool_call_id'.
-                        tool_calls_continue.push(ContentPart::ToolOutput {
-                            name: tool.name.clone(),
-                            output: res.output.clone(),
-                            call_id: tool.call_id.clone(),
-                            remote_id: tool.remote_id,
-                        });
+                    && let Some(res) = &mut tool.result
+                {
+                    self.usage.accumulate(&res.usage);
+                    // We can not ignore some tool calls.
+                    // GPT-5: An assistant message with 'tool_calls' must be followed by tool messages responding to each 'tool_call_id'.
+                    tool_calls_continue.push(ContentPart::ToolOutput {
+                        name: tool.name.clone(),
+                        output: res.output.clone(),
+                        call_id: tool.call_id.clone(),
+                        remote_id: tool.remote_id,
+                    });
 
-                        self.artifacts.append(&mut res.artifacts);
-                        tool_calls.push(tool);
-                    }
+                    self.artifacts.append(&mut res.artifacts);
+                    tool_calls.push(tool);
+                }
                 if let Some(err) = err {
                     tool_call_errors.push(err);
                 }

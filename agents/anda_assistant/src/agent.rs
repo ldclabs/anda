@@ -327,6 +327,7 @@ impl Agent<AgentCtx> for Assistant {
             created_at: now_ms,
             updated_at: now_ms,
             usage: Usage::default(),
+            ancestors: None,
         };
 
         let id = self
