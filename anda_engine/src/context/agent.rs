@@ -200,6 +200,8 @@ impl AgentCtx {
             tool_calls: Vec::new(),
             usage: Usage::default(),
             artifacts: Vec::new(),
+            steering_message: None,
+            follow_up_message: None,
             done: false,
             step: 0,
         }
@@ -954,6 +956,8 @@ pub struct CompletionRunner {
     tool_calls: Vec<ToolCall>,
     usage: Usage,
     artifacts: Vec<Resource>,
+    steering_message: Option<String>,
+    follow_up_message: Option<String>,
     done: bool,
     step: usize,
 }
@@ -967,6 +971,20 @@ impl CompletionRunner {
     /// Returns the number of steps executed.
     pub fn steps(&self) -> usize {
         self.step
+    }
+
+    /// Queue a steering message to interrupt the agent mid-run.
+    /// Delivered after current tool execution, skips remaining tools.
+    /// No effect if the completion has finished.
+    pub fn steer(&mut self, message: String) {
+        self.steering_message = Some(message);
+    }
+
+    /// Queue a follow-up message to be processed after the agent finishes.
+    /// Delivered only when agent has no more tool calls or steering messages.
+    /// No effect if the completion has finished.
+    pub fn follow_up(&mut self, message: String) {
+        self.follow_up_message = Some(message);
     }
 
     /// Execute the next step.
@@ -1032,6 +1050,28 @@ impl CompletionRunner {
         self.req.raw_history.append(&mut output.raw_history);
         // 累计所有对话历史（不包含初始的 req.chat_history）
         self.chat_history.append(&mut output.chat_history);
+
+        if let Some(steering) = self.steering_message.take() {
+            // 准备下一轮转向请求
+            if !output.tool_calls.is_empty() {
+                // 去掉模型最后的 tool_calls 输出，避免对后续轮次造成干扰
+                self.req.raw_history.pop();
+            }
+
+            self.req.chat_history.clear();
+            self.req.documents.clear();
+            self.req.content.clear();
+            self.req.prompt = steering;
+            self.req.role = Some("user".to_string());
+
+            // 返回本轮的中间结果（带当前累计 usage；不强制覆盖 artifacts/tool_calls，
+            // 让调用方查看模型本轮原始输出；最终轮会附带汇总）
+            output.usage = self.usage.clone();
+            // 本次 output 也包含当前所有对话
+            output.chat_history = self.chat_history.clone();
+
+            return Ok(Some(output));
+        }
 
         // 自动执行工具/代理调用
         let mut tool_call_futs: Vec<BoxPinFut<(Option<ToolCall>, Option<String>)>> = Vec::new();
@@ -1150,29 +1190,51 @@ impl CompletionRunner {
             return Ok(Some(self.final_output(output)));
         }
 
-        // 若无需继续，返回最终结果并结束
-        if tool_calls_continue.is_empty() {
-            return Ok(Some(self.final_output(output)));
+        // 如果有需要继续调用工具
+        if !tool_calls_continue.is_empty() {
+            // 准备下一轮请求
+            self.req.chat_history.clear();
+            self.req.documents.clear();
+            self.req.content.clear();
+            self.req.prompt.clear();
+            // 追加到下一轮请求
+            self.req.role = Some("tool".to_string());
+            self.req.content.append(&mut tool_calls_continue);
+
+            // 返回本轮的中间结果（带当前累计 usage；不强制覆盖 artifacts/tool_calls，
+            // 让调用方查看模型本轮原始输出；最终轮会附带汇总）
+            // // output.tool_calls = self.tool_calls_result.clone();
+            // // output.artifacts = self.artifacts.clone();
+            output.usage = self.usage.clone();
+            // 本次 output 也包含当前所有对话
+            output.chat_history = self.chat_history.clone();
+
+            return Ok(Some(output));
         }
 
-        // 准备下一轮请求
-        self.req.chat_history.clear();
-        self.req.documents.clear();
-        self.req.content.clear();
-        self.req.prompt.clear();
-        // 追加到下一轮请求
-        self.req.role = Some("tool".to_string());
-        self.req.content.append(&mut tool_calls_continue);
+        // 如果有 steering_message / follow_up_message 则继续下一轮对话
+        if let Some(prompt) = self
+            .steering_message
+            .take()
+            .or_else(|| self.follow_up_message.take())
+        {
+            // 准备下一轮 steering 请求
+            self.req.chat_history.clear();
+            self.req.documents.clear();
+            self.req.content.clear();
+            self.req.prompt = prompt;
+            self.req.role = Some("user".to_string());
 
-        // 返回本轮的中间结果（带当前累计 usage；不强制覆盖 artifacts/tool_calls，
-        // 让调用方查看模型本轮原始输出；最终轮会附带汇总）
-        // // output.tool_calls = self.tool_calls_result.clone();
-        // // output.artifacts = self.artifacts.clone();
-        output.usage = self.usage.clone();
-        // 本次 output 也包含当前所有对话
-        output.chat_history = self.chat_history.clone();
+            // 返回本轮的中间结果（带当前累计 usage；不强制覆盖 artifacts/tool_calls，
+            // 让调用方查看模型本轮原始输出；最终轮会附带汇总）
+            output.usage = self.usage.clone();
+            // 本次 output 也包含当前所有对话
+            output.chat_history = self.chat_history.clone();
 
-        Ok(Some(output))
+            return Ok(Some(output));
+        }
+
+        Ok(Some(self.final_output(output)))
     }
 
     fn final_output(&mut self, mut output: AgentOutput) -> AgentOutput {

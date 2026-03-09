@@ -54,6 +54,8 @@ pub static FUNCTION_DEFINITION: LazyLock<FunctionDefinition> = LazyLock::new(|| 
     })).unwrap()
 });
 
+/// A conversation between an agent and the system, stored in the database for memory management.
+/// Version 2
 #[derive(Debug, Clone, Deserialize, Serialize, AndaDBSchema)]
 pub struct Conversation {
     /// The unique identifier for this resource in the Anda DB collection "conversation".
@@ -84,6 +86,17 @@ pub struct Conversation {
     #[field_type = "Map<String, U64>"]
     pub usage: Usage,
 
+    /// Queue a steering message to interrupt the agent mid-run.
+    /// Delivered after current tool execution, skips remaining tools.
+    pub steering_messages: Option<Vec<String>>,
+
+    /// Queue a follow-up message to be processed after the agent finishes.
+    /// Delivered only when agent has no more tool calls or steering messages.
+    pub follow_up_messages: Option<Vec<String>>,
+
+    /// The ancestor conversation IDs, ordered from the closest to the farthest ancestor.
+    pub ancestors: Option<Vec<u64>>,
+
     /// The period when the conversation was created, in hours (timestamp / 3600 / 1000).
     /// It is used to index the conversation for faster retrieval by time.
     pub period: u64,
@@ -93,9 +106,6 @@ pub struct Conversation {
 
     /// The timestamp when the conversation was updated, in milliseconds.
     pub updated_at: u64,
-
-    /// The ancestor conversation IDs, ordered from the closest to the farthest ancestor.
-    pub ancestors: Option<Vec<u64>>,
 }
 
 impl Conversation {
@@ -122,6 +132,22 @@ impl Conversation {
                 )?,
             ),
             ("updated_at".to_string(), Fv::U64(self.updated_at)),
+            (
+                "steering_messages".to_string(),
+                if let Some(msg) = self.steering_messages.clone() {
+                    msg.into()
+                } else {
+                    Fv::Null
+                },
+            ),
+            (
+                "follow_up_messages".to_string(),
+                if let Some(msg) = self.follow_up_messages.clone() {
+                    msg.into()
+                } else {
+                    Fv::Null
+                },
+            ),
         ]);
         if let Some(reason) = &self.failed_reason {
             changes.insert("failed_reason".to_string(), Fv::Text(reason.clone()));
@@ -166,6 +192,8 @@ pub struct ConversationRef<'a> {
     pub artifacts: &'a [Resource],
     pub status: &'a ConversationStatus,
     pub usage: &'a Usage,
+    pub steering_messages: &'a Option<Vec<String>>,
+    pub follow_up_messages: &'a Option<Vec<String>>,
     pub period: u64,
     pub created_at: u64,
     pub updated_at: u64,
@@ -183,6 +211,8 @@ impl<'a> From<&'a Conversation> for ConversationRef<'a> {
             artifacts: &conversation.artifacts,
             status: &conversation.status,
             usage: &conversation.usage,
+            steering_messages: &conversation.steering_messages,
+            follow_up_messages: &conversation.follow_up_messages,
             period: conversation.period,
             created_at: conversation.created_at,
             updated_at: conversation.updated_at,
@@ -939,6 +969,18 @@ pub enum MemoryToolArgs {
         /// The ID of the conversation to stop
         _id: u64,
     },
+    SteerConversation {
+        /// The ID of the conversation to steer
+        _id: u64,
+        /// The steering message to interrupt the agent mid-run, delivered after current tool execution, skips remaining tools.
+        message: String,
+    },
+    FollowUpConversation {
+        /// The ID of the conversation to follow up
+        _id: u64,
+        /// The follow-up message to be processed after the agent finishes, delivered only when agent has no more tool calls or steering messages.
+        message: String,
+    },
     DeleteConversation {
         /// The ID of the conversation to delete
         _id: u64,
@@ -1069,6 +1111,69 @@ impl Tool<BaseCtx> for MemoryTool {
                     ignore: None,
                 }))
             }
+            MemoryToolArgs::SteerConversation { _id, message } => {
+                if message.trim().is_empty() {
+                    return Err("steering message cannot be empty".into());
+                }
+
+                let mut conversation = self.memory.get_conversation(_id).await?;
+                if &conversation.user != ctx.caller() {
+                    return Err("permission denied".into());
+                }
+
+                let steering_messages = if let Some(msg) = conversation.steering_messages.clone() {
+                    let mut msgs = msg;
+                    msgs.push(message.clone());
+                    msgs
+                } else {
+                    vec![message.clone()]
+                };
+                conversation.steering_messages = Some(steering_messages.clone());
+                conversation.updated_at = unix_ms();
+                let changes = BTreeMap::from([
+                    ("steering_messages".to_string(), steering_messages.into()),
+                    ("updated_at".to_string(), Fv::U64(conversation.updated_at)),
+                ]);
+                self.memory.update_conversation(_id, changes).await?;
+
+                Ok(ToolOutput::new(Response::Ok {
+                    result: json!(conversation),
+                    next_cursor: None,
+                    ignore: None,
+                }))
+            }
+            MemoryToolArgs::FollowUpConversation { _id, message } => {
+                if message.trim().is_empty() {
+                    return Err("follow-up message cannot be empty".into());
+                }
+
+                let mut conversation = self.memory.get_conversation(_id).await?;
+                if &conversation.user != ctx.caller() {
+                    return Err("permission denied".into());
+                }
+
+                let follow_up_messages = if let Some(msg) = conversation.follow_up_messages.clone()
+                {
+                    let mut msgs = msg;
+                    msgs.push(message.clone());
+                    msgs
+                } else {
+                    vec![message.clone()]
+                };
+                conversation.follow_up_messages = Some(follow_up_messages.clone());
+                conversation.updated_at = unix_ms();
+                let changes = BTreeMap::from([
+                    ("follow_up_messages".to_string(), follow_up_messages.into()),
+                    ("updated_at".to_string(), Fv::U64(conversation.updated_at)),
+                ]);
+                self.memory.update_conversation(_id, changes).await?;
+
+                Ok(ToolOutput::new(Response::Ok {
+                    result: json!(conversation),
+                    next_cursor: None,
+                    ignore: None,
+                }))
+            }
             MemoryToolArgs::DeleteConversation { _id } => {
                 let conversation = self.memory.get_conversation(_id).await?;
                 if &conversation.user != ctx.caller() {
@@ -1142,6 +1247,8 @@ mod tests {
             updated_at: 0,
             usage: Usage::default(),
             ancestors: None,
+            steering_messages: None,
+            follow_up_messages: None,
         };
         let rt = ConversationStatus::Completed;
         println!("{}", rt);

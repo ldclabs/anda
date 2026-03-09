@@ -327,6 +327,8 @@ impl Agent<AgentCtx> for Assistant {
             created_at: now_ms,
             updated_at: now_ms,
             usage: Usage::default(),
+            steering_messages: None,
+            follow_up_messages: None,
             ancestors: None,
         };
 
