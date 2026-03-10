@@ -1271,12 +1271,19 @@ impl Stream for CompletionStream {
 
 #[cfg(test)]
 mod tests {
-    use anda_core::{AgentOutput, BoxError, CompletionFeatures, CompletionRequest, Resource};
+    use anda_core::{
+        Agent, AgentOutput, BoxError, CancellationToken, CompletionFeatures, CompletionRequest,
+        FunctionDefinition, Resource, Tool, ToolCall, ToolOutput, Usage,
+    };
     use ciborium::from_reader;
+    use futures_util::StreamExt;
     use ic_cose_types::to_cbor_bytes;
+    use serde::Deserialize;
     use serde_json::json;
     use std::sync::Arc;
 
+    use super::AgentCtx;
+    use crate::context::base::BaseCtx;
     use crate::{engine::EngineBuilder, model::CompletionFeaturesDyn, model::Model};
 
     #[test]
@@ -1295,6 +1302,8 @@ mod tests {
         let val: serde_json::Value = from_reader(&data[..]).unwrap();
         assert_eq!(json, val);
     }
+
+    // ── Helper completers ──
 
     #[derive(Clone, Debug)]
     struct AlwaysFailCompleter;
@@ -1334,6 +1343,303 @@ mod tests {
         }
     }
 
+    /// Completer that echoes prompt as content, no tool calls.
+    #[derive(Clone, Debug)]
+    struct EchoCompleter;
+
+    impl CompletionFeaturesDyn for EchoCompleter {
+        fn model_name(&self) -> String {
+            "echo".to_string()
+        }
+
+        fn completion(
+            &self,
+            req: CompletionRequest,
+        ) -> anda_core::BoxPinFut<Result<AgentOutput, BoxError>> {
+            Box::pin(futures::future::ready(Ok(AgentOutput {
+                content: req.prompt.clone(),
+                usage: Usage {
+                    input_tokens: 5,
+                    output_tokens: 10,
+                    requests: 1,
+                },
+                ..Default::default()
+            })))
+        }
+    }
+
+    /// Completer that returns tool calls on the first call, then echoes on subsequent calls.
+    #[derive(Clone, Debug)]
+    struct ToolCallCompleter {
+        tool_calls: Vec<ToolCall>,
+    }
+
+    impl CompletionFeaturesDyn for ToolCallCompleter {
+        fn model_name(&self) -> String {
+            "tool_call".to_string()
+        }
+
+        fn completion(
+            &self,
+            req: CompletionRequest,
+        ) -> anda_core::BoxPinFut<Result<AgentOutput, BoxError>> {
+            // If the request role is "tool", it means we already executed tools,
+            // so respond with final content.
+            let role = req.role.as_deref().unwrap_or("");
+            if role == "tool" {
+                return Box::pin(futures::future::ready(Ok(AgentOutput {
+                    content: "tool_result_processed".to_string(),
+                    usage: Usage {
+                        input_tokens: 3,
+                        output_tokens: 6,
+                        requests: 1,
+                    },
+                    ..Default::default()
+                })));
+            }
+
+            let tool_calls = self.tool_calls.clone();
+            Box::pin(futures::future::ready(Ok(AgentOutput {
+                content: String::new(),
+                tool_calls,
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 20,
+                    requests: 1,
+                },
+                ..Default::default()
+            })))
+        }
+    }
+
+    /// Completer that returns agent calls.
+    #[derive(Clone, Debug)]
+    struct AgentCallCompleter {
+        agent_name: String,
+    }
+
+    impl CompletionFeaturesDyn for AgentCallCompleter {
+        fn model_name(&self) -> String {
+            "agent_call".to_string()
+        }
+
+        fn completion(
+            &self,
+            req: CompletionRequest,
+        ) -> anda_core::BoxPinFut<Result<AgentOutput, BoxError>> {
+            let role = req.role.as_deref().unwrap_or("");
+            if role == "tool" {
+                return Box::pin(futures::future::ready(Ok(AgentOutput {
+                    content: "agent_result_processed".to_string(),
+                    usage: Usage {
+                        input_tokens: 2,
+                        output_tokens: 4,
+                        requests: 1,
+                    },
+                    ..Default::default()
+                })));
+            }
+
+            let agent_name = self.agent_name.clone();
+            Box::pin(futures::future::ready(Ok(AgentOutput {
+                tool_calls: vec![ToolCall {
+                    name: agent_name,
+                    args: json!({"prompt": "sub-agent task"}),
+                    call_id: Some("agent_call_1".into()),
+                    result: None,
+                    remote_id: None,
+                }],
+                usage: Usage {
+                    input_tokens: 8,
+                    output_tokens: 16,
+                    requests: 1,
+                },
+                ..Default::default()
+            })))
+        }
+    }
+
+    /// Completer that returns an Err (not failed_reason, but actual error).
+    #[derive(Clone, Debug)]
+    struct ErrorCompleter;
+
+    impl CompletionFeaturesDyn for ErrorCompleter {
+        fn model_name(&self) -> String {
+            "error".to_string()
+        }
+
+        fn completion(
+            &self,
+            _req: CompletionRequest,
+        ) -> anda_core::BoxPinFut<Result<AgentOutput, BoxError>> {
+            Box::pin(futures::future::ready(Err("model error".into())))
+        }
+    }
+
+    /// Completer where both primary and fallback fail.
+    #[derive(Clone, Debug)]
+    struct AlwaysFailCompleter2;
+
+    impl CompletionFeaturesDyn for AlwaysFailCompleter2 {
+        fn model_name(&self) -> String {
+            "always_fail_2".to_string()
+        }
+
+        fn completion(
+            &self,
+            _req: CompletionRequest,
+        ) -> anda_core::BoxPinFut<Result<AgentOutput, BoxError>> {
+            Box::pin(futures::future::ready(Ok(AgentOutput {
+                failed_reason: Some("fallback also failed".to_string()),
+                ..Default::default()
+            })))
+        }
+    }
+
+    /// Completer that waits forever (for cancellation tests).
+    #[derive(Clone, Debug)]
+    struct SlowCompleter;
+
+    impl CompletionFeaturesDyn for SlowCompleter {
+        fn model_name(&self) -> String {
+            "slow".to_string()
+        }
+
+        fn completion(
+            &self,
+            _req: CompletionRequest,
+        ) -> anda_core::BoxPinFut<Result<AgentOutput, BoxError>> {
+            Box::pin(async {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                Ok(AgentOutput::default())
+            })
+        }
+    }
+
+    // ── Helper tool ──
+
+    struct EchoTool;
+
+    #[derive(Debug, Deserialize)]
+    struct EchoToolArgs {
+        #[serde(default)]
+        input: String,
+    }
+
+    impl Tool<BaseCtx> for EchoTool {
+        type Args = EchoToolArgs;
+        type Output = String;
+
+        fn name(&self) -> String {
+            "echo_tool".to_string()
+        }
+
+        fn description(&self) -> String {
+            "Echoes input back".to_string()
+        }
+
+        fn definition(&self) -> FunctionDefinition {
+            FunctionDefinition {
+                name: "echo_tool".to_string(),
+                description: "Echoes input back".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "input": {"type": "string"}
+                    }
+                }),
+                strict: None,
+            }
+        }
+
+        async fn call(
+            &self,
+            _ctx: BaseCtx,
+            args: Self::Args,
+            _resources: Vec<Resource>,
+        ) -> Result<ToolOutput<String>, BoxError> {
+            Ok(ToolOutput {
+                output: format!("echoed:{}", args.input),
+                artifacts: Vec::new(),
+                usage: Usage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    requests: 1,
+                },
+            })
+        }
+    }
+
+    /// A tool that always fails.
+    struct FailTool;
+
+    #[derive(Debug, Deserialize)]
+    struct FailToolArgs {}
+
+    impl Tool<BaseCtx> for FailTool {
+        type Args = FailToolArgs;
+        type Output = String;
+
+        fn name(&self) -> String {
+            "fail_tool".to_string()
+        }
+
+        fn description(&self) -> String {
+            "Always fails".to_string()
+        }
+
+        fn definition(&self) -> FunctionDefinition {
+            FunctionDefinition {
+                name: "fail_tool".to_string(),
+                description: "Always fails".to_string(),
+                parameters: json!({"type": "object", "properties": {}}),
+                strict: None,
+            }
+        }
+
+        async fn call(
+            &self,
+            _ctx: BaseCtx,
+            _args: Self::Args,
+            _resources: Vec<Resource>,
+        ) -> Result<ToolOutput<String>, BoxError> {
+            Err("tool execution failed".into())
+        }
+    }
+
+    // ── Helper agent ──
+
+    struct EchoAgent;
+
+    impl Agent<AgentCtx> for EchoAgent {
+        fn name(&self) -> String {
+            "echo_agent".to_string()
+        }
+
+        fn description(&self) -> String {
+            "Echoes prompt back".to_string()
+        }
+
+        async fn run(
+            &self,
+            _ctx: AgentCtx,
+            prompt: String,
+            _resources: Vec<Resource>,
+        ) -> Result<AgentOutput, BoxError> {
+            Ok(AgentOutput {
+                content: format!("agent_echoed:{}", prompt),
+                usage: Usage {
+                    input_tokens: 1,
+                    output_tokens: 2,
+                    requests: 1,
+                },
+                ..Default::default()
+            })
+        }
+    }
+
+    // ── Tests ──
+
     #[tokio::test(flavor = "current_thread")]
     async fn completion_falls_back_on_failed_reason() {
         let primary = Model::with_completer(Arc::new(AlwaysFailCompleter));
@@ -1352,5 +1658,834 @@ mod tests {
         let out = ctx.completion(req, Vec::<Resource>::new()).await.unwrap();
         assert!(out.failed_reason.is_none());
         assert_eq!(out.content, "from_fallback");
+    }
+
+    // ── CompletionRunner basic tests ──
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_basic_completion_no_tool_calls() {
+        let model = Model::with_completer(Arc::new(EchoCompleter));
+        let ctx = EngineBuilder::new().with_model(model).mock_ctx();
+
+        let req = CompletionRequest {
+            prompt: "hello world".to_string(),
+            ..Default::default()
+        };
+
+        let mut runner = ctx.completion_iter(req, Vec::new());
+
+        assert!(!runner.is_done());
+        assert_eq!(runner.steps(), 0);
+
+        let output = runner.next().await.unwrap().unwrap();
+        assert!(runner.is_done());
+        assert_eq!(runner.steps(), 1);
+        assert_eq!(output.content, "hello world");
+        assert!(output.failed_reason.is_none());
+        assert_eq!(output.model, Some("echo".to_string()));
+        assert_eq!(output.usage.input_tokens, 5);
+        assert_eq!(output.usage.output_tokens, 10);
+        assert_eq!(output.usage.requests, 1);
+
+        // Subsequent call returns None.
+        let output = runner.next().await.unwrap();
+        assert!(output.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_is_done_returns_none_immediately() {
+        let model = Model::with_completer(Arc::new(EchoCompleter));
+        let ctx = EngineBuilder::new().with_model(model).mock_ctx();
+
+        let req = CompletionRequest {
+            prompt: "test".to_string(),
+            ..Default::default()
+        };
+
+        let mut runner = ctx.completion_iter(req, Vec::new());
+        // Complete the runner.
+        runner.next().await.unwrap().unwrap();
+        assert!(runner.is_done());
+
+        // Further calls return None.
+        assert!(runner.next().await.unwrap().is_none());
+        assert!(runner.next().await.unwrap().is_none());
+    }
+
+    // ── Fallback model tests ──
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_fallback_on_primary_failure() {
+        let primary = Model::with_completer(Arc::new(AlwaysFailCompleter));
+        let fallback = Model::with_completer(Arc::new(AlwaysOkCompleter));
+
+        let ctx = EngineBuilder::new()
+            .with_model(primary)
+            .with_fallback_model(fallback)
+            .mock_ctx();
+
+        let req = CompletionRequest {
+            prompt: "hello".to_string(),
+            ..Default::default()
+        };
+
+        let mut runner = ctx.completion_iter(req, Vec::new());
+        let output = runner.next().await.unwrap().unwrap();
+        assert!(runner.is_done());
+        assert_eq!(output.content, "from_fallback");
+        assert!(output.failed_reason.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_both_primary_and_fallback_fail() {
+        let primary = Model::with_completer(Arc::new(AlwaysFailCompleter));
+        let fallback = Model::with_completer(Arc::new(AlwaysFailCompleter2));
+
+        let ctx = EngineBuilder::new()
+            .with_model(primary)
+            .with_fallback_model(fallback)
+            .mock_ctx();
+
+        let req = CompletionRequest {
+            prompt: "hello".to_string(),
+            ..Default::default()
+        };
+
+        let mut runner = ctx.completion_iter(req, Vec::new());
+        let output = runner.next().await.unwrap().unwrap();
+        assert!(runner.is_done());
+        assert!(output.failed_reason.is_some());
+        let reason = output.failed_reason.unwrap();
+        assert!(reason.contains("primary model failed"));
+        assert!(reason.contains("fallback model failed"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_no_fallback_on_primary_failure() {
+        let primary = Model::with_completer(Arc::new(AlwaysFailCompleter));
+
+        let ctx = EngineBuilder::new().with_model(primary).mock_ctx();
+
+        let req = CompletionRequest {
+            prompt: "hello".to_string(),
+            ..Default::default()
+        };
+
+        let mut runner = ctx.completion_iter(req, Vec::new());
+        let output = runner.next().await.unwrap().unwrap();
+        assert!(runner.is_done());
+        assert!(output.failed_reason.is_some());
+        assert_eq!(output.failed_reason.unwrap(), "primary failed");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_fallback_used_only_once() {
+        // After fallback succeeds on step 1, step 2 should use the fallback model.
+        let primary = Model::with_completer(Arc::new(AlwaysFailCompleter));
+        let fallback = Model::with_completer(Arc::new(EchoCompleter));
+
+        let ctx = EngineBuilder::new()
+            .with_model(primary)
+            .with_fallback_model(fallback)
+            .mock_ctx();
+
+        let req = CompletionRequest {
+            prompt: "test".to_string(),
+            ..Default::default()
+        };
+
+        let mut runner = ctx.completion_iter(req, Vec::new());
+        // Set follow-up so the runner won't finish after step 1.
+        runner.follow_up("follow-up prompt".to_string());
+
+        let step1 = runner.next().await.unwrap().unwrap();
+        assert!(!runner.is_done());
+        assert_eq!(step1.content, "test"); // from EchoCompleter (fallback)
+
+        // Step 2 uses fallback model (now primary) and processes follow-up.
+        let step2 = runner.next().await.unwrap().unwrap();
+        assert!(runner.is_done());
+        assert_eq!(step2.content, "follow-up prompt"); // echo from fallback model
+    }
+
+    // ── Model error propagation ──
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_model_error_propagates() {
+        let model = Model::with_completer(Arc::new(ErrorCompleter));
+        let ctx = EngineBuilder::new().with_model(model).mock_ctx();
+
+        let req = CompletionRequest {
+            prompt: "hello".to_string(),
+            ..Default::default()
+        };
+
+        let mut runner = ctx.completion_iter(req, Vec::new());
+        let result = runner.next().await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("model error"));
+    }
+
+    // ── Tool call tests ──
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_executes_tool_calls() {
+        let completer = ToolCallCompleter {
+            tool_calls: vec![ToolCall {
+                name: "echo_tool".to_string(),
+                args: json!({"input": "hello"}),
+                call_id: Some("call_1".into()),
+                result: None,
+                remote_id: None,
+            }],
+        };
+
+        let model = Model::with_completer(Arc::new(completer));
+        let ctx = EngineBuilder::new()
+            .with_model(model)
+            .register_tool(EchoTool)
+            .unwrap()
+            .mock_ctx();
+
+        let req = CompletionRequest {
+            prompt: "call tool".to_string(),
+            ..Default::default()
+        };
+
+        let mut runner = ctx.completion_iter(req, Vec::new());
+
+        // Step 1: model returns tool calls, runner executes them and returns intermediate.
+        let step1 = runner.next().await.unwrap().unwrap();
+        assert!(!runner.is_done());
+        assert_eq!(step1.usage.input_tokens, 10);
+        assert_eq!(step1.usage.output_tokens, 20);
+
+        // Step 2: model processes tool results and returns final.
+        let step2 = runner.next().await.unwrap().unwrap();
+        assert!(runner.is_done());
+        assert_eq!(step2.content, "tool_result_processed");
+        // Usage accumulated from both steps.
+        assert_eq!(step2.usage.input_tokens, 13); // 10 + 3
+        assert_eq!(step2.usage.output_tokens, 26); // 20 + 6
+        // tool_calls accumulated.
+        assert_eq!(step2.tool_calls.len(), 1);
+        assert_eq!(step2.tool_calls[0].name, "echo_tool");
+        assert!(step2.tool_calls[0].result.is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_tool_call_failure_produces_failed_reason() {
+        let completer = ToolCallCompleter {
+            tool_calls: vec![ToolCall {
+                name: "fail_tool".to_string(),
+                args: json!({}),
+                call_id: Some("call_fail".into()),
+                result: None,
+                remote_id: None,
+            }],
+        };
+
+        let model = Model::with_completer(Arc::new(completer));
+        let ctx = EngineBuilder::new()
+            .with_model(model)
+            .register_tool(FailTool)
+            .unwrap()
+            .mock_ctx();
+
+        let req = CompletionRequest {
+            prompt: "call fail".to_string(),
+            ..Default::default()
+        };
+
+        let mut runner = ctx.completion_iter(req, Vec::new());
+        let output = runner.next().await.unwrap().unwrap();
+        assert!(runner.is_done());
+        assert!(output.failed_reason.is_some());
+        assert!(
+            output
+                .failed_reason
+                .unwrap()
+                .contains("tool execution failed")
+        );
+    }
+
+    // ── Agent call tests ──
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_executes_agent_calls() {
+        let completer = AgentCallCompleter {
+            agent_name: "echo_agent".to_string(),
+        };
+
+        let model = Model::with_completer(Arc::new(completer));
+        let ctx = EngineBuilder::new()
+            .with_model(model)
+            .register_agent(EchoAgent, None)
+            .unwrap()
+            .mock_ctx();
+
+        let req = CompletionRequest {
+            prompt: "call agent".to_string(),
+            ..Default::default()
+        };
+
+        let mut runner = ctx.completion_iter(req, Vec::new());
+
+        // Step 1: agent call returns intermediate result.
+        let _step1 = runner.next().await.unwrap().unwrap();
+        assert!(!runner.is_done());
+
+        // Step 2: final result.
+        let step2 = runner.next().await.unwrap().unwrap();
+        assert!(runner.is_done());
+        assert_eq!(step2.content, "agent_result_processed");
+        assert_eq!(step2.tool_calls.len(), 1);
+        assert_eq!(step2.tool_calls[0].name, "echo_agent");
+        // Agent call result should be stored.
+        let result = step2.tool_calls[0].result.as_ref().unwrap();
+        assert!(
+            result
+                .output
+                .as_str()
+                .unwrap()
+                .contains("agent_echoed:sub-agent task")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_agent_call_with_invalid_args() {
+        // Agent call expects AgentArgs { prompt }, but we provide invalid args.
+        #[derive(Clone, Debug)]
+        struct BadArgsCompleter;
+
+        impl CompletionFeaturesDyn for BadArgsCompleter {
+            fn model_name(&self) -> String {
+                "bad_args".to_string()
+            }
+
+            fn completion(
+                &self,
+                _req: CompletionRequest,
+            ) -> anda_core::BoxPinFut<Result<AgentOutput, BoxError>> {
+                Box::pin(futures::future::ready(Ok(AgentOutput {
+                    tool_calls: vec![ToolCall {
+                        name: "echo_agent".to_string(),
+                        args: json!({"invalid_field": 42}), // Missing "prompt"
+                        call_id: Some("bad_call".into()),
+                        result: None,
+                        remote_id: None,
+                    }],
+                    ..Default::default()
+                })))
+            }
+        }
+
+        let model = Model::with_completer(Arc::new(BadArgsCompleter));
+        let ctx = EngineBuilder::new()
+            .with_model(model)
+            .register_agent(EchoAgent, None)
+            .unwrap()
+            .mock_ctx();
+
+        let req = CompletionRequest {
+            prompt: "bad args".to_string(),
+            ..Default::default()
+        };
+
+        let mut runner = ctx.completion_iter(req, Vec::new());
+        let output = runner.next().await.unwrap().unwrap();
+        assert!(runner.is_done());
+        assert!(output.failed_reason.is_some());
+        assert!(
+            output
+                .failed_reason
+                .unwrap()
+                .contains("failed to parse agent args")
+        );
+    }
+
+    // ── Steering message tests ──
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_steering_message_before_first_step() {
+        let model = Model::with_completer(Arc::new(EchoCompleter));
+        let ctx = EngineBuilder::new().with_model(model).mock_ctx();
+
+        let req = CompletionRequest {
+            prompt: "initial".to_string(),
+            ..Default::default()
+        };
+
+        let mut runner = ctx.completion_iter(req, Vec::new());
+        runner.steer("redirect to this".to_string());
+
+        // Step 1: model completes "initial", but steering intercepts.
+        let step1 = runner.next().await.unwrap().unwrap();
+        assert!(!runner.is_done());
+        assert_eq!(step1.content, "initial"); // Original completion before steering.
+
+        // Step 2: processes the steering prompt.
+        let step2 = runner.next().await.unwrap().unwrap();
+        assert!(runner.is_done());
+        assert_eq!(step2.content, "redirect to this");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_steering_skips_pending_tool_calls() {
+        // If model returns tool_calls and steering is set, tool_calls should be skipped.
+        let completer = ToolCallCompleter {
+            tool_calls: vec![ToolCall {
+                name: "echo_tool".to_string(),
+                args: json!({"input": "test"}),
+                call_id: Some("skipped_call".into()),
+                result: None,
+                remote_id: None,
+            }],
+        };
+
+        let model = Model::with_completer(Arc::new(completer));
+        let ctx = EngineBuilder::new()
+            .with_model(model)
+            .register_tool(EchoTool)
+            .unwrap()
+            .mock_ctx();
+
+        let req = CompletionRequest {
+            prompt: "call tool".to_string(),
+            ..Default::default()
+        };
+
+        let mut runner = ctx.completion_iter(req, Vec::new());
+        runner.steer("abort and redirect".to_string());
+
+        // Step 1: steering intercepts — tool calls are NOT executed.
+        let step1 = runner.next().await.unwrap().unwrap();
+        assert!(!runner.is_done());
+        // The tool calls in step1 are the raw model output (not executed).
+        assert!(!step1.tool_calls.is_empty());
+
+        // Step 2: ToolCallCompleter sees role != "tool", returns tool_calls again,
+        // but no steering now so tools execute.
+        let _step2 = runner.next().await.unwrap().unwrap();
+        assert!(!runner.is_done());
+
+        // Step 3: model processes tool results and returns final.
+        let step3 = runner.next().await.unwrap().unwrap();
+        assert!(runner.is_done());
+        assert_eq!(step3.content, "tool_result_processed");
+    }
+
+    // ── Follow-up message tests ──
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_follow_up_message_after_completion() {
+        let model = Model::with_completer(Arc::new(EchoCompleter));
+        let ctx = EngineBuilder::new().with_model(model).mock_ctx();
+
+        let req = CompletionRequest {
+            prompt: "initial".to_string(),
+            ..Default::default()
+        };
+
+        let mut runner = ctx.completion_iter(req, Vec::new());
+        runner.follow_up("follow up question".to_string());
+
+        // Step 1: initial completion, follow_up makes it continue.
+        let step1 = runner.next().await.unwrap().unwrap();
+        assert!(!runner.is_done());
+        assert_eq!(step1.content, "initial");
+
+        // Step 2: processes follow-up prompt.
+        let step2 = runner.next().await.unwrap().unwrap();
+        assert!(runner.is_done());
+        assert_eq!(step2.content, "follow up question");
+        // Usage accumulated.
+        assert_eq!(step2.usage.input_tokens, 10); // 5 + 5
+        assert_eq!(step2.usage.output_tokens, 20); // 10 + 10
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_steering_takes_priority_over_follow_up() {
+        let model = Model::with_completer(Arc::new(EchoCompleter));
+        let ctx = EngineBuilder::new().with_model(model).mock_ctx();
+
+        let req = CompletionRequest {
+            prompt: "initial".to_string(),
+            ..Default::default()
+        };
+
+        let mut runner = ctx.completion_iter(req, Vec::new());
+        runner.steer("steering".to_string());
+        runner.follow_up("follow_up".to_string());
+
+        // Step 1: steering intercepts.
+        let step1 = runner.next().await.unwrap().unwrap();
+        assert!(!runner.is_done());
+        assert_eq!(step1.content, "initial");
+
+        // Step 2: processes the steering prompt.
+        let step2 = runner.next().await.unwrap().unwrap();
+        assert!(!runner.is_done());
+        assert_eq!(step2.content, "steering");
+
+        // Step 3: processes the follow-up prompt.
+        let step3 = runner.next().await.unwrap().unwrap();
+        assert!(runner.is_done());
+        assert_eq!(step3.content, "follow_up");
+    }
+
+    // ── Cancellation tests ──
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_cancellation_returns_cancelled_output() {
+        // Use SlowCompleter so tokio::select picks the cancellation branch.
+        let model = Model::with_completer(Arc::new(SlowCompleter));
+        let cancel_token = CancellationToken::new();
+
+        let ctx = EngineBuilder::new()
+            .with_model(model)
+            .with_cancellation_token(cancel_token.clone())
+            .mock_ctx();
+
+        let req = CompletionRequest {
+            prompt: "hello".to_string(),
+            ..Default::default()
+        };
+
+        let mut runner = ctx.completion_iter(req, Vec::new());
+
+        // Cancel before first step.
+        cancel_token.cancel();
+
+        let output = runner.next().await.unwrap().unwrap();
+        assert!(runner.is_done());
+        assert!(output.failed_reason.is_some());
+        assert_eq!(output.failed_reason.unwrap(), "operation cancelled");
+
+        // After cancellation, returns None.
+        assert!(runner.next().await.unwrap().is_none());
+    }
+
+    // ── Usage accumulation tests ──
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_usage_accumulates_across_steps() {
+        let completer = ToolCallCompleter {
+            tool_calls: vec![ToolCall {
+                name: "echo_tool".to_string(),
+                args: json!({"input": "test"}),
+                call_id: Some("call_1".into()),
+                result: None,
+                remote_id: None,
+            }],
+        };
+
+        let model = Model::with_completer(Arc::new(completer));
+        let ctx = EngineBuilder::new()
+            .with_model(model)
+            .register_tool(EchoTool)
+            .unwrap()
+            .mock_ctx();
+
+        let req = CompletionRequest {
+            prompt: "test".to_string(),
+            ..Default::default()
+        };
+
+        let mut runner = ctx.completion_iter(req, Vec::new());
+
+        // Step 1: intermediate (usage = step1_model + tool)
+        let step1 = runner.next().await.unwrap().unwrap();
+        assert!(!runner.is_done());
+        assert!(step1.usage.requests >= 1);
+
+        // Step 2: final (usage = total accumulated)
+        let step2 = runner.next().await.unwrap().unwrap();
+        assert!(runner.is_done());
+        // Should have accumulated usage from both model calls + tool call.
+        assert!(step2.usage.requests >= 2);
+        assert!(step2.usage.input_tokens > 0);
+        assert!(step2.usage.output_tokens > 0);
+    }
+
+    // ── CompletionStream tests ──
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stream_basic_completion() {
+        let model = Model::with_completer(Arc::new(EchoCompleter));
+        let ctx = EngineBuilder::new().with_model(model).mock_ctx();
+
+        let req = CompletionRequest {
+            prompt: "stream test".to_string(),
+            ..Default::default()
+        };
+
+        let mut stream = ctx.completion_stream(req, Vec::new());
+
+        let item = stream.next().await;
+        assert!(item.is_some());
+        let output = item.unwrap().unwrap();
+        assert_eq!(output.content, "stream test");
+
+        // Stream should end.
+        let item = stream.next().await;
+        assert!(item.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stream_multi_step_with_tool_calls() {
+        let completer = ToolCallCompleter {
+            tool_calls: vec![ToolCall {
+                name: "echo_tool".to_string(),
+                args: json!({"input": "via_stream"}),
+                call_id: Some("stream_call".into()),
+                result: None,
+                remote_id: None,
+            }],
+        };
+
+        let model = Model::with_completer(Arc::new(completer));
+        let ctx = EngineBuilder::new()
+            .with_model(model)
+            .register_tool(EchoTool)
+            .unwrap()
+            .mock_ctx();
+
+        let req = CompletionRequest {
+            prompt: "stream with tools".to_string(),
+            ..Default::default()
+        };
+
+        let stream = ctx.completion_stream(req, Vec::new());
+        let results: Vec<_> = stream.collect().await;
+
+        // Should have 2 items: intermediate tool call result + final.
+        assert_eq!(results.len(), 2);
+        assert!(results[0].is_ok());
+        assert!(results[1].is_ok());
+
+        let final_output = results.last().unwrap().as_ref().unwrap();
+        assert_eq!(final_output.content, "tool_result_processed");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stream_error_propagation() {
+        let model = Model::with_completer(Arc::new(ErrorCompleter));
+        let ctx = EngineBuilder::new().with_model(model).mock_ctx();
+
+        let req = CompletionRequest {
+            prompt: "error stream".to_string(),
+            ..Default::default()
+        };
+
+        let mut stream = ctx.completion_stream(req, Vec::new());
+
+        let item = stream.next().await;
+        assert!(item.is_some());
+        assert!(item.unwrap().is_err());
+    }
+
+    // ── Step counter tests ──
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_step_counter_increments() {
+        let completer = ToolCallCompleter {
+            tool_calls: vec![ToolCall {
+                name: "echo_tool".to_string(),
+                args: json!({}),
+                call_id: Some("step_call".into()),
+                result: None,
+                remote_id: None,
+            }],
+        };
+
+        let model = Model::with_completer(Arc::new(completer));
+        let ctx = EngineBuilder::new()
+            .with_model(model)
+            .register_tool(EchoTool)
+            .unwrap()
+            .mock_ctx();
+
+        let req = CompletionRequest {
+            prompt: "steps".to_string(),
+            ..Default::default()
+        };
+
+        let mut runner = ctx.completion_iter(req, Vec::new());
+        assert_eq!(runner.steps(), 0);
+
+        runner.next().await.unwrap(); // step 1
+        assert_eq!(runner.steps(), 1);
+
+        runner.next().await.unwrap(); // step 2 (final)
+        assert_eq!(runner.steps(), 2);
+    }
+
+    // ── Chat history accumulation tests ──
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_chat_history_accumulated_in_final() {
+        let model = Model::with_completer(Arc::new(EchoCompleter));
+        let ctx = EngineBuilder::new().with_model(model).mock_ctx();
+
+        let req = CompletionRequest {
+            prompt: "hello".to_string(),
+            ..Default::default()
+        };
+
+        let mut runner = ctx.completion_iter(req, Vec::new());
+        runner.follow_up("follow up".to_string());
+
+        let step1 = runner.next().await.unwrap().unwrap();
+        // Intermediate output includes current chat history.
+        let step1_history_len = step1.chat_history.len();
+
+        let step2 = runner.next().await.unwrap().unwrap();
+        assert!(runner.is_done());
+        // Final output should have more chat history (accumulated from both steps).
+        assert!(step2.chat_history.len() >= step1_history_len);
+    }
+
+    // ── Artifacts accumulation tests ──
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_artifacts_accumulated_from_tool_calls() {
+        /// A tool that returns artifacts.
+        struct ArtifactTool;
+
+        #[derive(Debug, Deserialize)]
+        struct ArtifactArgs {}
+
+        impl Tool<BaseCtx> for ArtifactTool {
+            type Args = ArtifactArgs;
+            type Output = String;
+
+            fn name(&self) -> String {
+                "artifact_tool".to_string()
+            }
+
+            fn description(&self) -> String {
+                "Returns artifacts".to_string()
+            }
+
+            fn definition(&self) -> FunctionDefinition {
+                FunctionDefinition {
+                    name: "artifact_tool".to_string(),
+                    description: "Returns artifacts".to_string(),
+                    parameters: json!({"type": "object", "properties": {}}),
+                    strict: None,
+                }
+            }
+
+            async fn call(
+                &self,
+                _ctx: BaseCtx,
+                _args: Self::Args,
+                _resources: Vec<Resource>,
+            ) -> Result<ToolOutput<String>, BoxError> {
+                Ok(ToolOutput {
+                    output: "done".to_string(),
+                    artifacts: vec![Resource {
+                        tags: vec!["test_artifact".to_string()],
+                        ..Default::default()
+                    }],
+                    usage: Usage::default(),
+                })
+            }
+        }
+
+        let completer = ToolCallCompleter {
+            tool_calls: vec![ToolCall {
+                name: "artifact_tool".to_string(),
+                args: json!({}),
+                call_id: Some("art_call".into()),
+                result: None,
+                remote_id: None,
+            }],
+        };
+
+        let model = Model::with_completer(Arc::new(completer));
+        let ctx = EngineBuilder::new()
+            .with_model(model)
+            .register_tool(ArtifactTool)
+            .unwrap()
+            .mock_ctx();
+
+        let req = CompletionRequest {
+            prompt: "artifacts".to_string(),
+            ..Default::default()
+        };
+
+        let mut runner = ctx.completion_iter(req, Vec::new());
+        runner.next().await.unwrap(); // step 1: tool execution
+        let final_out = runner.next().await.unwrap().unwrap(); // step 2: final
+
+        assert!(runner.is_done());
+        assert_eq!(final_out.artifacts.len(), 1);
+        assert_eq!(final_out.artifacts[0].tags, vec!["test_artifact"]);
+    }
+
+    // ── Model name in output ──
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_sets_model_name_in_output() {
+        let model = Model::with_completer(Arc::new(EchoCompleter));
+        let ctx = EngineBuilder::new().with_model(model).mock_ctx();
+
+        let req = CompletionRequest {
+            prompt: "check model".to_string(),
+            ..Default::default()
+        };
+
+        let mut runner = ctx.completion_iter(req, Vec::new());
+        let output = runner.next().await.unwrap().unwrap();
+        assert_eq!(output.model, Some("echo".to_string()));
+    }
+
+    // ── Multiple tool calls in parallel ──
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_multiple_tool_calls_in_parallel() {
+        let completer = ToolCallCompleter {
+            tool_calls: vec![
+                ToolCall {
+                    name: "echo_tool".to_string(),
+                    args: json!({"input": "first"}),
+                    call_id: Some("call_a".into()),
+                    result: None,
+                    remote_id: None,
+                },
+                ToolCall {
+                    name: "echo_tool".to_string(),
+                    args: json!({"input": "second"}),
+                    call_id: Some("call_b".into()),
+                    result: None,
+                    remote_id: None,
+                },
+            ],
+        };
+
+        let model = Model::with_completer(Arc::new(completer));
+        let ctx = EngineBuilder::new()
+            .with_model(model)
+            .register_tool(EchoTool)
+            .unwrap()
+            .mock_ctx();
+
+        let req = CompletionRequest {
+            prompt: "multi tools".to_string(),
+            ..Default::default()
+        };
+
+        let mut runner = ctx.completion_iter(req, Vec::new());
+        runner.next().await.unwrap(); // step 1: both tools execute in parallel
+        let final_out = runner.next().await.unwrap().unwrap();
+
+        assert!(runner.is_done());
+        assert_eq!(final_out.tool_calls.len(), 2);
+        // Both tool results present.
+        for tc in &final_out.tool_calls {
+            assert!(tc.result.is_some());
+        }
     }
 }

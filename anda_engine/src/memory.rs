@@ -55,7 +55,7 @@ pub static FUNCTION_DEFINITION: LazyLock<FunctionDefinition> = LazyLock::new(|| 
 });
 
 /// A conversation between an agent and the system, stored in the database for memory management.
-/// Version 2
+/// Version 1
 #[derive(Debug, Clone, Deserialize, Serialize, AndaDBSchema)]
 pub struct Conversation {
     /// The unique identifier for this resource in the Anda DB collection "conversation".
@@ -303,7 +303,9 @@ pub struct MemoryManagement {
 
 impl MemoryManagement {
     pub async fn connect(db: Arc<AndaDB>, nexus: Arc<CognitiveNexus>) -> Result<Self, BoxError> {
-        let schema = Conversation::schema()?;
+        let mut schema = Conversation::schema()?;
+        schema.with_version(1);
+
         let conversations = db
             .open_or_create_collection(
                 schema,
