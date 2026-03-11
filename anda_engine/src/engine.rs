@@ -152,9 +152,9 @@ impl Engine {
         let meta = input.meta.unwrap_or_default();
         if meta.engine.is_some() && meta.engine != Some(self.id) {
             return Err(format!(
-                "invalid engine ID, expected {}, got {}",
+                "invalid engine ID, expected {}, got {:?}",
                 self.id.to_text(),
-                meta.engine.unwrap().to_text()
+                meta.engine
             )
             .into());
         }
@@ -202,9 +202,9 @@ impl Engine {
         let meta = input.meta.unwrap_or_default();
         if meta.engine.is_some() && meta.engine != Some(self.id) {
             return Err(format!(
-                "invalid engine ID, expected {}, got {}",
+                "invalid engine ID, expected {}, got {:?}",
                 self.id.to_text(),
-                meta.engine.unwrap().to_text()
+                meta.engine
             )
             .into());
         }

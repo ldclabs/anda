@@ -293,10 +293,10 @@ pub struct KIPLogs {
 
 #[derive(Debug, Clone)]
 pub struct MemoryManagement {
-    nexus: Arc<CognitiveNexus>,
-    conversations: Arc<Collection>,
-    logs: Arc<Collection>,
-    resources: Arc<Collection>,
+    pub nexus: Arc<CognitiveNexus>,
+    pub conversations: Arc<Collection>,
+    pub logs: Arc<Collection>,
+    pub resources: Arc<Collection>,
     enable_kip_logging: bool,
     kip_function_definitions: FunctionDefinition,
 }
@@ -395,6 +395,10 @@ impl MemoryManagement {
 
     pub fn nexus(&self) -> Arc<CognitiveNexus> {
         self.nexus.clone()
+    }
+
+    pub fn max_conversation_id(&self) -> u64 {
+        self.conversations.max_document_id()
     }
 
     pub async fn describe_primer(&self) -> Result<Json, KipError> {
@@ -697,11 +701,11 @@ impl Tool<BaseCtx> for Arc<MemoryManagement> {
         request: Self::Args,
         _resources: Vec<Resource>,
     ) -> Result<ToolOutput<Self::Output>, BoxError> {
-        let timestamp = unix_ms();
-        let conversation = ctx.get_state::<ConversationState>().map(|c| c._id);
-
         let (command, res) = request.execute(self.nexus.as_ref()).await;
+
         if self.enable_kip_logging {
+            let conversation = ctx.get_state::<ConversationState>().map(|c| c._id);
+            let timestamp = unix_ms();
             let log = KIPLogs {
                 _id: 0, // This will be set by the database
                 user: *ctx.caller(),
@@ -716,6 +720,49 @@ impl Tool<BaseCtx> for Arc<MemoryManagement> {
             self.logs.add_from(&log).await?;
             self.logs.flush(timestamp).await?;
         }
+
+        Ok(ToolOutput::new(res))
+    }
+}
+
+/// A read-only version of the KIP tool for memory management, which does not allow any modifications to the memory and is safe to use for retrieval operations.
+#[derive(Debug, Clone)]
+pub struct MemoryReadonly {
+    memory: Arc<MemoryManagement>,
+}
+
+impl MemoryReadonly {
+    pub const NAME: &'static str = "execute_kip_readonly";
+
+    /// Creates a new MemoryReadonly instance
+    pub fn new(memory: Arc<MemoryManagement>) -> Self {
+        Self { memory }
+    }
+}
+
+impl Tool<BaseCtx> for MemoryReadonly {
+    type Args = Request;
+    type Output = Response;
+
+    fn name(&self) -> String {
+        Self::NAME.to_string()
+    }
+
+    fn description(&self) -> String {
+        "Executes one or more KIP (Knowledge Interaction Protocol) commands against the Cognitive Nexus to read from your persistent memory. This tool does not allow any modifications to the memory and is safe to use for retrieval operations.".to_string()
+    }
+
+    fn definition(&self) -> FunctionDefinition {
+        self.memory.kip_function_definitions.clone()
+    }
+
+    async fn call(
+        &self,
+        _ctx: BaseCtx,
+        mut request: Self::Args,
+        _resources: Vec<Resource>,
+    ) -> Result<ToolOutput<Self::Output>, BoxError> {
+        let (_, res) = request.readonly().execute(self.memory.nexus.as_ref()).await;
         Ok(ToolOutput::new(res))
     }
 }
@@ -752,7 +799,7 @@ impl Tool<BaseCtx> for GetResourceContentTool {
     }
 
     fn description(&self) -> String {
-        "Get a resource content as text (base64-url encoded if not UTF-8) by it's ID".to_string()
+        "Retrieves the full content of a stored resource by its ID. Returns the content as plain text if UTF-8 encoded, or as a base64url-encoded string for binary data. If the resource has no local blob but has a URI, it will be fetched from the remote source.".to_string()
     }
 
     fn definition(&self) -> FunctionDefinition {
@@ -822,7 +869,7 @@ impl Tool<BaseCtx> for ListConversationsTool {
     }
 
     fn description(&self) -> String {
-        "List previous conversations".to_string()
+        "Lists the current user's previous conversations in reverse chronological order with cursor-based pagination. Returns conversation metadata including status, timestamps, messages, and usage statistics. Use the cursor parameter to paginate through older conversations.".to_string()
     }
 
     fn definition(&self) -> FunctionDefinition {
@@ -906,7 +953,7 @@ impl Tool<BaseCtx> for SearchConversationsTool {
     }
 
     fn description(&self) -> String {
-        "Search conversations".to_string()
+        "Performs a full-text search across the current user's conversation history using a query string. Searches through messages, resources, and artifacts to find relevant past conversations. Use this to recall specific topics, instructions, or context from previous interactions.".to_string()
     }
 
     fn definition(&self) -> FunctionDefinition {
@@ -1036,7 +1083,7 @@ impl Tool<BaseCtx> for MemoryTool {
     }
 
     fn description(&self) -> String {
-        "Conversation API".to_string()
+        "A unified API for managing conversations and memory. Supports retrieving resources and conversation details, stopping or steering in-progress conversations, sending follow-up messages, deleting conversations, listing previous conversations with pagination, searching conversation history by keyword, and listing KIP command logs.".to_string()
     }
 
     fn definition(&self) -> FunctionDefinition {

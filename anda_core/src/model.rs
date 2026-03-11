@@ -161,7 +161,7 @@ impl Message {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all_fields = "camelCase")]
 pub enum ContentPart {
     Text {
@@ -210,6 +210,118 @@ pub enum ContentPart {
     Any(Json),
 }
 
+impl<'de> Deserialize<'de> for ContentPart {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = Json::deserialize(deserializer)?;
+        match &value {
+            Json::String(s) => Ok(ContentPart::Text { text: s.clone() }),
+            Json::Object(map)
+                if matches!(
+                    map.get("type").and_then(|t| t.as_str()),
+                    Some(
+                        "Text"
+                            | "Reasoning"
+                            | "FileData"
+                            | "InlineData"
+                            | "ToolCall"
+                            | "ToolOutput"
+                            | "Action"
+                    )
+                ) =>
+            {
+                #[derive(Deserialize)]
+                #[serde(tag = "type", rename_all_fields = "camelCase")]
+                enum Helper {
+                    Text {
+                        text: String,
+                    },
+                    Reasoning {
+                        text: String,
+                    },
+                    FileData {
+                        file_uri: String,
+                        mime_type: Option<String>,
+                    },
+                    InlineData {
+                        mime_type: String,
+                        data: ByteBufB64,
+                    },
+                    ToolCall {
+                        name: String,
+                        args: Json,
+                        call_id: Option<String>,
+                    },
+                    ToolOutput {
+                        name: String,
+                        output: Json,
+                        call_id: Option<String>,
+                        remote_id: Option<Principal>,
+                    },
+                    Action {
+                        name: String,
+                        payload: Json,
+                        recipients: Option<Vec<Principal>>,
+                        signature: Option<ByteBufB64>,
+                    },
+                }
+
+                match serde_json::from_value::<Helper>(value) {
+                    Ok(h) => Ok(match h {
+                        Helper::Text { text } => ContentPart::Text { text },
+                        Helper::Reasoning { text } => ContentPart::Reasoning { text },
+                        Helper::FileData {
+                            file_uri,
+                            mime_type,
+                        } => ContentPart::FileData {
+                            file_uri,
+                            mime_type,
+                        },
+                        Helper::InlineData { mime_type, data } => {
+                            ContentPart::InlineData { mime_type, data }
+                        }
+                        Helper::ToolCall {
+                            name,
+                            args,
+                            call_id,
+                        } => ContentPart::ToolCall {
+                            name,
+                            args,
+                            call_id,
+                        },
+                        Helper::ToolOutput {
+                            name,
+                            output,
+                            call_id,
+                            remote_id,
+                        } => ContentPart::ToolOutput {
+                            name,
+                            output,
+                            call_id,
+                            remote_id,
+                        },
+                        Helper::Action {
+                            name,
+                            payload,
+                            recipients,
+                            signature,
+                        } => ContentPart::Action {
+                            name,
+                            payload,
+                            recipients,
+                            signature,
+                        },
+                    }),
+                    Err(_) => Err(serde::de::Error::custom("invalid ContentPart")),
+                }
+            }
+            _ => Ok(ContentPart::Any(value)),
+        }
+    }
+}
+
 impl From<String> for ContentPart {
     fn from(text: String) -> Self {
         Self::Text { text }
@@ -223,7 +335,7 @@ impl From<Json> for ContentPart {
         {
             match t {
                 "Text" | "Reasoning" | "FileData" | "InlineData" | "ToolCall" | "ToolOutput"
-                | "Any" => {
+                | "Action" | "Any" => {
                     if let Ok(part) = serde_json::from_value::<ContentPart>(val.clone()) {
                         return part;
                     }
@@ -633,6 +745,30 @@ mod tests {
         assert_eq!(back, part);
         let back: ContentPart = v.into();
         assert_eq!(back, part);
+
+        let part: Vec<ContentPart> = serde_json::from_str(
+            r#"
+            [
+                "hello",
+                {
+                    "type": "Text",
+                    "text": "world"
+                }
+            ]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            part,
+            vec![
+                ContentPart::Text {
+                    text: "hello".into()
+                },
+                ContentPart::Text {
+                    text: "world".into()
+                }
+            ]
+        );
     }
 
     #[test]

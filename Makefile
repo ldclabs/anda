@@ -1,6 +1,6 @@
 BUILD_ENV := rust
 
-.PHONY: build-wasm build-did
+.PHONY: lint fix test
 
 lint:
 	@cargo fmt

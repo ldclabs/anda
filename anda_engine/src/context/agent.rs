@@ -26,12 +26,11 @@
 //! agents or tools while maintaining access to the core functionality.
 
 use anda_core::{
-    AgentArgs, AgentContext, AgentInput, AgentOutput, AgentSet, BaseContext, BoxError, BoxPinFut,
-    CacheExpiry, CacheFeatures, CacheStoreFeatures, CancellationToken, CanisterCaller,
-    CompletionFeatures, CompletionRequest, ContentPart, Embedding, EmbeddingFeatures,
-    FunctionDefinition, HttpFeatures, Json, KeysFeatures, Message, ObjectMeta, Path, PutMode,
-    PutResult, RequestMeta, Resource, StateFeatures, StoreFeatures, ToolCall, ToolInput,
-    ToolOutput, ToolSet, Usage,
+    AgentContext, AgentInput, AgentOutput, AgentSet, BaseContext, BoxError, BoxPinFut, CacheExpiry,
+    CacheFeatures, CacheStoreFeatures, CancellationToken, CanisterCaller, CompletionFeatures,
+    CompletionRequest, ContentPart, Embedding, EmbeddingFeatures, FunctionDefinition, HttpFeatures,
+    Json, KeysFeatures, Message, ObjectMeta, Path, PutMode, PutResult, RequestMeta, Resource,
+    StateFeatures, StoreFeatures, ToolCall, ToolInput, ToolOutput, ToolSet, Usage,
 };
 use bytes::Bytes;
 use candid::{CandidType, Principal, utils::ArgumentEncoder};
@@ -1111,22 +1110,21 @@ impl CompletionRunner {
                 || tool.name.starts_with("RA_")
                 || tool.name.starts_with("ra_")
             {
-                // 代理调用
-                let args: AgentArgs = match serde_json::from_value(tool.args.clone()) {
-                    Ok(args) => args,
-                    Err(err) => {
-                        output.failed_reason = Some(format!(
-                            "failed to parse agent args {:?}: {}",
-                            tool.args, err
-                        ));
-                        return Ok(Some(self.final_output(output)));
-                    }
+                // 代理调用的 prompt 可能在 args 中的 "prompt" 字段，也可能直接在 args 的 JSON 中（如果 args 是一个字符串的话），也可能整个 args 就是 prompt（如果没有 "prompt" 字段的话）
+                let prompt = if let Some(args) = tool.args.as_str() {
+                    args.to_string()
+                } else if let Some(args) = tool.args.get("prompt")
+                    && let Some(prompt) = args.as_str()
+                {
+                    prompt.to_string()
+                } else {
+                    serde_json::to_string(&tool.args).unwrap_or_else(|_| tool.args.to_string())
                 };
 
                 let ctx = self.ctx.clone();
                 let input = AgentInput {
                     name: tool.name.clone(),
-                    prompt: args.prompt,
+                    prompt,
                     resources: self
                         .ctx
                         .select_agent_resources(&tool.name, &mut self.resources)
@@ -1953,8 +1951,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn runner_agent_call_with_invalid_args() {
-        // Agent call expects AgentArgs { prompt }, but we provide invalid args.
+    async fn runner_agent_call_with_arbitrary_args() {
+        // Agent call args no longer require a "prompt" field.
+        // When missing, the whole args JSON should be used as the prompt.
         #[derive(Clone, Debug)]
         struct BadArgsCompleter;
 
@@ -1965,12 +1964,20 @@ mod tests {
 
             fn completion(
                 &self,
-                _req: CompletionRequest,
+                req: CompletionRequest,
             ) -> anda_core::BoxPinFut<Result<AgentOutput, BoxError>> {
+                let role = req.role.as_deref().unwrap_or("");
+                if role == "tool" {
+                    return Box::pin(futures::future::ready(Ok(AgentOutput {
+                        content: "agent_result_processed".to_string(),
+                        ..Default::default()
+                    })));
+                }
+
                 Box::pin(futures::future::ready(Ok(AgentOutput {
                     tool_calls: vec![ToolCall {
                         name: "echo_agent".to_string(),
-                        args: json!({"invalid_field": 42}), // Missing "prompt"
+                        args: json!({"invalid_field": 42}),
                         call_id: Some("bad_call".into()),
                         result: None,
                         remote_id: None,
@@ -1993,14 +2000,21 @@ mod tests {
         };
 
         let mut runner = ctx.completion_iter(req, Vec::new());
+        let _step1 = runner.next().await.unwrap().unwrap();
+        assert!(!runner.is_done());
+
         let output = runner.next().await.unwrap().unwrap();
         assert!(runner.is_done());
-        assert!(output.failed_reason.is_some());
-        assert!(
-            output
-                .failed_reason
-                .unwrap()
-                .contains("failed to parse agent args")
+        assert!(output.failed_reason.is_none());
+        assert_eq!(output.content, "agent_result_processed");
+        assert_eq!(output.tool_calls.len(), 1);
+        assert_eq!(output.tool_calls[0].name, "echo_agent");
+
+        // The whole args object should be forwarded as prompt JSON.
+        let result = output.tool_calls[0].result.as_ref().unwrap();
+        assert_eq!(
+            result.output.as_str().unwrap(),
+            "agent_echoed:{\"invalid_field\":42}"
         );
     }
 
