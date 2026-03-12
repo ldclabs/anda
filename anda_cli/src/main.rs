@@ -3,6 +3,7 @@ use anda_web3_client::client::{Client as Web3Client, load_identity};
 use base64::{Engine, prelude::BASE64_URL_SAFE};
 use ciborium::value::Value;
 use clap::{Parser, Subcommand};
+use ic_cose_types::cose::ed25519::{SigningKey, VerifyingKey};
 use rand::RngCore;
 use std::sync::Arc;
 
@@ -30,6 +31,10 @@ pub enum Commands {
         /// Output format: hex or base64, default is hex
         #[arg(short, long, default_value = "hex")]
         format: String,
+
+        /// Whether to generate an ed25519 key pair, if true, the len will be ignored.
+        #[arg(long)]
+        ed25519: bool,
     },
 
     /// make an signed RPC call to the endpoint with the given ICP identity, method and args.
@@ -81,19 +86,44 @@ async fn main() -> Result<(), BoxError> {
     println!("principal: {}", identity.sender()?);
 
     match &cli.command {
-        Some(Commands::RandBytes { len, format }) => {
+        Some(Commands::RandBytes {
+            len,
+            format,
+            ed25519,
+        }) => {
             let mut rng = rand::rng();
-            let mut bytes = vec![0u8; (*len).min(1024)];
-            rng.fill_bytes(&mut bytes);
-            match format.as_str() {
-                "hex" => {
-                    println!("{}", hex::encode(&bytes));
+
+            if *ed25519 {
+                let mut bytes = [0u8; 32];
+                rng.fill_bytes(&mut bytes);
+                let signing_key = SigningKey::from_bytes(&bytes);
+                let verifying_key = VerifyingKey::from(&signing_key);
+                match format.as_str() {
+                    "hex" => {
+                        println!("Secret Key: {}", hex::encode(&bytes));
+                        println!("Public Key: {}", hex::encode(verifying_key.to_bytes()));
+                    }
+                    _ => {
+                        println!("Secret Key: {}", BASE64_URL_SAFE.encode(&bytes));
+                        println!(
+                            "Public Key: {}",
+                            BASE64_URL_SAFE.encode(verifying_key.to_bytes())
+                        );
+                    }
                 }
-                "base64" => {
-                    println!("{}", BASE64_URL_SAFE.encode(&bytes));
-                }
-                _ => {
-                    println!("{:?}", bytes);
+            } else {
+                let mut bytes = vec![0u8; (*len).min(1024)];
+                rng.fill_bytes(&mut bytes);
+                match format.as_str() {
+                    "hex" => {
+                        println!("{}", hex::encode(&bytes));
+                    }
+                    "base64" => {
+                        println!("{}", BASE64_URL_SAFE.encode(&bytes));
+                    }
+                    _ => {
+                        println!("{:?}", bytes);
+                    }
                 }
             }
         }
