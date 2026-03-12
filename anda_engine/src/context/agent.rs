@@ -1045,6 +1045,9 @@ impl CompletionRunner {
             output = output2;
         }
 
+        // 关闭下一轮模型输出中的工具调用强制需求（如果有的话）
+        self.req.tool_choice_required = false;
+        self.req.output_schema = None;
         // 累计所有原始对话历史（包含初始的 req.raw_history 和 req.chat_history）
         self.req.raw_history.append(&mut output.raw_history);
         // 累计所有对话历史（不包含初始的 req.chat_history）
