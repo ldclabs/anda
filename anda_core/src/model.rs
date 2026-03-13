@@ -100,6 +100,20 @@ pub struct AgentOutput {
     pub model: Option<String>,
 }
 
+fn deserialize_content<'de, D>(deserializer: D) -> Result<Vec<ContentPart>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Json::deserialize(deserializer)?;
+    match value {
+        Json::String(s) => Ok(vec![ContentPart::Text { text: s }]),
+        Json::Array(_) => Vec::<ContentPart>::deserialize(value).map_err(serde::de::Error::custom),
+        _ => Err(serde::de::Error::custom(
+            "expected a string or array for content",
+        )),
+    }
+}
+
 /// Represents a message send to LLM for completion.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Message {
@@ -107,6 +121,7 @@ pub struct Message {
     pub role: String,
 
     /// The content of the message
+    #[serde(default, deserialize_with = "deserialize_content")]
     pub content: Vec<ContentPart>,
 
     /// An optional name for the participant. Provides the model information to differentiate between participants of the same role.
@@ -910,6 +925,40 @@ mod tests {
         assert_eq!(calls[0].args, serde_json::json!({"x":1, "y":2}));
         assert_eq!(calls[1].name, "echo");
         assert_eq!(calls[1].args, serde_json::json!({"text":"hi"}));
+    }
+
+    #[test]
+    fn test_message_content_deserialize_from_string() {
+        // content as a plain string
+        let msg: Message = serde_json::from_value(serde_json::json!({
+            "role": "user",
+            "content": "hello world"
+        }))
+        .unwrap();
+        assert_eq!(msg.role, "user");
+        assert_eq!(msg.content.len(), 1);
+        assert_eq!(
+            msg.content[0],
+            ContentPart::Text {
+                text: "hello world".into()
+            }
+        );
+
+        // content as an array still works
+        let msg2: Message = serde_json::from_value(serde_json::json!({
+            "role": "assistant",
+            "content": [{"type": "Text", "text": "hi"}]
+        }))
+        .unwrap();
+        assert_eq!(msg2.content.len(), 1);
+        assert_eq!(msg2.content[0], ContentPart::Text { text: "hi".into() });
+
+        // missing content defaults to empty vec
+        let msg3: Message = serde_json::from_value(serde_json::json!({
+            "role": "system"
+        }))
+        .unwrap();
+        assert!(msg3.content.is_empty());
     }
 
     #[test]

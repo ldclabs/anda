@@ -65,6 +65,7 @@ pub struct Conversation {
     pub user: Principal,
 
     #[field_type = "Option<Bytes>"]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub thread: Option<Xid>,
 
     pub messages: Vec<Json>,
@@ -88,13 +89,16 @@ pub struct Conversation {
 
     /// Queue a steering message to interrupt the agent mid-run.
     /// Delivered after current tool execution, skips remaining tools.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub steering_messages: Option<Vec<String>>,
 
     /// Queue a follow-up message to be processed after the agent finishes.
     /// Delivered only when agent has no more tool calls or steering messages.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub follow_up_messages: Option<Vec<String>>,
 
     /// The ancestor conversation IDs, ordered from the closest to the farthest ancestor.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ancestors: Option<Vec<u64>>,
 
     /// The period when the conversation was created, in hours (timestamp / 3600 / 1000).

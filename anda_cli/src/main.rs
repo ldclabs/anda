@@ -100,11 +100,11 @@ async fn main() -> Result<(), BoxError> {
                 let verifying_key = VerifyingKey::from(&signing_key);
                 match format.as_str() {
                     "hex" => {
-                        println!("Secret Key: {}", hex::encode(&bytes));
+                        println!("Secret Key: {}", hex::encode(bytes));
                         println!("Public Key: {}", hex::encode(verifying_key.to_bytes()));
                     }
                     _ => {
-                        println!("Secret Key: {}", BASE64_URL_SAFE.encode(&bytes));
+                        println!("Secret Key: {}", BASE64_URL_SAFE.encode(bytes));
                         println!(
                             "Public Key: {}",
                             BASE64_URL_SAFE.encode(verifying_key.to_bytes())
