@@ -12,7 +12,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.9.8"
+version = "0.9.9"
 description = "Anda is an AI agent framework built with Rust, powered by ICP and TEEs."
 repository = "https://github.com/ldclabs/anda"
 homepage = "https://github.com/ldclabs/anda"
@@ -61,9 +61,9 @@ ic_cose_types = "0.9"
 ic_cose = "0.9"
 ic-oss-types = "1.2"
 ic_object_store = "1.4"
-ic-agent = "0.45"
-ic_auth_types = "0.7"
-ic_auth_verifier = "0.7"
+ic-agent = "0.46"
+ic_auth_types = "0.8"
+ic_auth_verifier = "0.8"
 ic_tee_cdk = "0.6"
 ic_tee_agent = "0.6"
 ic_tee_gateway_sdk = "0.6"
