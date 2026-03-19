@@ -1195,7 +1195,6 @@ impl Tool<BaseCtx> for ThreadTool {
                 Response::Ok {
                     result: json!(thread),
                     next_cursor: None,
-                    ignore: None,
                 }
             }
             ThreadToolArgs::Update { thread_id, input } => {
@@ -1203,7 +1202,6 @@ impl Tool<BaseCtx> for ThreadTool {
                 Response::Ok {
                     result: json!(thread),
                     next_cursor: None,
-                    ignore: None,
                 }
             }
             ThreadToolArgs::UpdateControllers {
@@ -1217,7 +1215,6 @@ impl Tool<BaseCtx> for ThreadTool {
                 Response::Ok {
                     result: json!(thread),
                     next_cursor: None,
-                    ignore: None,
                 }
             }
             ThreadToolArgs::UpdateManagers {
@@ -1232,7 +1229,6 @@ impl Tool<BaseCtx> for ThreadTool {
                 Response::Ok {
                     result: json!(thread),
                     next_cursor: None,
-                    ignore: None,
                 }
             }
             ThreadToolArgs::AddParticipants {
@@ -1247,7 +1243,6 @@ impl Tool<BaseCtx> for ThreadTool {
                 Response::Ok {
                     result: json!(thread),
                     next_cursor: None,
-                    ignore: None,
                 }
             }
             ThreadToolArgs::RemoveParticipants {
@@ -1262,7 +1257,6 @@ impl Tool<BaseCtx> for ThreadTool {
                 Response::Ok {
                     result: json!(thread),
                     next_cursor: None,
-                    ignore: None,
                 }
             }
             ThreadToolArgs::Quit { thread_id } => {
@@ -1270,7 +1264,6 @@ impl Tool<BaseCtx> for ThreadTool {
                 Response::Ok {
                     result: json!({ "quit": thread_id }),
                     next_cursor: None,
-                    ignore: None,
                 }
             }
             ThreadToolArgs::Delete { thread_id } => {
@@ -1278,7 +1271,6 @@ impl Tool<BaseCtx> for ThreadTool {
                 Response::Ok {
                     result: json!({ "deleted": thread_id }),
                     next_cursor: None,
-                    ignore: None,
                 }
             }
             ThreadToolArgs::Get { thread_id } => {
@@ -1286,7 +1278,6 @@ impl Tool<BaseCtx> for ThreadTool {
                 Response::Ok {
                     result: json!(thread),
                     next_cursor: None,
-                    ignore: None,
                 }
             }
             ThreadToolArgs::ListMy { cursor, limit } => {
@@ -1295,7 +1286,6 @@ impl Tool<BaseCtx> for ThreadTool {
                 Response::Ok {
                     result: json!(threads),
                     next_cursor,
-                    ignore: None,
                 }
             }
             ThreadToolArgs::ListPublic { limit } => {
@@ -1303,7 +1293,6 @@ impl Tool<BaseCtx> for ThreadTool {
                 Response::Ok {
                     result: json!(threads),
                     next_cursor: None,
-                    ignore: None,
                 }
             }
             ThreadToolArgs::FetchMyThreadsState {} => {
@@ -1311,7 +1300,6 @@ impl Tool<BaseCtx> for ThreadTool {
                 Response::Ok {
                     result: json!(states),
                     next_cursor: None,
-                    ignore: None,
                 }
             }
             ThreadToolArgs::FetchPublicThreadsState { thread_ids } => {
@@ -1320,7 +1308,6 @@ impl Tool<BaseCtx> for ThreadTool {
                 Response::Ok {
                     result: json!(states),
                     next_cursor: None,
-                    ignore: None,
                 }
             }
         };
@@ -1428,7 +1415,6 @@ impl Tool<BaseCtx> for MessageTool {
                 Response::Ok {
                     result: json!(msg),
                     next_cursor: None,
-                    ignore: None,
                 }
             }
             MessageToolArgs::Get {
@@ -1442,7 +1428,6 @@ impl Tool<BaseCtx> for MessageTool {
                 Response::Ok {
                     result: json!(msg),
                     next_cursor: None,
-                    ignore: None,
                 }
             }
             MessageToolArgs::List {
@@ -1457,7 +1442,6 @@ impl Tool<BaseCtx> for MessageTool {
                 Response::Ok {
                     result: json!(messages),
                     next_cursor,
-                    ignore: None,
                 }
             }
             MessageToolArgs::Delete {
@@ -1470,7 +1454,6 @@ impl Tool<BaseCtx> for MessageTool {
                 Response::Ok {
                     result: json!({ "deleted": message_id }),
                     next_cursor: None,
-                    ignore: None,
                 }
             }
         };
@@ -1547,6 +1530,5 @@ impl Tool<BaseCtx> for GetResourceTool {
 }
 
 fn principals_set_schema(generator: &mut SchemaGenerator) -> Schema {
-    
     Vec::<String>::json_schema(generator)
 }

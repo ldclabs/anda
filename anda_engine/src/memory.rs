@@ -917,7 +917,6 @@ impl Tool<BaseCtx> for ListConversationsTool {
         Ok(ToolOutput::new(Response::Ok {
             result: result.into(),
             next_cursor,
-            ignore: None,
         }))
     }
 }
@@ -998,7 +997,6 @@ impl Tool<BaseCtx> for SearchConversationsTool {
         Ok(ToolOutput::new(Response::Ok {
             result: result.into(),
             next_cursor: None,
-            ignore: None,
         }))
     }
 }
@@ -1122,7 +1120,6 @@ impl Tool<BaseCtx> for MemoryTool {
                 Ok(ToolOutput::new(Response::Ok {
                     result: json!(res),
                     next_cursor: None,
-                    ignore: None,
                 }))
             }
             MemoryToolArgs::GetConversation { _id } => {
@@ -1134,7 +1131,6 @@ impl Tool<BaseCtx> for MemoryTool {
                 Ok(ToolOutput::new(Response::Ok {
                     result: json!(conversation),
                     next_cursor: None,
-                    ignore: None,
                 }))
             }
             MemoryToolArgs::StopConversation { _id } => {
@@ -1161,7 +1157,6 @@ impl Tool<BaseCtx> for MemoryTool {
                 Ok(ToolOutput::new(Response::Ok {
                     result: json!(conversation),
                     next_cursor: None,
-                    ignore: None,
                 }))
             }
             MemoryToolArgs::SteerConversation { _id, message } => {
@@ -1192,7 +1187,6 @@ impl Tool<BaseCtx> for MemoryTool {
                 Ok(ToolOutput::new(Response::Ok {
                     result: json!(conversation),
                     next_cursor: None,
-                    ignore: None,
                 }))
             }
             MemoryToolArgs::FollowUpConversation { _id, message } => {
@@ -1224,7 +1218,6 @@ impl Tool<BaseCtx> for MemoryTool {
                 Ok(ToolOutput::new(Response::Ok {
                     result: json!(conversation),
                     next_cursor: None,
-                    ignore: None,
                 }))
             }
             MemoryToolArgs::DeleteConversation { _id } => {
@@ -1237,7 +1230,6 @@ impl Tool<BaseCtx> for MemoryTool {
                 Ok(ToolOutput::new(Response::Ok {
                     result: json!({ "deleted": deleted }),
                     next_cursor: None,
-                    ignore: None,
                 }))
             }
             MemoryToolArgs::ListPrevConversations { cursor, limit } => {
@@ -1249,7 +1241,6 @@ impl Tool<BaseCtx> for MemoryTool {
                 Ok(ToolOutput::new(Response::Ok {
                     result: json!(conversations),
                     next_cursor,
-                    ignore: None,
                 }))
             }
             MemoryToolArgs::SearchConversations { query, limit } => {
@@ -1261,7 +1252,6 @@ impl Tool<BaseCtx> for MemoryTool {
                 Ok(ToolOutput::new(Response::Ok {
                     result: json!(conversations),
                     next_cursor: None,
-                    ignore: None,
                 }))
             }
             MemoryToolArgs::ListKipLogs { cursor, limit } => {
@@ -1273,7 +1263,6 @@ impl Tool<BaseCtx> for MemoryTool {
                 Ok(ToolOutput::new(Response::Ok {
                     result: json!(logs),
                     next_cursor,
-                    ignore: None,
                 }))
             }
         }
