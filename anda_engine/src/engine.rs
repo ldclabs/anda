@@ -38,7 +38,7 @@ use candid::Principal;
 use ic_tee_cdk::AttestationRequest;
 use object_store::memory::InMemory;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     sync::Arc,
 };
 use structured_logger::unix_ms;
@@ -48,7 +48,7 @@ use crate::{
     context::{AgentCtx, BaseCtx, Web3Client, Web3SDK},
     hook::{Hook, Hooks},
     management::{BaseManagement, Management, SYSTEM_PATH, Visibility},
-    model::Model,
+    model::{Model, Models},
     store::Store,
 };
 
@@ -111,6 +111,11 @@ impl Engine {
     /// Creates and returns a child cancellation token.
     pub fn cancellation_token(&self) -> CancellationToken {
         self.ctx.base.cancellation_token.child_token()
+    }
+
+    /// Returns a reference to the engine's models.
+    pub fn models(&self) -> Arc<Models> {
+        self.ctx.models.clone()
     }
 
     /// Closes the engine, cancelling all tasks and waiting for cancellation to complete.
@@ -325,10 +330,7 @@ pub struct EngineBuilder {
     tools: ToolSet<BaseCtx>,
     agents: AgentSet<AgentCtx>,
     remote: BTreeMap<String, RemoteEngineArgs>,
-    model: Model,
-    models: BTreeMap<String, Model>, // label -> Model
-    fallback_model: Option<Model>,
-    fallback_models: BTreeMap<String, Model>, // label -> fallback Model
+    models: Models, // label -> Model
     store: Store,
     web3: Arc<Web3SDK>,
     hooks: Arc<Hooks>,
@@ -359,10 +361,7 @@ impl EngineBuilder {
             tools: ToolSet::new(),
             agents: AgentSet::new(),
             remote: BTreeMap::new(),
-            model: Model::not_implemented(),
-            models: BTreeMap::new(),
-            fallback_model: None,
-            fallback_models: BTreeMap::new(),
+            models: Models::default(),
             store: Store::new(mstore),
             web3: Arc::new(Web3SDK::Web3(Web3Client::not_implemented())),
             hooks: Arc::new(Hooks::new()),
@@ -392,8 +391,8 @@ impl EngineBuilder {
     }
 
     /// Sets the model to be used by the engine.
-    pub fn with_model(mut self, model: Model) -> Self {
-        self.model = model;
+    pub fn with_model(self, model: Model) -> Self {
+        self.models.set_model(model);
         self
     }
 
@@ -401,23 +400,14 @@ impl EngineBuilder {
     ///
     /// The fallback model will be used when the primary model returns an `AgentOutput`
     /// with `failed_reason`.
-    pub fn with_fallback_model(mut self, model: Model) -> Self {
-        self.fallback_model = Some(model);
+    pub fn with_fallback_model(self, model: Model) -> Self {
+        self.models.set_fallback_model(model);
         self
     }
 
     /// Sets multiple models with labels for the engine.
-    pub fn with_models(mut self, models: BTreeMap<String, Model>) -> Self {
-        self.models = models;
-        self
-    }
-
-    /// Sets fallback models with labels for the engine.
-    ///
-    /// If a fallback model is configured for the current agent label, it will take
-    /// precedence over the global fallback model.
-    pub fn with_fallback_models(mut self, models: BTreeMap<String, Model>) -> Self {
-        self.fallback_models = models;
+    pub fn with_models(self, models: HashMap<String, Model>) -> Self {
+        self.models.set_models(models);
         self
     }
 
@@ -545,15 +535,7 @@ impl EngineBuilder {
 
         let tools = Arc::new(ToolSet::new());
         let agents = Arc::new(AgentSet::new());
-        let ctx = AgentCtx::new(
-            ctx,
-            self.model,
-            Arc::new(self.models),
-            self.fallback_model,
-            Arc::new(self.fallback_models),
-            tools,
-            agents,
-        );
+        let ctx = AgentCtx::new(ctx, Arc::new(self.models), tools, agents);
 
         Engine {
             id,
@@ -617,15 +599,7 @@ impl EngineBuilder {
 
         let tools = Arc::new(self.tools);
         let agents = Arc::new(self.agents);
-        let ctx = AgentCtx::new(
-            ctx,
-            self.model,
-            Arc::new(self.models),
-            self.fallback_model,
-            Arc::new(self.fallback_models),
-            tools.clone(),
-            agents.clone(),
-        );
+        let ctx = AgentCtx::new(ctx, Arc::new(self.models), tools.clone(), agents.clone());
 
         let meta = RequestMeta::default();
         for (name, tool) in &tools.set {
@@ -679,10 +653,7 @@ impl EngineBuilder {
 
         AgentCtx::new(
             ctx,
-            self.model,
             Arc::new(self.models),
-            self.fallback_model,
-            Arc::new(self.fallback_models),
             Arc::new(self.tools),
             Arc::new(self.agents),
         )

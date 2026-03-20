@@ -1,7 +1,7 @@
 use anda_cognitive_nexus::{CognitiveNexus, ConceptPK};
 use anda_core::{
     Agent, AgentContext, AgentOutput, BoxError, CacheExpiry, CacheFeatures, CompletionRequest,
-    Document, Documents, Message, Principal, Resource, StateFeatures, Tool, ToolSet, Usage,
+    Document, Documents, Message, Principal, Resource, StateFeatures, Tool, ToolSet,
     evaluate_tokens, update_resources,
 };
 use anda_db::{database::AndaDB, index::BTree};
@@ -310,9 +310,7 @@ impl Agent<AgentCtx> for Assistant {
         let resource_docs: Vec<Document> = rs.iter().map(Document::from).collect();
 
         let mut conversation = Conversation {
-            _id: 0,
             user: *caller,
-            thread: None,
             messages: vec![serde_json::json!(Message {
                 role: "user".into(),
                 content: vec![prompt.clone().into()],
@@ -320,16 +318,10 @@ impl Agent<AgentCtx> for Assistant {
                 ..Default::default()
             })],
             resources: rs,
-            artifacts: vec![],
-            status: ConversationStatus::Submitted,
-            failed_reason: None,
             period: now_ms / 3600 / 1000,
             created_at: now_ms,
             updated_at: now_ms,
-            usage: Usage::default(),
-            steering_messages: None,
-            follow_up_messages: None,
-            ancestors: None,
+            ..Default::default()
         };
 
         let id = self

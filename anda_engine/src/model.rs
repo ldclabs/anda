@@ -18,8 +18,9 @@ use anda_core::{
     AgentOutput, BoxError, BoxPinFut, CONTENT_TYPE_JSON, CompletionRequest, Embedding, ToolCall,
     Usage,
 };
-use std::sync::Arc;
+use arc_swap::ArcSwap;
 use std::time::Duration;
+use std::{collections::HashMap, sync::Arc};
 
 pub mod cohere;
 pub mod deepseek;
@@ -34,6 +35,97 @@ pub use reqwest;
 pub use reqwest::Proxy;
 
 use crate::APP_USER_AGENT;
+
+/// Thread-safe model registry used by the engine.
+///
+/// It maintains three layers:
+/// - `model`: the primary default model for general requests
+/// - `models`: a label-based map for selecting specific models
+/// - `fallback_model`: a safety fallback when primary lookup is missing
+pub struct Models {
+    model: ArcSwap<Option<Model>>,
+    models: ArcSwap<HashMap<String, Model>>,
+    fallback_model: ArcSwap<Option<Model>>,
+}
+
+impl Default for Models {
+    fn default() -> Self {
+        Self {
+            model: ArcSwap::new(Arc::new(None)),
+            models: ArcSwap::new(Arc::new(HashMap::new())),
+            fallback_model: ArcSwap::new(Arc::new(None)),
+        }
+    }
+}
+
+impl Models {
+    /// Sets the primary default model.
+    pub fn set_model(&self, model: Model) {
+        self.model.store(Arc::new(Some(model)));
+    }
+
+    /// Replaces all labeled models.
+    ///
+    /// If no primary model is configured yet, the first model in the provided
+    /// map is promoted to the primary default model.
+    pub fn set_models(&self, models: HashMap<String, Model>) {
+        if self.model.load().is_none()
+            && let Some((_, m)) = models.iter().next() {
+                self.model.store(Arc::new(Some(m.clone())));
+            }
+        self.models.store(Arc::new(models));
+    }
+
+    /// Inserts or updates a model by label.
+    ///
+    /// If no primary model is configured yet, this inserted model becomes the
+    /// primary default model.
+    pub fn set_model_by(&self, label: String, model: Model) {
+        let mut models = self.models.load().as_ref().clone();
+        models.insert(label, model.clone());
+        self.models.store(Arc::new(models));
+        if self.model.load().is_none() {
+            self.model.store(Arc::new(Some(model)));
+        }
+    }
+
+    /// Sets the fallback model used when primary lookup fails.
+    pub fn set_fallback_model(&self, model: Model) {
+        self.fallback_model.store(Arc::new(Some(model)));
+    }
+
+    /// Returns the primary model if available; otherwise returns the fallback model.
+    pub fn get_model(&self) -> Option<Model> {
+        if let Some(m) = self.model.load().as_ref() {
+            return Some(m.clone());
+        }
+        if let Some(m) = self.fallback_model.load().as_ref() {
+            return Some(m.clone());
+        }
+        None
+    }
+
+    /// Returns a model by label.
+    ///
+    /// If the label is not found, returns the fallback model when configured.
+    pub fn get_model_by(&self, label: &str) -> Option<Model> {
+        if label.is_empty() {
+            return self.get_model();
+        }
+        if let Some(m) = self.models.load().get(label) {
+            return Some(m.clone());
+        }
+        if let Some(m) = self.fallback_model.load().as_ref() {
+            return Some(m.clone());
+        }
+        None
+    }
+
+    /// Returns the fallback model if configured.
+    pub fn fallback_model(&self) -> Option<Model> {
+        self.fallback_model.load().as_ref().clone()
+    }
+}
 
 /// Trait for dynamic completion features that can be used across threads
 pub trait CompletionFeaturesDyn: Send + Sync + 'static {
@@ -276,4 +368,150 @@ pub fn request_client_builder() -> reqwest::ClientBuilder {
             headers.insert(http::header::ACCEPT, ct);
             headers
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Clone)]
+    struct TestCompleter {
+        name: &'static str,
+    }
+
+    impl CompletionFeaturesDyn for TestCompleter {
+        fn completion(&self, _req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
+            Box::pin(futures::future::ready(Ok(AgentOutput::default())))
+        }
+
+        fn model_name(&self) -> String {
+            self.name.to_string()
+        }
+    }
+
+    #[derive(Clone)]
+    struct TestEmbedder;
+
+    impl EmbeddingFeaturesDyn for TestEmbedder {
+        fn ndims(&self) -> usize {
+            3
+        }
+
+        fn embed(
+            &self,
+            _texts: Vec<String>,
+        ) -> BoxPinFut<Result<(Vec<Embedding>, Usage), BoxError>> {
+            Box::pin(futures::future::ready(Ok((vec![], Usage::default()))))
+        }
+
+        fn embed_query(&self, _text: String) -> BoxPinFut<Result<(Embedding, Usage), BoxError>> {
+            Box::pin(futures::future::ready(Ok((
+                Embedding {
+                    text: String::new(),
+                    vec: vec![0.0; 3],
+                },
+                Usage::default(),
+            ))))
+        }
+    }
+
+    fn test_model(name: &'static str) -> Model {
+        Model::new(Arc::new(TestCompleter { name }), Arc::new(TestEmbedder))
+    }
+
+    #[test]
+    fn models_default_is_empty() {
+        let models = Models::default();
+
+        assert!(models.get_model().is_none());
+        assert!(models.get_model_by("missing").is_none());
+    }
+
+    #[test]
+    fn set_model_sets_primary_and_fallback() {
+        let models = Models::default();
+        models.set_model(test_model("primary"));
+
+        assert_eq!(
+            models
+                .get_model()
+                .expect("primary model should exist")
+                .model_name(),
+            "primary"
+        );
+        assert!(models.get_model_by("missing").is_none());
+    }
+
+    #[test]
+    fn set_models_updates_map_and_promotes_one_when_primary_absent() {
+        let models = Models::default();
+        let mut map = HashMap::new();
+        map.insert("a".to_string(), test_model("A"));
+        map.insert("b".to_string(), test_model("B"));
+
+        models.set_models(map);
+
+        let primary = models
+            .get_model()
+            .expect("primary model should be promoted from set_models")
+            .model_name();
+        assert!(primary == "A" || primary == "B");
+
+        assert_eq!(
+            models
+                .get_model_by("a")
+                .expect("label a should exist")
+                .model_name(),
+            "A"
+        );
+        assert_eq!(
+            models
+                .get_model_by("b")
+                .expect("label b should exist")
+                .model_name(),
+            "B"
+        );
+    }
+
+    #[test]
+    fn set_model_by_inserts_and_sets_primary_when_empty() {
+        let models = Models::default();
+        models.set_model_by("x".to_string(), test_model("X"));
+
+        assert_eq!(
+            models
+                .get_model_by("x")
+                .expect("label x should exist")
+                .model_name(),
+            "X"
+        );
+        assert_eq!(
+            models
+                .get_model()
+                .expect("primary model should be initialized")
+                .model_name(),
+            "X"
+        );
+    }
+
+    #[test]
+    fn fallback_is_used_when_primary_or_label_missing() {
+        let models = Models::default();
+        models.set_fallback_model(test_model("fallback"));
+
+        assert_eq!(
+            models
+                .get_model()
+                .expect("fallback should be returned when primary is missing")
+                .model_name(),
+            "fallback"
+        );
+        assert_eq!(
+            models
+                .get_model_by("unknown")
+                .expect("fallback should be returned when label is missing")
+                .model_name(),
+            "fallback"
+        );
+    }
 }

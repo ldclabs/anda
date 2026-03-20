@@ -43,6 +43,7 @@ anda_db_tfs = { version = "0.5", features = ["full"] }
 anda_cognitive_nexus = "0.7"
 anda_db_schema = "0.4"
 anda_kip = "0.7"
+arc-swap = "1.8"
 bytes = "1"
 base64 = "0.22"
 candid = "0.10"

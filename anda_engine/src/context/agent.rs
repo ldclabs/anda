@@ -37,7 +37,6 @@ use candid::{CandidType, Principal, utils::ArgumentEncoder};
 use futures_util::Stream;
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
-    collections::BTreeMap,
     future::Future,
     pin::Pin,
     sync::Arc,
@@ -46,7 +45,7 @@ use std::{
 };
 
 use super::{base::BaseCtx, engine::RemoteEngines};
-use crate::model::Model;
+use crate::model::{Model, Models};
 
 pub static DYNAMIC_REMOTE_ENGINES: &str = "_engines";
 
@@ -58,15 +57,10 @@ pub struct AgentCtx {
 
     /// Label of the agent.
     pub(crate) label: String,
-    /// AI model used for completions and embeddings.
     pub(crate) model: Model,
     // label -> model
-    pub(crate) models: Arc<BTreeMap<String, Model>>,
+    pub(crate) models: Arc<Models>,
 
-    /// Global fallback model used when the primary model returns `failed_reason`.
-    pub(crate) fallback_model: Option<Model>,
-    /// label -> fallback model
-    pub(crate) fallback_models: Arc<BTreeMap<String, Model>>,
     /// Set of available tools that can be called.
     pub(crate) tools: Arc<ToolSet<BaseCtx>>,
     /// Set of available agents that can be invoked.
@@ -83,20 +77,17 @@ impl AgentCtx {
     /// * `agents` - Set of available agents.
     pub(crate) fn new(
         base: BaseCtx,
-        model: Model,
-        models: Arc<BTreeMap<String, Model>>,
-        fallback_model: Option<Model>,
-        fallback_models: Arc<BTreeMap<String, Model>>,
+        models: Arc<Models>,
         tools: Arc<ToolSet<BaseCtx>>,
         agents: Arc<AgentSet<AgentCtx>>,
     ) -> Self {
         Self {
             base,
             label: String::new(),
-            model,
+            model: models
+                .get_model()
+                .unwrap_or_else(Model::not_implemented),
             models,
-            fallback_model,
-            fallback_models,
             tools,
             agents,
         }
@@ -112,8 +103,6 @@ impl AgentCtx {
             label: agent_label.to_string(),
             model: self.model.clone(),
             models: self.models.clone(),
-            fallback_model: self.fallback_model.clone(),
-            fallback_models: self.fallback_models.clone(),
             tools: self.tools.clone(),
             agents: self.agents.clone(),
         })
@@ -147,8 +136,6 @@ impl AgentCtx {
             label: agent_label.to_string(),
             model: self.model.clone(),
             models: self.models.clone(),
-            fallback_model: self.fallback_model.clone(),
-            fallback_models: self.fallback_models.clone(),
             tools: self.tools.clone(),
             agents: self.agents.clone(),
         })
@@ -179,15 +166,10 @@ impl AgentCtx {
         let label = req.model.as_ref().unwrap_or(&self.label);
         let model = self
             .models
-            .get(label)
-            .cloned()
+            .get_model_by(label)
             .unwrap_or_else(|| self.model.clone());
 
-        let fallback_model = self
-            .fallback_models
-            .get(label)
-            .cloned()
-            .or_else(|| self.fallback_model.clone());
+        let fallback_model = self.models.fallback_model();
 
         CompletionRunner {
             ctx: self.clone(),
@@ -984,6 +966,11 @@ impl CompletionRunner {
     /// No effect if the completion has finished.
     pub fn follow_up(&mut self, message: String) {
         self.follow_up_message = Some(message);
+    }
+
+    /// Returns the name of the model currently used for completion.
+    pub fn model_name(&self) -> String {
+        self.model.model_name()
     }
 
     /// Execute the next step.
