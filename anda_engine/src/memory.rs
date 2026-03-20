@@ -55,13 +55,14 @@ pub static FUNCTION_DEFINITION: LazyLock<FunctionDefinition> = LazyLock::new(|| 
 });
 
 /// A conversation between an agent and the system, stored in the database for memory management.
-/// Version 1
+/// Version 2
 #[derive(Debug, Clone, Deserialize, Serialize, AndaDBSchema)]
 pub struct Conversation {
     /// The unique identifier for this resource in the Anda DB collection "conversation".
     pub _id: u64,
 
     #[field_type = "Bytes"]
+    #[serde(default = "Principal::anonymous")]
     pub user: Principal,
 
     #[field_type = "Option<Bytes>"]
@@ -101,6 +102,10 @@ pub struct Conversation {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ancestors: Option<Vec<u64>>,
 
+    /// An optional label for the conversation, which can be used for categorization or retrieval.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+
     /// The period when the conversation was created, in hours (timestamp / 3600 / 1000).
     /// It is used to index the conversation for faster retrieval by time.
     pub period: u64,
@@ -110,6 +115,29 @@ pub struct Conversation {
 
     /// The timestamp when the conversation was updated, in milliseconds.
     pub updated_at: u64,
+}
+
+impl Default for Conversation {
+    fn default() -> Self {
+        Self {
+            _id: 0,
+            user: Principal::anonymous(),
+            thread: None,
+            messages: Vec::new(),
+            resources: Vec::new(),
+            artifacts: Vec::new(),
+            status: ConversationStatus::default(),
+            failed_reason: None,
+            usage: Usage::default(),
+            steering_messages: None,
+            follow_up_messages: None,
+            ancestors: None,
+            label: None,
+            period: 0,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
 }
 
 impl Conversation {
@@ -152,6 +180,14 @@ impl Conversation {
                     Fv::Null
                 },
             ),
+            (
+                "label".to_string(),
+                if let Some(label) = self.label.clone() {
+                    label.into()
+                } else {
+                    Fv::Null
+                },
+            ),
         ]);
         if let Some(reason) = &self.failed_reason {
             changes.insert("failed_reason".to_string(), Fv::Text(reason.clone()));
@@ -179,6 +215,9 @@ impl From<Conversation> for Document {
         if let Some(thread) = conversation.thread {
             metadata.insert("thread".to_string(), thread.to_string().into());
         }
+        if let Some(label) = conversation.label {
+            metadata.insert("label".to_string(), label.into());
+        }
         Self {
             content: json_convert_rfc3339_timestamp(conversation.messages).into(),
             metadata,
@@ -196,11 +235,16 @@ pub struct ConversationRef<'a> {
     pub artifacts: &'a [Resource],
     pub status: &'a ConversationStatus,
     pub usage: &'a Usage,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub steering_messages: &'a Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub follow_up_messages: &'a Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: &'a Option<String>,
     pub period: u64,
     pub created_at: u64,
     pub updated_at: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ancestors: &'a Option<Vec<u64>>,
 }
 
@@ -217,6 +261,7 @@ impl<'a> From<&'a Conversation> for ConversationRef<'a> {
             usage: &conversation.usage,
             steering_messages: &conversation.steering_messages,
             follow_up_messages: &conversation.follow_up_messages,
+            label: &conversation.label,
             period: conversation.period,
             created_at: conversation.created_at,
             updated_at: conversation.updated_at,
@@ -249,9 +294,10 @@ impl From<&Conversation> for ConversationState {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ConversationStatus {
+    #[default]
     Submitted,
     Working,
     Completed,
@@ -308,7 +354,7 @@ pub struct MemoryManagement {
 impl MemoryManagement {
     pub async fn connect(db: Arc<AndaDB>, nexus: Arc<CognitiveNexus>) -> Result<Self, BoxError> {
         let mut schema = Conversation::schema()?;
-        schema.with_version(1);
+        schema.with_version(2);
 
         let conversations = db
             .open_or_create_collection(
@@ -1276,21 +1322,8 @@ mod tests {
     #[test]
     fn test_conversation_status() {
         let chat = Conversation {
-            _id: 0,
-            user: Principal::anonymous(),
-            thread: None,
-            messages: Vec::new(),
-            resources: Vec::new(),
-            artifacts: Vec::new(),
             status: ConversationStatus::Completed,
-            failed_reason: None,
-            period: 0,
-            created_at: 0,
-            updated_at: 0,
-            usage: Usage::default(),
-            ancestors: None,
-            steering_messages: None,
-            follow_up_messages: None,
+            ..Default::default()
         };
         let rt = ConversationStatus::Completed;
         println!("{}", rt);
