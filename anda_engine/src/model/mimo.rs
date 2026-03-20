@@ -9,6 +9,7 @@ use anda_core::{
 use log::{Level::Debug, log_enabled};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::HashMap;
 
 use super::{CompletionFeaturesDyn, request_client_builder};
 use crate::{rfc3339_datetime, unix_ms};
@@ -316,6 +317,7 @@ pub struct CompletionModel {
     pub model: String,
     // enabled， disabled
     thinking: Option<String>,
+    extra_body: Option<HashMap<String, Json>>,
 }
 
 impl CompletionModel {
@@ -329,6 +331,7 @@ impl CompletionModel {
             client,
             model: model.to_string(),
             thinking: None,
+            extra_body: None,
         }
     }
 
@@ -336,6 +339,12 @@ impl CompletionModel {
     /// Default is enabled.
     pub fn with_thinking(mut self, thinking: Option<String>) -> Self {
         self.thinking = thinking;
+        self
+    }
+
+    /// Sets extra body parameters for the model.
+    pub fn with_extra_body(mut self, extra_body: HashMap<String, Json>) -> Self {
+        self.extra_body = Some(extra_body);
         self
     }
 }
@@ -363,6 +372,7 @@ impl CompletionFeaturesDyn for CompletionModel {
         let model = self.model.clone();
         let client = self.client.clone();
         let thinking = self.thinking.clone();
+        let extra_body = self.extra_body.clone();
 
         Box::pin(async move {
             let timestamp = unix_ms();
@@ -468,6 +478,12 @@ impl CompletionFeaturesDyn for CompletionModel {
                         "type": thinking
                     }),
                 );
+            }
+
+            if let Some(extra_body) = extra_body {
+                for (k, v) in extra_body.into_iter() {
+                    body.insert(k, v);
+                }
             }
 
             if log_enabled!(Debug)

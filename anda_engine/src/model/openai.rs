@@ -13,6 +13,7 @@ use anda_core::{
 use log::{Level::Debug, log_enabled};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::HashMap;
 
 pub mod types;
 
@@ -526,6 +527,7 @@ pub struct Function {
 pub struct CompletionModel {
     client: Client,
     pub model: String,
+    extra_body: Option<HashMap<String, Json>>,
 }
 
 impl CompletionModel {
@@ -538,7 +540,14 @@ impl CompletionModel {
         Self {
             client,
             model: model.to_string(),
+            extra_body: None,
         }
+    }
+
+    /// Sets extra body parameters for the model.
+    pub fn with_extra_body(mut self, extra_body: HashMap<String, Json>) -> Self {
+        self.extra_body = Some(extra_body);
+        self
     }
 }
 
@@ -550,6 +559,7 @@ impl CompletionFeaturesDyn for CompletionModel {
     fn completion(&self, mut req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
         let model = self.model.clone();
         let client = self.client.clone();
+        let extra_body = self.extra_body.clone();
 
         Box::pin(async move {
             let timestamp = unix_ms();
@@ -649,6 +659,12 @@ impl CompletionFeaturesDyn for CompletionModel {
                     },
                 );
             };
+
+            if let Some(extra_body) = extra_body {
+                for (k, v) in extra_body.into_iter() {
+                    body.insert(k, v);
+                }
+            }
 
             if log_enabled!(Debug)
                 && let Ok(val) = serde_json::to_string(&body)
