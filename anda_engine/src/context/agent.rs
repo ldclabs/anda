@@ -56,7 +56,8 @@ pub struct AgentCtx {
     pub base: BaseCtx,
 
     /// Label of the agent.
-    pub(crate) label: String,
+    pub label: String,
+
     pub(crate) model: Model,
     // label -> model
     pub(crate) models: Arc<Models>,
@@ -84,9 +85,7 @@ impl AgentCtx {
         Self {
             base,
             label: String::new(),
-            model: models
-                .get_model()
-                .unwrap_or_else(Model::not_implemented),
+            model: models.get_model().unwrap_or_else(Model::not_implemented),
             models,
             tools,
             agents,

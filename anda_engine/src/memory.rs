@@ -40,16 +40,19 @@ pub static FUNCTION_DEFINITION: LazyLock<FunctionDefinition> = LazyLock::new(|| 
         "parameters": {
             "type": "object",
             "properties": {
-                "command": {
-                    "type": "string",
-                    "description": "A complete, multi-line KIP command (KQL, KML or META) string to be executed."
+                "commands": {
+                    "type": "array",
+                    "description": "An array of KIP commands for batch execution (reduces round-trips). Commands are executed sequentially; execution stops on first error.",
+                    "items": {
+                        "type": "string"
+                    }
                 },
                 "parameters": {
                     "type": "object",
-                    "description": "Optional JSON object of key-value pairs for safe placeholder substitution (placeholders start with ':', e.g., :name). Must be complete JSON tokens; do not embed in quoted strings. Only provide if placeholders are used in the command."
-                }
+                    "description": "An optional JSON object of key-value pairs used for safe substitution of placeholders in the command string(s). Placeholders should start with ':' (e.g., :name, :limit). IMPORTANT: A placeholder must represent a complete JSON value token (e.g., name: :name). Do not embed placeholders inside quoted strings (e.g., \"Hello :name\"), because substitution uses JSON serialization."
+                },
             },
-            "required": ["command"]
+            "required": ["commands"]
         }
     })).unwrap()
 });

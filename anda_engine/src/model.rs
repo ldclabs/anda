@@ -22,6 +22,7 @@ use arc_swap::ArcSwap;
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 
+pub mod anthropic;
 pub mod cohere;
 pub mod deepseek;
 pub mod doubao;
@@ -70,9 +71,10 @@ impl Models {
     /// map is promoted to the primary default model.
     pub fn set_models(&self, models: HashMap<String, Model>) {
         if self.model.load().is_none()
-            && let Some((_, m)) = models.iter().next() {
-                self.model.store(Arc::new(Some(m.clone())));
-            }
+            && let Some((_, m)) = models.iter().next()
+        {
+            self.model.store(Arc::new(Some(m.clone())));
+        }
         self.models.store(Arc::new(models));
     }
 

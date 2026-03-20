@@ -38,7 +38,7 @@ use candid::Principal;
 use ic_tee_cdk::AttestationRequest;
 use object_store::memory::InMemory;
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap},
     sync::Arc,
 };
 use structured_logger::unix_ms;
@@ -329,7 +329,7 @@ pub struct EngineBuilder {
     info: AgentInfo,
     tools: ToolSet<BaseCtx>,
     agents: AgentSet<AgentCtx>,
-    remote: BTreeMap<String, RemoteEngineArgs>,
+    remote: HashMap<String, RemoteEngineArgs>,
     models: Models, // label -> Model
     store: Store,
     web3: Arc<Web3SDK>,
@@ -360,7 +360,7 @@ impl EngineBuilder {
             },
             tools: ToolSet::new(),
             agents: AgentSet::new(),
-            remote: BTreeMap::new(),
+            remote: HashMap::new(),
             models: Models::default(),
             store: Store::new(mstore),
             web3: Arc::new(Web3SDK::Web3(Web3Client::not_implemented())),
