@@ -330,7 +330,7 @@ pub struct EngineBuilder {
     tools: ToolSet<BaseCtx>,
     agents: AgentSet<AgentCtx>,
     remote: HashMap<String, RemoteEngineArgs>,
-    models: Models, // label -> Model
+    models: Arc<Models>,
     store: Store,
     web3: Arc<Web3SDK>,
     hooks: Arc<Hooks>,
@@ -361,7 +361,7 @@ impl EngineBuilder {
             tools: ToolSet::new(),
             agents: AgentSet::new(),
             remote: HashMap::new(),
-            models: Models::default(),
+            models: Arc::new(Models::default()),
             store: Store::new(mstore),
             web3: Arc::new(Web3SDK::Web3(Web3Client::not_implemented())),
             hooks: Arc::new(Hooks::new()),
@@ -412,7 +412,7 @@ impl EngineBuilder {
     }
 
     /// Sets the models.
-    pub fn set_models(mut self, models: Models) -> Self {
+    pub fn set_models(mut self, models: Arc<Models>) -> Self {
         self.models = models;
         self
     }
@@ -541,7 +541,7 @@ impl EngineBuilder {
 
         let tools = Arc::new(ToolSet::new());
         let agents = Arc::new(AgentSet::new());
-        let ctx = AgentCtx::new(ctx, Arc::new(self.models), tools, agents);
+        let ctx = AgentCtx::new(ctx, self.models, tools, agents);
 
         Engine {
             id,
@@ -605,7 +605,7 @@ impl EngineBuilder {
 
         let tools = Arc::new(self.tools);
         let agents = Arc::new(self.agents);
-        let ctx = AgentCtx::new(ctx, Arc::new(self.models), tools.clone(), agents.clone());
+        let ctx = AgentCtx::new(ctx, self.models, tools.clone(), agents.clone());
 
         let meta = RequestMeta::default();
         for (name, tool) in &tools.set {
@@ -659,7 +659,7 @@ impl EngineBuilder {
 
         AgentCtx::new(
             ctx,
-            Arc::new(self.models),
+            self.models,
             Arc::new(self.tools),
             Arc::new(self.agents),
         )
