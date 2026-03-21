@@ -411,6 +411,12 @@ impl EngineBuilder {
         self
     }
 
+    /// Sets the models.
+    pub fn set_models(mut self, models: Models) -> Self {
+        self.models = models;
+        self
+    }
+
     /// Sets the storage backend for the engine.
     pub fn with_store(mut self, store: Store) -> Self {
         self.store = store;

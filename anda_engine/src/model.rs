@@ -59,7 +59,34 @@ impl Default for Models {
     }
 }
 
+impl From<HashMap<String, Model>> for Models {
+    fn from(models: HashMap<String, Model>) -> Self {
+        let model = models.values().next().cloned();
+        Self {
+            model: ArcSwap::new(Arc::new(model)),
+            models: ArcSwap::new(Arc::new(models)),
+            fallback_model: ArcSwap::new(Arc::new(None)),
+        }
+    }
+}
+
 impl Models {
+    /// Creates a new Models instance by cloning the internal state of another Models instance.
+    pub fn from_clone(other: &Models) -> Self {
+        let models: HashMap<String, Model> = HashMap::from_iter(
+            other
+                .models
+                .load()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone())),
+        );
+        Self {
+            model: ArcSwap::new(other.model.load_full()),
+            models: ArcSwap::new(Arc::new(models)),
+            fallback_model: ArcSwap::new(other.fallback_model.load_full()),
+        }
+    }
+
     /// Sets the primary default model.
     pub fn set_model(&self, model: Model) {
         self.model.store(Arc::new(Some(model)));

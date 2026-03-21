@@ -31,6 +31,7 @@ pub struct Client {
     endpoint: String,
     api_key: String,
     api_version: String,
+    bearer_auth: bool,
     http: reqwest::Client,
 }
 
@@ -52,6 +53,7 @@ impl Client {
         };
         Self {
             endpoint,
+            bearer_auth: false,
             api_key: api_key.to_string(),
             api_version: API_VERSION.to_string(),
             http: request_client_builder()
@@ -64,6 +66,7 @@ impl Client {
     pub fn with_client(self, http: reqwest::Client) -> Self {
         Self {
             endpoint: self.endpoint,
+            bearer_auth: self.bearer_auth,
             api_key: self.api_key,
             api_version: self.api_version,
             http,
@@ -75,13 +78,22 @@ impl Client {
         self
     }
 
+    pub fn with_bearer_auth(mut self, bearer_auth: bool) -> Self {
+        self.bearer_auth = bearer_auth;
+        self
+    }
+
     /// Creates a POST request builder for the specified API path
     fn post(&self, path: &str) -> reqwest::RequestBuilder {
         let url = format!("{}{}", self.endpoint, path);
-        self.http
-            .post(url)
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", &self.api_version)
+        if self.bearer_auth {
+            self.http.post(url).bearer_auth(&self.api_key)
+        } else {
+            self.http
+                .post(url)
+                .header("x-api-key", &self.api_key)
+                .header("anthropic-version", &self.api_version)
+        }
     }
 
     /// Creates a new completion model instance
