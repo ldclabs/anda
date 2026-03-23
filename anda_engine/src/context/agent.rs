@@ -184,6 +184,7 @@ impl AgentCtx {
             follow_up_message: None,
             done: false,
             step: 0,
+            hook: Arc::new(NoopCompletionHook),
         }
     }
 
@@ -940,7 +941,21 @@ pub struct CompletionRunner {
     follow_up_message: Option<String>,
     done: bool,
     step: usize,
+    hook: Arc<dyn CompletionHook>,
 }
+
+#[async_trait::async_trait]
+pub trait CompletionHook: Send + Sync {
+    async fn on_completion_start(
+        &self,
+        req: CompletionRequest,
+    ) -> Result<CompletionRequest, BoxError> {
+        Ok(req)
+    }
+}
+
+pub struct NoopCompletionHook;
+impl CompletionHook for NoopCompletionHook {}
 
 impl CompletionRunner {
     /// Returns whether the completion has finished.
@@ -965,6 +980,11 @@ impl CompletionRunner {
     /// No effect if the completion has finished.
     pub fn follow_up(&mut self, message: String) {
         self.follow_up_message = Some(message);
+    }
+
+    /// Sets a completion hook to customize the completion request before each turn.
+    pub fn set_hook(&mut self, hook: Arc<dyn CompletionHook>) {
+        self.hook = hook;
     }
 
     /// Returns the name of the model currently used for completion.
@@ -999,7 +1019,8 @@ impl CompletionRunner {
     async fn inner_next(&mut self) -> Result<Option<AgentOutput>, BoxError> {
         self.step += 1;
 
-        let mut output = self.model.completion(self.req.clone()).await?;
+        let req = self.hook.on_completion_start(self.req.clone()).await?;
+        let mut output = self.model.completion(req).await?;
         output.model = Some(self.model.model_name());
 
         self.usage.accumulate(&output.usage);
@@ -1237,7 +1258,7 @@ impl CompletionRunner {
 }
 
 pub struct CompletionStream {
-    runner: CompletionRunner,
+    pub runner: CompletionRunner,
 }
 
 impl Stream for CompletionStream {
