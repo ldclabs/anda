@@ -517,7 +517,7 @@ impl FunctionDefinition {
     }
 }
 
-/// Returns the number of tokens in the given content in the simplest way.
+/// Estimate the number of tokens in the given content in the simplest way.
 pub fn evaluate_tokens(content: &str) -> usize {
     content.len() / 3
 }

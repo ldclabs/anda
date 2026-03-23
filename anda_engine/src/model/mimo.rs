@@ -168,68 +168,58 @@ pub struct MessageInput {
     pub tool_call_id: Option<String>,
 }
 
-fn to_message_input(msg: &Message) -> Vec<MessageInput> {
-    let mut res = Vec::new();
+fn to_message_input(msg: &Message) -> MessageInput {
+    let mut arr: Vec<Json> = Vec::new();
+    let mut res = MessageInput {
+        role: msg.role.clone(),
+        content: Json::Null,
+        tool_call_id: None,
+    };
     for content in msg.content.iter() {
         match content {
-            ContentPart::Text { text } => res.push(MessageInput {
-                role: msg.role.clone(),
-                content: text.clone().into(),
-                tool_call_id: None,
-            }),
+            ContentPart::Text { text } => arr.push(json!({
+                "type": "text",
+                "text": text,
+            })),
             ContentPart::ToolOutput {
                 output, call_id, ..
-            } => res.push(MessageInput {
-                role: msg.role.clone(),
-                content: serde_json::to_string(output).unwrap_or_default().into(),
-                tool_call_id: call_id.clone(),
-            }),
-            ContentPart::FileData {
-                file_uri,
-                mime_type,
-            } => res.push(MessageInput {
-                role: msg.role.clone(),
-                content: match mime_type.clone().unwrap_or_default().as_str() {
+            } => {
+                arr.push(serde_json::to_string(output).unwrap_or_default().into());
+                res.tool_call_id = call_id.clone();
+            }
+            ContentPart::InlineData { data, mime_type } => {
+                match mime_type.as_str() {
                     mt if mt.starts_with("image") => {
-                        json!({
-                            "type": "input_image",
-                            "image_url":  {
-                                "url": file_uri,
+                        arr.push(json!({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": data.to_string(),
                             },
-                        })
+                        }));
                     }
-                    _ => serde_json::to_string(content).unwrap_or_default().into(),
-                },
-                tool_call_id: None,
-            }),
-            ContentPart::InlineData { data, mime_type } => res.push(MessageInput {
-                role: msg.role.clone(),
-                content: match mime_type.as_str() {
-                    mt if mt.starts_with("image") => {
-                        json!({
-                            "type": "input_image",
-                            "image_url":  {
-                                "url": data,
+                    mt if mt.starts_with("video") => {
+                        arr.push(json!({
+                            "type": "video_url",
+                            "video_url": {
+                                "url": data.to_string(),
                             },
-                        })
+                        }));
                     }
-                    _ => json!({
-                        "type": "file",
-                        "file":  {
-                            "file_data": data,
-                        },
-                    }),
-                },
-                tool_call_id: None,
-            }),
-            // TODO: handle other content parts
-            v => res.push(MessageInput {
-                role: msg.role.clone(),
-                content: serde_json::to_string(v).unwrap_or_default().into(),
-                tool_call_id: None,
-            }),
+                    mt if mt.starts_with("audio") => {
+                        arr.push(json!({
+                            "type": "input_audio",
+                            "input_audio": {
+                                "data": data.to_string(),
+                            },
+                        }));
+                    }
+                    _ => {}
+                };
+            }
+            _ => {} // TODO: handle other content parts
         }
     }
+    res.content = Json::Array(arr);
     res
 }
 
@@ -391,10 +381,7 @@ impl CompletionFeaturesDyn for CompletionModel {
             let skip_raw = raw_history.len();
 
             for msg in req.chat_history {
-                let val = to_message_input(&msg);
-                for v in val {
-                    raw_history.push(serde_json::to_value(&v)?);
-                }
+                raw_history.push(json!(to_message_input(&msg)));
             }
 
             if let Some(mut msg) = req
@@ -402,10 +389,7 @@ impl CompletionFeaturesDyn for CompletionModel {
                 .to_message(&rfc3339_datetime(timestamp).unwrap())
             {
                 msg.timestamp = Some(timestamp);
-                let val = to_message_input(&msg);
-                for v in val {
-                    raw_history.push(serde_json::to_value(&v)?);
-                }
+                raw_history.push(json!(to_message_input(&msg)));
                 chat_history.push(msg);
             }
 
@@ -421,10 +405,7 @@ impl CompletionFeaturesDyn for CompletionModel {
                     ..Default::default()
                 };
 
-                let val = to_message_input(&msg);
-                for v in val {
-                    raw_history.push(serde_json::to_value(&v)?);
-                }
+                raw_history.push(json!(to_message_input(&msg)));
                 chat_history.push(msg);
             }
 

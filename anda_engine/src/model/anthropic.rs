@@ -10,6 +10,7 @@ use anda_core::{
     Resource,
 };
 use log::{Level::Debug, log_enabled};
+use serde_json::json;
 
 use super::{CompletionFeaturesDyn, request_client_builder};
 use crate::{rfc3339_datetime, unix_ms};
@@ -186,7 +187,7 @@ impl CompletionFeaturesDyn for CompletionModel {
 
             for msg in req.chat_history {
                 let val = types::Message::from(msg);
-                raw_history.push(serde_json::to_value(&val)?);
+                raw_history.push(json!(&val));
                 creq.messages.push(val);
             }
 
@@ -197,7 +198,7 @@ impl CompletionFeaturesDyn for CompletionModel {
                 msg.timestamp = Some(timestamp);
                 chat_history.push(msg.clone());
                 let msg = types::Message::from(msg);
-                raw_history.push(serde_json::to_value(&msg)?);
+                raw_history.push(json!(&msg));
                 creq.messages.push(msg);
             }
 
@@ -215,7 +216,7 @@ impl CompletionFeaturesDyn for CompletionModel {
 
                 chat_history.push(msg.clone());
                 let msg = types::Message::from(msg);
-                raw_history.push(serde_json::to_value(&msg)?);
+                raw_history.push(json!(&msg));
                 creq.messages.push(msg);
             }
 
