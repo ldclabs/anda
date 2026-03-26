@@ -1111,7 +1111,16 @@ impl CompletionRunner {
                             tool.result = Some(res);
                             (Some(tool), None)
                         }
-                        Err(err) => (None, Some(err.to_string())),
+                        Err(err) => {
+                            // 工具调用失败了，但我们不一定要因此终止整个对话流程，可以让 LLM 尝试纠正错误并继续对话
+                            {
+                                tool.result = Some(ToolOutput {
+                                    output: Json::String(format!("tool call error: {}", err)),
+                                    ..Default::default()
+                                });
+                                (Some(tool), None)
+                            }
+                        }
                     }
                 }));
             } else if self.ctx.agents.contains(&tool.name)
@@ -1882,7 +1891,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn runner_tool_call_failure_produces_failed_reason() {
+    async fn runner_tool_call_failure_dont_produces_failed_reason() {
         let completer = ToolCallCompleter {
             tool_calls: vec![ToolCall {
                 name: "fail_tool".to_string(),
@@ -1907,14 +1916,8 @@ mod tests {
 
         let mut runner = ctx.completion_iter(req, Vec::new());
         let output = runner.next().await.unwrap().unwrap();
-        assert!(runner.is_done());
-        assert!(output.failed_reason.is_some());
-        assert!(
-            output
-                .failed_reason
-                .unwrap()
-                .contains("tool execution failed")
-        );
+        assert!(!runner.is_done());
+        assert!(output.failed_reason.is_none());
     }
 
     // ── Agent call tests ──
