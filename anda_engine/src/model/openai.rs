@@ -714,6 +714,8 @@ impl CompletionFeaturesDyn for CompletionModel {
 #[derive(Clone)]
 pub struct CompletionModelV2 {
     client: Client,
+    /// Default request template
+    default_request: types::CompletionRequest,
     pub model: String,
 }
 
@@ -726,8 +728,23 @@ impl CompletionModelV2 {
     pub fn new(client: Client, model: &str) -> Self {
         Self {
             client,
+            default_request: types::CompletionRequest {
+                model: model.to_string(),
+                additional_parameters: types::AdditionalParameters {
+                    store: Some(false),
+                    reasoning: Some(types::Reasoning::default()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
             model: model.to_string(),
         }
+    }
+
+    /// Sets a default request template for the model
+    pub fn with_default_request(mut self, req: types::CompletionRequest) -> Self {
+        self.default_request = req;
+        self
     }
 }
 
@@ -737,18 +754,14 @@ impl CompletionFeaturesDyn for CompletionModelV2 {
     }
 
     fn completion(&self, req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
-        let model = self.model.clone();
         let client = self.client.clone();
+        let mut oreq = self.default_request.clone();
+        oreq.model = self.model.clone();
 
         Box::pin(async move {
             let timestamp = unix_ms();
             let mut raw_history: Vec<Json> = Vec::new();
             let mut chat_history: Vec<Message> = Vec::new();
-            let mut oreq = types::CompletionRequest {
-                model,
-                ..Default::default()
-            };
-            oreq.additional_parameters.store = Some(false);
 
             if !req.instructions.is_empty() {
                 oreq.instructions = Some(req.instructions);
@@ -833,6 +846,8 @@ impl CompletionFeaturesDyn for CompletionModelV2 {
                 });
             };
 
+            println!("oreq: {:#?}", serde_json::to_string_pretty(&oreq)?);
+
             if log_enabled!(Debug)
                 && let Ok(val) = serde_json::to_string(&oreq)
             {
@@ -872,5 +887,27 @@ impl CompletionFeaturesDyn for CompletionModelV2 {
                 Err(format!("OpenAI completions error: {}", msg).into())
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore]
+    async fn test_openai() {
+        let cli = Client::new(
+            "sk-or-v1-0**",
+            Some("https://openrouter.ai/api/v1".to_string()),
+        )
+        .completion_model_v2("openai/gpt-5.4-mini");
+        let res = cli
+            .completion(CompletionRequest {
+                prompt: "What is 1+1?".to_string(),
+                ..Default::default()
+            })
+            .await;
+        println!("res: {:#?}", res);
     }
 }

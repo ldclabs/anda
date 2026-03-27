@@ -24,6 +24,7 @@ pub struct CompletionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
     /// Controls which (if any) tool is called by the model. "none", "auto", "required"
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<String>,
     /// The tools you want to use. Currently this is limited to functions, but will be expanded on in future.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -179,6 +180,7 @@ pub enum MessageItem {
         arguments: String, // JSON format
         call_id: String,
         id: Option<String>,
+        namespace: Option<String>,
         status: Option<String>,
     },
     FunctionCallOutput {
@@ -235,6 +237,7 @@ pub fn message_into(msg: Message) -> Vec<MessageItem> {
                     name,
                     arguments: serde_json::to_string(&args).unwrap_or_default(),
                     call_id: call_id.unwrap_or_default(),
+                    namespace: None,
                     id: None,
                     status: None,
                 });
@@ -307,10 +310,9 @@ pub fn message_from(output: Vec<MessageItem>) -> (Option<Message>, Option<String
             MessageItem::FunctionCallOutput {
                 output, call_id, ..
             } => {
-                let out: Json = serde_json::from_str(&output).unwrap_or_default();
                 msg.content.push(ContentPart::ToolOutput {
                     name: "".to_string(),
-                    output: out,
+                    output: serde_json::from_str(&output).unwrap_or_default(),
                     call_id: Some(call_id),
                     remote_id: None,
                 });
@@ -495,15 +497,14 @@ pub struct StructuredOutputsInput {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Reasoning {
     /// How much effort you want the model to put into thinking/reasoning.
-    pub effort: Option<ReasoningEffort>,
+    pub effort: ReasoningEffort,
     /// How much effort you want the model to put into writing the reasoning summary.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub summary: Option<ReasoningSummaryLevel>,
+    pub summary: ReasoningSummaryLevel,
 }
 
 /// The billing service tier that will be used. On auto by default.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "lowercase")]
 pub enum OpenAIServiceTier {
     #[default]
     Auto,
@@ -513,18 +514,19 @@ pub enum OpenAIServiceTier {
 
 /// The amount of reasoning effort that will be used by a given model.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
     Minimal,
     Low,
     #[default]
     Medium,
     High,
+    XHigh,
 }
 
 /// The amount of effort that will go into a reasoning summary by a given model.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "lowercase")]
 pub enum ReasoningSummaryLevel {
     #[default]
     Auto,
@@ -663,6 +665,7 @@ mod tests {
                 name: "f".into(),
                 arguments: r#"{"x":1}"#.into(),
                 call_id: "c1".into(),
+                namespace: None,
                 id: None,
                 status: None,
             },
@@ -770,6 +773,7 @@ mod tests {
             arguments: r#"{"a":1}"#.into(),
             call_id: "cid".into(),
             id: None,
+            namespace: None,
             status: None,
         };
         let s = serde_json::to_string(&item).unwrap();
