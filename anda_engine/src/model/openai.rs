@@ -307,6 +307,14 @@ pub struct CompletionResponse {
 }
 
 impl CompletionResponse {
+    pub fn parse_output(&mut self) {
+        for choice in self.choices.iter_mut() {
+            if let Ok(msg) = serde_json::from_value::<MessageOutput>(choice.message.clone()) {
+                choice.parsed_message = Some(msg);
+            }
+        }
+    }
+
     fn try_into(
         mut self,
         raw_history: Vec<Json>,
@@ -331,13 +339,17 @@ impl CompletionResponse {
         if !matches!(choice.finish_reason.as_str(), "stop" | "tool_calls") {
             output.failed_reason = Some(choice.finish_reason);
         } else {
-            if let Some(refusal) = &choice.message.refusal {
+            output.raw_history.push(choice.message);
+            let timestamp = unix_ms();
+            let msg = choice
+                .parsed_message
+                .ok_or("Failed to parse message output")?;
+
+            if let Some(refusal) = &msg.refusal {
                 output.failed_reason = Some(refusal.clone());
             }
 
-            output.raw_history.push(json!(&choice.message));
-            let timestamp = unix_ms();
-            let mut msg: Message = choice.message.into();
+            let mut msg: Message = msg.into();
             msg.name = Some(self.model);
             msg.timestamp = Some(timestamp);
             output.content = msg.text().unwrap_or_default();
@@ -351,8 +363,11 @@ impl CompletionResponse {
     fn maybe_failed(&self) -> bool {
         !self.choices.iter().any(|choice| {
             matches!(choice.finish_reason.as_str(), "stop" | "tool_calls")
-                && choice.message.refusal.is_none()
-                && (!choice.message.content.is_empty() || choice.message.tool_calls.is_some())
+                && choice
+                    .parsed_message
+                    .as_ref()
+                    .map(|m| !m.content.is_empty() || m.tool_calls.is_some())
+                    .unwrap_or(false)
         })
     }
 }
@@ -383,6 +398,11 @@ fn to_message_input(msg: &Message) -> MessageInput {
             ContentPart::ToolOutput {
                 output, call_id, ..
             } => {
+                if msg.content.len() == 1 {
+                    res.content = serde_json::to_value(output).unwrap_or_default();
+                    res.tool_call_id = call_id.clone();
+                    return res;
+                }
                 arr.push(json!({
                     "type": "text",
                     "text": serde_json::to_string(output).unwrap_or_default(),
@@ -443,8 +463,11 @@ fn to_message_input(msg: &Message) -> MessageInput {
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Choice {
     pub index: usize,
-    pub message: MessageOutput,
+    pub message: Json,
     pub finish_reason: String,
+
+    #[serde(skip)]
+    pub parsed_message: Option<MessageOutput>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -453,6 +476,9 @@ pub struct MessageOutput {
 
     #[serde(default)]
     pub content: String,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refusal: Option<String>,
@@ -657,7 +683,8 @@ impl CompletionFeaturesDyn for CompletionModel {
             if response.status().is_success() {
                 let text = response.text().await?;
                 match serde_json::from_str::<CompletionResponse>(&text) {
-                    Ok(res) => {
+                    Ok(mut res) => {
+                        res.parse_output();
                         if log_enabled!(Debug) {
                             log::debug!(
                                 request:serde = body,

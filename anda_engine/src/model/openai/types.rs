@@ -98,7 +98,7 @@ pub struct CompletionResponse {
     pub usage: ResponsesUsage,
     /// The model output (messages, etc will go here)
     pub output: Vec<Json>,
-    #[serde(default)]
+    #[serde(skip, default)]
     pub parsed_output: Vec<MessageItem>,
     /// Tools
     #[serde(default)]
