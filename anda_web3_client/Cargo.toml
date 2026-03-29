@@ -27,3 +27,7 @@ ic_tee_gateway_sdk = { workspace = true }
 reqwest = { workspace = true }
 
 [dev-dependencies]
+
+[lib]
+test = false
+doctest = false

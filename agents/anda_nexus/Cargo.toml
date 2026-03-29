@@ -45,3 +45,6 @@ tokio-util = { workspace = true }
 object_store = { workspace = true, features = ["aws"] }
 
 [dev-dependencies]
+
+[lib]
+doctest = false

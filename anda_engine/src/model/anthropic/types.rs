@@ -96,7 +96,7 @@ pub enum MessageContent {
 }
 
 /// Content block in a message
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
 #[serde(tag = "type")]
 pub enum ContentBlock {
     /// Text content
@@ -124,6 +124,85 @@ pub enum ContentBlock {
     /// Redacted thinking
     #[serde(rename = "redacted_thinking")]
     RedactedThinking { data: String },
+    #[serde(untagged)]
+    Any(Value),
+}
+
+impl<'de> Deserialize<'de> for ContentBlock {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        match &value {
+            Value::Object(map)
+                if matches!(
+                    map.get("type").and_then(|t| t.as_str()),
+                    Some(
+                        "text"
+                            | "image"
+                            | "tool_use"
+                            | "tool_result"
+                            | "thinking"
+                            | "redacted_thinking"
+                    )
+                ) =>
+            {
+                #[derive(Deserialize)]
+                #[serde(tag = "type")]
+                enum Helper {
+                    #[serde(rename = "text")]
+                    Text { text: String },
+                    #[serde(rename = "image")]
+                    Image { source: ImageSource },
+                    #[serde(rename = "tool_use")]
+                    ToolUse {
+                        id: String,
+                        name: String,
+                        input: Value,
+                    },
+                    #[serde(rename = "tool_result")]
+                    ToolResult {
+                        tool_use_id: String,
+                        content: String,
+                    },
+                    #[serde(rename = "thinking")]
+                    Thinking { thinking: String, signature: String },
+                    #[serde(rename = "redacted_thinking")]
+                    RedactedThinking { data: String },
+                }
+
+                match serde_json::from_value::<Helper>(value.clone()) {
+                    Ok(h) => Ok(match h {
+                        Helper::Text { text } => ContentBlock::Text { text },
+                        Helper::Image { source } => ContentBlock::Image { source },
+                        Helper::ToolUse { id, name, input } => {
+                            ContentBlock::ToolUse { id, name, input }
+                        }
+                        Helper::ToolResult {
+                            tool_use_id,
+                            content,
+                        } => ContentBlock::ToolResult {
+                            tool_use_id,
+                            content,
+                        },
+                        Helper::Thinking {
+                            thinking,
+                            signature,
+                        } => ContentBlock::Thinking {
+                            thinking,
+                            signature,
+                        },
+                        Helper::RedactedThinking { data } => {
+                            ContentBlock::RedactedThinking { data }
+                        }
+                    }),
+                    Err(_) => Ok(ContentBlock::Any(value)),
+                }
+            }
+            _ => Ok(ContentBlock::Any(value)),
+        }
+    }
 }
 
 /// Source of an image
@@ -369,6 +448,7 @@ impl From<ContentBlock> for ContentPart {
                 "type": "redacted_thinking",
                 "data": data,
             })),
+            ContentBlock::Any(value) => ContentPart::Any(value),
         }
     }
 }
@@ -381,14 +461,15 @@ impl From<CoreMessage> for Message {
         };
         let blocks: Vec<ContentBlock> = msg.content.into_iter().map(|v| v.into()).collect();
         if blocks.len() == 1
-            && let Some(ContentBlock::Text { text }) = blocks.first() {
-                return Message {
-                    role,
-                    content: MessageContent::Text {
-                        content: text.clone(),
-                    },
-                };
-            }
+            && let Some(ContentBlock::Text { text }) = blocks.first()
+        {
+            return Message {
+                role,
+                content: MessageContent::Text {
+                    content: text.clone(),
+                },
+            };
+        }
         Message {
             role,
             content: MessageContent::Blocks { content: blocks },

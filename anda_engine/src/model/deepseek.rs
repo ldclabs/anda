@@ -156,7 +156,7 @@ impl CompletionResponse {
     fn maybe_failed(&self) -> bool {
         !self.choices.iter().any(|choice| {
             matches!(choice.finish_reason.as_str(), "stop" | "tool_calls")
-                && (choice.message.content.is_some() || choice.message.tool_calls.is_some())
+                && (!choice.message.content.is_empty() || choice.message.tool_calls.is_some())
         })
     }
 }
@@ -210,8 +210,8 @@ pub struct Choice {
 #[derive(Debug, Deserialize, Serialize)]
 pub struct MessageOutput {
     pub role: String,
-
-    pub content: Option<String>,
+    #[serde(default)]
+    pub content: String,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
@@ -223,8 +223,8 @@ pub struct MessageOutput {
 impl From<MessageOutput> for Message {
     fn from(msg: MessageOutput) -> Self {
         let mut content = Vec::new();
-        if let Some(text) = msg.content {
-            content.push(ContentPart::Text { text });
+        if !msg.content.is_empty() {
+            content.push(ContentPart::Text { text: msg.content });
         }
         if let Some(text) = msg.reasoning_content {
             content.push(ContentPart::Reasoning { text });

@@ -277,6 +277,7 @@ impl From<Part> for ContentPart {
                 call_id: id,
                 remote_id: None,
             },
+            PartKind::Any(val) => ContentPart::Any(val),
             _ => {
                 value.thought_signature = None;
                 ContentPart::Any(json!(value.data))
@@ -285,7 +286,7 @@ impl From<Part> for ContentPart {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Serialize, Clone, PartialEq)]
 #[serde(rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum PartKind {
     CodeExecutionResult {
@@ -325,6 +326,108 @@ pub enum PartKind {
         data: String,
     },
     Text(String),
+    #[serde(untagged)]
+    Any(Value),
+}
+
+impl<'de> Deserialize<'de> for PartKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        // Text variant is just a string under "text" key (handled by flatten in Part)
+        if let Value::String(s) = &value {
+            return Ok(PartKind::Text(s.clone()));
+        }
+        if let Value::Object(map) = &value {
+            // Detect variant by checking which key exists
+            if map.contains_key("codeExecutionResult")
+                || map.contains_key("executableCode")
+                || map.contains_key("fileData")
+                || map.contains_key("functionCall")
+                || map.contains_key("functionResponse")
+                || map.contains_key("inlineData")
+                || map.contains_key("text")
+            {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase", rename_all_fields = "camelCase")]
+                enum Helper {
+                    CodeExecutionResult {
+                        outcome: String,
+                        output: String,
+                    },
+                    ExecutableCode {
+                        language: String,
+                        code: String,
+                    },
+                    FileData {
+                        file_uri: String,
+                        mime_type: Option<String>,
+                    },
+                    FunctionCall {
+                        name: String,
+                        args: Option<Value>,
+                        id: Option<String>,
+                    },
+                    FunctionResponse {
+                        name: String,
+                        response: FunctionResponseValue,
+                        id: Option<String>,
+                        will_continue: Option<bool>,
+                        scheduling: Option<String>,
+                        parts: Option<Vec<Value>>,
+                    },
+                    InlineData {
+                        mime_type: String,
+                        data: String,
+                    },
+                    Text(String),
+                }
+
+                if let Ok(h) = serde_json::from_value::<Helper>(value.clone()) {
+                    return Ok(match h {
+                        Helper::CodeExecutionResult { outcome, output } => {
+                            PartKind::CodeExecutionResult { outcome, output }
+                        }
+                        Helper::ExecutableCode { language, code } => {
+                            PartKind::ExecutableCode { language, code }
+                        }
+                        Helper::FileData {
+                            file_uri,
+                            mime_type,
+                        } => PartKind::FileData {
+                            file_uri,
+                            mime_type,
+                        },
+                        Helper::FunctionCall { name, args, id } => {
+                            PartKind::FunctionCall { name, args, id }
+                        }
+                        Helper::FunctionResponse {
+                            name,
+                            response,
+                            id,
+                            will_continue,
+                            scheduling,
+                            parts,
+                        } => PartKind::FunctionResponse {
+                            name,
+                            response,
+                            id,
+                            will_continue,
+                            scheduling,
+                            parts,
+                        },
+                        Helper::InlineData { mime_type, data } => {
+                            PartKind::InlineData { mime_type, data }
+                        }
+                        Helper::Text(text) => PartKind::Text(text),
+                    });
+                }
+            }
+        }
+        Ok(PartKind::Any(value))
+    }
 }
 
 // The function response in JSON object format. Use "output" key to specify function output and "error" key to specify error details (if any)

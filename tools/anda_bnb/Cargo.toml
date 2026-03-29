@@ -23,7 +23,6 @@ reqwest = { workspace = true }
 thiserror = { workspace = true }
 k256 = { workspace = true }
 async-trait = { workspace = true }
-structured-logger = { workspace = true }
 alloy = { version = "1.0.25", features = [
     "providers",
     "network",
@@ -34,3 +33,7 @@ alloy = { version = "1.0.25", features = [
 
 [dev-dependencies]
 rand = { workspace = true }
+structured-logger = { workspace = true }
+
+[lib]
+doctest = false

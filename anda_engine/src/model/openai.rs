@@ -352,7 +352,7 @@ impl CompletionResponse {
         !self.choices.iter().any(|choice| {
             matches!(choice.finish_reason.as_str(), "stop" | "tool_calls")
                 && choice.message.refusal.is_none()
-                && (choice.message.content.is_some() || choice.message.tool_calls.is_some())
+                && (!choice.message.content.is_empty() || choice.message.tool_calls.is_some())
         })
     }
 }
@@ -367,86 +367,73 @@ pub struct MessageInput {
     pub tool_call_id: Option<String>,
 }
 
-fn to_message_input(msg: &Message) -> Vec<MessageInput> {
-    let mut res = Vec::new();
+fn to_message_input(msg: &Message) -> MessageInput {
+    let mut arr: Vec<Json> = Vec::new();
+    let mut res = MessageInput {
+        role: msg.role.clone(),
+        content: Json::Null,
+        tool_call_id: None,
+    };
     for content in msg.content.iter() {
         match content {
-            ContentPart::Text { text } => res.push(MessageInput {
-                role: msg.role.clone(),
-                content: text.clone().into(),
-                tool_call_id: None,
-            }),
+            ContentPart::Text { text } => arr.push(json!({
+                "type": "text",
+                "text": text,
+            })),
             ContentPart::ToolOutput {
                 output, call_id, ..
-            } => res.push(MessageInput {
-                role: msg.role.clone(),
-                content: serde_json::to_string(output).unwrap_or_default().into(),
-                tool_call_id: call_id.clone(),
-            }),
+            } => {
+                arr.push(serde_json::to_string(output).unwrap_or_default().into());
+                res.tool_call_id = call_id.clone();
+            }
             ContentPart::FileData {
                 file_uri,
                 mime_type,
-            } => res.push(MessageInput {
-                role: msg.role.clone(),
-                content: match mime_type.clone().unwrap_or_default().as_str() {
+            } => match mime_type.clone().unwrap_or_default().as_str() {
+                mt if mt.starts_with("image") => arr.push(json!({
+                    "type": "image_url",
+                    "image_url":  {
+                        "url": file_uri,
+                    },
+                })),
+                _ => arr.push(json!({
+                    "type": "file",
+                    "file":  {
+                        "file_data": file_uri,
+                    },
+                })),
+            },
+            ContentPart::InlineData { data, mime_type } => {
+                match mime_type.as_str() {
                     mt if mt.starts_with("image") => {
-                        json!({
-                            "type": "input_image",
-                            "image_url":  {
-                                "url": file_uri,
+                        arr.push(json!({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": data.to_string(),
                             },
-                        })
+                        }));
                     }
-                    _ => serde_json::to_string(content).unwrap_or_default().into(),
-                },
-                tool_call_id: None,
-            }),
-            ContentPart::InlineData { data, mime_type } => res.push(MessageInput {
-                role: msg.role.clone(),
-                content: match mime_type.as_str() {
-                    mt if mt.starts_with("image") => {
-                        json!({
-                            "type": "input_image",
-                            "image_url":  {
-                                "url": data,
-                            },
-                        })
-                    }
-                    "audio/wav" => {
-                        json!({
+                    mt if mt.starts_with("audio") => {
+                        arr.push(json!({
                             "type": "input_audio",
-                            "input_audio":  {
-                                "data": data,
-                                "format": "wav",
+                            "input_audio": {
+                                "data": data.to_string(),
+                                "format": if mt.contains("wav") { "wav" } else { "mp3" },
                             },
-                        })
+                        }));
                     }
-                    "audio/mp3" => {
-                        json!({
-                            "type": "input_audio",
-                            "input_audio":  {
-                                "data": data,
-                                "format": "mp3",
-                            },
-                        })
-                    }
-                    _ => json!({
+                    _ => arr.push(json!({
                         "type": "file",
                         "file":  {
                             "file_data": data,
                         },
-                    }),
-                },
-                tool_call_id: None,
-            }),
-            // TODO: handle other content parts
-            v => res.push(MessageInput {
-                role: msg.role.clone(),
-                content: serde_json::to_string(v).unwrap_or_default().into(),
-                tool_call_id: None,
-            }),
+                    })),
+                };
+            }
+            v => arr.push(json!(v)),
         }
     }
+    res.content = Json::Array(arr);
     res
 }
 
@@ -462,7 +449,7 @@ pub struct MessageOutput {
     pub role: String,
 
     #[serde(default)]
-    pub content: Option<String>,
+    pub content: String,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refusal: Option<String>,
@@ -474,8 +461,8 @@ pub struct MessageOutput {
 impl From<MessageOutput> for Message {
     fn from(msg: MessageOutput) -> Self {
         let mut content = Vec::new();
-        if let Some(text) = msg.content {
-            content.push(ContentPart::Text { text });
+        if !msg.content.is_empty() {
+            content.push(ContentPart::Text { text: msg.content });
         }
         if let Some(tool_calls) = msg.tool_calls {
             for tc in tool_calls {
@@ -578,10 +565,7 @@ impl CompletionFeaturesDyn for CompletionModel {
             let skip_raw = raw_history.len();
 
             for msg in req.chat_history {
-                let val = to_message_input(&msg);
-                for v in val {
-                    raw_history.push(serde_json::to_value(&v)?);
-                }
+                raw_history.push(serde_json::to_value(to_message_input(&msg))?);
             }
 
             if let Some(mut msg) = req
@@ -589,10 +573,7 @@ impl CompletionFeaturesDyn for CompletionModel {
                 .to_message(&rfc3339_datetime(timestamp).unwrap())
             {
                 msg.timestamp = Some(timestamp);
-                let val = to_message_input(&msg);
-                for v in val {
-                    raw_history.push(serde_json::to_value(&v)?);
-                }
+                raw_history.push(serde_json::to_value(to_message_input(&msg))?);
                 chat_history.push(msg);
             }
 
@@ -608,10 +589,7 @@ impl CompletionFeaturesDyn for CompletionModel {
                     ..Default::default()
                 };
 
-                let val = to_message_input(&msg);
-                for v in val {
-                    raw_history.push(serde_json::to_value(&v)?);
-                }
+                raw_history.push(serde_json::to_value(to_message_input(&msg))?);
                 chat_history.push(msg);
             }
 
@@ -846,8 +824,6 @@ impl CompletionFeaturesDyn for CompletionModelV2 {
                 });
             };
 
-            println!("oreq: {:#?}", serde_json::to_string_pretty(&oreq)?);
-
             if log_enabled!(Debug)
                 && let Ok(val) = serde_json::to_string(&oreq)
             {
@@ -858,7 +834,9 @@ impl CompletionFeaturesDyn for CompletionModelV2 {
             if response.status().is_success() {
                 let text = response.text().await?;
                 match serde_json::from_str::<types::CompletionResponse>(&text) {
-                    Ok(res) => {
+                    Ok(mut res) => {
+                        res.parse_output();
+
                         if log_enabled!(Debug) {
                             log::debug!(
                                 request:serde = oreq,

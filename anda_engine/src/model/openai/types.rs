@@ -1,6 +1,6 @@
 use anda_core::{AgentOutput, BoxError, ContentPart, Json, Message, Usage as ModelUsage};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, json};
+use serde_json::Map;
 
 use crate::unix_ms;
 
@@ -82,32 +82,47 @@ pub struct CompletionResponse {
     pub id: String,
     /// UNIX epoch in seconds.
     pub created_at: u64,
-    /// The status of the response.
-    pub status: ResponseStatus,
+    #[serde(default)]
+    pub output_text: String,
     /// Response error (optional)
     pub error: Option<ResponseError>,
     /// Incomplete response details (optional)
     pub incomplete_details: Option<IncompleteDetailsReason>,
     /// System prompt/preamble
     pub instructions: Option<String>,
-    /// The maximum number of tokens the model should output
-    pub max_output_tokens: Option<u64>,
+    pub metadata: Option<Json>,
     /// The model name
     pub model: String,
     /// Token usage
+    #[serde(default)]
     pub usage: ResponsesUsage,
     /// The model output (messages, etc will go here)
-    pub output: Vec<MessageItem>,
+    pub output: Vec<Json>,
+    #[serde(default)]
+    pub parsed_output: Vec<MessageItem>,
     /// Tools
+    #[serde(default)]
     pub tools: Vec<ToolDefinition>,
+    /// The status of the response.
+    #[serde(default)]
+    pub status: ResponseStatus,
     /// Additional parameters
     #[serde(flatten)]
     pub additional_parameters: AdditionalParameters,
 }
 
 impl CompletionResponse {
+    pub fn parse_output(&mut self) {
+        // If parsing fails, parsed_output will just be empty, and the raw output can be used instead.
+        self.parsed_output = self
+            .output
+            .iter()
+            .filter_map(|item| serde_json::from_value::<MessageItem>(item.clone()).ok())
+            .collect();
+    }
+
     pub fn try_into(
-        self,
+        mut self,
         raw_history: Vec<Json>,
         chat_history: Vec<Message>,
     ) -> Result<AgentOutput, BoxError> {
@@ -126,11 +141,9 @@ impl CompletionResponse {
         if let Some(error) = self.error {
             output.failed_reason = serde_json::to_string(&error).ok();
         } else {
-            for msg in &self.output {
-                output.raw_history.push(json!(&msg));
-            }
+            output.raw_history.append(&mut self.output);
 
-            let (msg, failed_reason) = message_from(self.output);
+            let (msg, failed_reason) = message_from(self.parsed_output);
             if let Some(mut msg) = msg {
                 msg.name = Some(self.model);
                 msg.timestamp = Some(timestamp);
@@ -146,8 +159,8 @@ impl CompletionResponse {
 
     pub fn maybe_failed(&self) -> bool {
         self.error.is_some()
-            || self.output.is_empty()
-            || self.output.iter().any(|item| {
+            || self.parsed_output.is_empty()
+            || self.parsed_output.iter().any(|item| {
                 if let MessageItem::Message { content, .. } = item {
                     content
                         .iter()
@@ -160,17 +173,15 @@ impl CompletionResponse {
 }
 
 /// An input item for CompletionRequest.
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Serialize, Clone, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MessageItem {
     Message {
         role: String,
         content: Vec<ContentItem>,
-
         // in output message
         #[serde(skip_serializing_if = "Option::is_none")]
         status: Option<String>,
-
         // in output message
         #[serde(skip_serializing_if = "Option::is_none")]
         id: Option<String>,
@@ -179,22 +190,139 @@ pub enum MessageItem {
         name: String,
         arguments: String, // JSON format
         call_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
         id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         namespace: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         status: Option<String>,
     },
     FunctionCallOutput {
-        output: String, // JSON format
-        call_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
         id: Option<String>,
+        call_id: String,
+        output: Json, // JSON format
+        #[serde(skip_serializing_if = "Option::is_none")]
         status: Option<String>,
     },
     Reasoning {
         id: String,
         summary: Vec<ReasoningSummary>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         content: Option<Vec<ReasoningContent>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        encrypted_content: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         status: Option<String>,
     },
+    #[serde(untagged)]
+    Any(Json),
+}
+
+impl<'de> Deserialize<'de> for MessageItem {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = Json::deserialize(deserializer)?;
+        match &value {
+            Json::Object(map)
+                if matches!(
+                    map.get("type").and_then(|t| t.as_str()),
+                    Some("message" | "function_call" | "function_call_output" | "reasoning")
+                ) =>
+            {
+                #[derive(Deserialize)]
+                #[serde(tag = "type", rename_all = "snake_case")]
+                enum Helper {
+                    Message {
+                        role: String,
+                        content: Vec<ContentItem>,
+                        status: Option<String>,
+                        id: Option<String>,
+                    },
+                    FunctionCall {
+                        name: String,
+                        arguments: String,
+                        call_id: String,
+                        id: Option<String>,
+                        namespace: Option<String>,
+                        status: Option<String>,
+                    },
+                    FunctionCallOutput {
+                        id: Option<String>,
+                        call_id: String,
+                        output: Json, // JSON format
+                        status: Option<String>,
+                    },
+                    Reasoning {
+                        id: String,
+                        summary: Vec<ReasoningSummary>,
+                        content: Option<Vec<ReasoningContent>>,
+                        encrypted_content: Option<String>,
+                        status: Option<String>,
+                    },
+                }
+
+                match serde_json::from_value::<Helper>(value.clone()) {
+                    Ok(h) => Ok(match h {
+                        Helper::Message {
+                            role,
+                            content,
+                            status,
+                            id,
+                        } => MessageItem::Message {
+                            role,
+                            content,
+                            status,
+                            id,
+                        },
+                        Helper::FunctionCall {
+                            name,
+                            arguments,
+                            call_id,
+                            id,
+                            namespace,
+                            status,
+                        } => MessageItem::FunctionCall {
+                            name,
+                            arguments,
+                            call_id,
+                            id,
+                            namespace,
+                            status,
+                        },
+                        Helper::FunctionCallOutput {
+                            id,
+                            call_id,
+                            output,
+                            status,
+                        } => MessageItem::FunctionCallOutput {
+                            id,
+                            call_id,
+                            output,
+                            status,
+                        },
+                        Helper::Reasoning {
+                            id,
+                            summary,
+                            content,
+                            encrypted_content,
+                            status,
+                        } => MessageItem::Reasoning {
+                            id,
+                            summary,
+                            content,
+                            encrypted_content,
+                            status,
+                        },
+                    }),
+                    Err(_) => Ok(MessageItem::Any(value)),
+                }
+            }
+            _ => Ok(MessageItem::Any(value)),
+        }
+    }
 }
 
 pub fn message_into(msg: Message) -> Vec<MessageItem> {
@@ -207,10 +335,20 @@ pub fn message_into(msg: Message) -> Vec<MessageItem> {
                 content.push(ContentItem::Text { text });
             }
             ContentPart::Reasoning { text } => {
+                if !content.is_empty() {
+                    rt.push(MessageItem::Message {
+                        role: msg.role.clone(),
+                        content,
+                        status: None,
+                        id: None,
+                    });
+                    content = Vec::new();
+                }
                 rt.push(MessageItem::Reasoning {
                     id: "".to_string(),
                     summary: vec![ReasoningSummary::SummaryText { text }],
                     content: None,
+                    encrypted_content: None,
                     status: None,
                 });
             }
@@ -233,6 +371,15 @@ pub fn message_into(msg: Message) -> Vec<MessageItem> {
                 args,
                 call_id,
             } => {
+                if !content.is_empty() {
+                    rt.push(MessageItem::Message {
+                        role: msg.role.clone(),
+                        content,
+                        status: None,
+                        id: None,
+                    });
+                    content = Vec::new();
+                }
                 rt.push(MessageItem::FunctionCall {
                     name,
                     arguments: serde_json::to_string(&args).unwrap_or_default(),
@@ -245,14 +392,25 @@ pub fn message_into(msg: Message) -> Vec<MessageItem> {
             ContentPart::ToolOutput {
                 output, call_id, ..
             } => {
+                if !content.is_empty() {
+                    rt.push(MessageItem::Message {
+                        role: msg.role.clone(),
+                        content,
+                        status: None,
+                        id: None,
+                    });
+                    content = Vec::new();
+                }
                 rt.push(MessageItem::FunctionCallOutput {
-                    output: serde_json::to_string(&output).unwrap_or_default(),
+                    output,
                     call_id: call_id.unwrap_or_default(),
                     id: None,
                     status: None,
                 });
             }
-            _ => {}
+            v => content.push(ContentItem::Any(
+                serde_json::to_value(v).unwrap_or(Json::Null),
+            )),
         }
     }
 
@@ -290,7 +448,31 @@ pub fn message_from(output: Vec<MessageItem>) -> (Option<Message>, Option<String
                         ContentItem::OutputText { text } => {
                             msg.content.push(ContentPart::Text { text });
                         }
-                        _ => {}
+                        ContentItem::Image { image_url, .. } => {
+                            msg.content.push(ContentPart::FileData {
+                                file_uri: image_url,
+                                mime_type: Some("image".to_string()),
+                            });
+                        }
+                        ContentItem::Audio { input_audio } => {
+                            msg.content.push(ContentPart::FileData {
+                                file_uri: input_audio.data,
+                                mime_type: Some(format!("audio/{}", input_audio.format)),
+                            });
+                        }
+                        ContentItem::File {
+                            file_data,
+                            file_url,
+                            ..
+                        } => {
+                            msg.content.push(ContentPart::FileData {
+                                file_uri: file_url.or(file_data).unwrap_or_default(),
+                                mime_type: None,
+                            });
+                        }
+                        ContentItem::Any(json) => {
+                            msg.content.push(ContentPart::Any(json));
+                        }
                     }
                 }
             }
@@ -310,14 +492,23 @@ pub fn message_from(output: Vec<MessageItem>) -> (Option<Message>, Option<String
             MessageItem::FunctionCallOutput {
                 output, call_id, ..
             } => {
+                let output = if let Some(s) = output.as_str()
+                    && let Ok(v) = serde_json::from_str::<Json>(s)
+                {
+                    v
+                } else {
+                    output
+                };
                 msg.content.push(ContentPart::ToolOutput {
                     name: "".to_string(),
-                    output: serde_json::from_str(&output).unwrap_or_default(),
+                    output,
                     call_id: Some(call_id),
                     remote_id: None,
                 });
             }
-            MessageItem::Reasoning { summary, .. } => {
+            MessageItem::Reasoning {
+                summary, content, ..
+            } => {
                 for s in summary {
                     match s {
                         ReasoningSummary::SummaryText { text } => {
@@ -325,7 +516,17 @@ pub fn message_from(output: Vec<MessageItem>) -> (Option<Message>, Option<String
                         }
                     }
                 }
+                if let Some(content) = content {
+                    for c in content {
+                        match c {
+                            ReasoningContent::ReasoningText { text } => {
+                                msg.content.push(ContentPart::Reasoning { text });
+                            }
+                        }
+                    }
+                }
             }
+            MessageItem::Any(json) => msg.content.push(ContentPart::Any(json)),
         }
     }
 
@@ -336,7 +537,7 @@ pub fn message_from(output: Vec<MessageItem>) -> (Option<Message>, Option<String
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+#[derive(Debug, Serialize, PartialEq, Clone)]
 #[serde(tag = "type")]
 pub enum ContentItem {
     #[serde(rename = "input_text")]
@@ -352,17 +553,106 @@ pub enum ContentItem {
     Image {
         detail: String, // One of high, low, or auto. Defaults to auto
         image_url: String,
+
+        #[serde(skip_serializing_if = "Option::is_none")]
         file_id: Option<String>,
     },
     #[serde(rename = "input_file")]
     File {
+        #[serde(skip_serializing_if = "Option::is_none")]
         file_data: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         file_url: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         file_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         filename: Option<String>,
     },
     #[serde(rename = "input_audio")]
     Audio { input_audio: InputAudio },
+    #[serde(untagged)]
+    Any(Json),
+}
+
+impl<'de> Deserialize<'de> for ContentItem {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = Json::deserialize(deserializer)?;
+        match &value {
+            Json::Object(map)
+                if matches!(
+                    map.get("type").and_then(|t| t.as_str()),
+                    Some(
+                        "input_text"
+                            | "output_text"
+                            | "refusal"
+                            | "input_image"
+                            | "input_file"
+                            | "input_audio"
+                    )
+                ) =>
+            {
+                #[derive(Deserialize)]
+                #[serde(tag = "type")]
+                enum Helper {
+                    #[serde(rename = "input_text")]
+                    Text { text: String },
+                    #[serde(rename = "output_text")]
+                    OutputText { text: String },
+                    #[serde(rename = "refusal")]
+                    Refusal { refusal: String },
+                    #[serde(rename = "input_image")]
+                    Image {
+                        detail: String,
+                        image_url: String,
+                        file_id: Option<String>,
+                    },
+                    #[serde(rename = "input_file")]
+                    File {
+                        file_data: Option<String>,
+                        file_url: Option<String>,
+                        file_id: Option<String>,
+                        filename: Option<String>,
+                    },
+                    #[serde(rename = "input_audio")]
+                    Audio { input_audio: InputAudio },
+                }
+
+                match serde_json::from_value::<Helper>(value.clone()) {
+                    Ok(h) => Ok(match h {
+                        Helper::Text { text } => ContentItem::Text { text },
+                        Helper::OutputText { text } => ContentItem::OutputText { text },
+                        Helper::Refusal { refusal } => ContentItem::Refusal { refusal },
+                        Helper::Image {
+                            detail,
+                            image_url,
+                            file_id,
+                        } => ContentItem::Image {
+                            detail,
+                            image_url,
+                            file_id,
+                        },
+                        Helper::File {
+                            file_data,
+                            file_url,
+                            file_id,
+                            filename,
+                        } => ContentItem::File {
+                            file_data,
+                            file_url,
+                            file_id,
+                            filename,
+                        },
+                        Helper::Audio { input_audio } => ContentItem::Audio { input_audio },
+                    }),
+                    Err(_) => Ok(ContentItem::Any(value)),
+                }
+            }
+            _ => Ok(ContentItem::Any(value)),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
@@ -400,7 +690,7 @@ pub struct ToolDefinition {
 
 /// Token usage.
 /// Token usage from the OpenAI Responses API generally shows the input tokens and output tokens (both with more in-depth details) as well as a total tokens field.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ResponsesUsage {
     /// Input tokens
     pub input_tokens: u64,
@@ -427,9 +717,10 @@ pub struct ResponseError {
 }
 
 /// The response status as an enum (ensures type validation)
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum ResponseStatus {
+    #[default]
     InProgress,
     Completed,
     Failed,
@@ -572,14 +863,29 @@ mod tests {
 
         let items = message_into(msg);
         // Expected order:
+        // 0) Message (accumulated content: Text)
         // 1) Reasoning
         // 2) FunctionCall
         // 3) FunctionCallOutput
-        // 4) Message (accumulated content: Text + File)
-        assert_eq!(items.len(), 4);
+        // 4) Message (accumulated content: File)
+        assert_eq!(items.len(), 5);
+
+        // Text
+        if let MessageItem::Message { role, content, .. } = &items[0] {
+            assert_eq!(role, "user");
+            assert_eq!(content.len(), 1);
+
+            // content[0] should be Text("hello")
+            match &content[0] {
+                ContentItem::Text { text } => assert_eq!(text, "hello"),
+                _ => panic!("content[0] should be Text"),
+            }
+        } else {
+            panic!("items[0] should be Message");
+        }
 
         // Reasoning
-        if let MessageItem::Reasoning { summary, .. } = &items[0] {
+        if let MessageItem::Reasoning { summary, .. } = &items[1] {
             assert_eq!(
                 summary,
                 &vec![ReasoningSummary::SummaryText {
@@ -587,7 +893,7 @@ mod tests {
                 }]
             );
         } else {
-            panic!("items[0] should be Reasoning");
+            panic!("items[1] should be Reasoning");
         }
 
         // FunctionCall
@@ -596,39 +902,33 @@ mod tests {
             arguments,
             call_id,
             ..
-        } = &items[1]
+        } = &items[2]
         {
             assert_eq!(name, "sum");
             assert_eq!(arguments, r#"{"x":1}"#);
             assert_eq!(call_id, "c1");
         } else {
-            panic!("items[1] should be FunctionCall");
+            panic!("items[2] should be FunctionCall");
         }
 
         // FunctionCallOutput
         if let MessageItem::FunctionCallOutput {
             output, call_id, ..
-        } = &items[2]
+        } = &items[3]
         {
-            assert_eq!(output, r#"{"ok":true}"#);
+            assert_eq!(output, &json!({"ok":true}));
             assert_eq!(call_id, "c1");
         } else {
-            panic!("items[2] should be FunctionCallOutput");
+            panic!("items[3] should be FunctionCallOutput");
         }
 
         // Message with accumulated non-tool content
-        if let MessageItem::Message { role, content, .. } = &items[3] {
+        if let MessageItem::Message { role, content, .. } = &items[4] {
             assert_eq!(role, "user");
-            assert_eq!(content.len(), 2);
+            assert_eq!(content.len(), 1);
 
-            // content[0] should be Text("hello")
+            // content[0] should be File with file_url Some("http://a/b")
             match &content[0] {
-                ContentItem::Text { text } => assert_eq!(text, "hello"),
-                _ => panic!("content[0] should be Text"),
-            }
-
-            // content[1] should be File with file_url Some("http://a/b")
-            match &content[1] {
                 ContentItem::File {
                     file_data,
                     file_url,
@@ -640,10 +940,10 @@ mod tests {
                     assert!(file_id.is_none());
                     assert!(filename.is_none());
                 }
-                _ => panic!("content[1] should be File"),
+                _ => panic!("content[0] should be File"),
             }
         } else {
-            panic!("items[3] should be Message");
+            panic!("items[4] should be Message");
         }
     }
 
@@ -681,6 +981,7 @@ mod tests {
                     text: "think".into(),
                 }],
                 content: None,
+                encrypted_content: None,
                 status: None,
             },
         ];
@@ -735,6 +1036,39 @@ mod tests {
             ContentPart::Reasoning { text } => assert_eq!(text, "think"),
             _ => panic!("msg.content[3] should be Reasoning"),
         }
+
+        let s = r#"{"type":"function_call_output","call_id":"cid","output":"{\"ok\":true}"}"#;
+        let v = serde_json::from_str::<MessageItem>(s).unwrap();
+        let m = message_from(vec![v.clone()]).0.unwrap();
+        assert_eq!(
+            m,
+            Message {
+                role: "assistant".into(),
+                content: vec![ContentPart::ToolOutput {
+                    name: "".into(),
+                    output: json!({"ok": true}),
+                    call_id: Some("cid".into()),
+                    remote_id: None,
+                }],
+                ..Default::default()
+            }
+        );
+        let s = r#"{"type":"function_call_output","call_id":"cid","output":{"ok":true}}"#;
+        let v = serde_json::from_str::<MessageItem>(s).unwrap();
+        let m = message_from(vec![v.clone()]).0.unwrap();
+        assert_eq!(
+            m,
+            Message {
+                role: "assistant".into(),
+                content: vec![ContentPart::ToolOutput {
+                    name: "".into(),
+                    output: json!({"ok": true}),
+                    call_id: Some("cid".into()),
+                    remote_id: None,
+                }],
+                ..Default::default()
+            }
+        );
     }
 
     #[test]
@@ -794,6 +1128,7 @@ mod tests {
             id: "".into(),
             summary: vec![ReasoningSummary::SummaryText { text: "t".into() }],
             content: None,
+            encrypted_content: None,
             status: None,
         };
         let s = serde_json::to_string(&item).unwrap();

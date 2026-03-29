@@ -153,7 +153,7 @@ impl CompletionResponse {
     fn maybe_failed(&self) -> bool {
         !self.choices.iter().any(|choice| {
             matches!(choice.finish_reason.as_str(), "stop" | "tool_calls")
-                && (choice.message.content.is_some() || choice.message.tool_calls.is_some())
+                && (!choice.message.content.is_empty() || choice.message.tool_calls.is_some())
         })
     }
 }
@@ -216,7 +216,7 @@ fn to_message_input(msg: &Message) -> MessageInput {
                     _ => {}
                 };
             }
-            _ => {} // TODO: handle other content parts
+            v => arr.push(json!(v)),
         }
     }
     res.content = Json::Array(arr);
@@ -236,7 +236,7 @@ pub struct Choice {
 pub struct MessageOutput {
     pub role: String,
     #[serde(default)]
-    pub content: Option<String>,
+    pub content: String,
 
     // 模型处理问题的思维链内容，仅深度推理模型支持返回此字段
     #[serde(default)]
@@ -249,8 +249,8 @@ pub struct MessageOutput {
 impl From<MessageOutput> for Message {
     fn from(msg: MessageOutput) -> Self {
         let mut content = Vec::new();
-        if let Some(text) = msg.content {
-            content.push(ContentPart::Text { text });
+        if !msg.content.is_empty() {
+            content.push(ContentPart::Text { text: msg.content });
         }
         if let Some(tool_calls) = msg.tool_calls {
             for tc in tool_calls {
@@ -370,18 +370,18 @@ impl CompletionFeaturesDyn for CompletionModel {
             let mut chat_history: Vec<Message> = Vec::new();
 
             if !req.instructions.is_empty() {
-                raw_history.push(json!(MessageInput {
+                raw_history.push(serde_json::to_value(MessageInput {
                     role: "system".into(),
                     content: req.instructions.clone().into(),
                     tool_call_id: None,
-                }));
+                })?);
             };
 
             raw_history.append(&mut req.raw_history);
             let skip_raw = raw_history.len();
 
             for msg in req.chat_history {
-                raw_history.push(json!(to_message_input(&msg)));
+                raw_history.push(serde_json::to_value(to_message_input(&msg))?);
             }
 
             if let Some(mut msg) = req
@@ -389,7 +389,7 @@ impl CompletionFeaturesDyn for CompletionModel {
                 .to_message(&rfc3339_datetime(timestamp).unwrap())
             {
                 msg.timestamp = Some(timestamp);
-                raw_history.push(json!(to_message_input(&msg)));
+                raw_history.push(serde_json::to_value(to_message_input(&msg))?);
                 chat_history.push(msg);
             }
 
@@ -405,7 +405,7 @@ impl CompletionFeaturesDyn for CompletionModel {
                     ..Default::default()
                 };
 
-                raw_history.push(json!(to_message_input(&msg)));
+                raw_history.push(serde_json::to_value(to_message_input(&msg))?);
                 chat_history.push(msg);
             }
 

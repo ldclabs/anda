@@ -115,7 +115,7 @@ where
 }
 
 /// Represents a message send to LLM for completion.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Message {
     /// Message role: "system", "user", "assistant", "tool".
     pub role: String,
@@ -222,6 +222,7 @@ pub enum ContentPart {
         #[serde(skip_serializing_if = "Option::is_none")]
         signature: Option<ByteBufB64>,
     },
+    #[serde(untagged)]
     Any(Json),
 }
 
@@ -849,7 +850,7 @@ mod tests {
             "data": "aGVsbG8=",
         }));
         let v2 = serde_json::to_value(&part).unwrap();
-        assert_eq!(v2.get("type").unwrap(), "Any");
+        assert!(v2.get("type").is_none());
         assert_eq!(v2.get("data").unwrap(), "aGVsbG8=");
     }
 
