@@ -11,7 +11,7 @@ use crate::unix_ms;
 #[derive(Debug)]
 pub struct RequiredMessageParams {
     pub model: String,
-    pub messages: Vec<Message>,
+    pub messages: Vec<Value>, // Vec<Message>
     pub max_tokens: u32,
 }
 
@@ -21,7 +21,7 @@ pub struct CreateMessageParams {
     /// Maximum number of tokens to generate
     pub max_tokens: u32,
     /// Input messages for the conversation
-    pub messages: Vec<Message>,
+    pub messages: Vec<Value>, // Vec<Message>
     /// Model to use
     pub model: String,
     /// System prompt

@@ -745,9 +745,8 @@ impl CompletionFeaturesDyn for CompletionModelV2 {
                 oreq.instructions = Some(req.instructions);
             };
 
-            for msg in req.raw_history {
-                oreq.input.push(serde_json::from_value(msg)?);
-            }
+            oreq.input
+                .extend(req.raw_history.into_iter().map(types::MessageItem::Any));
 
             for msg in req.chat_history {
                 let vals = types::message_into(msg);

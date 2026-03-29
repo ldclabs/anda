@@ -137,7 +137,7 @@ impl CompletionFeaturesDyn for CompletionModel {
         self.model.clone()
     }
 
-    fn completion(&self, req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
+    fn completion(&self, mut req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
         let model = self.model.clone();
         let client = self.client.clone();
         let mut greq = self.default_request.clone();
@@ -157,13 +157,11 @@ impl CompletionFeaturesDyn for CompletionModel {
                 });
             };
 
-            for msg in req.raw_history {
-                greq.contents.push(serde_json::from_value(msg)?);
-            }
-
+            greq.contents.append(&mut req.raw_history);
             for msg in req.chat_history {
                 let val = types::Content::from(msg);
-                raw_history.push(serde_json::to_value(&val)?);
+                let val = serde_json::to_value(val)?;
+                raw_history.push(val.clone());
                 greq.contents.push(val);
             }
 
@@ -173,9 +171,10 @@ impl CompletionFeaturesDyn for CompletionModel {
             {
                 msg.timestamp = Some(timestamp);
                 chat_history.push(msg.clone());
-                let msg = types::Content::from(msg);
-                raw_history.push(serde_json::to_value(&msg)?);
-                greq.contents.push(msg);
+                let val = types::Content::from(msg);
+                let val = serde_json::to_value(val)?;
+                raw_history.push(val.clone());
+                greq.contents.push(val);
             }
 
             let mut content = req.content;
@@ -191,9 +190,10 @@ impl CompletionFeaturesDyn for CompletionModel {
                 };
 
                 chat_history.push(msg.clone());
-                let msg = types::Content::from(msg);
-                raw_history.push(serde_json::to_value(&msg)?);
-                greq.contents.push(msg);
+                let val = types::Content::from(msg);
+                let val = serde_json::to_value(val)?;
+                raw_history.push(val.clone());
+                greq.contents.push(val);
             }
 
             if let Some(temperature) = req.temperature {

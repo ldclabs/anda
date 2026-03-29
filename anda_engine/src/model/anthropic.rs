@@ -10,7 +10,6 @@ use anda_core::{
     Resource,
 };
 use log::{Level::Debug, log_enabled};
-use serde_json::json;
 
 use super::{CompletionFeaturesDyn, request_client_builder};
 use crate::{rfc3339_datetime, unix_ms};
@@ -165,7 +164,7 @@ impl CompletionFeaturesDyn for CompletionModel {
         self.model.clone()
     }
 
-    fn completion(&self, req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
+    fn completion(&self, mut req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
         let model = self.model.clone();
         let client = self.client.clone();
         let mut creq = self.default_request.clone();
@@ -180,14 +179,11 @@ impl CompletionFeaturesDyn for CompletionModel {
                 creq.system = Some(req.instructions);
             }
 
-            for msg in req.raw_history {
-                creq.messages
-                    .push(serde_json::from_value::<types::Message>(msg)?);
-            }
-
+            creq.messages.append(&mut req.raw_history);
             for msg in req.chat_history {
                 let val = types::Message::from(msg);
-                raw_history.push(json!(&val));
+                let val = serde_json::to_value(val)?;
+                raw_history.push(val.clone());
                 creq.messages.push(val);
             }
 
@@ -197,9 +193,10 @@ impl CompletionFeaturesDyn for CompletionModel {
             {
                 msg.timestamp = Some(timestamp);
                 chat_history.push(msg.clone());
-                let msg = types::Message::from(msg);
-                raw_history.push(json!(&msg));
-                creq.messages.push(msg);
+                let val = types::Message::from(msg);
+                let val = serde_json::to_value(val)?;
+                raw_history.push(val.clone());
+                creq.messages.push(val);
             }
 
             let mut content = req.content;
@@ -215,9 +212,10 @@ impl CompletionFeaturesDyn for CompletionModel {
                 };
 
                 chat_history.push(msg.clone());
-                let msg = types::Message::from(msg);
-                raw_history.push(json!(&msg));
-                creq.messages.push(msg);
+                let val = types::Message::from(msg);
+                let val = serde_json::to_value(val)?;
+                raw_history.push(val.clone());
+                creq.messages.push(val);
             }
 
             if let Some(temperature) = req.temperature {

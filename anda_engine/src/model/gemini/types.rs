@@ -18,7 +18,7 @@ pub struct GenerateContentRequest {
     pub system_instruction: Option<Content>,
 
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub contents: Vec<Content>,
+    pub contents: Vec<Value>, // Vec<Content>
 
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<Tool>,
