@@ -187,7 +187,10 @@ fn to_message_input(msg: &Message) -> MessageInput {
             ContentPart::ToolOutput {
                 output, call_id, ..
             } => {
-                arr.push(serde_json::to_string(output).unwrap_or_default().into());
+                arr.push(json!({
+                    "type": "text",
+                    "text": serde_json::to_string(output).unwrap_or_default(),
+                }));
                 res.tool_call_id = call_id.clone();
             }
             ContentPart::InlineData { data, mime_type } => {

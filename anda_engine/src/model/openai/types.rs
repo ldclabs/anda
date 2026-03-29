@@ -201,7 +201,7 @@ pub enum MessageItem {
         #[serde(skip_serializing_if = "Option::is_none")]
         id: Option<String>,
         call_id: String,
-        output: Json, // JSON format
+        output: FunctionCallOutput,
         #[serde(skip_serializing_if = "Option::is_none")]
         status: Option<String>,
     },
@@ -252,7 +252,7 @@ impl<'de> Deserialize<'de> for MessageItem {
                     FunctionCallOutput {
                         id: Option<String>,
                         call_id: String,
-                        output: Json, // JSON format
+                        output: FunctionCallOutput,
                         status: Option<String>,
                     },
                     Reasoning {
@@ -402,7 +402,9 @@ pub fn message_into(msg: Message) -> Vec<MessageItem> {
                     content = Vec::new();
                 }
                 rt.push(MessageItem::FunctionCallOutput {
-                    output,
+                    output: FunctionCallOutput::String(
+                        serde_json::to_string(&output).unwrap_or_default(),
+                    ),
                     call_id: call_id.unwrap_or_default(),
                     id: None,
                     status: None,
@@ -492,12 +494,13 @@ pub fn message_from(output: Vec<MessageItem>) -> (Option<Message>, Option<String
             MessageItem::FunctionCallOutput {
                 output, call_id, ..
             } => {
-                let output = if let Some(s) = output.as_str()
-                    && let Ok(v) = serde_json::from_str::<Json>(s)
-                {
-                    v
-                } else {
-                    output
+                let output = match output {
+                    FunctionCallOutput::String(s) => {
+                        serde_json::from_str(&s).unwrap_or(Json::String(s))
+                    }
+                    FunctionCallOutput::Items(items) => {
+                        serde_json::to_value(items).unwrap_or(Json::Array(vec![]))
+                    }
                 };
                 msg.content.push(ContentPart::ToolOutput {
                     name: "".to_string(),
@@ -653,6 +656,40 @@ impl<'de> Deserialize<'de> for ContentItem {
             _ => Ok(ContentItem::Any(value)),
         }
     }
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+#[serde(tag = "type")]
+pub enum FunctionCallOutputItem {
+    #[serde(rename = "input_text")]
+    Text { text: String },
+
+    #[serde(rename = "input_image")]
+    Image {
+        detail: String, // One of high, low, or auto. Defaults to auto
+        image_url: String,
+
+        #[serde(skip_serializing_if = "Option::is_none")]
+        file_id: Option<String>,
+    },
+    #[serde(rename = "input_file")]
+    File {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        file_data: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        file_url: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        file_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        filename: Option<String>,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+#[serde(untagged)]
+pub enum FunctionCallOutput {
+    Items(Vec<FunctionCallOutputItem>),
+    String(String),
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
@@ -916,7 +953,10 @@ mod tests {
             output, call_id, ..
         } = &items[3]
         {
-            assert_eq!(output, &json!({"ok":true}));
+            assert_eq!(
+                output,
+                &FunctionCallOutput::String(r#"{"ok":true}"#.to_string())
+            );
             assert_eq!(call_id, "c1");
         } else {
             panic!("items[3] should be FunctionCallOutput");
@@ -970,7 +1010,7 @@ mod tests {
                 status: None,
             },
             MessageItem::FunctionCallOutput {
-                output: r#"{"ok":true}"#.into(),
+                output: FunctionCallOutput::String(r#"{"ok":true}"#.into()),
                 call_id: "c1".into(),
                 id: None,
                 status: None,
@@ -1024,7 +1064,7 @@ mod tests {
                 remote_id,
             } => {
                 assert_eq!(name, "");
-                assert_eq!(output, &json!({"ok": true}));
+                assert_eq!(output, &json!({"ok":true}));
                 assert_eq!(call_id.as_deref(), Some("c1"));
                 assert!(remote_id.is_none());
             }
@@ -1037,6 +1077,7 @@ mod tests {
             _ => panic!("msg.content[3] should be Reasoning"),
         }
 
+        // Test deserializing function_call_output with string output
         let s = r#"{"type":"function_call_output","call_id":"cid","output":"{\"ok\":true}"}"#;
         let v = serde_json::from_str::<MessageItem>(s).unwrap();
         let m = message_from(vec![v.clone()]).0.unwrap();
@@ -1046,23 +1087,39 @@ mod tests {
                 role: "assistant".into(),
                 content: vec![ContentPart::ToolOutput {
                     name: "".into(),
-                    output: json!({"ok": true}),
+                    output: json!({"ok":true}),
                     call_id: Some("cid".into()),
                     remote_id: None,
                 }],
                 ..Default::default()
             }
         );
-        let s = r#"{"type":"function_call_output","call_id":"cid","output":{"ok":true}}"#;
+
+        // Test deserializing function_call_output with Items (array) output
+        let s = r#"{"type":"function_call_output","call_id":"cid","output":[{"type":"input_text","text":"result"}]}"#;
         let v = serde_json::from_str::<MessageItem>(s).unwrap();
-        let m = message_from(vec![v.clone()]).0.unwrap();
+        if let MessageItem::FunctionCallOutput {
+            output, call_id, ..
+        } = &v
+        {
+            assert_eq!(
+                output,
+                &FunctionCallOutput::Items(vec![FunctionCallOutputItem::Text {
+                    text: "result".into()
+                }])
+            );
+            assert_eq!(call_id, "cid");
+        } else {
+            panic!("should be FunctionCallOutput");
+        }
+        let m = message_from(vec![v]).0.unwrap();
         assert_eq!(
             m,
             Message {
                 role: "assistant".into(),
                 content: vec![ContentPart::ToolOutput {
                     name: "".into(),
-                    output: json!({"ok": true}),
+                    output: json!([{"type": "input_text", "text": "result"}]),
                     call_id: Some("cid".into()),
                     remote_id: None,
                 }],
@@ -1113,15 +1170,29 @@ mod tests {
         let s = serde_json::to_string(&item).unwrap();
         assert!(s.contains(r#""type":"function_call""#));
 
-        // FunctionCallOutput
+        // FunctionCallOutput with String output
         let item = MessageItem::FunctionCallOutput {
-            output: r#"{"ok":true}"#.into(),
+            output: FunctionCallOutput::String(r#"{"ok":true}"#.into()),
             call_id: "cid".into(),
             id: None,
             status: None,
         };
         let s = serde_json::to_string(&item).unwrap();
         assert!(s.contains(r#""type":"function_call_output""#));
+        assert!(s.contains(r#""output":"{\"ok\":true}""#));
+
+        // FunctionCallOutput with Items output
+        let item = MessageItem::FunctionCallOutput {
+            output: FunctionCallOutput::Items(vec![FunctionCallOutputItem::Text {
+                text: "result".into(),
+            }]),
+            call_id: "cid".into(),
+            id: None,
+            status: None,
+        };
+        let s = serde_json::to_string(&item).unwrap();
+        assert!(s.contains(r#""type":"function_call_output""#));
+        assert!(s.contains(r#""output":[{"type":"input_text","text":"result"}]"#));
 
         // Reasoning
         let item = MessageItem::Reasoning {
