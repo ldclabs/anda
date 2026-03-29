@@ -204,7 +204,7 @@ fn to_message_input(msg: &Message) -> MessageInput {
                 output, call_id, ..
             } => {
                 if msg.content.len() == 1 {
-                    res.content = serde_json::to_value(output).unwrap_or_default();
+                    res.content = serde_json::to_string(output).unwrap_or_default().into();
                     res.tool_call_id = call_id.clone();
                     return res;
                 }
@@ -447,14 +447,7 @@ impl CompletionFeaturesDyn for CompletionModel {
                             .collect::<Vec<_>>()
                     ),
                 );
-                body.insert(
-                    "tool_choice".to_string(),
-                    if req.tool_choice_required {
-                        Json::from("required")
-                    } else {
-                        Json::from("auto")
-                    },
-                );
+                body.insert("tool_choice".to_string(), Json::from("auto"));
             };
 
             if log_enabled!(Debug)

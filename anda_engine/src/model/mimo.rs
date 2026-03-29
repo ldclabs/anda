@@ -200,7 +200,7 @@ fn to_message_input(msg: &Message) -> MessageInput {
                 output, call_id, ..
             } => {
                 if msg.content.len() == 1 {
-                    res.content = serde_json::to_value(output).unwrap_or_default();
+                    res.content = serde_json::to_string(output).unwrap_or_default().into();
                     res.tool_call_id = call_id.clone();
                     return res;
                 }

@@ -411,15 +411,7 @@ impl CompletionFeaturesDyn for CompletionModel {
                             .collect::<Vec<_>>()
                     ),
                 );
-                body.insert(
-                    "tool_choice".to_string(),
-                    if req.tool_choice_required && model != DEEKSEEK_R1 {
-                        // deepseek-reasoner does not support this tool_choice
-                        Json::from("required")
-                    } else {
-                        Json::from("auto")
-                    },
-                );
+                body.insert("tool_choice".to_string(), Json::from("auto"));
             };
 
             if log_enabled!(Debug)
