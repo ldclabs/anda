@@ -4,7 +4,7 @@ use base64::{Engine, prelude::BASE64_URL_SAFE};
 use ciborium::value::Value;
 use clap::{Parser, Subcommand};
 use ic_cose_types::cose::ed25519::{SigningKey, VerifyingKey};
-use rand::RngCore;
+use rand::Rng;
 use std::sync::Arc;
 
 #[derive(Parser)]

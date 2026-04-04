@@ -6,9 +6,6 @@ members = [
   "anda_engine",
   "anda_engine_server",
   "anda_web3_client",
-  "agents/*",
-  "examples/*",
-  "tools/*",
 ]
 
 [workspace.package]
@@ -37,7 +34,6 @@ axum = { version = "0.8", features = [
   "query",
 ], default-features = true }
 async-trait = "0.1"
-anda_object_store = "0.3"
 anda_db = { version = "0.7", features = ["full"] }
 anda_db_tfs = { version = "0.5", features = ["full"] }
 anda_cognitive_nexus = "0.7"
@@ -48,7 +44,6 @@ bytes = "1"
 base64 = "0.22"
 candid = "0.10"
 ciborium = "0.2"
-config = "0.15"
 chrono = "0.4"
 encoding_rs = "0.8"
 futures = "0.3"
@@ -61,7 +56,6 @@ serde_bytes = "0.11"
 ic_cose_types = "0.9"
 ic_cose = "0.9"
 ic-oss-types = "1.2"
-ic_object_store = "1.4"
 ic-agent = "0.46"
 ic_auth_types = "0.8"
 ic_auth_verifier = "0.8"
@@ -69,13 +63,12 @@ ic_tee_cdk = "0.6"
 ic_tee_agent = "0.6"
 ic_tee_gateway_sdk = "0.6"
 anda_cloud_cdk = "0.4"
-num-traits = "0.2"
 object_store = { version = "0.13" }
 parking_lot = "0.12"
 tokio-util = "0.7"
 tokio = { version = "1", features = ["full"] }
 structured-logger = "1"
-rand = "0.9"
+rand = "0.10"
 reqwest = { version = "0.13", features = [
   "rustls",
   "json",
@@ -86,9 +79,6 @@ reqwest = { version = "0.13", features = [
 ], default-features = true }
 thiserror = "2"
 moka = { version = "0.12", features = ["future"] }
-xid = "1.1"
-toml = "0.9"
-k256 = { version = "0.13", features = ["ecdsa"] }
 log = { version = "0.4", features = ["kv_serde"] }
 dotenv = "0.15"
 schemars = { version = "1.0" }
@@ -96,19 +86,10 @@ clap = { version = "4.5", features = ["derive", "env"] }
 idna = "1.0" # https://github.com/ldclabs/anda/security/dependabot/1
 url = "2.5"
 hex = "0.4"
-isolang = { version = "2.4", features = [
-  "english_names",
-  "lowercase_names",
-  "local_names",
-  "list_languages",
-] }
 tower-http = { version = "0.6", features = ["compression-gzip"] }
 
-# [patch.crates-io]
-# candid = { git = "https://github.com/ldclabs/candid.git", rev = "4cf7d02bad9530172cb4cafe733cb1e80689b793" } # remove check_recursion on stack for TEE
-
 [workspace.metadata.cargo-shear]
-ignored = ["idna", "xid", "ic_auth_types", "serde_bytes"]
+ignored = ["idna", "serde_bytes"]
 
 [profile.release]
 debug = false

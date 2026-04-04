@@ -1,7 +1,7 @@
 use anda_core::Json;
 use candid::Principal;
 use chrono::prelude::*;
-use rand::Rng;
+use rand::RngExt;
 
 pub mod context;
 pub mod engine;

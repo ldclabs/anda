@@ -29,7 +29,6 @@ ic-oss-types = { workspace = true }
 tokio-util = { workspace = true }
 reqwest = { workspace = true }
 schemars = { workspace = true }
-xid = { workspace = true, optional = true }
 
 [dev-dependencies]
 
