@@ -320,38 +320,12 @@ impl fmt::Display for ConversationStatus {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, AndaDBSchema)]
-pub struct KIPLogs {
-    /// The unique identifier for this resource in the Anda DB collection "kip_logs".
-    pub _id: u64,
-
-    #[field_type = "Bytes"]
-    pub user: Principal,
-
-    #[field_type = "Text"]
-    pub command: CommandType,
-
-    #[field_type = "Map<String, Json>"]
-    pub request: anda_kip::Request,
-
-    #[field_type = "Map<String, Json>"]
-    pub response: anda_kip::Response,
-
-    pub conversation: Option<u64>,
-
-    pub period: u64,
-
-    pub timestamp: u64,
-}
-
 #[derive(Debug, Clone)]
 pub struct MemoryManagement {
     pub nexus: Arc<CognitiveNexus>,
     pub conversations: Arc<Collection>,
-    pub logs: Arc<Collection>,
     pub resources: Arc<Collection>,
-    enable_kip_logging: bool,
-    kip_function_definitions: FunctionDefinition,
+    pub kip_function_definitions: FunctionDefinition,
 }
 
 impl MemoryManagement {
@@ -376,27 +350,6 @@ impl MemoryManagement {
                     collection
                         .create_bm25_index_nx(&["messages", "resources", "artifacts"])
                         .await?;
-
-                    Ok::<(), DBError>(())
-                },
-            )
-            .await?;
-
-        let schema = KIPLogs::schema()?;
-        let logs = db
-            .open_or_create_collection(
-                schema,
-                CollectionConfig {
-                    name: "kip_logs".to_string(),
-                    description: "KIP logs collection".to_string(),
-                },
-                async |collection| {
-                    // set tokenizer
-                    collection.set_tokenizer(jieba_tokenizer());
-                    // create BTree indexes if not exists
-                    collection.create_btree_index_nx(&["user"]).await?;
-                    collection.create_btree_index_nx(&["command"]).await?;
-                    collection.create_btree_index_nx(&["period"]).await?;
 
                     Ok::<(), DBError>(())
                 },
@@ -430,9 +383,7 @@ impl MemoryManagement {
         Ok(Self {
             nexus,
             conversations,
-            logs,
             resources,
-            enable_kip_logging: true,
             kip_function_definitions: FUNCTION_DEFINITION.clone(),
         })
     }
@@ -440,10 +391,6 @@ impl MemoryManagement {
     pub fn with_kip_function_definitions(mut self, def: FunctionDefinition) -> Self {
         self.kip_function_definitions = def;
         self
-    }
-
-    pub fn disable_kip_logging(&mut self) {
-        self.enable_kip_logging = false;
     }
 
     pub fn nexus(&self) -> Arc<CognitiveNexus> {
@@ -656,44 +603,6 @@ impl MemoryManagement {
         Ok(rt)
     }
 
-    pub async fn list_kip_logs_by_user(
-        &self,
-        user: &Principal,
-        cursor: Option<String>,
-        limit: Option<usize>,
-    ) -> Result<(Vec<KIPLogs>, Option<String>), BoxError> {
-        let limit = limit.unwrap_or(10).min(100);
-        let cursor = match BTree::from_cursor::<u64>(&cursor)? {
-            Some(cursor) => cursor,
-            None => self.logs.max_document_id() + 1,
-        };
-        let filter = Some(Filter::And(vec![
-            Box::new(Filter::Field((
-                "user".to_string(),
-                RangeQuery::Eq(Fv::Bytes(user.as_slice().to_vec())),
-            ))),
-            Box::new(Filter::Field((
-                "_id".to_string(),
-                RangeQuery::Lt(Fv::U64(cursor)),
-            ))),
-        ]));
-
-        let rt: Vec<KIPLogs> = self
-            .logs
-            .search_as(Query {
-                search: None,
-                filter,
-                limit: Some(limit),
-            })
-            .await?;
-        let cursor = if rt.len() >= limit {
-            BTree::to_cursor(&rt.last().unwrap()._id)
-        } else {
-            None
-        };
-        Ok((rt, cursor))
-    }
-
     pub async fn delete_expired_conversations(&self, timestamp: u64) -> Result<u64, BoxError> {
         let period = timestamp / 3600 / 1000;
         let filter = Filter::Field(("period".to_string(), RangeQuery::Lt(Fv::U64(period))));
@@ -750,30 +659,11 @@ impl Tool<BaseCtx> for Arc<MemoryManagement> {
 
     async fn call(
         &self,
-        ctx: BaseCtx,
+        _ctx: BaseCtx,
         request: Self::Args,
         _resources: Vec<Resource>,
     ) -> Result<ToolOutput<Self::Output>, BoxError> {
-        let (command, res) = request.execute(self.nexus.as_ref()).await;
-
-        if self.enable_kip_logging {
-            let conversation = ctx.get_state::<ConversationState>().map(|c| c._id);
-            let timestamp = unix_ms();
-            let log = KIPLogs {
-                _id: 0, // This will be set by the database
-                user: *ctx.caller(),
-                command,
-                request,
-                response: res.clone(),
-                conversation,
-                period: timestamp / 3600 / 1000,
-                timestamp,
-            };
-
-            self.logs.add_from(&log).await?;
-            self.logs.flush(timestamp).await?;
-        }
-
+        let (_, res) = request.execute(self.nexus.as_ref()).await;
         Ok(ToolOutput::new(res))
     }
 }
@@ -1099,13 +989,6 @@ pub enum MemoryToolArgs {
         /// The max number of conversations to return, default to 10
         limit: Option<usize>,
     },
-    /// List KIP logs
-    ListKipLogs {
-        /// The cursor for pagination
-        cursor: Option<String>,
-        /// The limit for pagination, default to 10
-        limit: Option<usize>,
-    },
 }
 
 /// A tool for conversation API
@@ -1301,17 +1184,6 @@ impl Tool<BaseCtx> for MemoryTool {
                 Ok(ToolOutput::new(Response::Ok {
                     result: json!(conversations),
                     next_cursor: None,
-                }))
-            }
-            MemoryToolArgs::ListKipLogs { cursor, limit } => {
-                let (logs, next_cursor) = self
-                    .memory
-                    .list_kip_logs_by_user(ctx.caller(), cursor, limit)
-                    .await?;
-
-                Ok(ToolOutput::new(Response::Ok {
-                    result: json!(logs),
-                    next_cursor,
                 }))
             }
         }
