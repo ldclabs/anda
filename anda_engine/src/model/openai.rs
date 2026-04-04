@@ -436,6 +436,14 @@ fn to_message_input(msg: &Message) -> MessageInput {
                             },
                         }));
                     }
+                    mt if mt.starts_with("video") => {
+                        arr.push(json!({
+                            "type": "video_url",
+                            "video_url": {
+                                "url": data.to_string(),
+                            },
+                        }));
+                    }
                     mt if mt.starts_with("audio") => {
                         arr.push(json!({
                             "type": "input_audio",

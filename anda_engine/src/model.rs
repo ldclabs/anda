@@ -24,12 +24,8 @@ use std::{collections::HashMap, sync::Arc};
 
 pub mod anthropic;
 pub mod deepseek;
-pub mod doubao;
 pub mod gemini;
-pub mod kimi;
-pub mod mimo;
 pub mod openai;
-pub mod xai;
 
 pub use reqwest;
 pub use reqwest::Proxy;
