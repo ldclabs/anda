@@ -23,7 +23,6 @@ use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 
 pub mod anthropic;
-pub mod cohere;
 pub mod deepseek;
 pub mod doubao;
 pub mod gemini;
