@@ -17,11 +17,9 @@ use crate::Json;
 pub use ic_auth_types::{ByteArrayB64, ByteBufB64, Xid};
 
 mod completion;
-mod embedding;
 mod resource;
 
 pub use completion::*;
-pub use embedding::*;
 pub use resource::*;
 
 /// Represents a request to an agent for processing.
@@ -64,6 +62,10 @@ impl AgentInput {
 pub struct AgentOutput {
     /// The output content from the agent, may be empty.
     pub content: String,
+
+    /// The intermediate thinking process of the agent, may be empty if the agent does not provide it or the execution is already finished.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
 
     /// The usage statistics for the agent execution.
     pub usage: Usage,

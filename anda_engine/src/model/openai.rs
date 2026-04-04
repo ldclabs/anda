@@ -7,8 +7,8 @@
 //! - Response parsing and conversion to Anda's internal formats
 
 use anda_core::{
-    AgentOutput, BoxError, BoxPinFut, CompletionRequest, ContentPart, Embedding,
-    FunctionDefinition, Json, Message, Usage as ModelUsage,
+    AgentOutput, BoxError, BoxPinFut, CompletionRequest, ContentPart, FunctionDefinition, Json,
+    Message, Usage as ModelUsage,
 };
 use log::{Level::Debug, log_enabled};
 use serde::{Deserialize, Serialize};
@@ -17,7 +17,7 @@ use std::collections::HashMap;
 
 pub mod types;
 
-use super::{CompletionFeaturesDyn, EmbeddingFeaturesDyn, request_client_builder};
+use super::{CompletionFeaturesDyn, request_client_builder};
 use crate::{rfc3339_datetime, unix_ms};
 
 // ================================================================
@@ -25,25 +25,10 @@ use crate::{rfc3339_datetime, unix_ms};
 // ================================================================
 const API_BASE_URL: &str = "https://api.openai.com/v1";
 
-// ================================================================
-// OpenAI Embedding API
-// ================================================================
-/// `text-embedding-3-large` embedding model
-pub const TEXT_EMBEDDING_3_LARGE: &str = "text-embedding-3-large";
-/// `text-embedding-3-small` embedding model
-pub const TEXT_EMBEDDING_3_SMALL: &str = "text-embedding-3-small";
-/// `text-embedding-ada-002` embedding model
-pub const TEXT_EMBEDDING_ADA_002: &str = "text-embedding-ada-002";
+/// Default completion model to use if not specified
+pub const DEFAULT_COMPLETION_MODEL: &str = "gpt-5.4-mini";
 
-// ================================================================
-// OpenAI Completion API
-// ================================================================
-/// `o1` completion model
-pub const O1: &str = "o1";
-/// `o1-mini completion model
-pub const O3_MINI: &str = "o3-mini";
-
-/// OpenAI API client for handling embeddings and completions
+/// OpenAI API client for handling completions
 #[derive(Clone)]
 pub struct Client {
     endpoint: String,
@@ -87,83 +72,32 @@ impl Client {
         self.http.post(url).bearer_auth(&self.api_key)
     }
 
-    /// Creates an embedding model with the given name
-    ///
-    /// # Arguments
-    /// * `model` - Name of the embedding model to use
-    ///
-    /// # Note
-    /// Default embedding dimension of 0 will be used if model is not known
-    pub fn embedding_model(&self, model: &str) -> EmbeddingModel {
-        let ndims = match model {
-            TEXT_EMBEDDING_3_LARGE => 3072,
-            TEXT_EMBEDDING_3_SMALL | TEXT_EMBEDDING_ADA_002 => 1536,
-            _ => 0,
-        };
-        EmbeddingModel::new(self.clone(), model, ndims)
-    }
-
     /// Creates a completion model with the given name
     ///
     /// # Arguments
     /// * `model` - Name of the completion model to use
     pub fn completion_model(&self, model: &str) -> CompletionModel {
-        CompletionModel::new(self.clone(), if model.is_empty() { O3_MINI } else { model })
+        CompletionModel::new(
+            self.clone(),
+            if model.is_empty() {
+                DEFAULT_COMPLETION_MODEL
+            } else {
+                model
+            },
+        )
     }
 
     /// Completion model with Responses API
     pub fn completion_model_v2(&self, model: &str) -> CompletionModelV2 {
-        CompletionModelV2::new(self.clone(), if model.is_empty() { O3_MINI } else { model })
-    }
-}
-
-/// Response structure for OpenAI embedding API
-#[derive(Debug, Deserialize, Serialize)]
-pub struct EmbeddingResponse {
-    pub object: String,
-    pub data: Vec<EmbeddingData>,
-    pub model: String,
-    pub usage: Usage,
-}
-
-impl EmbeddingResponse {
-    fn try_into(self, texts: Vec<String>) -> Result<(Vec<Embedding>, ModelUsage), BoxError> {
-        if self.data.len() != texts.len() {
-            return Err(format!(
-                "Expected {} embeddings, got {}",
-                texts.len(),
-                self.data.len()
-            )
-            .into());
-        }
-
-        Ok((
-            self.data
-                .into_iter()
-                .zip(texts)
-                .map(|(embedding, text)| Embedding {
-                    text,
-                    vec: embedding.embedding,
-                })
-                .collect(),
-            ModelUsage {
-                input_tokens: self.usage.prompt_tokens as u64,
-                output_tokens: self
-                    .usage
-                    .total_tokens
-                    .saturating_sub(self.usage.prompt_tokens) as u64,
-                requests: 1,
+        CompletionModelV2::new(
+            self.clone(),
+            if model.is_empty() {
+                DEFAULT_COMPLETION_MODEL
+            } else {
+                model
             },
-        ))
+        )
     }
-}
-
-/// Individual embedding data from OpenAI response
-#[derive(Debug, Deserialize, Serialize)]
-pub struct EmbeddingData {
-    pub object: String,
-    pub embedding: Vec<f32>,
-    pub index: usize,
 }
 
 /// Token usage information from OpenAI API
@@ -182,116 +116,6 @@ impl std::fmt::Display for Usage {
             "Prompt tokens: {}, completion tokens: {}",
             self.prompt_tokens, self.completion_tokens
         )
-    }
-}
-
-/// Embedding model implementation for OpenAI API
-#[derive(Clone)]
-pub struct EmbeddingModel {
-    pub model: String,
-    client: Client,
-    ndims: usize,
-}
-
-const MAX_DOCUMENTS: usize = 1024;
-impl EmbeddingFeaturesDyn for EmbeddingModel {
-    /// The number of dimensions in the embedding vector.
-    fn ndims(&self) -> usize {
-        self.ndims
-    }
-
-    /// Generates embeddings for multiple texts in a batch
-    /// Returns a vector of Embedding structs in the same order as input texts
-    fn embed(
-        &self,
-        texts: Vec<String>,
-    ) -> BoxPinFut<Result<(Vec<Embedding>, ModelUsage), BoxError>> {
-        let model = self.model.clone();
-        let client = self.client.clone();
-        Box::pin(async move {
-            if texts.len() > MAX_DOCUMENTS {
-                return Err(format!("Too many documents, max is {}", MAX_DOCUMENTS).into());
-            }
-
-            let response = client
-                .post("/embeddings")
-                .json(&json!({
-                    "model": model,
-                    "input": texts,
-                }))
-                .send()
-                .await?;
-
-            if response.status().is_success() {
-                match response.json::<EmbeddingResponse>().await {
-                    Ok(res) => res.try_into(texts),
-                    Err(err) => Err(format!("OpenAI embeddings error: {}", err).into()),
-                }
-            } else {
-                let msg = response.text().await?;
-                Err(format!("OpenAI embeddings error: {}", msg).into())
-            }
-        })
-    }
-
-    /// Generates a single embedding for a query text
-    /// Optimized for single text embedding generation
-    fn embed_query(&self, text: String) -> BoxPinFut<Result<(Embedding, ModelUsage), BoxError>> {
-        let model = self.model.clone();
-        let client = self.client.clone();
-        Box::pin(async move {
-            let response = client
-                .post("/embeddings")
-                .json(&json!({
-                    "model": model,
-                    "input": text,
-                }))
-                .send()
-                .await?;
-
-            if response.status().is_success() {
-                match response.json::<EmbeddingResponse>().await {
-                    Ok(mut res) => {
-                        let data = res.data.pop().ok_or("no embedding data")?;
-                        Ok((
-                            Embedding {
-                                text: text.to_string(),
-                                vec: data.embedding,
-                            },
-                            ModelUsage {
-                                input_tokens: res.usage.prompt_tokens as u64,
-                                output_tokens: res
-                                    .usage
-                                    .total_tokens
-                                    .saturating_sub(res.usage.prompt_tokens)
-                                    as u64,
-                                requests: 1,
-                            },
-                        ))
-                    }
-                    Err(err) => Err(format!("OpenAI embeddings error: {}", err).into()),
-                }
-            } else {
-                let msg = response.text().await?;
-                Err(format!("OpenAI embeddings error: {}", msg).into())
-            }
-        })
-    }
-}
-
-impl EmbeddingModel {
-    /// Creates a new embedding model instance
-    ///
-    /// # Arguments
-    /// * `client` - OpenAI client instance
-    /// * `model` - Name of the embedding model
-    /// * `ndims` - Number of dimensions for the embedding
-    pub fn new(client: Client, model: &str, ndims: usize) -> Self {
-        Self {
-            client,
-            model: model.to_string(),
-            ndims,
-        }
     }
 }
 
@@ -695,32 +519,37 @@ impl CompletionFeaturesDyn for CompletionModel {
                         res.parse_output();
                         if log_enabled!(Debug) {
                             log::debug!(
+                                model = model,
                                 request:serde = body,
                                 response:serde = res;
-                                "OpenAI completions response");
+                                "Completion response");
                         } else if res.maybe_failed() {
                             log::warn!(
+                                model = model,
                                 request:serde = body,
                                 response:serde = res;
-                                "completions maybe failed");
+                                "Completion maybe failed");
                         }
                         if skip_raw > 0 {
                             raw_history.drain(0..skip_raw);
                         }
                         res.try_into(raw_history, chat_history)
                     }
-                    Err(err) => {
-                        Err(format!("OpenAI completions error: {}, body: {}", err, text).into())
-                    }
+                    Err(err) => Err(format!(
+                        "Invalid completion response, model: {}, error: {}, body: {}",
+                        model, err, text
+                    )
+                    .into()),
                 }
             } else {
                 let status = response.status();
                 let msg = response.text().await?;
                 log::error!(
+                    model = model,
                     request:serde = body;
-                    "completions request failed: {status}, body: {msg}",
+                    "Completion request failed: {status}, body: {msg}",
                 );
-                Err(format!("OpenAI completions error: {}", msg).into())
+                Err(format!("Completion failed, model: {}, error: {}", model, msg).into())
             }
         })
     }
@@ -864,7 +693,7 @@ impl CompletionFeaturesDyn for CompletionModelV2 {
             if log_enabled!(Debug)
                 && let Ok(val) = serde_json::to_string(&oreq)
             {
-                log::debug!(request = val; "OpenAI completions request");
+                log::debug!(request = val; "Completion request");
             }
 
             let response = client.post("/responses").json(&oreq).send().await?;
@@ -876,30 +705,34 @@ impl CompletionFeaturesDyn for CompletionModelV2 {
 
                         if log_enabled!(Debug) {
                             log::debug!(
+                                model = oreq.model,
                                 request:serde = oreq,
                                 response:serde = res;
-                                "OpenAI completions response");
+                                "Completion response");
                         } else if res.maybe_failed() {
                             log::warn!(
                                 request:serde = oreq,
                                 response:serde = res;
-                                "completions maybe failed");
+                                "Completion maybe failed");
                         }
 
                         res.try_into(raw_history, chat_history)
                     }
-                    Err(err) => {
-                        Err(format!("OpenAI completions error: {}, body: {}", err, text).into())
-                    }
+                    Err(err) => Err(format!(
+                        "Invalid completion response, model: {}, error: {}, body: {}",
+                        oreq.model, err, text
+                    )
+                    .into()),
                 }
             } else {
                 let status = response.status();
                 let msg = response.text().await?;
                 log::error!(
+                    model = oreq.model,
                     request:serde = oreq;
-                    "completions request failed: {status}, body: {msg}",
+                    "Completion request failed: {status}, body: {msg}",
                 );
-                Err(format!("OpenAI completions error: {}", msg).into())
+                Err(format!("Completion failed, model: {}, error: {}", oreq.model, msg).into())
             }
         })
     }

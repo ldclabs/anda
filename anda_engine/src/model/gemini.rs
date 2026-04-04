@@ -21,8 +21,7 @@ pub mod types;
 // ================================================================
 const API_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta/models";
 
-pub static GEMINI_2_5_PRO: &str = "gemini-2.5-pro";
-pub static GEMINI_2_5_FLASH: &str = "gemini-2.5-flash";
+pub static DEFAULT_COMPLETION_MODEL: &str = "gemini-flash-latest";
 
 /// Gemini API client configuration and HTTP client
 #[derive(Clone)]
@@ -76,7 +75,7 @@ impl Client {
         CompletionModel::new(
             self.clone(),
             if model.is_empty() {
-                GEMINI_2_5_PRO
+                DEFAULT_COMPLETION_MODEL
             } else {
                 model
             },
@@ -221,7 +220,7 @@ impl CompletionFeaturesDyn for CompletionModel {
             if log_enabled!(Debug)
                 && let Ok(val) = serde_json::to_string(&greq)
             {
-                log::debug!(request = val; "Gemini completions request");
+                log::debug!(request = val; "Completion request");
             }
 
             let response = client
@@ -242,20 +241,20 @@ impl CompletionFeaturesDyn for CompletionModel {
                                 request:serde = greq,
                                 messages:serde = raw_history,
                                 response:serde = res;
-                                "Gemini completions response");
+                                "Completion response");
                         } else if res.maybe_failed() {
                             log::warn!(
                                 model = model,
                                 request:serde = greq,
                                 messages:serde = raw_history,
                                 response:serde = res;
-                                "Gemini completions maybe failed");
+                                "Completion maybe failed");
                         }
 
                         res.try_into(raw_history, chat_history)
                     }
                     Err(err) => Err(format!(
-                        "Gemini {} completions error: {}, body: {}",
+                        "Invalid completion response, model: {}, error: {}, body: {}",
                         model, err, text
                     )
                     .into()),
@@ -267,9 +266,13 @@ impl CompletionFeaturesDyn for CompletionModel {
                     model = model,
                     request:serde = greq,
                     messages:serde = raw_history;
-                    "Gemini completions request failed: {status}, body: {msg}",
+                    "Completion request failed: {status}, body: {msg}",
                 );
-                Err(format!("Gemini {} completions error: {}", model, msg).into())
+                Err(format!(
+                    "Completion failed, model: {}, error: {}, body: {}",
+                    model, status, msg
+                )
+                .into())
             }
         })
     }

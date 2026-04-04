@@ -28,9 +28,9 @@
 use anda_core::{
     AgentContext, AgentInput, AgentOutput, AgentSet, BaseContext, BoxError, BoxPinFut, CacheExpiry,
     CacheFeatures, CacheStoreFeatures, CancellationToken, CanisterCaller, CompletionFeatures,
-    CompletionRequest, ContentPart, Embedding, EmbeddingFeatures, FunctionDefinition, HttpFeatures,
-    Json, KeysFeatures, Message, ObjectMeta, Path, PutMode, PutResult, RequestMeta, Resource,
-    StateFeatures, StoreFeatures, ToolCall, ToolInput, ToolOutput, ToolSet, Usage,
+    CompletionRequest, ContentPart, FunctionDefinition, HttpFeatures, Json, KeysFeatures, Message,
+    ObjectMeta, Path, PutMode, PutResult, RequestMeta, Resource, StateFeatures, StoreFeatures,
+    ToolCall, ToolInput, ToolOutput, ToolSet, Usage,
 };
 use bytes::Bytes;
 use candid::{CandidType, Principal, utils::ArgumentEncoder};
@@ -541,38 +541,6 @@ impl CompletionFeatures for AgentCtx {
         }
 
         last.ok_or_else(|| "completion runner returned no output".into())
-    }
-}
-
-impl EmbeddingFeatures for AgentCtx {
-    /// Gets the number of dimensions for the embedding model.
-    fn ndims(&self) -> usize {
-        self.model.ndims()
-    }
-
-    /// Generates embeddings for a collection of texts.
-    ///
-    /// # Arguments
-    /// * `texts` - Collection of text strings to embed.
-    ///
-    /// # Returns
-    /// Vector of embeddings, one for each input text.
-    async fn embed(
-        &self,
-        texts: impl IntoIterator<Item = String> + Send,
-    ) -> Result<(Vec<Embedding>, Usage), BoxError> {
-        self.model.embed(texts).await
-    }
-
-    /// Generates an embedding for a single query text.
-    ///
-    /// # Arguments
-    /// * `text` - Input text to embed.
-    ///
-    /// # Returns
-    /// Embedding vector for the input text.
-    async fn embed_query(&self, text: &str) -> Result<(Embedding, Usage), BoxError> {
-        self.model.embed_query(text).await
     }
 }
 

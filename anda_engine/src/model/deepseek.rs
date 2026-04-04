@@ -20,8 +20,7 @@ use crate::{rfc3339_datetime, unix_ms};
 // Main DeepSeek Client
 // ================================================================
 const API_BASE_URL: &str = "https://api.deepseek.com";
-pub static DEEKSEEK_V3: &str = "deepseek-chat";
-pub static DEEKSEEK_R1: &str = "deepseek-reasoner";
+pub static DEFAULT_COMPLETION_MODEL: &str = "deepseek-chat";
 
 /// DeepSeek API client configuration and HTTP client
 #[derive(Clone)]
@@ -74,7 +73,11 @@ impl Client {
     pub fn completion_model(&self, model: &str) -> CompletionModel {
         CompletionModel::new(
             self.clone(),
-            if model.is_empty() { DEEKSEEK_V3 } else { model },
+            if model.is_empty() {
+                DEFAULT_COMPLETION_MODEL
+            } else {
+                model
+            },
         )
     }
 }
@@ -417,7 +420,7 @@ impl CompletionFeaturesDyn for CompletionModel {
             if log_enabled!(Debug)
                 && let Ok(val) = serde_json::to_string(&body)
             {
-                log::debug!(request = val; "DeepSeek completions request");
+                log::debug!(request = val; "Completion request");
             }
 
             let response = client.post("/chat/completions").json(body).send().await?;
@@ -427,32 +430,37 @@ impl CompletionFeaturesDyn for CompletionModel {
                     Ok(res) => {
                         if log_enabled!(Debug) {
                             log::debug!(
+                                model = model,
                                 request:serde = body,
                                 response:serde = res;
-                                "DeepSeek completions response");
+                                "Completion response");
                         } else if res.maybe_failed() {
                             log::warn!(
+                                model = model,
                                 request:serde = body,
                                 response:serde = res;
-                                "completions maybe failed");
+                                "Completion maybe failed");
                         }
                         if skip_raw > 0 {
                             raw_history.drain(0..skip_raw);
                         }
                         res.try_into(raw_history, chat_history)
                     }
-                    Err(err) => {
-                        Err(format!("DeepSeek completions error: {}, body: {}", err, text).into())
-                    }
+                    Err(err) => Err(format!(
+                        "Invalid completion response, model: {}, error: {}, body: {}",
+                        model, err, text
+                    )
+                    .into()),
                 }
             } else {
                 let status = response.status();
                 let msg = response.text().await?;
                 log::error!(
+                    model = model,
                     request:serde = body;
-                    "completions request failed: {status}, body: {msg}",
+                    "Completion request failed: {status}, body: {msg}",
                 );
-                Err(format!("DeepSeek completions error: {}", msg).into())
+                Err(format!("Completion failed, model: {}, error: {}", model, msg).into())
             }
         })
     }

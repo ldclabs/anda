@@ -53,8 +53,7 @@ use crate::model::*;
 /// It combines core functionality with AI-specific features:
 /// - [`BaseContext`]`: Fundamental operations;
 /// - [`CompletionFeatures`]: LLM completions and function calling;
-/// - [`EmbeddingFeatures`]: Text embeddings.
-pub trait AgentContext: BaseContext + CompletionFeatures + EmbeddingFeatures {
+pub trait AgentContext: BaseContext + CompletionFeatures {
     /// Retrieves definitions for available tools.
     ///
     /// # Arguments
@@ -212,25 +211,6 @@ pub trait StateFeatures: Sized {
 
     /// Gets the time elapsed since the original context was created.
     fn time_elapsed(&self) -> Duration;
-}
-
-/// Provides vector search capabilities for semantic similarity search.
-pub trait VectorSearchFeatures: Sized {
-    /// Performs a semantic search to find top n most similar documents.
-    /// Returns a list of deserialized json document.
-    fn top_n(
-        &self,
-        query: &str,
-        n: usize,
-    ) -> impl Future<Output = Result<Vec<String>, BoxError>> + Send;
-
-    /// Performs a semantic search but returns only document IDs.
-    /// More efficient when only document identifiers are needed.
-    fn top_n_ids(
-        &self,
-        query: &str,
-        n: usize,
-    ) -> impl std::future::Future<Output = Result<Vec<String>, BoxError>> + Send;
 }
 
 /// KeysFeatures is one of the context feature sets available when calling Agent or Tool.

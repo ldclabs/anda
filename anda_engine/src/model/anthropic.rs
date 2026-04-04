@@ -22,8 +22,7 @@ pub mod types;
 const API_BASE_URL: &str = "https://api.anthropic.com/v1";
 const API_VERSION: &str = "2023-06-01";
 
-pub static CLAUDE_SONNET_4: &str = "claude-sonnet-4-6";
-pub static CLAUDE_OPUS_4: &str = "claude-opus-4-6";
+pub static DEFAULT_COMPLETION_MODEL: &str = "claude-sonnet-4-6";
 
 /// Anthropic Claude API client configuration and HTTP client
 #[derive(Clone)]
@@ -101,7 +100,7 @@ impl Client {
         CompletionModel::new(
             self.clone(),
             if model.is_empty() {
-                CLAUDE_SONNET_4
+                DEFAULT_COMPLETION_MODEL
             } else {
                 model
             },
@@ -242,7 +241,7 @@ impl CompletionFeaturesDyn for CompletionModel {
             if log_enabled!(Debug)
                 && let Ok(val) = serde_json::to_string(&creq)
             {
-                log::debug!(request = val; "Anthropic completions request");
+                log::debug!(request = val; "Completion request");
             }
 
             let response = client.post("/messages").json(&creq).send().await?;
@@ -259,20 +258,20 @@ impl CompletionFeaturesDyn for CompletionModel {
                                 request:serde = creq,
                                 messages:serde = raw_history,
                                 response:serde = res;
-                                "Anthropic completions response");
+                                "Completion response");
                         } else if res.maybe_failed() {
                             log::warn!(
                                 model = model,
                                 request:serde = creq,
                                 messages:serde = raw_history,
                                 response:serde = res;
-                                "Anthropic completions maybe failed");
+                                "Completion maybe failed");
                         }
 
                         res.try_into(raw_history, chat_history)
                     }
                     Err(err) => Err(format!(
-                        "Anthropic {} completions error: {}, body: {}",
+                        "Completion error, model: {}, error: {}, body: {}",
                         model, err, text
                     )
                     .into()),
@@ -284,9 +283,9 @@ impl CompletionFeaturesDyn for CompletionModel {
                     model = model,
                     request:serde = creq,
                     messages:serde = raw_history;
-                    "Anthropic completions request failed: {status}, body: {msg}",
+                    "Completion request failed: {status}, body: {msg}",
                 );
-                Err(format!("Anthropic {} completions error: {}", model, msg).into())
+                Err(format!("Completion failed, model: {}, error: {}", model, msg).into())
             }
         })
     }
