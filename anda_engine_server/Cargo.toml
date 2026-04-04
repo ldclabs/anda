@@ -3,15 +3,15 @@ name = "anda_engine_server"
 description = "A http server to serve multiple Anda engines."
 repository = "https://github.com/ldclabs/anda/tree/main/anda_engine_server"
 publish = true
-version = "0.9.13"
+version = "0.10.0"
 edition.workspace = true
 keywords.workspace = true
 categories.workspace = true
 license.workspace = true
 
 [dependencies]
-anda_core = { path = "../anda_core", version = "0.9" }
-anda_engine = { path = "../anda_engine", version = "0.9" }
+anda_core = { path = "../anda_core", version = "0.10" }
+anda_engine = { path = "../anda_engine", version = "0.10" }
 axum = { workspace = true }
 candid = { workspace = true }
 ciborium = { workspace = true }

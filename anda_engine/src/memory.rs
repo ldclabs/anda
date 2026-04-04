@@ -13,7 +13,7 @@ use anda_db::{
 use anda_db_schema::{AndaDBSchema, FieldEntry, FieldType, Ft, Fv, Json, Schema, SchemaError};
 use anda_db_tfs::jieba_tokenizer;
 use anda_kip::{
-    CommandType, DescribeTarget, KipError, META_SYSTEM_NAME, MetaCommand, PERSON_TYPE, Request,
+    DescribeTarget, KipError, META_SYSTEM_NAME, MetaCommand, PERSON_TYPE, Request,
     Response,
 };
 use candid::Principal;
