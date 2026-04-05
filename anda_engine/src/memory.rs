@@ -13,8 +13,7 @@ use anda_db::{
 use anda_db_schema::{AndaDBSchema, FieldEntry, FieldType, Ft, Fv, Json, Schema, SchemaError};
 use anda_db_tfs::jieba_tokenizer;
 use anda_kip::{
-    DescribeTarget, KipError, META_SYSTEM_NAME, MetaCommand, PERSON_TYPE, Request,
-    Response,
+    DescribeTarget, KipError, META_SYSTEM_NAME, MetaCommand, PERSON_TYPE, Request, Response,
 };
 use candid::Principal;
 use ciborium::cbor;
@@ -42,7 +41,7 @@ pub static FUNCTION_DEFINITION: LazyLock<FunctionDefinition> = LazyLock::new(|| 
             "properties": {
                 "commands": {
                     "type": "array",
-                    "description": "An array of KIP commands for batch execution (reduces round-trips). Commands are executed sequentially; execution stops on first error.",
+                    "description": "An array of KIP commands for batch execution (reduces round-trips). Commands are executed sequentially; execution stops on first KML error.",
                     "items": {
                         "type": "string"
                     }
@@ -696,7 +695,12 @@ impl Tool<BaseCtx> for MemoryReadonly {
     }
 
     fn definition(&self) -> FunctionDefinition {
-        self.memory.kip_function_definitions.clone()
+        FunctionDefinition {
+            name: self.name(),
+            description: self.description(),
+            parameters: self.memory.kip_function_definitions.parameters.clone(),
+            strict: None,
+        }
     }
 
     async fn call(
