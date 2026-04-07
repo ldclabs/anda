@@ -10,6 +10,7 @@ use std::{
 };
 
 use super::{DefaultExecutorHook, ExecArgs, ExecOutput, Executor, ExecutorHook};
+use crate::context::BaseCtx;
 
 /// Native runtime — full access, runs on Mac/Linux/Docker/Raspberry Pi
 pub struct NativeRuntime {
@@ -37,7 +38,6 @@ impl NativeRuntime {
     }
 
     #[cfg(test)]
-    #[allow(dead_code)]
     fn test(shell: Option<ShellProgram>, workdir: PathBuf) -> Self {
         Self {
             shell,
@@ -68,10 +68,12 @@ impl Executor for NativeRuntime {
 
     async fn execute(
         &self,
+        ctx: BaseCtx,
         input: ExecArgs,
-        envs: &HashMap<String, String>,
+        envs: HashMap<String, String>,
     ) -> Result<ExecOutput, BoxError> {
         let shell = self.shell.as_ref().ok_or_else(|| missing_shell_error())?;
+        self.hook.on_execution_start(&ctx, &input).await?;
 
         let mut cmd = tokio::process::Command::new(&shell.program);
         shell.add_shell_args(&mut cmd, &input.command);
@@ -89,26 +91,35 @@ impl Executor for NativeRuntime {
             let temp_dir = self.temp_dir();
             match child.wait_with_output().await {
                 Ok(output) => {
-                    return Ok(ExecOutput::from_output(pid, Some(output), temp_dir).await);
+                    let exec_output = ExecOutput::from_output(pid, Some(output), &temp_dir).await;
+                    self.hook.on_execution_end(&ctx, &input, &exec_output).await;
+                    return Ok(exec_output);
                 }
                 Err(err) => {
-                    return Ok(ExecOutput {
+                    let exec_output = ExecOutput {
                         process_id: pid,
                         stderr: Some(format!("Failed to execute background process: {err}")),
                         ..Default::default()
-                    });
+                    };
+                    self.hook.on_execution_end(&ctx, &input, &exec_output).await;
+                    return Ok(exec_output);
                 }
             }
         }
+
+        let temp_dir = self.temp_dir();
+        let exec_output = ExecOutput::from_output(pid, None, temp_dir).await;
+        self.hook.on_execution_end(&ctx, &input, &exec_output).await;
+
         {
             let hook = self.hook.clone();
-            let temp_dir = self.temp_dir().clone();
+            let temp_dir = temp_dir.clone();
             tokio::spawn(async move {
                 match child.wait_with_output().await {
                     Ok(output) => {
                         let exec_output =
                             ExecOutput::from_output(pid, Some(output), &temp_dir).await;
-                        hook.on_background_end(input, exec_output).await;
+                        hook.on_background_end(ctx, input, exec_output).await;
                     }
                     Err(err) => {
                         let exec_output = ExecOutput {
@@ -116,14 +127,13 @@ impl Executor for NativeRuntime {
                             stderr: Some(format!("Failed to execute background process: {err}")),
                             ..Default::default()
                         };
-                        hook.on_background_end(input, exec_output).await;
+                        hook.on_background_end(ctx, input, exec_output).await;
                     }
                 }
             });
         }
 
-        let temp_dir = self.temp_dir();
-        Ok(ExecOutput::from_output(pid, None, temp_dir).await)
+        Ok(exec_output)
     }
 }
 
@@ -264,6 +274,7 @@ pub(super) fn missing_shell_error() -> BoxError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::EngineBuilder;
     use std::{ffi::OsStr, io::ErrorKind, sync::Mutex, time::Duration};
     use tokio::sync::oneshot;
 
@@ -308,7 +319,7 @@ mod tests {
 
     #[async_trait]
     impl ExecutorHook for TestHook {
-        async fn on_background_end(&self, input: ExecArgs, output: ExecOutput) {
+        async fn on_background_end(&self, _ctx: BaseCtx, input: ExecArgs, output: ExecOutput) {
             if let Some(sender) = self.sender.lock().unwrap().take() {
                 let _ = sender.send((input, output));
             }
@@ -530,16 +541,18 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn execute_returns_error_when_shell_is_missing() {
+        let ctx = EngineBuilder::new().mock_ctx();
         let workdir = TestTempDir::new("anda-native-no-shell").await;
         let runtime = NativeRuntime::test(None, workdir.path().to_path_buf());
 
         let err = runtime
             .execute(
+                ctx.base,
                 ExecArgs {
                     command: "echo ignored".to_string(),
                     ..Default::default()
                 },
-                &HashMap::new(),
+                HashMap::new(),
             )
             .await
             .unwrap_err();
@@ -549,6 +562,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn execute_runs_foreground_command_with_envs_and_workdir() {
+        let ctx = EngineBuilder::new().mock_ctx();
         let workdir = TestTempDir::new("anda-native-foreground").await;
         let nested_dir = workdir.create_dir("nested").await;
         let shell = shell_for_tests();
@@ -560,12 +574,13 @@ mod tests {
 
         let output = runtime
             .execute(
+                ctx.base,
                 ExecArgs {
                     command: foreground_command(shell.kind, env_name, output_file),
                     workdir: "nested".to_string(),
-                    background: false,
+                    ..Default::default()
                 },
-                &envs,
+                envs,
             )
             .await
             .unwrap();
@@ -582,18 +597,20 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn execute_returns_spawn_error_for_missing_workdir() {
+        let ctx = EngineBuilder::new().mock_ctx();
         let workdir = TestTempDir::new("anda-native-missing-workdir").await;
         let shell = shell_for_tests();
         let runtime = NativeRuntime::test(Some(shell.clone()), workdir.path().to_path_buf());
 
         let err = runtime
             .execute(
+                ctx.base,
                 ExecArgs {
                     command: foreground_command(shell.kind, "IGNORED", "env.txt"),
                     workdir: "missing".to_string(),
-                    background: false,
+                    ..Default::default()
                 },
-                &HashMap::new(),
+                HashMap::new(),
             )
             .await
             .unwrap_err();
@@ -606,6 +623,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn execute_reports_background_output_via_hook() {
+        let ctx = EngineBuilder::new().mock_ctx();
         let workdir = TestTempDir::new("anda-native-background").await;
         let shell = shell_for_tests();
         let (sender, receiver) = oneshot::channel();
@@ -616,10 +634,11 @@ mod tests {
             command: background_command(shell.kind),
             workdir: String::new(),
             background: true,
+            ..Default::default()
         };
 
         let output = runtime
-            .execute(input.clone(), &HashMap::new())
+            .execute(ctx.base, input.clone(), HashMap::new())
             .await
             .unwrap();
 

@@ -236,7 +236,9 @@ impl Engine {
             return Err("caller does not have permission".into());
         }
 
-        let ctx = self.ctx.child_base_with(caller, &input.name, meta)?;
+        let ctx = self
+            .ctx
+            .child_base_with(caller, &self.default_agent, &input.name, meta)?;
         self.hooks.on_tool_start(&ctx, &input.name).await?;
 
         let output = tool.call(ctx.clone(), input.args, input.resources).await?;
@@ -532,6 +534,7 @@ impl EngineBuilder {
         let ctx = BaseCtx::new(
             id,
             self.info.name.clone(),
+            "".to_string(),
             self.cancellation_token,
             BTreeSet::new(),
             self.web3,
@@ -596,6 +599,7 @@ impl EngineBuilder {
         let ctx = BaseCtx::new(
             id,
             self.info.name.clone(),
+            default_agent.clone(),
             self.cancellation_token,
             names,
             self.web3,
@@ -609,7 +613,7 @@ impl EngineBuilder {
 
         let meta = RequestMeta::default();
         for (name, tool) in &tools.set {
-            let ct = ctx.child_base_with(id, name, meta.clone())?;
+            let ct = ctx.child_base_with(id, &default_agent, name, meta.clone())?;
             tool.init(ct).await?;
         }
 
@@ -649,6 +653,7 @@ impl EngineBuilder {
         names.insert(Path::from(SYSTEM_PATH));
         let ctx = BaseCtx::new(
             Principal::anonymous(),
+            "Mocker".to_string(),
             "Mocker".to_string(),
             self.cancellation_token,
             names,

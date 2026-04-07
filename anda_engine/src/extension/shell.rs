@@ -69,18 +69,30 @@ pub trait Executor: Send + Sync {
     /// Execute a shell command in this runtime environment, returning the output.
     async fn execute(
         &self,
+        ctx: BaseCtx,
         input: ExecArgs,
-        envs: &HashMap<String, String>,
+        envs: HashMap<String, String>,
     ) -> Result<ExecOutput, BoxError>;
 }
 
 /// Hook for receiving callbacks when a background command finishes.
 #[async_trait]
 pub trait ExecutorHook: Send + Sync {
+    /// Called before any command execution (foreground or background).
+    /// The execution will be cancelled if this returns an error.
+    async fn on_execution_start(&self, _ctx: &BaseCtx, _input: &ExecArgs) -> Result<(), BoxError> {
+        Ok(())
+    }
+
+    /// Called after any command execution (foreground or background).
+    async fn on_execution_end(&self, _ctx: &BaseCtx, _input: &ExecArgs, _output: &ExecOutput) {
+        // Default implementation does nothing.
+    }
+
     /// Called after a background execution ends.
     ///
     /// The default implementation is a no-op.
-    async fn on_background_end(&self, _input: ExecArgs, _output: ExecOutput) {
+    async fn on_background_end(&self, _ctx: BaseCtx, _input: ExecArgs, _output: ExecOutput) {
         // Default implementation does nothing.
     }
 }
@@ -97,6 +109,9 @@ pub struct ExecArgs {
     /// The working directory to execute the command in (relative to runtime storage path)
     #[serde(default)]
     pub workdir: String,
+    /// Additional environment variable keys to set for the command
+    #[serde(default)]
+    pub env_keys: Vec<String>,
     /// Whether to run the command in the background (non-blocking)
     #[serde(default)]
     pub background: bool,
@@ -234,6 +249,14 @@ impl Tool<BaseCtx> for ShellTool {
                         "description": "The working directory to execute the command in (relative to runtime storage path)",
                         "default": ""
                     },
+                    "env_keys": {
+                        "type": "array",
+                        "items": {
+                            "type": "string"
+                        },
+                        "description": "Additional environment variable keys to set for the command",
+                        "default": []
+                    },
                     "background": {
                         "type": "boolean",
                         "description": "Whether to run the command in the background (non-blocking)",
@@ -261,14 +284,20 @@ impl Tool<BaseCtx> for ShellTool {
     /// regular tool output.
     async fn call(
         &self,
-        _ctx: BaseCtx,
+        ctx: BaseCtx,
         args: Self::Args,
         _resources: Vec<Resource>,
     ) -> Result<ToolOutput<Self::Output>, BoxError> {
         let command = args.command.clone();
+        let envs: HashMap<String, String> = args
+            .env_keys
+            .iter()
+            .filter_map(|key| self.envs.get(key).map(|value| (key.clone(), value.clone())))
+            .collect();
+
         let result = tokio::time::timeout(
             Duration::from_secs(SHELL_TIMEOUT_SECS),
-            self.runtime.execute(args, &self.envs),
+            self.runtime.execute(ctx, args, envs),
         )
         .await;
 

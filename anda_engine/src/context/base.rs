@@ -52,6 +52,8 @@ use crate::store::Store;
 
 #[derive(Clone)]
 pub struct BaseCtx {
+    pub agent: String,
+
     pub(crate) id: Principal,
     pub(crate) name: String,
     pub(crate) caller: Principal,
@@ -87,6 +89,7 @@ impl BaseCtx {
     pub(crate) fn new(
         id: Principal,
         name: String,
+        agent: String,
         cancellation_token: CancellationToken,
         names: BTreeSet<Path>,
         web3: Arc<Web3SDK>,
@@ -97,6 +100,7 @@ impl BaseCtx {
         Self {
             id,
             name: name.clone(),
+            agent,
             caller,
             path: Path::default(),
             cancellation_token,
@@ -129,6 +133,7 @@ impl BaseCtx {
         let child = Self {
             id: self.id,
             name: self.name.clone(),
+            agent: self.agent.clone(),
             caller: self.caller,
             path,
             cancellation_token: self.cancellation_token.child_token(),
@@ -154,9 +159,9 @@ impl BaseCtx {
     /// for the new context.
     ///
     /// # Arguments
-    /// * `path` - New path for the child context;
     /// * `caller` - caller principal (or ANONYMOUS);
-    /// * `user` - user state;
+    /// * `agent` - agent name who called this context creation;
+    /// * `path` - New path for the child context;
     /// * `meta` - Metadata for the new context.
     ///
     /// # Errors
@@ -164,6 +169,7 @@ impl BaseCtx {
     pub(crate) fn child_with(
         &self,
         caller: Principal,
+        agent: String,
         path: String,
         meta: RequestMeta,
     ) -> Result<Self, BoxError> {
@@ -171,6 +177,7 @@ impl BaseCtx {
         let child = Self {
             id: self.id,
             name: self.name.clone(),
+            agent,
             caller,
             path,
             cancellation_token: self.cancellation_token.child_token(),

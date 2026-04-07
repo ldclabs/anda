@@ -129,9 +129,12 @@ impl AgentCtx {
         meta: RequestMeta,
     ) -> Result<Self, BoxError> {
         Ok(Self {
-            base: self
-                .base
-                .child_with(caller, format!("A:{}", agent_name), meta)?,
+            base: self.base.child_with(
+                caller,
+                agent_name.to_string(),
+                format!("A:{}", agent_name),
+                meta,
+            )?,
             label: agent_label.to_string(),
             model: self.model.clone(),
             models: self.models.clone(),
@@ -149,11 +152,16 @@ impl AgentCtx {
     pub(crate) fn child_base_with(
         &self,
         caller: Principal,
+        agent_name: &str,
         tool_name: &str,
         meta: RequestMeta,
     ) -> Result<BaseCtx, BoxError> {
-        self.base
-            .child_with(caller, format!("T:{}", tool_name), meta)
+        self.base.child_with(
+            caller,
+            agent_name.to_string(),
+            format!("T:{}", tool_name),
+            meta,
+        )
     }
 
     /// Creates a completion runner for iterative processing of completion requests.
@@ -533,7 +541,6 @@ impl CompletionFeatures for AgentCtx {
         let mut last: Option<AgentOutput> = None;
 
         while let Some(step) = runner.next().await? {
-            // 出错即返回（保持原行为）
             if step.failed_reason.is_some() {
                 return Ok(step);
             }
