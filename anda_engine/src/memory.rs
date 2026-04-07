@@ -28,8 +28,8 @@ use std::{
 };
 
 use crate::{
-    context::BaseCtx, extension::fetch::FetchWebResourcesTool, json_convert_rfc3339_timestamp,
-    rfc3339_datetime, rfc3339_datetime_now, unix_ms,
+    context::BaseCtx, extension::fetch::FetchWebResourcesTool, rfc3339_datetime,
+    rfc3339_datetime_now, unix_ms,
 };
 
 pub static FUNCTION_DEFINITION: LazyLock<FunctionDefinition> = LazyLock::new(|| {
@@ -220,8 +220,30 @@ impl From<Conversation> for Document {
         if let Some(label) = conversation.label {
             metadata.insert("label".to_string(), label.into());
         }
+        let message: Vec<Json> = conversation
+            .messages
+            .iter()
+            .filter_map(|v| {
+                serde_json::from_value::<Message>(v.clone())
+                    .ok()
+                    .and_then(|m| {
+                        if let Some(text) = m.text() {
+                            Some(json!({
+                                "role": m.role,
+                                "content": text,
+                                "name": m.name,
+                                "user": m.user,
+                                "timestamp": m.timestamp.map(|ts| rfc3339_datetime(ts).unwrap_or_else(|| ts.to_string())),
+                            }))
+                        } else {
+                            // ignore non-text messages.
+                            None
+                        }
+                    })
+            })
+            .collect();
         Self {
-            content: json_convert_rfc3339_timestamp(conversation.messages).into(),
+            content: message.into(),
             metadata,
         }
     }
