@@ -1,0 +1,33 @@
+name: sync-alpine
+on:
+  workflow_dispatch:
+    inputs:
+      sync_tag:
+        description: "alpine image tag"
+        required: true
+        type: string
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: imjasonh/setup-crane@v0.4
+      - name: Login to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | crane auth login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: Copy alpine
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tag="${{ github.event.inputs.sync_tag }}"
+          src="docker.io/library/alpine:${tag}"
+          dst="ghcr.io/ldclabs/alpine"
+
+          crane copy "${src}" "${dst}:${tag}"
+
+          if [[ "${tag}" != "latest" ]]; then
+            crane copy "${src}" "${dst}:latest"
+          fi

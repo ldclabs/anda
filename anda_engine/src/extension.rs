@@ -12,3 +12,4 @@
 pub mod extractor;
 pub mod fetch;
 pub mod google;
+pub mod shell;

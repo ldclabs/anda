@@ -87,6 +87,7 @@ idna = "1.0" # https://github.com/ldclabs/anda/security/dependabot/1
 url = "2.5"
 hex = "0.4"
 tower-http = { version = "0.6", features = ["compression-gzip"] }
+which = "8"
 
 [workspace.metadata.cargo-shear]
 ignored = ["idna", "serde_bytes"]

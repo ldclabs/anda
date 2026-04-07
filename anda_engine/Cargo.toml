@@ -48,6 +48,17 @@ moka = { workspace = true }
 tokio = { workspace = true }
 log = { workspace = true }
 url = { workspace = true }
+which = { workspace = true }
+boxlite = { git = "https://github.com/boxlite-ai/boxlite.git", tag = "v0.8.2", optional = true }
 
 [dev-dependencies]
 dotenv = { workspace = true }
+
+[features]
+default = []
+full = ["sandbox"]
+sandbox = ["dep:boxlite"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
