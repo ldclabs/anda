@@ -89,6 +89,9 @@ hex = "0.4"
 tower-http = { version = "0.6", features = ["compression-gzip"] }
 which = "8"
 
+[patch.crates-io]
+boxlite = { git = "https://github.com/boxlite-ai/boxlite.git", tag = "v0.8.2" }
+
 [workspace.metadata.cargo-shear]
 ignored = ["idna", "serde_bytes"]
 
