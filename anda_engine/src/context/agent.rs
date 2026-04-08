@@ -26,11 +26,11 @@
 //! agents or tools while maintaining access to the core functionality.
 
 use anda_core::{
-    AgentContext, AgentInput, AgentOutput, AgentSet, BaseContext, BoxError, BoxPinFut, CacheExpiry,
-    CacheFeatures, CacheStoreFeatures, CancellationToken, CanisterCaller, CompletionFeatures,
-    CompletionRequest, ContentPart, FunctionDefinition, HttpFeatures, Json, KeysFeatures, Message,
-    ObjectMeta, Path, PutMode, PutResult, RequestMeta, Resource, StateFeatures, StoreFeatures,
-    ToolCall, ToolInput, ToolOutput, ToolSet, Usage,
+    Agent, AgentContext, AgentInput, AgentOutput, AgentSet, BaseContext, BoxError, BoxPinFut,
+    CacheExpiry, CacheFeatures, CacheStoreFeatures, CancellationToken, CanisterCaller,
+    CompletionFeatures, CompletionRequest, ContentPart, FunctionDefinition, HttpFeatures, Json,
+    KeysFeatures, Message, ObjectMeta, Path, PutMode, PutResult, RequestMeta, Resource,
+    StateFeatures, StoreFeatures, ToolCall, ToolInput, ToolOutput, ToolSet, Usage,
 };
 use bytes::Bytes;
 use candid::{CandidType, Principal, utils::ArgumentEncoder};
@@ -44,7 +44,7 @@ use std::{
     time::Duration,
 };
 
-use super::{base::BaseCtx, engine::RemoteEngines};
+use super::{base::BaseCtx, engine::RemoteEngines, subagent::SubAgents};
 use crate::model::{Model, Models};
 
 pub static DYNAMIC_REMOTE_ENGINES: &str = "_engines";
@@ -66,6 +66,7 @@ pub struct AgentCtx {
     pub(crate) tools: Arc<ToolSet<BaseCtx>>,
     /// Set of available agents that can be invoked.
     pub(crate) agents: Arc<AgentSet<AgentCtx>>,
+    pub(crate) subagents: Arc<SubAgents>,
 }
 
 impl AgentCtx {
@@ -81,6 +82,7 @@ impl AgentCtx {
         models: Arc<Models>,
         tools: Arc<ToolSet<BaseCtx>>,
         agents: Arc<AgentSet<AgentCtx>>,
+        subagents: Arc<SubAgents>,
     ) -> Self {
         Self {
             base,
@@ -89,6 +91,7 @@ impl AgentCtx {
             models,
             tools,
             agents,
+            subagents,
         }
     }
 
@@ -104,6 +107,7 @@ impl AgentCtx {
             models: self.models.clone(),
             tools: self.tools.clone(),
             agents: self.agents.clone(),
+            subagents: self.subagents.clone(),
         })
     }
 
@@ -140,6 +144,7 @@ impl AgentCtx {
             models: self.models.clone(),
             tools: self.tools.clone(),
             agents: self.agents.clone(),
+            subagents: self.subagents.clone(),
         })
     }
 
@@ -291,16 +296,23 @@ impl AgentContext for AgentCtx {
         names: Option<&[&str]>,
         with_prefix: bool,
     ) -> Vec<FunctionDefinition> {
-        let res = self.agents.definitions(names);
+        let mut defs = self.agents.definitions(names);
+        let defs2 = self.subagents.definitions(names);
+        for def in defs2 {
+            if !defs.iter().any(|d| d.name == def.name) {
+                defs.push(def);
+            }
+        }
+
         if with_prefix {
-            res.into_iter()
+            defs.into_iter()
                 .map(|mut d| {
                     d.name = format!("LA_{}", d.name);
                     d
                 })
                 .collect()
         } else {
-            res
+            defs
         }
     }
 
@@ -427,56 +439,66 @@ impl AgentContext for AgentCtx {
     ///
     /// # Returns
     /// [`AgentOutput`] containing the result of the agent execution.
-    async fn agent_run(
+    fn agent_run(
         &self,
         mut input: AgentInput,
-    ) -> Result<(AgentOutput, Option<Principal>), BoxError> {
-        if input.name.starts_with("la_") {
-            input.name.replace_range(..3, "LA_");
-        }
-        if input.name.starts_with("ra_") {
-            input.name.replace_range(..3, "RA_");
-        }
+    ) -> impl Future<Output = Result<(AgentOutput, Option<Principal>), BoxError>> + Send {
+        let ctx = self.clone();
+        Box::pin(async move {
+            if input.name.starts_with("la_") {
+                input.name.replace_range(..3, "LA_");
+            }
+            if input.name.starts_with("ra_") {
+                input.name.replace_range(..3, "RA_");
+            }
 
-        if !input.name.starts_with("RA_") {
-            let name = input.name.strip_prefix("LA_").unwrap_or(&input.name);
-            let name = name.to_ascii_lowercase();
-            let agent = self
-                .agents
-                .get(&name)
-                .ok_or_else(|| format!("agent {} not found", name))?;
-            let ctx = self.child(&name, agent.label())?;
-            return agent
-                .run(ctx, input.prompt, input.resources)
+            if !input.name.starts_with("RA_") {
+                let name = input.name.strip_prefix("LA_").unwrap_or(&input.name);
+                let name = name.to_ascii_lowercase();
+                if let Some(agent) = ctx.agents.get(&name) {
+                    let child = ctx.child(&name, agent.label())?;
+                    return agent
+                        .run(child, input.prompt, input.resources)
+                        .await
+                        .map(|output| (output, None));
+                } else if let Some(agent) = ctx.subagents.get(&name) {
+                    let child = ctx.child(&name, &name)?;
+                    return agent
+                        .run(child, input.prompt, input.resources)
+                        .await
+                        .map(|output| (output, None));
+                } else {
+                    return Err(format!("agent {} not found", &input.name).into());
+                }
+            }
+
+            // Box the future here to avoid a rustc opaque-future cycle through subagents.
+            if let Some((id, endpoint, agent_name)) =
+                ctx.base.remote.get_agent_endpoint(&input.name)
+            {
+                input.name = agent_name;
+                input.meta = Some(ctx.base.self_meta(id));
+                return ctx
+                    .remote_agent_run(&endpoint, input)
+                    .await
+                    .map(|output| (output, Some(id)));
+            }
+
+            if let Ok((engines, _)) = ctx
+                .cache_store_get::<RemoteEngines>(DYNAMIC_REMOTE_ENGINES)
                 .await
-                .map(|output| (output, None));
-        }
+                && let Some((id, endpoint, agent_name)) = engines.get_agent_endpoint(&input.name)
+            {
+                input.name = agent_name;
+                input.meta = Some(ctx.base.self_meta(id));
+                return ctx
+                    .remote_agent_run(&endpoint, input)
+                    .await
+                    .map(|output| (output, Some(id)));
+            }
 
-        // find registered remote agent and run it
-        if let Some((id, endpoint, agent_name)) = self.base.remote.get_agent_endpoint(&input.name) {
-            input.name = agent_name;
-            input.meta = Some(self.base.self_meta(id));
-            return self
-                .remote_agent_run(&endpoint, input)
-                .await
-                .map(|output| (output, Some(id)));
-        }
-
-        // find dynamic remote agent and run it
-        if let Ok((engines, _)) = self
-            .cache_store_get::<RemoteEngines>(DYNAMIC_REMOTE_ENGINES)
-            .await
-            && let Some((id, endpoint, agent_name)) = engines.get_agent_endpoint(&input.name)
-        {
-            input.name = agent_name;
-            input.meta = Some(self.base.self_meta(id));
-            return self
-                .remote_agent_run(&endpoint, input)
-                .await
-                .map(|output| (output, Some(id)));
-        }
-
-        Err(format!("agent {} not found", input.name).into())
+            Err(format!("agent {} not found", input.name).into())
+        })
     }
 
     /// Runs a remote agent via HTTP RPC.
@@ -532,22 +554,25 @@ impl CompletionFeatures for AgentCtx {
     ///    - Adds tool results to the chat history;
     ///    - Repeats the completion with updated history;
     /// 3. Returns final result when no more tool calls need processing.
-    async fn completion(
+    fn completion(
         &self,
         req: CompletionRequest,
         resources: Vec<Resource>,
-    ) -> Result<AgentOutput, BoxError> {
-        let mut runner = self.completion_iter(req, resources);
-        let mut last: Option<AgentOutput> = None;
+    ) -> impl Future<Output = Result<AgentOutput, BoxError>> + Send {
+        let ctx = self.clone();
+        Box::pin(async move {
+            let mut runner = ctx.completion_iter(req, resources);
+            let mut last: Option<AgentOutput> = None;
 
-        while let Some(step) = runner.next().await? {
-            if step.failed_reason.is_some() {
-                return Ok(step);
+            while let Some(step) = runner.next().await? {
+                if step.failed_reason.is_some() {
+                    return Ok(step);
+                }
+                last = Some(step);
             }
-            last = Some(step);
-        }
 
-        last.ok_or_else(|| "completion runner returned no output".into())
+            last.ok_or_else(|| "completion runner returned no output".into())
+        })
     }
 }
 
@@ -1065,10 +1090,8 @@ impl CompletionRunner {
                 return Err("operation cancelled".into());
             }
 
-            if self.ctx.tools.contains(&tool.name)
-                || tool.name.starts_with("RT_")
-                || tool.name.starts_with("rt_")
-            {
+            let tool_name = tool.name.to_ascii_lowercase();
+            if self.ctx.tools.has(&tool_name) || tool_name.starts_with("rt_") {
                 let ctx = self.ctx.clone();
                 let input = ToolInput {
                     name: tool.name.clone(),
@@ -1098,11 +1121,10 @@ impl CompletionRunner {
                         }
                     }
                 }));
-            } else if self.ctx.agents.contains(&tool.name)
-                || tool.name.starts_with("LA_")
-                || tool.name.starts_with("la_")
-                || tool.name.starts_with("RA_")
-                || tool.name.starts_with("ra_")
+            } else if self.ctx.agents.has(&tool_name)
+                || self.ctx.subagents.has(&tool_name)
+                || tool_name.starts_with("la_")
+                || tool_name.starts_with("ra_")
             {
                 // 代理调用的 prompt 可能在 args 中的 "prompt" 字段，也可能直接在 args 的 JSON 中（如果 args 是一个字符串的话），也可能整个 args 就是 prompt（如果没有 "prompt" 字段的话）
                 let prompt = if let Some(args) = tool.args.as_str() {
@@ -1142,6 +1164,14 @@ impl CompletionRunner {
                         }
                         Err(err) => (None, Some(err.to_string())),
                     }
+                }));
+            } else {
+                tool_call_futs.push(Box::pin(async move {
+                    tool.result = Some(ToolOutput {
+                        output: Json::String(format!("tool {} not found", tool.name)),
+                        ..Default::default()
+                    });
+                    (Some(tool), None)
                 }));
             }
         }

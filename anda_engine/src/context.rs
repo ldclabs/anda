@@ -6,11 +6,13 @@ mod agent;
 mod base;
 mod cache;
 mod engine;
+mod subagent;
 mod web3;
 
 pub use agent::*;
 pub use base::*;
 pub use engine::*;
+pub use subagent::*;
 pub use web3::*;
 
 /// Mock implementations for testing purposes.

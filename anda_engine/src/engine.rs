@@ -45,7 +45,7 @@ use structured_logger::unix_ms;
 use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
 
 use crate::{
-    context::{AgentCtx, BaseCtx, Web3Client, Web3SDK},
+    context::{AgentCtx, BaseCtx, SubAgents, Web3Client, Web3SDK},
     hook::{Hook, Hooks},
     management::{BaseManagement, Management, SYSTEM_PATH, Visibility},
     model::{Model, Models},
@@ -544,7 +544,8 @@ impl EngineBuilder {
 
         let tools = Arc::new(ToolSet::new());
         let agents = Arc::new(AgentSet::new());
-        let ctx = AgentCtx::new(ctx, self.models, tools, agents);
+        let subagents = SubAgents::new(ctx.clone(), None);
+        let ctx = AgentCtx::new(ctx, self.models, tools, agents, Arc::new(subagents));
 
         Engine {
             id,
@@ -609,7 +610,16 @@ impl EngineBuilder {
 
         let tools = Arc::new(self.tools);
         let agents = Arc::new(self.agents);
-        let ctx = AgentCtx::new(ctx, self.models, tools.clone(), agents.clone());
+        let mut subagents = SubAgents::new(ctx.clone(), None);
+        subagents.load().await?;
+
+        let ctx = AgentCtx::new(
+            ctx,
+            self.models,
+            tools.clone(),
+            agents.clone(),
+            Arc::new(subagents),
+        );
 
         let meta = RequestMeta::default();
         for (name, tool) in &tools.set {
@@ -661,12 +671,14 @@ impl EngineBuilder {
             self.store,
             Arc::new(RemoteEngines::new()),
         );
+        let subagents = SubAgents::new(ctx.clone(), None);
 
         AgentCtx::new(
             ctx,
             self.models,
             Arc::new(self.tools),
             Arc::new(self.agents),
+            Arc::new(subagents),
         )
     }
 }

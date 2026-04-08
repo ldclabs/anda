@@ -283,10 +283,17 @@ mod tests {
         assert_eq!(definition.name, "teststruct_extractor");
         let s = serde_json::to_string(&definition).unwrap();
         println!("{}", s);
-        // {"name":"teststruct_extractor","description":"Extract structured data from text using LLMs.","parameters":{"type":"object","properties":{"prompt":{"type":"string","description":"optimized prompt or message."}},"required":["prompt"]}}
-        assert!(s.contains(
-            r#""parameters":{"type":"object","properties":{"prompt":{"type":"string","description":"optimized prompt or message."}},"required":["prompt"]}}"#
-        ));
+        assert_eq!(
+            definition.parameters["description"],
+            json!(
+                "Run this agent on a focused task. Provide a self-contained prompt with the goal, relevant context, constraints, and expected output."
+            )
+        );
+        assert_eq!(
+            definition.parameters["properties"]["prompt"]["minLength"],
+            json!(1)
+        );
+        assert_eq!(definition.parameters["additionalProperties"], json!(false));
         assert!(!s.contains("$schema"));
     }
 

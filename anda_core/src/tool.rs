@@ -224,12 +224,17 @@ where
         self.set.contains_key(&name.to_ascii_lowercase())
     }
 
+    /// Checks if a tool with given name (should be lowercase) exists.
+    pub fn has(&self, name: &str) -> bool {
+        self.set.contains_key(name)
+    }
+
     /// Returns the names of all tools in the set
     pub fn names(&self) -> Vec<String> {
         self.set.keys().cloned().collect()
     }
 
-    /// Retrieves definition for a specific agent.
+    /// Retrieves definition for a specific tool.
     pub fn definition(&self, name: &str) -> Option<FunctionDefinition> {
         self.set
             .get(&name.to_ascii_lowercase())

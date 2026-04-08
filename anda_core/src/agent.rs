@@ -46,7 +46,7 @@ use crate::{
 /// Arguments for an AI agent.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AgentArgs {
-    /// optimized prompt or message.
+    /// Self-contained task prompt for the agent.
     pub prompt: String,
 }
 
@@ -82,10 +82,16 @@ where
             description: self.description(),
             parameters: json!({
                 "type": "object",
+                "description": "Run this agent on a focused task. Provide a self-contained prompt with the goal, relevant context, constraints, and expected output.",
                 "properties": {
-                    "prompt": {"type": "string", "description": "optimized prompt or message."},
+                    "prompt": {
+                        "type": "string",
+                        "description": "The task for this agent. Include the objective, relevant context, constraints, preferred workflow or deliverable, and any success criteria needed to complete the work.",
+                        "minLength": 1
+                    },
                 },
                 "required": ["prompt"],
+                "additionalProperties": false
             }),
             strict: None,
         }
@@ -239,6 +245,11 @@ where
     /// Checks if an agent with given name exists.
     pub fn contains(&self, name: &str) -> bool {
         self.set.contains_key(&name.to_ascii_lowercase())
+    }
+
+    /// Checks if an agent with given name (should be lowercase) exists.
+    pub fn has(&self, name: &str) -> bool {
+        self.set.contains_key(name)
     }
 
     /// Returns the names of all agents in the set.
