@@ -12,6 +12,7 @@
 
 pub mod extractor;
 pub mod fetch;
+pub mod fs;
 pub mod google;
 pub mod shell;
 pub mod skill;

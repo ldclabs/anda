@@ -38,6 +38,7 @@ ic_cose = { workspace = true }
 ic_cose_types = { workspace = true }
 ic_tee_cdk = { workspace = true }
 ic_tee_gateway_sdk = { workspace = true }
+infer = { workspace = true }
 parking_lot = { workspace = true }
 tokio-util = { workspace = true }
 structured-logger = { workspace = true }

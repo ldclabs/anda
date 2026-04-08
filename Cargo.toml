@@ -62,6 +62,7 @@ ic_auth_verifier = "0.8"
 ic_tee_cdk = "0.6"
 ic_tee_agent = "0.6"
 ic_tee_gateway_sdk = "0.6"
+infer = "0.19"
 anda_cloud_cdk = "0.4"
 object_store = { version = "0.13" }
 parking_lot = "0.12"
