@@ -133,6 +133,7 @@ impl CompletionResponse {
             usage: ModelUsage {
                 input_tokens: self.usage.input_tokens,
                 output_tokens: self.usage.output_tokens,
+                cached_tokens: self.usage.input_tokens_details.cached_tokens,
                 requests: 1,
             },
             ..Default::default()
@@ -735,6 +736,20 @@ pub struct ResponsesUsage {
     pub output_tokens: u64,
     /// Total tokens used (for a given prompt)
     pub total_tokens: u64,
+    #[serde(default)]
+    pub input_tokens_details: InputTokensDetails,
+    #[serde(default)]
+    pub output_tokens_details: OutputTokensDetails,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct InputTokensDetails {
+    pub cached_tokens: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct OutputTokensDetails {
+    pub reasoning_tokens: u64,
 }
 
 /// Occasionally, when using OpenAI's Responses API you may get an incomplete response. This struct holds the reason as to why it happened.

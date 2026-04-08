@@ -450,6 +450,10 @@ pub struct Usage {
     /// output tokens received from the LLM
     pub output_tokens: u64,
 
+    /// cached tokens used in the execution.
+    #[serde(default)]
+    pub cached_tokens: u64,
+
     /// number of requests made to agents and tools
     pub requests: u64,
 }
@@ -459,6 +463,7 @@ impl Usage {
     pub fn accumulate(&mut self, other: &Usage) {
         self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
         self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.cached_tokens = self.cached_tokens.saturating_add(other.cached_tokens);
         self.requests = self.requests.saturating_add(other.requests);
     }
 }

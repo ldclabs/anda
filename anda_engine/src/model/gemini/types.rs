@@ -69,7 +69,11 @@ impl GenerateContentResponse {
             chat_history,
             usage: ModelUsage {
                 input_tokens: self.usage_metadata.prompt_token_count as u64,
-                output_tokens: self.usage_metadata.candidates_token_count as u64,
+                output_tokens: (self.usage_metadata.candidates_token_count
+                    + self.usage_metadata.thoughts_token_count
+                    + self.usage_metadata.tool_use_prompt_token_count)
+                    as u64,
+                cached_tokens: self.usage_metadata.cached_content_token_count as u64,
                 requests: 1,
             },
             ..Default::default()
@@ -804,6 +808,12 @@ pub struct UsageMetadata {
 
     #[serde(default)]
     pub thoughts_token_count: u32,
+
+    #[serde(default)]
+    pub tool_use_prompt_token_count: u32,
+
+    #[serde(default)]
+    pub cached_content_token_count: u32,
 }
 
 /// Config for thinking features.

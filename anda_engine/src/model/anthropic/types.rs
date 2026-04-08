@@ -8,6 +8,7 @@ use std::str::FromStr;
 
 use crate::unix_ms;
 
+// https://platform.claude.com/docs/en/api/messages/create
 #[derive(Debug)]
 pub struct RequiredMessageParams {
     pub model: String,
@@ -305,6 +306,12 @@ pub struct Usage {
     /// Input tokens used
     #[serde(default)]
     pub input_tokens: u32,
+    /// The number of input tokens used to create the cache entry.
+    #[serde(default)]
+    // The number of input tokens read from the cache.
+    pub cache_creation_input_tokens: u32,
+    #[serde(default)]
+    pub cache_read_input_tokens: u32,
     /// Output tokens used
     pub output_tokens: u32,
 }
@@ -520,9 +527,13 @@ impl CreateMessageResponse {
             raw_history,
             chat_history,
             model: Some(self.model.clone()),
+            // Total input tokens in a request is the summation of input_tokens, cache_creation_input_tokens, and cache_read_input_tokens.
             usage: ModelUsage {
-                input_tokens: self.usage.input_tokens as u64,
+                input_tokens: (self.usage.input_tokens
+                    + self.usage.cache_creation_input_tokens
+                    + self.usage.cache_read_input_tokens) as u64,
                 output_tokens: self.usage.output_tokens as u64,
+                cached_tokens: self.usage.cache_read_input_tokens as u64,
                 requests: 1,
             },
             ..Default::default()

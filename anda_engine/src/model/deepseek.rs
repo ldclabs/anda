@@ -89,6 +89,9 @@ pub struct Usage {
     pub prompt_tokens: usize,
     /// Number of tokens used in the completion
     pub completion_tokens: usize,
+    /// Number of tokens retrieved from the cache
+    #[serde(default)]
+    pub prompt_cache_hit_tokens: usize,
 }
 
 impl std::fmt::Display for Usage {
@@ -134,6 +137,7 @@ impl CompletionResponse {
                 .map(|u| ModelUsage {
                     input_tokens: u.prompt_tokens as u64,
                     output_tokens: u.completion_tokens as u64,
+                    cached_tokens: u.prompt_cache_hit_tokens as u64,
                     requests: 1,
                 })
                 .unwrap_or_default(),

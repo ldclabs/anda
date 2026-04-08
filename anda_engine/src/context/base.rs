@@ -86,6 +86,7 @@ pub struct BaseCtx {
 /// maintaining its own state while sharing underlying resources.
 impl BaseCtx {
     /// Creates a new BaseCtx instance.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         id: Principal,
         name: String,

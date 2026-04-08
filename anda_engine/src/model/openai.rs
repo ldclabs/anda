@@ -101,12 +101,19 @@ impl Client {
 }
 
 /// Token usage information from OpenAI API
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Default, Debug, Deserialize, Serialize)]
 pub struct Usage {
     pub prompt_tokens: usize,
-    #[serde(default)]
-    pub completion_tokens: usize, // no completion_tokens in embeddings API
+    pub completion_tokens: usize,
     pub total_tokens: usize,
+    #[serde(default)]
+    pub prompt_tokens_details: PromptTokensDetails,
+}
+
+#[derive(Clone, Default, Debug, Deserialize, Serialize)]
+pub struct PromptTokensDetails {
+    #[serde(default)]
+    pub cached_tokens: usize,
 }
 
 impl std::fmt::Display for Usage {
@@ -127,7 +134,9 @@ pub struct CompletionResponse {
     pub created: u64,
     pub model: String,
     pub choices: Vec<Choice>,
-    pub usage: Option<Usage>,
+
+    #[serde(default)]
+    pub usage: Usage,
 }
 
 impl CompletionResponse {
@@ -147,15 +156,12 @@ impl CompletionResponse {
         let mut output = AgentOutput {
             raw_history,
             chat_history,
-            usage: self
-                .usage
-                .as_ref()
-                .map(|u| ModelUsage {
-                    input_tokens: u.prompt_tokens as u64,
-                    output_tokens: u.completion_tokens as u64,
-                    requests: 1,
-                })
-                .unwrap_or_default(),
+            usage: ModelUsage {
+                input_tokens: self.usage.prompt_tokens as u64,
+                output_tokens: self.usage.completion_tokens as u64,
+                cached_tokens: self.usage.prompt_tokens_details.cached_tokens as u64,
+                requests: 1,
+            },
             ..Default::default()
         };
 

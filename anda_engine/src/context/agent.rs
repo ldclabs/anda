@@ -1383,6 +1383,7 @@ mod tests {
                 usage: Usage {
                     input_tokens: 5,
                     output_tokens: 10,
+                    cached_tokens: 0,
                     requests: 1,
                 },
                 ..Default::default()
@@ -1414,6 +1415,7 @@ mod tests {
                     usage: Usage {
                         input_tokens: 3,
                         output_tokens: 6,
+                        cached_tokens: 0,
                         requests: 1,
                     },
                     ..Default::default()
@@ -1427,6 +1429,7 @@ mod tests {
                 usage: Usage {
                     input_tokens: 10,
                     output_tokens: 20,
+                    cached_tokens: 0,
                     requests: 1,
                 },
                 ..Default::default()
@@ -1456,6 +1459,7 @@ mod tests {
                     usage: Usage {
                         input_tokens: 2,
                         output_tokens: 4,
+                        cached_tokens: 0,
                         requests: 1,
                     },
                     ..Default::default()
@@ -1474,6 +1478,7 @@ mod tests {
                 usage: Usage {
                     input_tokens: 8,
                     output_tokens: 16,
+                    cached_tokens: 0,
                     requests: 1,
                 },
                 ..Default::default()
@@ -1586,6 +1591,7 @@ mod tests {
                 usage: Usage {
                     input_tokens: 0,
                     output_tokens: 0,
+                    cached_tokens: 0,
                     requests: 1,
                 },
             })
@@ -1653,6 +1659,7 @@ mod tests {
                 usage: Usage {
                     input_tokens: 1,
                     output_tokens: 2,
+                    cached_tokens: 0,
                     requests: 1,
                 },
                 ..Default::default()

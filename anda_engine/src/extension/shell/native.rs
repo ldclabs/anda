@@ -91,7 +91,7 @@ impl Executor for NativeRuntime {
             let temp_dir = self.temp_dir();
             match child.wait_with_output().await {
                 Ok(output) => {
-                    let exec_output = ExecOutput::from_output(pid, Some(output), &temp_dir).await;
+                    let exec_output = ExecOutput::from_output(pid, Some(output), temp_dir).await;
                     self.hook.on_execution_end(&ctx, &input, &exec_output).await;
                     return Ok(exec_output);
                 }
