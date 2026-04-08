@@ -111,20 +111,21 @@ impl SubAgents {
         }
     }
 
-    pub async fn load(&mut self) -> Result<(), BoxError> {
+    pub async fn load(&self) -> Result<(), BoxError> {
         if let Ok((data, _)) = self.ctx.store_get(&Self::NAME.into()).await {
             let agents: BTreeMap<String, SubAgent> = from_reader(&data[..])?;
-            self.agents = RwLock::new(agents);
+            *self.agents.write() = agents;
         };
 
         Ok(())
     }
 
-    // Checks if a sub-agent with given name (should be lowercase) exists.
+    /// Checks if a sub-agent with given name (should be lowercase) exists.
     pub fn has(&self, lowercase_name: &str) -> bool {
         self.agents.read().contains_key(lowercase_name)
     }
 
+    /// Retrieves a sub-agent by its lowercase name. Returns None if not found. The returned agent will have the hook from SubAgents, if any.
     pub fn get(&self, lowercase_name: &str) -> Option<SubAgent> {
         self.agents
             .read()
@@ -136,6 +137,7 @@ impl SubAgents {
             })
     }
 
+    /// Creates or updates a sub-agent. The name is normalised to lowercase and validated. If an agent with the same name exists, it will be overwritten.
     pub async fn upsert(&self, agent: SubAgent) -> Result<(), BoxError> {
         let mut agent = agent;
         let name = agent.name.to_ascii_lowercase();
@@ -147,6 +149,27 @@ impl SubAgents {
             agents.insert(name, agent);
             deterministic_cbor_into_vec(&*agents)?
         };
+        self.ctx
+            .store_put(&SubAgents::NAME.into(), PutMode::Overwrite, data.into())
+            .await?;
+        Ok(())
+    }
+
+    /// Appends new sub-agents without overwriting existing ones. Invalid or duplicate names are skipped.
+    pub async fn try_append(&self, new_agents: Vec<SubAgent>) -> Result<(), BoxError> {
+        let data = {
+            let mut agents = self.agents.write();
+            for mut agent in new_agents {
+                agent.name = agent.name.to_ascii_lowercase();
+                if validate_function_name(&agent.name).is_err() || agents.contains_key(&agent.name)
+                {
+                    continue;
+                }
+                agents.insert(agent.name.clone(), agent);
+            }
+            deterministic_cbor_into_vec(&*agents)?
+        };
+
         self.ctx
             .store_put(&SubAgents::NAME.into(), PutMode::Overwrite, data.into())
             .await?;

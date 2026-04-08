@@ -610,7 +610,7 @@ impl EngineBuilder {
 
         let tools = Arc::new(self.tools);
         let agents = Arc::new(self.agents);
-        let mut subagents = SubAgents::new(ctx.clone(), None);
+        let subagents = SubAgents::new(ctx.clone(), None);
         subagents.load().await?;
 
         let ctx = AgentCtx::new(
