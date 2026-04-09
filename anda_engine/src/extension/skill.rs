@@ -62,6 +62,7 @@ pub struct SkillManager {
     skills_dir: PathBuf,
     skills: RwLock<BTreeMap<String, Skill>>,
     description: String,
+    default_skill_tools: Vec<String>,
 }
 
 impl SkillManager {
@@ -78,11 +79,23 @@ impl SkillManager {
          Agent Skills are folders of instructions, scripts, and resources that agents \
          can discover and use to perform tasks more accurately and efficiently."
                     .to_string(),
+            default_skill_tools: vec![
+                "shell".to_string(),
+                "fs_read".to_string(),
+                "fs_glob".to_string(),
+                "fs_write".to_string(),
+                "fs_edit".to_string(),
+            ],
         }
     }
 
     pub fn with_description(mut self, description: String) -> Self {
         self.description = description;
+        self
+    }
+
+    pub fn with_default_skill_tools(mut self, tools: Vec<String>) -> Self {
+        self.default_skill_tools = tools;
         self
     }
 
@@ -113,7 +126,20 @@ impl SkillManager {
 
     /// Retrieve a skill as a [`SubAgent`] by its normalised name.
     pub fn get(&self, lowercase_name: &str) -> Option<SubAgent> {
-        self.skills.read().get(lowercase_name).map(SubAgent::from)
+        self.skills
+            .read()
+            .get(lowercase_name)
+            .map(SubAgent::from)
+            .map(|agent| {
+                let mut tools = self.default_skill_tools.clone();
+                for tool in agent.tools {
+                    if !tools.contains(&tool) {
+                        tools.push(tool);
+                    }
+                }
+
+                SubAgent { tools, ..agent }
+            })
     }
 
     /// Retrieve the full [`Skill`] by its normalised name.
@@ -121,11 +147,22 @@ impl SkillManager {
         self.skills.read().get(lowercase_name).cloned()
     }
 
+    /// Return all loaded skills as [`SubAgent`]s with default tools included.
     pub fn subagents(&self) -> Vec<SubAgent> {
         self.skills
             .read()
             .values()
             .map(SubAgent::from)
+            .map(|agent| {
+                let mut tools = self.default_skill_tools.clone();
+                for tool in agent.tools {
+                    if !tools.contains(&tool) {
+                        tools.push(tool);
+                    }
+                }
+
+                SubAgent { tools, ..agent }
+            })
             .collect::<Vec<_>>()
     }
 

@@ -30,6 +30,7 @@ pub struct FsReadOutput {
     pub content: String,
     /// The encoding of the file content.
     pub encoding: String,
+    /// The size of the file in bytes.
     pub size: u64,
     /// The MIME type of the file content.
     #[serde(skip_serializing_if = "Option::is_none")]
