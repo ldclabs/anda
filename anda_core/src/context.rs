@@ -61,7 +61,7 @@ pub trait AgentContext: BaseContext + CompletionFeatures {
     ///
     /// # Returns
     /// Vector of function definitions for the requested tools.
-    fn tool_definitions(&self, names: Option<&[&str]>) -> Vec<FunctionDefinition>;
+    fn tool_definitions(&self, names: Option<&[String]>) -> Vec<FunctionDefinition>;
 
     /// Retrieves definitions for available tools in the remote engines.
     ///
@@ -74,7 +74,7 @@ pub trait AgentContext: BaseContext + CompletionFeatures {
     fn remote_tool_definitions(
         &self,
         endpoint: Option<&str>,
-        names: Option<&[&str]>,
+        names: Option<&[String]>,
     ) -> impl Future<Output = Result<Vec<FunctionDefinition>, BoxError>> + Send;
 
     /// Extracts resources from the provided list based on the tool's supported tags.
@@ -88,15 +88,10 @@ pub trait AgentContext: BaseContext + CompletionFeatures {
     ///
     /// # Arguments
     /// * `names` - Optional filter for specific agent names;
-    /// * `with_prefix` - Flag to add the prefix `LA_` to agent names to distinguish from tools.
     ///
     /// # Returns
     /// Vector of function definitions for the requested agents.
-    fn agent_definitions(
-        &self,
-        names: Option<&[&str]>,
-        with_prefix: bool,
-    ) -> Vec<FunctionDefinition>;
+    fn agent_definitions(&self, names: Option<&[String]>) -> Vec<FunctionDefinition>;
 
     /// Retrieves definitions for available agents in the remote engines.
     ///
@@ -109,7 +104,7 @@ pub trait AgentContext: BaseContext + CompletionFeatures {
     fn remote_agent_definitions(
         &self,
         endpoint: Option<&str>,
-        names: Option<&[&str]>,
+        names: Option<&[String]>,
     ) -> impl Future<Output = Result<Vec<FunctionDefinition>, BoxError>> + Send;
 
     /// Extracts resources from the provided list based on the agent's supported tags.
@@ -118,6 +113,18 @@ pub trait AgentContext: BaseContext + CompletionFeatures {
         name: &str,
         resources: &mut Vec<Resource>,
     ) -> impl Future<Output = Vec<Resource>> + Send;
+
+    /// Retrieves definitions for all available tools and agents, including those in remote engines.
+    ///
+    /// # Arguments
+    /// * `names` - Optional filter for specific tool or agent names;
+    ///
+    /// # Returns
+    /// Vector of function definitions for the requested tools and agents.
+    fn definitions(
+        &self,
+        names: Option<&[String]>,
+    ) -> impl Future<Output = Vec<FunctionDefinition>> + Send;
 
     /// Executes a local tool call.
     ///
@@ -139,7 +146,7 @@ pub trait AgentContext: BaseContext + CompletionFeatures {
     /// # Returns
     /// [`AgentOutput`] containing the result of the agent execution.
     fn agent_run(
-        &self,
+        self,
         args: AgentInput,
     ) -> impl Future<Output = Result<(AgentOutput, Option<Principal>), BoxError>> + Send;
 

@@ -1,13 +1,19 @@
 use anda_core::{
-    Agent, AgentContext, AgentOutput, BoxError, CompletionFeatures, CompletionRequest,
-    FunctionDefinition, PutMode, Resource, StoreFeatures, Tool, ToolOutput, validate_function_name,
+    Agent, AgentContext, AgentOutput, BoxError, CompletionFeatures, CompletionRequest, ContentPart,
+    FunctionDefinition, PutMode, Resource, StoreFeatures, Tool, ToolOutput, select_resources,
+    validate_function_name,
 };
 use ciborium::from_reader;
 use ic_auth_types::deterministic_cbor_into_vec;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::{collections::BTreeMap, future::Future, sync::Arc};
+use std::{
+    any::{Any, TypeId},
+    collections::BTreeMap,
+    future::Future,
+    sync::Arc,
+};
 
 use super::{AgentCtx, BaseCtx};
 use crate::hook::Hook;
@@ -20,6 +26,9 @@ pub struct SubAgent {
 
     #[serde(default)]
     pub tools: Vec<String>,
+
+    #[serde(default)]
+    pub tags: Vec<String>,
 
     #[serde(skip)]
     pub hook: Option<Arc<dyn Hook>>,
@@ -36,7 +45,7 @@ impl Agent<AgentCtx> for SubAgent {
 
     fn definition(&self) -> FunctionDefinition {
         FunctionDefinition {
-            name: self.name().to_ascii_lowercase(),
+            name: self.name(),
             description: self.description(),
             parameters: json!({
                 "type": "object",
@@ -59,6 +68,10 @@ impl Agent<AgentCtx> for SubAgent {
         self.tools.clone()
     }
 
+    fn supported_resource_tags(&self) -> Vec<String> {
+        self.tags.clone()
+    }
+
     fn run(
         &self,
         ctx: AgentCtx,
@@ -74,17 +87,16 @@ impl Agent<AgentCtx> for SubAgent {
             let req = CompletionRequest {
                 instructions: agent.instructions.clone(),
                 prompt,
+                content: resources.into_iter().map(ContentPart::from).collect(),
                 tools: if agent.tools.is_empty() {
                     vec![]
                 } else {
-                    ctx.tool_definitions(Some(
-                        &agent.tools.iter().map(|v| v.as_str()).collect::<Vec<_>>(),
-                    ))
+                    ctx.tool_definitions(Some(&agent.tools))
                 },
                 ..Default::default()
             };
 
-            let rt = ctx.completion(req, resources).await?;
+            let rt = ctx.completion(req, Vec::new()).await?;
             if let Some(hook) = &agent.hook {
                 return hook.on_agent_end(&ctx, &agent.name, rt).await;
             }
@@ -94,47 +106,52 @@ impl Agent<AgentCtx> for SubAgent {
     }
 }
 
-pub struct SubAgents {
-    ctx: BaseCtx,
+pub trait SubAgentSet: Send + Sync {
+    fn into_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync>;
+
+    /// Checks if a sub-agent with the given lowercase name exists.
+    fn contains_lowercase(&self, lowercase_name: &str) -> bool;
+
+    /// Retrieves a sub-agent by lowercase name.
+    fn get_lowercase(&self, lowercase_name: &str) -> Option<SubAgent>;
+
+    /// Returns definitions for all or specified agents.
+    ///
+    /// # Arguments
+    /// - `names`: Optional slice of agent names to filter by.
+    ///
+    /// # Returns
+    /// - Vec<[`FunctionDefinition`]>: Vector of agent definitions. The name in each definition is prefixed with "SA_" to avoid conflicts and indicate it's a sub-agent.
+    fn definitions(&self, names: Option<&[String]>) -> Vec<FunctionDefinition>;
+
+    /// Selects and returns resources relevant to the specified sub-agent name from the provided list.
+    fn select_resources(&self, name: &str, resources: &mut Vec<Resource>) -> Vec<Resource>;
+}
+
+pub struct SubAgentManager {
+    root_ctx: BaseCtx,
     agents: RwLock<BTreeMap<String, SubAgent>>,
     hook: Option<Arc<dyn Hook>>,
 }
 
-impl SubAgents {
-    pub const NAME: &'static str = "subagents";
+impl SubAgentManager {
+    pub const NAME: &'static str = "subagents_manager";
 
-    pub fn new(ctx: BaseCtx, hook: Option<Arc<dyn Hook>>) -> Self {
+    pub fn new(root_ctx: BaseCtx, hook: Option<Arc<dyn Hook>>) -> Self {
         Self {
-            ctx,
+            root_ctx,
             agents: RwLock::new(BTreeMap::new()),
             hook,
         }
     }
 
     pub async fn load(&self) -> Result<(), BoxError> {
-        if let Ok((data, _)) = self.ctx.store_get(&Self::NAME.into()).await {
+        if let Ok((data, _)) = self.root_ctx.store_get(&Self::NAME.into()).await {
             let agents: BTreeMap<String, SubAgent> = from_reader(&data[..])?;
             *self.agents.write() = agents;
         };
 
         Ok(())
-    }
-
-    /// Checks if a sub-agent with given name (should be lowercase) exists.
-    pub fn has(&self, lowercase_name: &str) -> bool {
-        self.agents.read().contains_key(lowercase_name)
-    }
-
-    /// Retrieves a sub-agent by its lowercase name. Returns None if not found. The returned agent will have the hook from SubAgents, if any.
-    pub fn get(&self, lowercase_name: &str) -> Option<SubAgent> {
-        self.agents
-            .read()
-            .get(lowercase_name)
-            .cloned()
-            .map(|mut agent| {
-                agent.hook = self.hook.clone();
-                agent
-            })
     }
 
     /// Creates or updates a sub-agent. The name is normalised to lowercase and validated. If an agent with the same name exists, it will be overwritten.
@@ -149,8 +166,12 @@ impl SubAgents {
             agents.insert(name, agent);
             deterministic_cbor_into_vec(&*agents)?
         };
-        self.ctx
-            .store_put(&SubAgents::NAME.into(), PutMode::Overwrite, data.into())
+        self.root_ctx
+            .store_put(
+                &SubAgentManager::NAME.into(),
+                PutMode::Overwrite,
+                data.into(),
+            )
             .await?;
         Ok(())
     }
@@ -170,20 +191,38 @@ impl SubAgents {
             deterministic_cbor_into_vec(&*agents)?
         };
 
-        self.ctx
-            .store_put(&SubAgents::NAME.into(), PutMode::Overwrite, data.into())
+        self.root_ctx
+            .store_put(
+                &SubAgentManager::NAME.into(),
+                PutMode::Overwrite,
+                data.into(),
+            )
             .await?;
         Ok(())
     }
+}
 
-    /// Returns definitions for all or specified agents.
-    ///
-    /// # Arguments
-    /// - `names`: Optional slice of agent names to filter by.
-    ///
-    /// # Returns
-    /// - Vec<[`FunctionDefinition`]>: Vector of agent definitions.
-    pub fn definitions(&self, names: Option<&[&str]>) -> Vec<FunctionDefinition> {
+impl SubAgentSet for SubAgentManager {
+    fn into_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
+        self
+    }
+
+    fn contains_lowercase(&self, lowercase_name: &str) -> bool {
+        self.agents.read().contains_key(lowercase_name)
+    }
+
+    fn get_lowercase(&self, lowercase_name: &str) -> Option<SubAgent> {
+        self.agents
+            .read()
+            .get(lowercase_name)
+            .cloned()
+            .map(|mut agent| {
+                agent.hook = self.hook.clone();
+                agent
+            })
+    }
+
+    fn definitions(&self, names: Option<&[String]>) -> Vec<FunctionDefinition> {
         let names: Option<Vec<String>> =
             names.map(|names| names.iter().map(|n| n.to_ascii_lowercase()).collect());
         self.agents
@@ -192,18 +231,125 @@ impl SubAgents {
             .filter_map(|(name, agent)| match &names {
                 Some(names) => {
                     if names.contains(name) {
-                        Some(agent.definition())
+                        Some(agent.definition().name_with_prefix("SA_"))
                     } else {
                         None
                     }
                 }
-                None => Some(agent.definition()),
+                None => Some(agent.definition().name_with_prefix("SA_")),
             })
             .collect()
     }
+
+    fn select_resources(
+        &self,
+        prefixed_name: &str,
+        resources: &mut Vec<Resource>,
+    ) -> Vec<Resource> {
+        if resources.is_empty() {
+            return Vec::new();
+        }
+
+        if let Some(name) = prefixed_name.strip_prefix("SA_") {
+            self.agents
+                .read()
+                .get(&name.to_ascii_lowercase())
+                .map(|agent| {
+                    let supported_tags = agent.supported_resource_tags();
+                    select_resources(resources, &supported_tags)
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        }
+    }
 }
 
-impl Tool<BaseCtx> for SubAgents {
+pub struct SubAgentSetManager {
+    sets: RwLock<BTreeMap<TypeId, Arc<dyn SubAgentSet>>>,
+}
+
+impl Default for SubAgentSetManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SubAgentSetManager {
+    pub fn new() -> Self {
+        Self {
+            sets: RwLock::new(BTreeMap::new()),
+        }
+    }
+
+    pub fn insert<T: SubAgentSet + Sized + 'static>(&self, set: Arc<T>) -> Option<Arc<T>> {
+        let type_id = TypeId::of::<T>();
+        self.sets
+            .write()
+            .insert(type_id, set)
+            .and_then(|boxed| boxed.into_any().downcast::<T>().ok())
+    }
+
+    pub fn get<T: SubAgentSet + Sized + 'static>(&self) -> Option<Arc<T>> {
+        let type_id = TypeId::of::<T>();
+        self.sets
+            .read()
+            .get(&type_id)
+            .and_then(|boxed| boxed.clone().into_any().downcast::<T>().ok())
+    }
+}
+
+impl SubAgentSet for SubAgentSetManager {
+    fn into_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
+        self
+    }
+
+    fn contains_lowercase(&self, lowercase_name: &str) -> bool {
+        self.sets
+            .read()
+            .values()
+            .any(|set| set.contains_lowercase(lowercase_name))
+    }
+
+    fn get_lowercase(&self, lowercase_name: &str) -> Option<SubAgent> {
+        for set in self.sets.read().values() {
+            if let Some(agent) = set.get_lowercase(lowercase_name) {
+                return Some(agent);
+            }
+        }
+        None
+    }
+
+    fn definitions(&self, names: Option<&[String]>) -> Vec<FunctionDefinition> {
+        self.sets
+            .read()
+            .values()
+            .flat_map(|set| set.definitions(names))
+            .collect()
+    }
+
+    fn select_resources(
+        &self,
+        prefixed_name: &str,
+        resources: &mut Vec<Resource>,
+    ) -> Vec<Resource> {
+        if resources.is_empty() {
+            return Vec::new();
+        }
+
+        if prefixed_name.starts_with("SA_") {
+            for set in self.sets.read().values() {
+                let selected = set.select_resources(prefixed_name, resources);
+                if !selected.is_empty() {
+                    return selected;
+                }
+            }
+        }
+        Vec::new()
+    }
+}
+
+impl Tool<BaseCtx> for SubAgentManager {
     type Args = SubAgent;
     type Output = String;
 
@@ -277,7 +423,7 @@ mod tests {
             description: "Handles recurring research tasks with concise synthesis.".to_string(),
             instructions: "Research carefully and synthesize findings.".to_string(),
             tools: vec!["google_web_search".to_string()],
-            hook: None,
+            ..Default::default()
         };
 
         let definition = agent.definition();
@@ -302,12 +448,12 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn subagents_tool_definition_guides_reusable_configs_and_normalizes_names() {
-        let ctx = EngineBuilder::new().mock_ctx();
-        let tool = SubAgents::new(ctx.base.clone(), None);
+        let engine = EngineBuilder::new().empty();
+        let tool: Arc<SubAgentManager> = engine.sub_agents_manager().get().unwrap();
 
         let definition = tool.definition();
 
-        assert_eq!(definition.name, "subagents");
+        assert_eq!(definition.name, "subagents_manager");
         assert!(definition.description.contains("reusable sub-agent"));
         assert_eq!(
             definition.parameters["properties"]["name"]["pattern"],
@@ -324,12 +470,12 @@ mod tests {
             description: "Handles recurring research tasks with concise synthesis.".to_string(),
             instructions: "Research carefully and synthesize findings.".to_string(),
             tools: vec!["google_web_search".to_string()],
-            hook: None,
+            ..Default::default()
         })
         .await
         .unwrap();
 
-        let agent = tool.get("research_assistant").unwrap();
+        let agent = tool.get_lowercase("research_assistant").unwrap();
         assert_eq!(agent.name, "research_assistant");
     }
 }

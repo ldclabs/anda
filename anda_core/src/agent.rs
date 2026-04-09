@@ -248,8 +248,8 @@ where
     }
 
     /// Checks if an agent with given name (should be lowercase) exists.
-    pub fn has(&self, name: &str) -> bool {
-        self.set.contains_key(name)
+    pub fn contains_lowercase(&self, lowercase_name: &str) -> bool {
+        self.set.contains_key(lowercase_name)
     }
 
     /// Returns the names of all agents in the set.
@@ -271,7 +271,7 @@ where
     ///
     /// # Returns
     /// - Vec<[`FunctionDefinition`]>: Vector of agent definitions.
-    pub fn definitions(&self, names: Option<&[&str]>) -> Vec<FunctionDefinition> {
+    pub fn definitions(&self, names: Option<&[String]>) -> Vec<FunctionDefinition> {
         let names: Option<Vec<String>> =
             names.map(|names| names.iter().map(|n| n.to_ascii_lowercase()).collect());
         self.set
@@ -296,7 +296,7 @@ where
     ///
     /// # Returns
     /// - Vec<[`Function`]>: Vector of agent functions.
-    pub fn functions(&self, names: Option<&[&str]>) -> Vec<Function> {
+    pub fn functions(&self, names: Option<&[String]>) -> Vec<Function> {
         let names: Option<Vec<String>> =
             names.map(|names| names.iter().map(|n| n.to_ascii_lowercase()).collect());
         self.set
@@ -339,7 +339,7 @@ where
     ///
     /// # Arguments
     /// - `agent`: The agent to register, must implement [`Agent`] trait.
-    pub fn add<T>(&mut self, agent: T, label: Option<String>) -> Result<(), BoxError>
+    pub fn add<T>(&mut self, agent: Arc<T>, label: Option<String>) -> Result<(), BoxError>
     where
         T: Agent<C> + Send + Sync + 'static,
     {
@@ -350,7 +350,7 @@ where
 
         validate_function_name(&name)?;
         let agent_dyn = AgentWrapper {
-            inner: Arc::new(agent),
+            inner: agent,
             label: label.unwrap_or_else(|| name.clone()),
             _phantom: PhantomData,
         };
@@ -361,5 +361,10 @@ where
     /// Retrieves an agent by name.
     pub fn get(&self, name: &str) -> Option<&dyn AgentDyn<C>> {
         self.set.get(&name.to_ascii_lowercase()).map(|v| &**v)
+    }
+
+    /// Retrieves an agent by lowercase name.
+    pub fn get_lowercase(&self, lowercase_name: &str) -> Option<&dyn AgentDyn<C>> {
+        self.set.get(lowercase_name).map(|v| &**v)
     }
 }

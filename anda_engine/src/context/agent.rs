@@ -36,6 +36,7 @@ use bytes::Bytes;
 use candid::{CandidType, Principal, utils::ArgumentEncoder};
 use futures_util::Stream;
 use serde::{Serialize, de::DeserializeOwned};
+use serde_json::json;
 use std::{
     future::Future,
     pin::Pin,
@@ -44,7 +45,12 @@ use std::{
     time::Duration,
 };
 
-use super::{base::BaseCtx, engine::RemoteEngines, subagent::SubAgents};
+use super::{
+    base::BaseCtx,
+    engine::RemoteEngines,
+    subagent::{SubAgentSet, SubAgentSetManager},
+    tool::{ToolsSelectOutput, is_tools_select_name},
+};
 use crate::model::{Model, Models};
 
 pub static DYNAMIC_REMOTE_ENGINES: &str = "_engines";
@@ -58,6 +64,7 @@ pub struct AgentCtx {
     /// Label of the agent.
     pub label: String,
 
+    pub(crate) root: BaseCtx,
     pub(crate) model: Model,
     // label -> model
     pub(crate) models: Arc<Models>,
@@ -66,7 +73,7 @@ pub struct AgentCtx {
     pub(crate) tools: Arc<ToolSet<BaseCtx>>,
     /// Set of available agents that can be invoked.
     pub(crate) agents: Arc<AgentSet<AgentCtx>>,
-    pub(crate) subagents: Arc<SubAgents>,
+    pub(crate) subagents: Arc<SubAgentSetManager>,
 }
 
 impl AgentCtx {
@@ -82,11 +89,12 @@ impl AgentCtx {
         models: Arc<Models>,
         tools: Arc<ToolSet<BaseCtx>>,
         agents: Arc<AgentSet<AgentCtx>>,
-        subagents: Arc<SubAgents>,
+        subagents: Arc<SubAgentSetManager>,
     ) -> Self {
         Self {
-            base,
+            base: base.clone(),
             label: String::new(),
+            root: base,
             model: models.get_model().unwrap_or_else(Model::not_implemented),
             models,
             tools,
@@ -101,8 +109,11 @@ impl AgentCtx {
     /// * `agent_name` - Name of the agent to create context for.
     pub(crate) fn child(&self, agent_name: &str, agent_label: &str) -> Result<Self, BoxError> {
         Ok(Self {
-            base: self.base.child(format!("A:{}", agent_name))?,
+            base: self
+                .base
+                .child(format!("A:{}", agent_name.to_ascii_lowercase()))?,
             label: agent_label.to_string(),
+            root: self.root.clone(),
             model: self.model.clone(),
             models: self.models.clone(),
             tools: self.tools.clone(),
@@ -116,7 +127,8 @@ impl AgentCtx {
     /// # Arguments
     /// * `tool_name` - Name of the tool to create context for.
     pub(crate) fn child_base(&self, tool_name: &str) -> Result<BaseCtx, BoxError> {
-        self.base.child(format!("T:{}", tool_name))
+        self.base
+            .child(format!("T:{}", tool_name.to_ascii_lowercase()))
     }
 
     /// Creates a child context with caller and meta information.
@@ -136,10 +148,11 @@ impl AgentCtx {
             base: self.base.child_with(
                 caller,
                 agent_name.to_string(),
-                format!("A:{}", agent_name),
+                format!("A:{}", agent_name.to_ascii_lowercase()),
                 meta,
             )?,
             label: agent_label.to_string(),
+            root: self.root.clone(),
             model: self.model.clone(),
             models: self.models.clone(),
             tools: self.tools.clone(),
@@ -164,29 +177,19 @@ impl AgentCtx {
         self.base.child_with(
             caller,
             agent_name.to_string(),
-            format!("T:{}", tool_name),
+            format!("T:{}", tool_name.to_ascii_lowercase()),
             meta,
         )
     }
 
     /// Creates a completion runner for iterative processing of completion requests.
     pub fn completion_iter(
-        &self,
+        self,
         req: CompletionRequest,
         resources: Vec<Resource>,
     ) -> CompletionRunner {
-        let label = req.model.as_ref().unwrap_or(&self.label);
-        let model = self
-            .models
-            .get_model_by(label)
-            .unwrap_or_else(|| self.model.clone());
-
-        let fallback_model = self.models.fallback_model();
-
         CompletionRunner {
-            ctx: self.clone(),
-            model,
-            fallback_model,
+            ctx: self,
             req,
             resources,
             chat_history: Vec::new(),
@@ -203,7 +206,7 @@ impl AgentCtx {
 
     /// Creates a completion stream for processing of completion requests.
     pub fn completion_stream(
-        &self,
+        self,
         req: CompletionRequest,
         resources: Vec<Resource>,
     ) -> CompletionStream {
@@ -223,7 +226,7 @@ impl AgentContext for AgentCtx {
     ///
     /// # Returns
     /// Vector of function definitions for the requested tools.
-    fn tool_definitions(&self, names: Option<&[&str]>) -> Vec<FunctionDefinition> {
+    fn tool_definitions(&self, names: Option<&[String]>) -> Vec<FunctionDefinition> {
         self.tools.definitions(names)
     }
 
@@ -238,10 +241,11 @@ impl AgentContext for AgentCtx {
     async fn remote_tool_definitions(
         &self,
         endpoint: Option<&str>,
-        names: Option<&[&str]>,
+        names: Option<&[String]>,
     ) -> Result<Vec<FunctionDefinition>, BoxError> {
         let mut defs = self.base.remote.tool_definitions(endpoint, names);
         if let Ok((engines, _)) = self
+            .root
             .cache_store_get::<RemoteEngines>(DYNAMIC_REMOTE_ENGINES)
             .await
         {
@@ -261,59 +265,46 @@ impl AgentContext for AgentCtx {
     /// Extracts resources from the provided list based on the tool's supported tags.
     async fn select_tool_resources(
         &self,
-        name: &str,
+        prefixed_name: &str,
         resources: &mut Vec<Resource>,
     ) -> Vec<Resource> {
-        if !name.starts_with("RT_") {
-            return self.tools.select_resources(name, resources);
+        if prefixed_name.starts_with("RT_") {
+            let res = self
+                .base
+                .remote
+                .select_tool_resources(prefixed_name, resources);
+            if !res.is_empty() {
+                return res;
+            }
+
+            if let Ok((engines, _)) = self
+                .root
+                .cache_store_get::<RemoteEngines>(DYNAMIC_REMOTE_ENGINES)
+                .await
+            {
+                return engines.select_tool_resources(prefixed_name, resources);
+            }
         }
 
-        let res = self.base.remote.select_tool_resources(name, resources);
-        if !res.is_empty() {
-            return res;
-        }
-
-        if let Ok((engines, _)) = self
-            .cache_store_get::<RemoteEngines>(DYNAMIC_REMOTE_ENGINES)
-            .await
-        {
-            return engines.select_tool_resources(name, resources);
-        }
-
-        Vec::new()
+        self.tools.select_resources(prefixed_name, resources)
     }
 
     /// Retrieves definitions for available agents.
     ///
     /// # Arguments
     /// * `names` - Optional filter for specific agent names;
-    /// * `with_prefix` - Flag to add the prefix `LA_` to agent names to distinguish from tools.
     ///
     /// # Returns
     /// Vector of function definitions for the requested agents.
-    fn agent_definitions(
-        &self,
-        names: Option<&[&str]>,
-        with_prefix: bool,
-    ) -> Vec<FunctionDefinition> {
+    fn agent_definitions(&self, names: Option<&[String]>) -> Vec<FunctionDefinition> {
         let mut defs = self.agents.definitions(names);
-        let defs2 = self.subagents.definitions(names);
-        for def in defs2 {
-            if !defs.iter().any(|d| d.name == def.name) {
-                defs.push(def);
-            }
-        }
-
-        if with_prefix {
-            defs.into_iter()
-                .map(|mut d| {
-                    d.name = format!("LA_{}", d.name);
-                    d
-                })
-                .collect()
-        } else {
-            defs
-        }
+        defs.extend(
+            self.subagents
+                .definitions(names)
+                .into_iter()
+                .map(|d| d.name_with_prefix("SA_")),
+        );
+        defs
     }
 
     /// Retrieves definitions for available agents in the remote engines.
@@ -327,10 +318,11 @@ impl AgentContext for AgentCtx {
     async fn remote_agent_definitions(
         &self,
         endpoint: Option<&str>,
-        names: Option<&[&str]>,
+        names: Option<&[String]>,
     ) -> Result<Vec<FunctionDefinition>, BoxError> {
         let mut defs = self.base.remote.agent_definitions(endpoint, names);
         if let Ok((engines, _)) = self
+            .root
             .cache_store_get::<RemoteEngines>(DYNAMIC_REMOTE_ENGINES)
             .await
         {
@@ -350,29 +342,46 @@ impl AgentContext for AgentCtx {
     /// Extracts resources from the provided list based on the agent's supported tags.
     async fn select_agent_resources(
         &self,
-        name: &str,
+        prefixed_name: &str,
         resources: &mut Vec<Resource>,
     ) -> Vec<Resource> {
-        if !name.starts_with("RA_") {
-            let name = name.strip_prefix("LA_").unwrap_or(name);
-            return self
-                .agents
-                .select_resources(&name.to_ascii_lowercase(), resources);
+        if prefixed_name.starts_with("RA_") {
+            let res = self
+                .base
+                .remote
+                .select_agent_resources(prefixed_name, resources);
+            if !res.is_empty() {
+                return res;
+            }
+
+            if let Ok((engines, _)) = self
+                .root
+                .cache_store_get::<RemoteEngines>(DYNAMIC_REMOTE_ENGINES)
+                .await
+            {
+                return engines.select_agent_resources(prefixed_name, resources);
+            }
         }
 
-        let res = self.base.remote.select_agent_resources(name, resources);
-        if !res.is_empty() {
-            return res;
+        if prefixed_name.starts_with("SA_") {
+            return self.subagents.select_resources(prefixed_name, resources);
         }
 
-        if let Ok((engines, _)) = self
-            .cache_store_get::<RemoteEngines>(DYNAMIC_REMOTE_ENGINES)
-            .await
-        {
-            return engines.select_agent_resources(name, resources);
+        self.agents.select_resources(prefixed_name, resources)
+    }
+
+    /// Retrieves definitions for available tools and agents, including those from remote engines.
+    async fn definitions(&self, names: Option<&[String]>) -> Vec<FunctionDefinition> {
+        let mut definitions = self.tool_definitions(names);
+        definitions.extend(self.agent_definitions(names));
+        if let Ok(remote) = self.remote_tool_definitions(None, names).await {
+            definitions.extend(remote);
+        }
+        if let Ok(remote) = self.remote_agent_definitions(None, names).await {
+            definitions.extend(remote);
         }
 
-        Vec::new()
+        definitions
     }
 
     /// Executes a tool call with the given arguments
@@ -387,49 +396,44 @@ impl AgentContext for AgentCtx {
         &self,
         mut input: ToolInput<Json>,
     ) -> Result<(ToolOutput<Json>, Option<Principal>), BoxError> {
-        if input.name.starts_with("rt_") {
-            input.name.replace_range(..3, "RT_");
-        }
+        if input.name.starts_with("RT_") {
+            // find registered remote tool and call it
+            if let Some((id, endpoint, tool_name)) = self.base.remote.get_tool_endpoint(&input.name)
+            {
+                input.name = tool_name;
+                input.meta = Some(self.base.self_meta(id));
+                return self
+                    .base
+                    .remote_tool_call(&endpoint, input)
+                    .await
+                    .map(|output| (output, Some(id)));
+            }
 
-        if !input.name.starts_with("RT_") {
-            let ctx = self.child_base(&input.name)?;
-            let tool = self
-                .tools
-                .get(&input.name)
-                .ok_or_else(|| format!("tool {} not found", &input.name))?;
-            return tool
-                .call(ctx, input.args, input.resources)
+            // find dynamic remote tool and call it
+            if let Ok((engines, _)) = self
+                .root
+                .cache_store_get::<RemoteEngines>(DYNAMIC_REMOTE_ENGINES)
                 .await
-                .map(|output| (output, None));
+                && let Some((id, endpoint, tool_name)) = engines.get_tool_endpoint(&input.name)
+            {
+                input.name = tool_name;
+                input.meta = Some(self.base.self_meta(id));
+                return self
+                    .base
+                    .remote_tool_call(&endpoint, input)
+                    .await
+                    .map(|output| (output, Some(id)));
+            }
         }
 
-        // find registered remote tool and call it
-        if let Some((id, endpoint, tool_name)) = self.base.remote.get_tool_endpoint(&input.name) {
-            input.name = tool_name;
-            input.meta = Some(self.base.self_meta(id));
-            return self
-                .base
-                .remote_tool_call(&endpoint, input)
-                .await
-                .map(|output| (output, Some(id)));
-        }
-
-        // find dynamic remote tool and call it
-        if let Ok((engines, _)) = self
-            .cache_store_get::<RemoteEngines>(DYNAMIC_REMOTE_ENGINES)
+        let ctx = self.child_base(&input.name)?;
+        let tool = self
+            .tools
+            .get(&input.name)
+            .ok_or_else(|| format!("tool {} not found", &input.name))?;
+        tool.call(ctx, input.args, input.resources)
             .await
-            && let Some((id, endpoint, tool_name)) = engines.get_tool_endpoint(&input.name)
-        {
-            input.name = tool_name;
-            input.meta = Some(self.base.self_meta(id));
-            return self
-                .base
-                .remote_tool_call(&endpoint, input)
-                .await
-                .map(|output| (output, Some(id)));
-        }
-
-        Err(format!("tool {} not found", &input.name).into())
+            .map(|output| (output, None))
     }
 
     /// Runs a local agent.
@@ -440,64 +444,64 @@ impl AgentContext for AgentCtx {
     /// # Returns
     /// [`AgentOutput`] containing the result of the agent execution.
     fn agent_run(
-        &self,
+        self,
         mut input: AgentInput,
     ) -> impl Future<Output = Result<(AgentOutput, Option<Principal>), BoxError>> + Send {
-        let ctx = self.clone();
+        let ctx = self;
         Box::pin(async move {
-            if input.name.starts_with("la_") {
-                input.name.replace_range(..3, "LA_");
-            }
-            if input.name.starts_with("ra_") {
-                input.name.replace_range(..3, "RA_");
+            if input.name.starts_with("RA_") {
+                if let Some((id, endpoint, agent_name)) =
+                    ctx.base.remote.get_agent_endpoint(&input.name)
+                {
+                    input.name = agent_name;
+                    input.meta = Some(ctx.base.self_meta(id));
+                    return ctx
+                        .remote_agent_run(&endpoint, input)
+                        .await
+                        .map(|output| (output, Some(id)));
+                }
+
+                if let Ok((engines, _)) = ctx
+                    .root
+                    .cache_store_get::<RemoteEngines>(DYNAMIC_REMOTE_ENGINES)
+                    .await
+                    && let Some((id, endpoint, agent_name)) =
+                        engines.get_agent_endpoint(&input.name)
+                {
+                    input.name = agent_name;
+                    input.meta = Some(ctx.base.self_meta(id));
+                    return ctx
+                        .remote_agent_run(&endpoint, input)
+                        .await
+                        .map(|output| (output, Some(id)));
+                }
+
+                return Err(format!("agent {} not found", input.name).into());
             }
 
-            if !input.name.starts_with("RA_") {
-                let name = input.name.strip_prefix("LA_").unwrap_or(&input.name);
-                let name = name.to_ascii_lowercase();
-                if let Some(agent) = ctx.agents.get(&name) {
-                    let child = ctx.child(&name, agent.label())?;
-                    return agent
-                        .run(child, input.prompt, input.resources)
-                        .await
-                        .map(|output| (output, None));
-                } else if let Some(agent) = ctx.subagents.get(&name) {
+            if input.name.starts_with("SA_") {
+                let name = input.name[3..].to_ascii_lowercase();
+                if let Some(agent) = ctx.subagents.get_lowercase(&name) {
                     let child = ctx.child(&name, &name)?;
                     return agent
                         .run(child, input.prompt, input.resources)
                         .await
                         .map(|output| (output, None));
                 } else {
-                    return Err(format!("agent {} not found", &input.name).into());
+                    return Err(format!("agent {} not found", input.name).into());
                 }
             }
 
-            // Box the future here to avoid a rustc opaque-future cycle through subagents.
-            if let Some((id, endpoint, agent_name)) =
-                ctx.base.remote.get_agent_endpoint(&input.name)
-            {
-                input.name = agent_name;
-                input.meta = Some(ctx.base.self_meta(id));
-                return ctx
-                    .remote_agent_run(&endpoint, input)
+            let name = input.name.to_ascii_lowercase();
+            if let Some(agent) = ctx.agents.get(&name) {
+                let child = ctx.child(&name, agent.label())?;
+                agent
+                    .run(child, input.prompt, input.resources)
                     .await
-                    .map(|output| (output, Some(id)));
+                    .map(|output| (output, None))
+            } else {
+                Err(format!("agent {} not found", input.name).into())
             }
-
-            if let Ok((engines, _)) = ctx
-                .cache_store_get::<RemoteEngines>(DYNAMIC_REMOTE_ENGINES)
-                .await
-                && let Some((id, endpoint, agent_name)) = engines.get_agent_endpoint(&input.name)
-            {
-                input.name = agent_name;
-                input.meta = Some(ctx.base.self_meta(id));
-                return ctx
-                    .remote_agent_run(&endpoint, input)
-                    .await
-                    .map(|output| (output, Some(id)));
-            }
-
-            Err(format!("agent {} not found", input.name).into())
         })
     }
 
@@ -929,8 +933,6 @@ impl HttpFeatures for AgentCtx {
 /// A iteration style executor for completion.
 pub struct CompletionRunner {
     ctx: AgentCtx,
-    model: Model,
-    fallback_model: Option<Model>,
     req: CompletionRequest,
     resources: Vec<Resource>,
     chat_history: Vec<Message>,
@@ -987,11 +989,6 @@ impl CompletionRunner {
         self.hook = hook;
     }
 
-    /// Returns the name of the model currently used for completion.
-    pub fn model_name(&self) -> String {
-        self.model.model_name()
-    }
-
     /// Execute the next step.
     /// - Calls the model completion.
     /// - Automatically handles tool/agent calls and writes the results back to the conversation history.
@@ -1020,8 +1017,16 @@ impl CompletionRunner {
         self.step += 1;
 
         let req = self.hook.on_completion_start(self.req.clone()).await?;
-        let mut output = self.model.completion(req).await?;
-        output.model = Some(self.model.model_name());
+        let label = req.model.as_ref().unwrap_or(&self.ctx.label);
+
+        let model = self
+            .ctx
+            .models
+            .get_model_by(label)
+            .unwrap_or_else(|| self.ctx.model.clone());
+
+        let mut output = model.completion(req.clone()).await?;
+        output.model = Some(model.model_name());
 
         self.usage.accumulate(&output.usage);
 
@@ -1029,19 +1034,18 @@ impl CompletionRunner {
         // and a fallback model is configured, switch to the fallback model and retry.
         // After switching, subsequent steps will keep using the fallback model.
         if output.failed_reason.is_some()
-            && let Some(fallback) = self.fallback_model.take()
+            && let Some(fallback) = self.ctx.models.fallback_model()
         {
             let primary_reason = output
                 .failed_reason
                 .clone()
                 .unwrap_or_else(|| "unknown error".to_string());
 
-            self.model = fallback;
-            let mut output2 = self.model.completion(self.req.clone()).await?;
-            output2.model = Some(self.model.model_name());
+            let mut output2 = fallback.completion(req).await?;
+            output2.model = Some(fallback.model_name());
             self.usage.accumulate(&output2.usage);
 
-            if let Some(fallback_reason) = output2.failed_reason.clone() {
+            if let Some(fallback_reason) = output2.failed_reason {
                 output2.failed_reason = Some(format!(
                     "primary model failed: {}; fallback model failed: {}",
                     primary_reason, fallback_reason
@@ -1091,7 +1095,7 @@ impl CompletionRunner {
             }
 
             let tool_name = tool.name.to_ascii_lowercase();
-            if self.ctx.tools.has(&tool_name) || tool_name.starts_with("rt_") {
+            if self.ctx.tools.contains_lowercase(&tool_name) || tool_name.starts_with("rt_") {
                 let ctx = self.ctx.clone();
                 let input = ToolInput {
                     name: tool.name.clone(),
@@ -1121,9 +1125,9 @@ impl CompletionRunner {
                         }
                     }
                 }));
-            } else if self.ctx.agents.has(&tool_name)
-                || self.ctx.subagents.has(&tool_name)
-                || tool_name.starts_with("la_")
+            } else if self.ctx.agents.contains_lowercase(&tool_name)
+                || self.ctx.subagents.contains_lowercase(&tool_name)
+                || tool_name.starts_with("sa_")
                 || tool_name.starts_with("ra_")
             {
                 // 代理调用的 prompt 可能在 args 中的 "prompt" 字段，也可能直接在 args 的 JSON 中（如果 args 是一个字符串的话），也可能整个 args 就是 prompt（如果没有 "prompt" 字段的话）
@@ -1152,7 +1156,14 @@ impl CompletionRunner {
                         Ok((res, remote_id)) => {
                             tool.remote_id = remote_id;
                             tool.result = Some(ToolOutput {
-                                output: res.content.clone().into(),
+                                output: if (res.content.starts_with("{")
+                                    || res.content.starts_with("["))
+                                    && let Ok(val) = serde_json::from_str(&res.content)
+                                {
+                                    val
+                                } else {
+                                    res.content.into()
+                                },
                                 artifacts: res.artifacts,
                                 usage: res.usage,
                             });
@@ -1168,7 +1179,7 @@ impl CompletionRunner {
             } else {
                 tool_call_futs.push(Box::pin(async move {
                     tool.result = Some(ToolOutput {
-                        output: Json::String(format!("tool {} not found", tool.name)),
+                        output: Json::String(format!("tool call error: {} not found", tool.name)),
                         ..Default::default()
                     });
                     (Some(tool), None)
@@ -1181,11 +1192,29 @@ impl CompletionRunner {
         let mut tool_call_errors: Vec<String> = Vec::new();
         if !tool_call_futs.is_empty() {
             let results = futures::future::join_all(tool_call_futs).await;
+
+            let mut selected_tools: Vec<FunctionDefinition> = Vec::new();
             for (tool, err) in results {
                 if let Some(mut tool) = tool
                     && let Some(res) = &mut tool.result
                 {
                     self.usage.accumulate(&res.usage);
+                    if is_tools_select_name(&tool.name) {
+                        // 从模型输出或工具调用结果中获取实际被选中的工具定义，传递给下一轮模型调用
+                        if let Ok(selected) =
+                            serde_json::from_value::<ToolsSelectOutput>(res.output.clone())
+                        {
+                            // 仅把选中的工具名称反馈给模型
+                            res.output = json!(
+                                selected
+                                    .tools
+                                    .iter()
+                                    .map(|t| t.name.clone())
+                                    .collect::<Vec<String>>()
+                            );
+                            selected_tools.extend(selected.tools);
+                        }
+                    }
                     // We can not ignore some tool calls.
                     // GPT-5: An assistant message with 'tool_calls' must be followed by tool messages responding to each 'tool_call_id'.
                     tool_calls_continue.push(ContentPart::ToolOutput {
@@ -1200,6 +1229,12 @@ impl CompletionRunner {
                 }
                 if let Some(err) = err {
                     tool_call_errors.push(err);
+                }
+            }
+
+            for tool in selected_tools {
+                if !self.req.tools.iter().any(|t| t.name == tool.name) {
+                    self.req.tools.push(tool);
                 }
             }
         }
@@ -1294,19 +1329,26 @@ impl Stream for CompletionStream {
 #[cfg(test)]
 mod tests {
     use anda_core::{
-        Agent, AgentOutput, BoxError, CancellationToken, CompletionFeatures, CompletionRequest,
-        FunctionDefinition, Resource, Tool, ToolCall, ToolOutput, Usage,
+        Agent, AgentContext, AgentOutput, BoxError, CancellationToken, CompletionFeatures,
+        CompletionRequest, FunctionDefinition, Resource, Tool, ToolCall, ToolOutput, Usage,
     };
+    use candid::Principal;
     use ciborium::from_reader;
     use futures_util::StreamExt;
     use ic_cose_types::to_cbor_bytes;
     use serde::Deserialize;
     use serde_json::json;
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use super::AgentCtx;
-    use crate::context::base::BaseCtx;
-    use crate::{engine::EngineBuilder, model::CompletionFeaturesDyn, model::Model};
+    use crate::context::{TOOLS_SELECT_NAME, base::BaseCtx};
+    use crate::{
+        engine::EngineBuilder,
+        model::{CompletionFeaturesDyn, Model, Models},
+    };
 
     #[test]
     fn json_in_cbor_works() {
@@ -1478,6 +1520,208 @@ mod tests {
                 usage: Usage {
                     input_tokens: 8,
                     output_tokens: 16,
+                    cached_tokens: 0,
+                    requests: 1,
+                },
+                ..Default::default()
+            })))
+        }
+    }
+
+    /// Completer that first selects an agent, then invokes the selected agent.
+    #[derive(Clone)]
+    struct ToolsSelectFlowCompleter {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ToolsSelectFlowCompleter {
+        fn new() -> Self {
+            Self {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl CompletionFeaturesDyn for ToolsSelectFlowCompleter {
+        fn model_name(&self) -> String {
+            "tools_select_flow".to_string()
+        }
+
+        fn completion(
+            &self,
+            req: CompletionRequest,
+        ) -> anda_core::BoxPinFut<Result<AgentOutput, BoxError>> {
+            let stage = self.calls.fetch_add(1, Ordering::SeqCst);
+
+            Box::pin(futures::future::ready(match stage {
+                0 => Ok(AgentOutput {
+                    tool_calls: vec![ToolCall {
+                        name: "tools_select".to_string(),
+                        args: json!({"tools": ["echo_agent"]}),
+                        call_id: Some("select_call".into()),
+                        result: None,
+                        remote_id: None,
+                    }],
+                    usage: Usage {
+                        input_tokens: 2,
+                        output_tokens: 4,
+                        cached_tokens: 0,
+                        requests: 1,
+                    },
+                    ..Default::default()
+                }),
+                1 => {
+                    let tool_names: Vec<String> =
+                        req.tools.iter().map(|tool| tool.name.clone()).collect();
+                    assert_eq!(tool_names, vec!["echo_agent".to_string()]);
+
+                    Ok(AgentOutput {
+                        tool_calls: vec![ToolCall {
+                            name: "echo_agent".to_string(),
+                            args: json!({"prompt": "selected agent task"}),
+                            call_id: Some("agent_call".into()),
+                            result: None,
+                            remote_id: None,
+                        }],
+                        usage: Usage {
+                            input_tokens: 3,
+                            output_tokens: 6,
+                            cached_tokens: 0,
+                            requests: 1,
+                        },
+                        ..Default::default()
+                    })
+                }
+                2 => Ok(AgentOutput {
+                    content: "tools_select_loaded".to_string(),
+                    usage: Usage {
+                        input_tokens: 1,
+                        output_tokens: 2,
+                        cached_tokens: 0,
+                        requests: 1,
+                    },
+                    ..Default::default()
+                }),
+                _ => panic!("unexpected completion stage {stage}"),
+            }))
+        }
+    }
+
+    /// Completer that first asks tools_select to resolve an agent by query, then invokes it.
+    #[derive(Clone)]
+    struct ToolsSelectQueryFlowCompleter {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ToolsSelectQueryFlowCompleter {
+        fn new() -> Self {
+            Self {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl CompletionFeaturesDyn for ToolsSelectQueryFlowCompleter {
+        fn model_name(&self) -> String {
+            "tools_select_query_flow".to_string()
+        }
+
+        fn completion(
+            &self,
+            req: CompletionRequest,
+        ) -> anda_core::BoxPinFut<Result<AgentOutput, BoxError>> {
+            let stage = self.calls.fetch_add(1, Ordering::SeqCst);
+
+            Box::pin(futures::future::ready(match stage {
+                0 => {
+                    assert!(req.tools.iter().any(|t| t.name == TOOLS_SELECT_NAME));
+                    Ok(AgentOutput {
+                        tool_calls: vec![ToolCall {
+                            name: TOOLS_SELECT_NAME.to_string(),
+                            args: json!({"query": "mirror my text", "limit": 1}),
+                            call_id: Some("select_call".into()),
+                            result: None,
+                            remote_id: None,
+                        }],
+                        usage: Usage {
+                            input_tokens: 2,
+                            output_tokens: 4,
+                            cached_tokens: 0,
+                            requests: 1,
+                        },
+                        ..Default::default()
+                    })
+                }
+                1 => {
+                    let tool_names: Vec<String> =
+                        req.tools.iter().map(|tool| tool.name.clone()).collect();
+                    assert_eq!(tool_names, vec!["tools_select", "echo_agent"]);
+
+                    Ok(AgentOutput {
+                        tool_calls: vec![ToolCall {
+                            name: "echo_agent".to_string(),
+                            args: json!({"prompt": "selected agent task"}),
+                            call_id: Some("agent_call".into()),
+                            result: None,
+                            remote_id: None,
+                        }],
+                        usage: Usage {
+                            input_tokens: 3,
+                            output_tokens: 6,
+                            cached_tokens: 0,
+                            requests: 1,
+                        },
+                        ..Default::default()
+                    })
+                }
+                2 => Ok(AgentOutput {
+                    content: "tools_select_loaded".to_string(),
+                    usage: Usage {
+                        input_tokens: 1,
+                        output_tokens: 2,
+                        cached_tokens: 0,
+                        requests: 1,
+                    },
+                    ..Default::default()
+                }),
+                _ => panic!("unexpected completion stage {stage}"),
+            }))
+        }
+    }
+
+    #[derive(Clone)]
+    struct ToolSelectorCompleter {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ToolSelectorCompleter {
+        fn new() -> Self {
+            Self {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl CompletionFeaturesDyn for ToolSelectorCompleter {
+        fn model_name(&self) -> String {
+            TOOLS_SELECT_NAME.to_string()
+        }
+
+        fn completion(
+            &self,
+            req: CompletionRequest,
+        ) -> anda_core::BoxPinFut<Result<AgentOutput, BoxError>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+
+            assert!(req.tools.is_empty());
+            assert!(req.prompt.contains("mirror my text"));
+            assert!(req.prompt.contains("echo_agent"));
+
+            Box::pin(futures::future::ready(Ok(AgentOutput {
+                content: r#"{"tools":["echo_agent"]}"#.to_string(),
+                usage: Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
                     cached_tokens: 0,
                     requests: 1,
                 },
@@ -1872,7 +2116,7 @@ mod tests {
         let model = Model::with_completer(Arc::new(completer));
         let ctx = EngineBuilder::new()
             .with_model(model)
-            .register_tool(EchoTool)
+            .register_tool(Arc::new(EchoTool))
             .unwrap()
             .mock_ctx();
 
@@ -1917,7 +2161,7 @@ mod tests {
         let model = Model::with_completer(Arc::new(completer));
         let ctx = EngineBuilder::new()
             .with_model(model)
-            .register_tool(FailTool)
+            .register_tool(Arc::new(FailTool))
             .unwrap()
             .mock_ctx();
 
@@ -1943,7 +2187,7 @@ mod tests {
         let model = Model::with_completer(Arc::new(completer));
         let ctx = EngineBuilder::new()
             .with_model(model)
-            .register_agent(EchoAgent, None)
+            .register_agent(Arc::new(EchoAgent), None)
             .unwrap()
             .mock_ctx();
 
@@ -1972,6 +2216,126 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("agent_echoed:sub-agent task")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_tools_select_loads_selected_agents_for_the_next_turn() {
+        let completer = ToolsSelectFlowCompleter::new();
+        let call_counter = completer.calls.clone();
+
+        let model = Model::with_completer(Arc::new(completer));
+        let engine = EngineBuilder::new()
+            .with_model(model)
+            .register_agent(Arc::new(EchoAgent), None)
+            .unwrap()
+            .build("echo_agent".to_string())
+            .await
+            .unwrap();
+        let ctx = engine
+            .ctx_with(
+                Principal::anonymous(),
+                "echo_agent",
+                "echo_agent",
+                Default::default(),
+            )
+            .unwrap();
+
+        let req = CompletionRequest {
+            prompt: "select agent then call it".to_string(),
+            ..Default::default()
+        };
+
+        let mut runner = ctx.completion_iter(req, Vec::new());
+
+        runner.next().await.unwrap().unwrap();
+        assert!(!runner.is_done());
+
+        runner.next().await.unwrap().unwrap();
+        assert!(!runner.is_done());
+
+        let final_out = runner.next().await.unwrap().unwrap();
+        assert!(runner.is_done());
+        assert_eq!(final_out.content, "tools_select_loaded");
+        assert_eq!(call_counter.load(Ordering::SeqCst), 3);
+
+        let tool_names: Vec<&str> = final_out
+            .tool_calls
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        assert_eq!(tool_names, vec!["tools_select", "echo_agent"]);
+        assert!(
+            final_out
+                .tool_calls
+                .iter()
+                .all(|tool| tool.result.is_some())
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_tools_select_query_loads_selected_agents_for_the_next_turn() {
+        let completer = ToolsSelectQueryFlowCompleter::new();
+        let call_counter = completer.calls.clone();
+        let selector = ToolSelectorCompleter::new();
+        let selector_calls = selector.calls.clone();
+
+        let models = Arc::new(Models::default());
+        models.set_model(Model::with_completer(Arc::new(completer)));
+        models.set_model_by(
+            TOOLS_SELECT_NAME.to_string(),
+            Model::with_completer(Arc::new(selector)),
+        );
+
+        let engine = EngineBuilder::new()
+            .set_models(models)
+            .register_agent(Arc::new(EchoAgent), None)
+            .unwrap()
+            .build("echo_agent".to_string())
+            .await
+            .unwrap();
+        let ctx = engine
+            .ctx_with(
+                Principal::anonymous(),
+                "echo_agent",
+                "echo_agent",
+                Default::default(),
+            )
+            .unwrap();
+
+        let req = CompletionRequest {
+            prompt: "select agent by intent then call it".to_string(),
+            tools: ctx
+                .definitions(Some(&[TOOLS_SELECT_NAME.to_string()]))
+                .await,
+            ..Default::default()
+        };
+
+        let mut runner = ctx.completion_iter(req, Vec::new());
+
+        let _rt = runner.next().await.unwrap().unwrap();
+        assert!(!runner.is_done());
+
+        let _rt = runner.next().await.unwrap().unwrap();
+        assert!(!runner.is_done());
+
+        let final_out = runner.next().await.unwrap().unwrap();
+        assert!(runner.is_done());
+        assert_eq!(final_out.content, "tools_select_loaded");
+        assert_eq!(call_counter.load(Ordering::SeqCst), 3);
+        assert_eq!(selector_calls.load(Ordering::SeqCst), 1);
+
+        let tool_names: Vec<&str> = final_out
+            .tool_calls
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        assert_eq!(tool_names, vec![TOOLS_SELECT_NAME, "echo_agent"]);
+        assert!(
+            final_out
+                .tool_calls
+                .iter()
+                .all(|tool| tool.result.is_some())
         );
     }
 
@@ -2015,7 +2379,7 @@ mod tests {
         let model = Model::with_completer(Arc::new(BadArgsCompleter));
         let ctx = EngineBuilder::new()
             .with_model(model)
-            .register_agent(EchoAgent, None)
+            .register_agent(Arc::new(EchoAgent), None)
             .unwrap()
             .mock_ctx();
 
@@ -2085,7 +2449,7 @@ mod tests {
         let model = Model::with_completer(Arc::new(completer));
         let ctx = EngineBuilder::new()
             .with_model(model)
-            .register_tool(EchoTool)
+            .register_tool(Arc::new(EchoTool))
             .unwrap()
             .mock_ctx();
 
@@ -2222,7 +2586,7 @@ mod tests {
         let model = Model::with_completer(Arc::new(completer));
         let ctx = EngineBuilder::new()
             .with_model(model)
-            .register_tool(EchoTool)
+            .register_tool(Arc::new(EchoTool))
             .unwrap()
             .mock_ctx();
 
@@ -2286,7 +2650,7 @@ mod tests {
         let model = Model::with_completer(Arc::new(completer));
         let ctx = EngineBuilder::new()
             .with_model(model)
-            .register_tool(EchoTool)
+            .register_tool(Arc::new(EchoTool))
             .unwrap()
             .mock_ctx();
 
@@ -2341,7 +2705,7 @@ mod tests {
         let model = Model::with_completer(Arc::new(completer));
         let ctx = EngineBuilder::new()
             .with_model(model)
-            .register_tool(EchoTool)
+            .register_tool(Arc::new(EchoTool))
             .unwrap()
             .mock_ctx();
 
@@ -2446,7 +2810,7 @@ mod tests {
         let model = Model::with_completer(Arc::new(completer));
         let ctx = EngineBuilder::new()
             .with_model(model)
-            .register_tool(ArtifactTool)
+            .register_tool(Arc::new(ArtifactTool))
             .unwrap()
             .mock_ctx();
 
@@ -2507,7 +2871,7 @@ mod tests {
         let model = Model::with_completer(Arc::new(completer));
         let ctx = EngineBuilder::new()
             .with_model(model)
-            .register_tool(EchoTool)
+            .register_tool(Arc::new(EchoTool))
             .unwrap()
             .mock_ctx();
 

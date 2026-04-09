@@ -13,14 +13,15 @@
 //! snake_case (`my_skill`) when loaded as [`SubAgent`] instances.
 
 use anda_core::{
-    Agent, BoxError, FunctionDefinition, Resource, Tool, ToolOutput, validate_function_name,
+    Agent, BoxError, FunctionDefinition, Resource, Tool, ToolOutput, select_resources,
+    validate_function_name,
 };
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{any::Any, collections::BTreeMap, path::PathBuf, sync::Arc};
 
-use crate::context::{BaseCtx, SubAgent};
+use crate::context::{BaseCtx, SubAgent, SubAgentSet};
 
 mod types;
 pub use types::*;
@@ -65,9 +66,11 @@ pub struct SkillManager {
     default_skill_tools: Vec<String>,
 }
 
+static DEFAULT_SKILL_TOOLS: &[&str] = &["shell", "fs_read", "fs_glob", "fs_write", "fs_edit"];
+
 impl SkillManager {
     /// Tool name used for registration.
-    pub const NAME: &'static str = "skills";
+    pub const NAME: &'static str = "skills_manager";
 
     /// Create a new, empty manager rooted at `skills_dir`.
     pub fn new(skills_dir: PathBuf) -> Self {
@@ -79,13 +82,7 @@ impl SkillManager {
          Agent Skills are folders of instructions, scripts, and resources that agents \
          can discover and use to perform tasks more accurately and efficiently."
                     .to_string(),
-            default_skill_tools: vec![
-                "shell".to_string(),
-                "fs_read".to_string(),
-                "fs_glob".to_string(),
-                "fs_write".to_string(),
-                "fs_edit".to_string(),
-            ],
+            default_skill_tools: DEFAULT_SKILL_TOOLS.iter().map(|s| s.to_string()).collect(),
         }
     }
 
@@ -119,29 +116,6 @@ impl SkillManager {
         Ok(())
     }
 
-    /// Check whether a skill with the given (lowercase) name exists.
-    pub fn has(&self, lowercase_name: &str) -> bool {
-        self.skills.read().contains_key(lowercase_name)
-    }
-
-    /// Retrieve a skill as a [`SubAgent`] by its normalised name.
-    pub fn get(&self, lowercase_name: &str) -> Option<SubAgent> {
-        self.skills
-            .read()
-            .get(lowercase_name)
-            .map(SubAgent::from)
-            .map(|agent| {
-                let mut tools = self.default_skill_tools.clone();
-                for tool in agent.tools {
-                    if !tools.contains(&tool) {
-                        tools.push(tool);
-                    }
-                }
-
-                SubAgent { tools, ..agent }
-            })
-    }
-
     /// Retrieve the full [`Skill`] by its normalised name.
     pub fn get_skill(&self, lowercase_name: &str) -> Option<Skill> {
         self.skills.read().get(lowercase_name).cloned()
@@ -169,29 +143,6 @@ impl SkillManager {
     /// Return all loaded skills.
     pub fn list(&self) -> BTreeMap<String, Skill> {
         self.skills.read().clone()
-    }
-
-    /// Return [`FunctionDefinition`]s for all or specified skills.
-    pub fn definitions(&self, names: Option<&[&str]>) -> Vec<FunctionDefinition> {
-        let names: Option<Vec<String>> =
-            names.map(|names| names.iter().map(|n| n.to_ascii_lowercase()).collect());
-        self.skills
-            .read()
-            .iter()
-            .filter_map(|(name, skill): (&String, &Skill)| {
-                let agent = SubAgent::from(skill);
-                match &names {
-                    Some(names) => {
-                        if names.contains(name) {
-                            Some(agent.definition())
-                        } else {
-                            None
-                        }
-                    }
-                    None => Some(agent.definition()),
-                }
-            })
-            .collect()
     }
 
     /// Create or update a skill on disk and in memory.
@@ -246,6 +197,81 @@ impl SkillManager {
             .write()
             .insert(agent_name.clone(), skill.clone());
         Ok(skill)
+    }
+}
+
+impl SubAgentSet for SkillManager {
+    fn into_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
+        self
+    }
+
+    fn contains_lowercase(&self, lowercase_name: &str) -> bool {
+        self.skills.read().contains_key(lowercase_name)
+    }
+
+    fn get_lowercase(&self, lowercase_name: &str) -> Option<SubAgent> {
+        self.skills
+            .read()
+            .get(lowercase_name)
+            .map(SubAgent::from)
+            .map(|agent| {
+                let mut tools = self.default_skill_tools.clone();
+                for tool in agent.tools {
+                    if !tools.contains(&tool) {
+                        tools.push(tool);
+                    }
+                }
+
+                SubAgent { tools, ..agent }
+            })
+    }
+
+    fn definitions(&self, names: Option<&[String]>) -> Vec<FunctionDefinition> {
+        let names: Option<Vec<String>> =
+            names.map(|names| names.iter().map(|n| n.to_ascii_lowercase()).collect());
+        let names: Option<Vec<String>> =
+            names.map(|names| names.iter().map(|n| n.to_ascii_lowercase()).collect());
+        self.skills
+            .read()
+            .iter()
+            .filter_map(|(name, skill): (&String, &Skill)| {
+                let agent = SubAgent::from(skill);
+                match &names {
+                    Some(names) => {
+                        if names.contains(name) {
+                            Some(agent.definition())
+                        } else {
+                            None
+                        }
+                    }
+                    None => Some(agent.definition()),
+                }
+            })
+            .collect()
+    }
+
+    fn select_resources(
+        &self,
+        prefixed_name: &str,
+        resources: &mut Vec<Resource>,
+    ) -> Vec<Resource> {
+        if resources.is_empty() {
+            return Vec::new();
+        }
+
+        if let Some(name) = prefixed_name.strip_prefix("SA_") {
+            self.skills
+                .read()
+                .get(&name.to_ascii_lowercase())
+                .map(SubAgent::from)
+                .map(|agent| {
+                    let supported_tags = agent.supported_resource_tags();
+                    select_resources(resources, &supported_tags)
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        }
     }
 }
 
@@ -331,6 +357,8 @@ impl Tool<BaseCtx> for SkillManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{context::SubAgentSet, engine::EngineBuilder};
+    use std::sync::Arc;
 
     // -- Tool definition --
 
@@ -338,7 +366,7 @@ mod tests {
     fn skill_manager_tool_definition_schema() {
         let mgr = SkillManager::new(PathBuf::from("/tmp/skills"));
         let def = mgr.definition();
-        assert_eq!(def.name, "skills");
+        assert_eq!(def.name, "skills_manager");
         assert!(def.description.contains("Agent Skills specification"));
         assert_eq!(def.parameters["additionalProperties"], json!(false));
         assert_eq!(def.parameters["properties"]["name"]["maxLength"], json!(64));
@@ -393,16 +421,21 @@ Beta instructions.
         let mgr = SkillManager::new(tmp.clone());
         mgr.load().await.unwrap();
 
-        assert!(mgr.has("skill_alpha"));
-        assert!(mgr.has("skill_beta_skill"));
-        assert!(!mgr.has("skill_gamma"));
+        assert!(mgr.contains_lowercase("skill_alpha"));
+        assert!(mgr.contains_lowercase("skill_beta_skill"));
+        assert!(!mgr.contains_lowercase("skill_gamma"));
 
-        let alpha = mgr.get("skill_alpha").unwrap();
+        let alpha = mgr.get_lowercase("skill_alpha").unwrap();
         assert_eq!(alpha.description, "Alpha skill for testing.");
-        assert!(alpha.tools.is_empty());
+        assert_eq!(alpha.tools, DEFAULT_SKILL_TOOLS);
 
-        let beta = mgr.get("skill_beta_skill").unwrap();
-        assert_eq!(beta.tools, vec!["shell", "fetch"]);
+        let beta = mgr.get_lowercase("skill_beta_skill").unwrap();
+        assert_eq!(
+            beta.tools,
+            vec![
+                "shell", "fs_read", "fs_glob", "fs_write", "fs_edit", "fetch"
+            ]
+        );
         assert!(beta.instructions.contains("Beta instructions."));
 
         let beta_skill = mgr.get_skill("skill_beta_skill").unwrap();
@@ -418,7 +451,7 @@ Beta instructions.
         .await
         .unwrap();
 
-        assert!(mgr.has("skill_gamma"));
+        assert!(mgr.contains_lowercase("skill_gamma"));
         assert!(tmp.join("gamma/SKILL.md").exists());
 
         // Verify on-disk content is valid SKILL.md.
@@ -439,13 +472,18 @@ Beta instructions.
         .await
         .unwrap();
 
-        let alpha2 = mgr.get("skill_alpha").unwrap();
+        let alpha2 = mgr.get_lowercase("skill_alpha").unwrap();
         assert_eq!(alpha2.description, "Alpha v2 for testing.");
         assert!(
             alpha2.instructions.contains(
             "You are a sub-agent specialised in \"alpha\" skill. Follow these instructions:\n\nUpdated.")
         );
-        assert_eq!(alpha2.tools, vec!["shell", "fetch"]);
+        assert_eq!(
+            alpha2.tools,
+            vec![
+                "shell", "fs_read", "fs_glob", "fs_write", "fs_edit", "fetch"
+            ]
+        );
 
         // File should be at the original path.
         let on_disk = tokio::fs::read_to_string(tmp.join("alpha/SKILL.md"))
@@ -457,7 +495,7 @@ Beta instructions.
         let defs = mgr.definitions(None);
         assert_eq!(defs.len(), 3);
 
-        let defs_filtered = mgr.definitions(Some(&["skill_gamma"]));
+        let defs_filtered = mgr.definitions(Some(&["skill_gamma".to_string()]));
         assert_eq!(defs_filtered.len(), 1);
         assert_eq!(defs_filtered[0].name, "skill_gamma");
 
@@ -494,7 +532,7 @@ Body.
         mgr.load().await.unwrap();
 
         // Should be skipped because dir name != skill name.
-        assert!(!mgr.has("skill_correct_name"));
+        assert!(!mgr.contains_lowercase("skill_correct_name"));
 
         let _ = tokio::fs::remove_dir_all(&tmp).await;
     }
@@ -527,5 +565,14 @@ Body.
             ..Default::default()
         }));
         assert!(err.is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sub_agents_manager_register_skills_manager() {
+        let tmp =
+            std::env::temp_dir().join(format!("anda-skills-val-{:016x}", rand::random::<u64>()));
+        let tool = SkillManager::new(tmp.clone());
+        let engine = EngineBuilder::new().empty();
+        assert!(engine.sub_agents_manager().insert(Arc::new(tool)).is_none());
     }
 }

@@ -41,10 +41,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+type CacheValue = Arc<(Bytes, Option<CacheExpiry>)>;
+type NamespaceCache = Cache<String, CacheValue>;
+
 #[derive(Debug)]
 pub(crate) struct CacheService {
-    #[allow(clippy::type_complexity)]
-    cache_store: HashMap<Path, Cache<String, Arc<(Bytes, Option<CacheExpiry>)>>>,
+    cache_store: HashMap<Path, NamespaceCache>,
 }
 
 /// CacheService provides an in-memory LRU cache with expiration for AI Agent system's agents and tools.
@@ -55,6 +57,14 @@ pub(crate) struct CacheService {
 /// Note: Data is cached only in memory and will be lost upon system restart.
 /// For persistent storage, use `StoreFeatures`.
 impl CacheService {
+    fn cache(&self, path: &Path) -> Option<&NamespaceCache> {
+        self.cache_store.get(path)
+    }
+
+    fn missing_path(path: &Path) -> BoxError {
+        format!("cache path {} not found", path).into()
+    }
+
     /// Creates a new CacheService instance with specified maximum capacity.
     ///
     /// # Arguments
@@ -89,16 +99,14 @@ impl CacheService {
     ///
     /// # Arguments
     /// * `path` - The namespace for the key. It is used to isolate cache storage for each agent/tool.
-    /// * It will panic if the cache is not created for the given path.
     /// * `key` - The key to check.
     ///
     /// # Returns
-    /// `true` if key exists, `false` otherwise.
+    /// `true` if key exists, `false` otherwise, including when the cache namespace is missing.
     pub fn contains(&self, path: &Path, key: &str) -> bool {
-        self.cache_store
-            .get(path)
-            .expect("CacheService: cache not found")
-            .contains_key(key)
+        self.cache(path)
+            .map(|cache| cache.contains_key(key))
+            .unwrap_or(false)
     }
 
     /// Retrieves a cached value by key.
@@ -113,16 +121,12 @@ impl CacheService {
     where
         T: DeserializeOwned,
     {
-        if let Some(val) = self
-            .cache_store
-            .get(path)
-            .expect("CacheService: cache not found")
-            .get(key)
-            .await
-        {
-            from_reader(&val.0[..]).map_err(|err| err.into())
-        } else {
-            Err(format!("key {} not found", key).into())
+        match self.cache(path) {
+            Some(cache) => match cache.get(key).await {
+                Some(val) => from_reader(&val.0[..]).map_err(|err| err.into()),
+                None => Err(format!("key {} not found", key).into()),
+            },
+            None => Err(Self::missing_path(path)),
         }
     }
 
@@ -142,11 +146,9 @@ impl CacheService {
         T: Sized + DeserializeOwned + Serialize + Send,
         F: Future<Output = Result<(T, Option<CacheExpiry>), BoxError>> + Send + 'static,
     {
+        let cache = self.cache(path).ok_or_else(|| Self::missing_path(path))?;
         futures_util::pin_mut!(init);
-        match self
-            .cache_store
-            .get(path)
-            .expect("CacheService: cache not found")
+        match cache
             .try_get_with_by_ref(key, async move {
                 match init.await {
                     Ok((val, expiry)) => {
@@ -173,10 +175,11 @@ impl CacheService {
     where
         T: Sized + Serialize + Send,
     {
+        let Some(cache) = self.cache(path) else {
+            return;
+        };
         let data = deterministic_cbor_into_vec(&value.0).unwrap();
-        self.cache_store
-            .get(path)
-            .expect("CacheService: cache not found")
+        cache
             .insert(key.to_string(), Arc::new((data.into(), value.1)))
             .await;
     }
@@ -196,11 +199,11 @@ impl CacheService {
     where
         T: Sized + Serialize + Send,
     {
+        let Some(cache) = self.cache(path) else {
+            return false;
+        };
         let data = deterministic_cbor_into_vec(&value.0).unwrap();
-        let entry = self
-            .cache_store
-            .get(path)
-            .expect("CacheService: cache not found")
+        let entry = cache
             .entry_by_ref(key)
             .or_optionally_insert_with(async { Some(Arc::new((data.into(), value.1))) })
             .await;
@@ -216,12 +219,10 @@ impl CacheService {
     /// # Returns
     /// `true` if key existed and was deleted, `false` otherwise.
     pub async fn delete(&self, path: &Path, key: &str) -> bool {
-        self.cache_store
-            .get(path)
-            .expect("CacheService: cache not found")
-            .remove(key)
-            .await
-            .is_some()
+        match self.cache(path) {
+            Some(cache) => cache.remove(key).await.is_some(),
+            None => false,
+        }
     }
 
     /// Returns an iterator over the cache entries for a given path.
@@ -229,10 +230,7 @@ impl CacheService {
         &self,
         path: &Path,
     ) -> impl Iterator<Item = (Arc<String>, Arc<(Bytes, Option<CacheExpiry>)>)> {
-        self.cache_store
-            .get(path)
-            .expect("CacheService: cache not found")
-            .iter()
+        self.cache(path).into_iter().flat_map(|cache| cache.iter())
     }
 }
 
@@ -336,6 +334,38 @@ mod tests {
         assert_eq!(res.age, Some(19));
 
         cache.delete(&path1, "key").await;
+        assert!(cache.get::<Profile>(&path1, "key").await.is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_cache_service_missing_path() {
+        let path1 = Path::from("path1");
+        let path2 = Path::from("path2");
+        let cache = CacheService::new(100, BTreeSet::from([path1.clone()]));
+        let profile = Profile {
+            name: "Anda".to_string(),
+            age: Some(18),
+        };
+
+        assert!(!cache.contains(&path2, "key"));
+        assert!(cache.get::<Profile>(&path2, "key").await.is_err());
+
+        let p1 = profile.clone();
+        assert!(
+            cache
+                .get_with(&path2, "key", async move { Ok((p1, None)) })
+                .await
+                .is_err()
+        );
+
+        cache.set(&path2, "key", (profile.clone(), None)).await;
+        assert!(
+            !cache
+                .set_if_not_exists(&path2, "key", (profile.clone(), None))
+                .await
+        );
+        assert!(!cache.delete(&path2, "key").await);
+        assert_eq!(cache.iter(&path2).count(), 0);
         assert!(cache.get::<Profile>(&path1, "key").await.is_err());
     }
 }

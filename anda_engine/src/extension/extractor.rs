@@ -257,6 +257,7 @@ where
 mod tests {
     use anda_core::{AgentContext, AgentInput, ToolInput};
     use serde_json::json;
+    use std::sync::Arc;
 
     use super::*;
     use crate::{engine::EngineBuilder, model::Model};
@@ -306,9 +307,9 @@ mod tests {
 
         let ctx = EngineBuilder::new()
             .with_model(Model::mock_implemented())
-            .register_tool(tool)
+            .register_tool(Arc::new(tool))
             .unwrap()
-            .register_agent(agent, None)
+            .register_agent(Arc::new(agent), None)
             .unwrap()
             .mock_ctx();
 
@@ -334,6 +335,7 @@ mod tests {
         assert!(res.unwrap_err().to_string().contains("invalid args"));
 
         let _res = ctx
+            .clone()
             .agent_run(AgentInput::new(
                 agent_name.to_string(),
                 r#"{"name": "Anda"}"#.into(),

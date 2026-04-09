@@ -178,6 +178,7 @@ impl From<&Skill> for SubAgent {
                 skill.instructions,
             ),
             tools: skill.tools.clone(),
+            tags: Vec::new(),
             hook: None,
         }
     }

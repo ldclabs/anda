@@ -366,6 +366,33 @@ impl From<Json> for ContentPart {
     }
 }
 
+impl From<Resource> for ContentPart {
+    fn from(res: Resource) -> Self {
+        if let Some(data) = res.blob {
+            match String::from_utf8(data.0) {
+                Ok(text) => {
+                    ContentPart::Text { text }
+                }
+                Err(v) => ContentPart::InlineData {
+                    mime_type: res
+                        .mime_type
+                        .unwrap_or_else(|| "application/octet-stream".to_string()),
+                    data: v.into_bytes().into(),
+                },
+            }
+        } else if let Some(file_uri) = res.uri {
+            ContentPart::FileData {
+                file_uri,
+                mime_type: res.mime_type,
+            }
+        } else {
+            ContentPart::Text {
+                text: serde_json::to_string(&res).unwrap_or_default(),
+            }
+        }
+    }
+}
+
 /// Represents a request to a tool for processing.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ToolInput<T> {

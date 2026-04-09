@@ -225,8 +225,8 @@ where
     }
 
     /// Checks if a tool with given name (should be lowercase) exists.
-    pub fn has(&self, name: &str) -> bool {
-        self.set.contains_key(name)
+    pub fn contains_lowercase(&self, lowercase_name: &str) -> bool {
+        self.set.contains_key(lowercase_name)
     }
 
     /// Returns the names of all tools in the set
@@ -244,11 +244,11 @@ where
     /// Returns definitions for all or specified tools.
     ///
     /// # Arguments
-    /// - `names`: Optional slice of agent names to filter by.
+    /// - `names`: Optional slice of tool names to filter by.
     ///
     /// # Returns
-    /// - Vec<[`FunctionDefinition`]>: Vector of agent definitions.
-    pub fn definitions(&self, names: Option<&[&str]>) -> Vec<FunctionDefinition> {
+    /// - Vec<[`FunctionDefinition`]>: Vector of tool definitions.
+    pub fn definitions(&self, names: Option<&[String]>) -> Vec<FunctionDefinition> {
         let names: Option<Vec<String>> =
             names.map(|names| names.iter().map(|n| n.to_ascii_lowercase()).collect());
         self.set
@@ -273,7 +273,7 @@ where
     ///
     /// # Returns
     /// - Vec<[`Function`]>: Vector of tool functions.
-    pub fn functions(&self, names: Option<&[&str]>) -> Vec<Function> {
+    pub fn functions(&self, names: Option<&[String]>) -> Vec<Function> {
         let names: Option<Vec<String>> =
             names.map(|names| names.iter().map(|n| n.to_ascii_lowercase()).collect());
         self.set
@@ -312,7 +312,7 @@ where
     ///
     /// # Arguments
     /// - `tool`: The tool to add, must implement the [`Tool`] trait.
-    pub fn add<T>(&mut self, tool: T) -> Result<(), BoxError>
+    pub fn add<T>(&mut self, tool: Arc<T>) -> Result<(), BoxError>
     where
         T: Tool<C> + Send + Sync + 'static,
     {
@@ -322,7 +322,7 @@ where
             return Err(format!("tool {} already exists", name).into());
         }
 
-        let tool_dyn = ToolWrapper(Arc::new(tool), PhantomData);
+        let tool_dyn = ToolWrapper(tool, PhantomData);
         self.set.insert(name, Box::new(tool_dyn));
         Ok(())
     }
@@ -330,5 +330,10 @@ where
     /// Retrieves a tool by name
     pub fn get(&self, name: &str) -> Option<&dyn ToolDyn<C>> {
         self.set.get(&name.to_ascii_lowercase()).map(|v| &**v)
+    }
+
+    /// Retrieves a tool by lowercase name.
+    pub fn get_lowercase(&self, lowercase_name: &str) -> Option<&dyn ToolDyn<C>> {
+        self.set.get(lowercase_name).map(|v| &**v)
     }
 }

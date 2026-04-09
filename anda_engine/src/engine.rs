@@ -45,7 +45,10 @@ use structured_logger::unix_ms;
 use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
 
 use crate::{
-    context::{AgentCtx, BaseCtx, SubAgents, Web3Client, Web3SDK},
+    context::{
+        AgentCtx, BaseCtx, SubAgentManager, SubAgentSetManager, ToolsSearch, ToolsSelect,
+        Web3Client, Web3SDK,
+    },
     hook::{Hook, Hooks},
     management::{BaseManagement, Management, SYSTEM_PATH, Visibility},
     model::{Model, Models},
@@ -248,14 +251,19 @@ impl Engine {
 
     /// Returns function definitions for the specified agents.
     /// If no names are provided, returns definitions for all agents.
-    pub fn agents(&self, names: Option<&[&str]>) -> Vec<Function> {
+    pub fn agents(&self, names: Option<&[String]>) -> Vec<Function> {
         self.ctx.agents.functions(names)
     }
 
     /// Returns function definitions for the specified tools.
     /// If no names are provided, returns definitions for all tools.
-    pub fn tools(&self, names: Option<&[&str]>) -> Vec<Function> {
+    pub fn tools(&self, names: Option<&[String]>) -> Vec<Function> {
         self.ctx.tools.functions(names)
+    }
+
+    /// Returns a reference to the sub-agents manager.
+    pub fn sub_agents_manager(&self) -> Arc<SubAgentSetManager> {
+        self.ctx.subagents.clone()
     }
 
     pub async fn challenge(
@@ -308,15 +316,13 @@ impl Engine {
             info: self.info.clone(),
             agents: self.agents(Some(
                 self.export_agents
-                    .iter()
-                    .map(|s| s.as_str())
+                    .iter().cloned()
                     .collect::<Vec<_>>()
                     .as_slice(),
             )),
             tools: self.tools(Some(
                 self.export_tools
-                    .iter()
-                    .map(|s| s.as_str())
+                    .iter().cloned()
                     .collect::<Vec<_>>()
                     .as_slice(),
             )),
@@ -352,6 +358,9 @@ impl EngineBuilder {
     /// Creates a new EngineBuilder with default values.
     pub fn new() -> Self {
         let mstore = Arc::new(InMemory::new());
+        let mut agents = AgentSet::new();
+        agents.add(Arc::new(ToolsSearch::new()), None).unwrap();
+        agents.add(Arc::new(ToolsSelect::new()), None).unwrap();
         EngineBuilder {
             info: AgentInfo {
                 handle: "anda".to_string(),
@@ -361,7 +370,7 @@ impl EngineBuilder {
                 ..Default::default()
             },
             tools: ToolSet::new(),
-            agents: AgentSet::new(),
+            agents,
             remote: HashMap::new(),
             models: Arc::new(Models::default()),
             store: Store::new(mstore),
@@ -433,7 +442,7 @@ impl EngineBuilder {
 
     /// Registers a single tool with the engine.
     /// Returns an error if the tool cannot be added.
-    pub fn register_tool<T>(mut self, tool: T) -> Result<Self, BoxError>
+    pub fn register_tool<T>(mut self, tool: Arc<T>) -> Result<Self, BoxError>
     where
         T: Tool<BaseCtx> + Send + Sync + 'static,
     {
@@ -457,7 +466,11 @@ impl EngineBuilder {
     /// Registers a single agent with optional label to the engine.
     /// Verifies that all required tools are registered before adding the agent.
     /// Returns an error if any dependency is missing or if the agent cannot be added.
-    pub fn register_agent<T>(mut self, agent: T, label: Option<String>) -> Result<Self, BoxError>
+    pub fn register_agent<T>(
+        mut self,
+        agent: Arc<T>,
+        label: Option<String>,
+    ) -> Result<Self, BoxError>
     where
         T: Agent<AgentCtx> + Send + Sync + 'static,
     {
@@ -529,23 +542,44 @@ impl EngineBuilder {
     }
 
     /// Creates an empty Engine instance.
-    pub fn empty(self) -> Engine {
+    pub fn empty(mut self) -> Engine {
         let id = self.web3.as_ref().get_principal();
+        let mut names: BTreeSet<Path> = self
+            .tools
+            .set
+            .keys()
+            .map(|p| Path::from(format!("T:{}", p)))
+            .chain(
+                self.agents
+                    .set
+                    .keys()
+                    .map(|p| Path::from(format!("A:{}", p))),
+            )
+            .collect();
+        names.insert(Path::from(SYSTEM_PATH));
         let ctx = BaseCtx::new(
             id,
             self.info.name.clone(),
             "".to_string(),
             self.cancellation_token,
-            BTreeSet::new(),
+            names,
             self.web3,
             self.store,
             Arc::new(RemoteEngines::new()),
         );
 
-        let tools = Arc::new(ToolSet::new());
-        let agents = Arc::new(AgentSet::new());
-        let subagents = SubAgents::new(ctx.clone(), None);
-        let ctx = AgentCtx::new(ctx, self.models, tools, agents, Arc::new(subagents));
+        let subagent_manager = Arc::new(SubAgentManager::new(ctx.clone(), None));
+        self.tools.add(subagent_manager.clone()).unwrap();
+        let subagents = SubAgentSetManager::new();
+        subagents.insert(subagent_manager);
+
+        let ctx = AgentCtx::new(
+            ctx,
+            self.models,
+            Arc::new(self.tools),
+            Arc::new(self.agents),
+            Arc::new(subagents),
+        );
 
         Engine {
             id,
@@ -608,10 +642,15 @@ impl EngineBuilder {
             Arc::new(remote),
         );
 
+        let subagent_manager = Arc::new(SubAgentManager::new(ctx.clone(), None));
+        subagent_manager.load().await?;
+
+        self.tools.add(subagent_manager.clone())?;
+        let subagents = SubAgentSetManager::new();
+        subagents.insert(subagent_manager);
+
         let tools = Arc::new(self.tools);
         let agents = Arc::new(self.agents);
-        let subagents = SubAgents::new(ctx.clone(), None);
-        subagents.load().await?;
 
         let ctx = AgentCtx::new(
             ctx,
@@ -652,13 +691,18 @@ impl EngineBuilder {
 
     /// Creates a mock context for testing purposes.
     // #[cfg(test)]
-    pub fn mock_ctx(self) -> AgentCtx {
+    pub fn mock_ctx(mut self) -> AgentCtx {
         let mut names: BTreeSet<Path> = self
             .tools
             .set
             .keys()
-            .chain(self.agents.set.keys())
-            .map(|s| Path::from(s.as_str()))
+            .map(|p| Path::from(format!("T:{}", p)))
+            .chain(
+                self.agents
+                    .set
+                    .keys()
+                    .map(|p| Path::from(format!("A:{}", p))),
+            )
             .collect();
         names.insert(Path::from(SYSTEM_PATH));
         let ctx = BaseCtx::new(
@@ -671,8 +715,10 @@ impl EngineBuilder {
             self.store,
             Arc::new(RemoteEngines::new()),
         );
-        let subagents = SubAgents::new(ctx.clone(), None);
-
+        let subagent_manager = Arc::new(SubAgentManager::new(ctx.clone(), None));
+        self.tools.add(subagent_manager.clone()).unwrap();
+        let subagents = SubAgentSetManager::new();
+        subagents.insert(subagent_manager);
         AgentCtx::new(
             ctx,
             self.models,

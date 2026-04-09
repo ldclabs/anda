@@ -173,7 +173,7 @@ impl RemoteEngines {
     pub fn tool_definitions(
         &self,
         endpoint: Option<&str>,
-        names: Option<&[&str]>,
+        names: Option<&[String]>,
     ) -> Vec<FunctionDefinition> {
         if let Some(endpoint) = endpoint {
             for (handle, engine) in self.engines.iter() {
@@ -184,7 +184,7 @@ impl RemoteEngines {
                         .iter()
                         .filter_map(|d| {
                             if let Some(names) = names {
-                                if names.contains(&d.definition.name.as_str()) {
+                                if names.contains(&d.definition.name) {
                                     Some(d.definition.clone().name_with_prefix(&prefix))
                                 } else {
                                     None
@@ -205,7 +205,7 @@ impl RemoteEngines {
             let prefix = format!("RT_{handle}_");
             definitions.extend(engine.tools.iter().filter_map(|d| {
                 if let Some(names) = names {
-                    if names.contains(&d.definition.name.as_str()) {
+                    if names.contains(&d.definition.name) {
                         Some(d.definition.clone().name_with_prefix(&prefix))
                     } else {
                         None
@@ -222,14 +222,16 @@ impl RemoteEngines {
     /// Extracts resources from the provided list based on the tool's supported tags.
     pub fn select_tool_resources(
         &self,
-        name: &str,
+        prefixed_name: &str,
         resources: &mut Vec<Resource>,
     ) -> Vec<Resource> {
-        if name.strip_prefix("RT_").is_some() {
-            for (_, engine) in self.engines.iter() {
-                for tool in engine.tools.iter() {
-                    if tool.definition.name == name {
-                        return select_resources(resources, &tool.supported_resource_tags);
+        if prefixed_name.starts_with("RT_") {
+            for (handle, engine) in self.engines.iter() {
+                if let Some(name) = prefixed_name.strip_prefix(&format!("RT_{handle}_")) {
+                    for tool in engine.tools.iter() {
+                        if tool.definition.name.eq_ignore_ascii_case(name) {
+                            return select_resources(resources, &tool.supported_resource_tags);
+                        }
                     }
                 }
             }
@@ -248,7 +250,7 @@ impl RemoteEngines {
     pub fn agent_definitions(
         &self,
         endpoint: Option<&str>,
-        names: Option<&[&str]>,
+        names: Option<&[String]>,
     ) -> Vec<FunctionDefinition> {
         if let Some(endpoint) = endpoint {
             for (handle, engine) in self.engines.iter() {
@@ -259,7 +261,7 @@ impl RemoteEngines {
                         .iter()
                         .filter_map(|d| {
                             if let Some(names) = names {
-                                if names.contains(&d.definition.name.as_str()) {
+                                if names.contains(&d.definition.name) {
                                     Some(d.definition.clone().name_with_prefix(&prefix))
                                 } else {
                                     None
@@ -279,7 +281,7 @@ impl RemoteEngines {
             let prefix = format!("RA_{handle}_");
             definitions.extend(engine.agents.iter().filter_map(|d| {
                 if let Some(names) = names {
-                    if names.contains(&d.definition.name.as_str()) {
+                    if names.contains(&d.definition.name) {
                         Some(d.definition.clone().name_with_prefix(&prefix))
                     } else {
                         None
@@ -296,13 +298,17 @@ impl RemoteEngines {
     /// Extracts resources from the provided list based on the agent's supported tags.
     pub fn select_agent_resources(
         &self,
-        name: &str,
+        prefixed_name: &str,
         resources: &mut Vec<Resource>,
     ) -> Vec<Resource> {
-        for (_, engine) in self.engines.iter() {
-            for agent in engine.agents.iter() {
-                if agent.definition.name == name {
-                    return select_resources(resources, &agent.supported_resource_tags);
+        if prefixed_name.starts_with("RA_") {
+            for (handle, engine) in self.engines.iter() {
+                if let Some(name) = prefixed_name.strip_prefix(&format!("RA_{handle}_")) {
+                    for agent in engine.agents.iter() {
+                        if agent.definition.name.eq_ignore_ascii_case(name) {
+                            return select_resources(resources, &agent.supported_resource_tags);
+                        }
+                    }
                 }
             }
         }
