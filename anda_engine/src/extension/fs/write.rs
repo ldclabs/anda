@@ -2,14 +2,12 @@ use anda_core::{BoxError, FunctionDefinition, Json, Resource, Tool, ToolOutput};
 use ic_auth_types::ByteBufB64;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::{
-    ffi::OsString,
-    path::{Path, PathBuf},
-    str::FromStr,
-    sync::Arc,
-};
+use std::{path::PathBuf, str::FromStr, sync::Arc};
 
-use super::{BASE64_ENCODING, UTF8_ENCODING, default_write_encoding, has_multiple_hard_links};
+use super::{
+    BASE64_ENCODING, UTF8_ENCODING, atomic_write_file, default_write_encoding, ensure_regular_file,
+    resolve_write_path,
+};
 use crate::{context::BaseCtx, hook::Hook};
 
 /// Arguments for filesystem write operations.
@@ -44,8 +42,8 @@ pub struct FsWriteOutput {
 #[derive(Clone)]
 pub struct FsWriteTool {
     work_dir: PathBuf,
-
     hook: Option<Arc<dyn Hook>>,
+    description: String,
 }
 
 impl FsWriteTool {
@@ -54,7 +52,20 @@ impl FsWriteTool {
 
     /// Create a new `FsWriteTool` with the specified working directory.
     pub fn new(work_dir: PathBuf, hook: Option<Arc<dyn Hook>>) -> Self {
-        Self { work_dir, hook }
+        let description = format!(
+            "Atomically write files to the filesystem in the workspace directory: {}",
+            work_dir.display()
+        );
+        Self {
+            work_dir,
+            hook,
+            description,
+        }
+    }
+
+    pub fn with_description(mut self, description: String) -> Self {
+        self.description = description;
+        self
     }
 }
 
@@ -67,10 +78,7 @@ impl Tool<BaseCtx> for FsWriteTool {
     }
 
     fn description(&self) -> String {
-        format!(
-            "Write files to the filesystem in the workspace directory: {}",
-            self.work_dir.display()
-        )
+        self.description.clone()
     }
 
     fn definition(&self) -> FunctionDefinition {
@@ -113,15 +121,11 @@ impl Tool<BaseCtx> for FsWriteTool {
 
         let data = decode_content(args.content, &args.encoding)?;
 
-        match tokio::fs::metadata(&resolved_path).await {
+        let existing_permissions = match tokio::fs::metadata(&resolved_path).await {
             Ok(meta) => {
-                if has_multiple_hard_links(&meta) {
-                    return Err("Writing multiply-linked files is not allowed".into());
-                }
+                ensure_regular_file(&meta, "Writing multiply-linked files is not allowed")?;
 
-                if !meta.is_file() {
-                    return Err("Path does not point to a regular file".into());
-                }
+                Some(meta.permissions())
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 if let Some(parent) = resolved_path.parent() {
@@ -130,14 +134,14 @@ impl Tool<BaseCtx> for FsWriteTool {
                         .await
                         .map_err(|err| format!("Failed to create parent directories: {err}"))?;
                 }
+
+                None
             }
             Err(err) => return Err(format!("Failed to read file metadata: {err}").into()),
-        }
+        };
 
         let size = data.len() as u64;
-        tokio::fs::write(&resolved_path, data)
-            .await
-            .map_err(|err| format!("Failed to write file: {err}"))?;
+        atomic_write_file(&resolved_path, &data, existing_permissions.as_ref()).await?;
 
         if let Some(hook) = &self.hook {
             return hook
@@ -152,72 +156,6 @@ impl Tool<BaseCtx> for FsWriteTool {
         Ok(ToolOutput::new(json!(FsWriteOutput { size })))
     }
 }
-
-/// Resolves a write target inside the workspace, even when the destination does not yet exist.
-async fn resolve_write_path(work_dir: &Path, user_path: &str) -> Result<PathBuf, BoxError> {
-    let resolved_work_dir = tokio::fs::canonicalize(work_dir)
-        .await
-        .map_err(|err| format!("Failed to resolve workspace path: {err}"))?;
-    let path = work_dir.join(user_path);
-
-    match tokio::fs::symlink_metadata(&path).await {
-        Ok(meta) => {
-            if meta.file_type().is_symlink() {
-                return Err("Writing to symbolic links is not allowed".into());
-            }
-
-            let resolved_path = tokio::fs::canonicalize(&path)
-                .await
-                .map_err(|err| format!("Failed to resolve file path: {err}"))?;
-            if !resolved_path.starts_with(&resolved_work_dir) {
-                return Err("Access to paths outside the workspace is not allowed".into());
-            }
-
-            Ok(resolved_path)
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            let (existing_ancestor, missing_components) = nearest_existing_ancestor(&path).await?;
-            let resolved_ancestor = tokio::fs::canonicalize(&existing_ancestor)
-                .await
-                .map_err(|err| format!("Failed to resolve file path: {err}"))?;
-            if !resolved_ancestor.starts_with(&resolved_work_dir) {
-                return Err("Access to paths outside the workspace is not allowed".into());
-            }
-
-            Ok(missing_components
-                .into_iter()
-                .rev()
-                .fold(resolved_ancestor, |acc, component| acc.join(component)))
-        }
-        Err(err) => Err(format!("Failed to inspect file path: {err}").into()),
-    }
-}
-
-/// Finds the nearest existing path component and returns the missing tail components.
-async fn nearest_existing_ancestor(path: &Path) -> Result<(PathBuf, Vec<OsString>), BoxError> {
-    let mut current = path.to_path_buf();
-    let mut missing_components = Vec::new();
-
-    loop {
-        match tokio::fs::symlink_metadata(&current).await {
-            Ok(_) => return Ok((current, missing_components)),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                let file_name = current.file_name().ok_or_else(|| {
-                    "Access to paths outside the workspace is not allowed".to_string()
-                })?;
-                missing_components.push(file_name.to_os_string());
-                current = current
-                    .parent()
-                    .ok_or_else(|| {
-                        "Access to paths outside the workspace is not allowed".to_string()
-                    })?
-                    .to_path_buf();
-            }
-            Err(err) => return Err(format!("Failed to inspect file path: {err}").into()),
-        }
-    }
-}
-
 /// Decodes content according to the requested encoding.
 fn decode_content(content: String, encoding: &str) -> Result<Vec<u8>, BoxError> {
     match encoding {
@@ -232,7 +170,10 @@ fn decode_content(content: String, encoding: &str) -> Result<Vec<u8>, BoxError> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::EngineBuilder;
+    use crate::{
+        engine::EngineBuilder,
+        extension::fs::{commit_atomic_replace, write_temp_file_for_atomic_replace},
+    };
     use serde_json::json;
     use std::path::{Path, PathBuf};
 
@@ -362,6 +303,71 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("Unsupported encoding"));
+    }
+
+    #[tokio::test]
+    async fn staged_atomic_replace_keeps_previous_content_visible_until_commit() {
+        let temp_dir = TestTempDir::new().await;
+        let workspace = temp_dir.path().join("workspace");
+        let target = workspace.join("notes.txt");
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+        tokio::fs::write(&target, "before").await.unwrap();
+
+        let metadata = tokio::fs::metadata(&target).await.unwrap();
+        let temp_path =
+            write_temp_file_for_atomic_replace(&target, b"after", Some(&metadata.permissions()))
+                .await
+                .unwrap();
+
+        assert_eq!(tokio::fs::read_to_string(&target).await.unwrap(), "before");
+        assert_eq!(
+            tokio::fs::read_to_string(&temp_path).await.unwrap(),
+            "after"
+        );
+
+        commit_atomic_replace(&temp_path, &target).await.unwrap();
+
+        assert_eq!(tokio::fs::read_to_string(&target).await.unwrap(), "after");
+        assert!(matches!(
+            tokio::fs::metadata(&temp_path).await,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn preserves_permissions_when_replacing_existing_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = TestTempDir::new().await;
+        let workspace = temp_dir.path().join("workspace");
+        let target = workspace.join("notes.txt");
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+        tokio::fs::write(&target, "before").await.unwrap();
+        tokio::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640))
+            .await
+            .unwrap();
+
+        write_tool(&workspace)
+            .call(
+                mock_ctx(),
+                FsWriteArgs {
+                    path: "notes.txt".to_string(),
+                    content: "after".to_string(),
+                    encoding: UTF8_ENCODING.to_string(),
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        let mode = tokio::fs::metadata(&target)
+            .await
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o640);
     }
 
     #[cfg(unix)]

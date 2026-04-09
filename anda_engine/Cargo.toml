@@ -51,6 +51,7 @@ log = { workspace = true }
 url = { workspace = true }
 which = { workspace = true }
 serde-saphyr = { workspace = true }
+glob = { workspace = true }
 boxlite = { version = "0.8.2", default-features = false, optional = true }
 
 [dev-dependencies]

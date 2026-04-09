@@ -61,6 +61,7 @@ pub struct SkillArgs {
 pub struct SkillManager {
     skills_dir: PathBuf,
     skills: RwLock<BTreeMap<String, Skill>>,
+    description: String,
 }
 
 impl SkillManager {
@@ -72,7 +73,17 @@ impl SkillManager {
         Self {
             skills_dir,
             skills: RwLock::new(BTreeMap::new()),
+            description:
+                "Create or update a reusable skill following the Agent Skills specification. \
+         Agent Skills are folders of instructions, scripts, and resources that agents \
+         can discover and use to perform tasks more accurately and efficiently."
+                    .to_string(),
         }
+    }
+
+    pub fn with_description(mut self, description: String) -> Self {
+        self.description = description;
+        self
     }
 
     /// Recursively load all `SKILL.md` files from the configured directory.
@@ -160,9 +171,10 @@ impl SkillManager {
             return Err("description must not exceed 1024 characters".into());
         }
         if let Some(compat) = &args.compatibility
-            && (compat.is_empty() || compat.len() > 500) {
-                return Err("compatibility must be 1-500 characters".into());
-            }
+            && (compat.is_empty() || compat.len() > 500)
+        {
+            return Err("compatibility must be 1-500 characters".into());
+        }
 
         let fm = SkillFrontmatter {
             name: args.name,
@@ -209,12 +221,7 @@ impl Tool<BaseCtx> for SkillManager {
     }
 
     fn description(&self) -> String {
-        "Create or update a reusable skill on disk following the Agent Skills specification. \
-         A skill is a persistent SKILL.md file (YAML frontmatter + Markdown instructions) \
-         that defines a sub-agent with its own instructions and optional tool whitelist. \
-         Use this when a task would benefit from a dedicated, file-backed agent that \
-         survives restarts."
-            .to_string()
+        self.description.clone()
     }
 
     fn definition(&self) -> FunctionDefinition {

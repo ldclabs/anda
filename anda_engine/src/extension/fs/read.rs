@@ -4,7 +4,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{path::PathBuf, sync::Arc};
 
-use super::{BASE64_ENCODING, MAX_FILE_SIZE_BYTES, UTF8_ENCODING, has_multiple_hard_links};
+use super::{
+    BASE64_ENCODING, MAX_FILE_SIZE_BYTES, UTF8_ENCODING, ensure_file_size_within_limit,
+    ensure_regular_file, resolve_read_path,
+};
 use crate::{context::BaseCtx, hook::Hook};
 
 /// Arguments for filesystem read operations.
@@ -39,8 +42,8 @@ pub struct FsReadOutput {
 #[derive(Clone)]
 pub struct FsReadTool {
     work_dir: PathBuf,
-
     hook: Option<Arc<dyn Hook>>,
+    description: String,
 }
 
 impl FsReadTool {
@@ -49,7 +52,20 @@ impl FsReadTool {
 
     /// Create a new `FsReadTool` with the specified working directory.
     pub fn new(work_dir: PathBuf, hook: Option<Arc<dyn Hook>>) -> Self {
-        Self { work_dir, hook }
+        let description = format!(
+            "Read files from the filesystem in the workspace directory: {}",
+            work_dir.display()
+        );
+        Self {
+            work_dir,
+            hook,
+            description,
+        }
+    }
+
+    pub fn with_description(mut self, description: String) -> Self {
+        self.description = description;
+        self
     }
 }
 
@@ -62,10 +78,7 @@ impl Tool<BaseCtx> for FsReadTool {
     }
 
     fn description(&self) -> String {
-        format!(
-            "Read files from the filesystem in the workspace directory: {}",
-            self.work_dir.display()
-        )
+        self.description.clone()
     }
 
     fn definition(&self) -> FunctionDefinition {
@@ -104,40 +117,14 @@ impl Tool<BaseCtx> for FsReadTool {
             hook.on_tool_start(&ctx, &self.name()).await?;
         }
 
-        // Canonicalize the workspace root as well so symlinked workspace paths behave consistently.
-        let resolved_work_dir = tokio::fs::canonicalize(&self.work_dir)
-            .await
-            .map_err(|err| format!("Failed to resolve workspace path: {err}"))?;
-
-        let path = self.work_dir.join(&args.path);
-        let resolved_path = match tokio::fs::canonicalize(&path).await {
-            Ok(p) => p,
-            Err(err) => return Err(format!("Failed to resolve file path: {err}").into()),
-        };
-        if !resolved_path.starts_with(&resolved_work_dir) {
-            return Err("Access to paths outside the workspace is not allowed".into());
-        }
+        let resolved_path = resolve_read_path(&self.work_dir, &args.path).await?;
 
         let meta = tokio::fs::metadata(&resolved_path)
             .await
             .map_err(|err| format!("Failed to read file metadata: {err}"))?;
 
-        if has_multiple_hard_links(&meta) {
-            return Err("Reading multiply-linked file is not allowed".into());
-        }
-
-        if !meta.is_file() {
-            return Err("Path does not point to a regular file".into());
-        }
-
-        if meta.len() > MAX_FILE_SIZE_BYTES {
-            return Err(format!(
-                "File size {} exceeds maximum allowed size of {} bytes",
-                meta.len(),
-                MAX_FILE_SIZE_BYTES
-            )
-            .into());
-        }
+        ensure_regular_file(&meta, "Reading multiply-linked file is not allowed")?;
+        ensure_file_size_within_limit(&meta, MAX_FILE_SIZE_BYTES)?;
 
         let data = tokio::fs::read(&resolved_path)
             .await

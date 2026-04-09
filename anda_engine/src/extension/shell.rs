@@ -204,6 +204,7 @@ impl ExecOutput {
 pub struct ShellTool {
     runtime: Arc<dyn Executor>,
     envs: HashMap<String, String>,
+    description: String,
 }
 
 impl ShellTool {
@@ -212,7 +213,23 @@ impl ShellTool {
 
     /// Create a shell tool with a runtime and a fixed environment map.
     pub fn new(runtime: Arc<dyn Executor>, envs: HashMap<String, String>) -> Self {
-        Self { runtime, envs }
+        let description = format!(
+            "Execute a shell command in the workspace directory (Runtime: {}, OS: {}, Shell: {})",
+            runtime.name(),
+            runtime.os(),
+            runtime.shell().unwrap_or("none")
+        );
+
+        Self {
+            runtime,
+            envs,
+            description,
+        }
+    }
+
+    pub fn with_description(mut self, description: String) -> Self {
+        self.description = description;
+        self
     }
 }
 
@@ -225,12 +242,7 @@ impl Tool<BaseCtx> for ShellTool {
     }
 
     fn description(&self) -> String {
-        format!(
-            "Execute a shell command in the workspace directory (Runtime: {}, OS: {}, Shell: {})",
-            self.runtime.name(),
-            self.runtime.os(),
-            self.runtime.shell().unwrap_or("none")
-        )
+        self.description.clone()
     }
 
     fn definition(&self) -> FunctionDefinition {

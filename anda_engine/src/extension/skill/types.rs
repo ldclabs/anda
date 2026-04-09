@@ -141,9 +141,10 @@ pub fn parse_skill_md(base_dir: PathBuf, content: &str) -> Result<Skill, BoxErro
         return Err("SKILL.md description must not exceed 1024 characters".into());
     }
     if let Some(compat) = &fm.compatibility
-        && (compat.is_empty() || compat.len() > 500) {
-            return Err("SKILL.md compatibility must be 1-500 characters".into());
-        }
+        && (compat.is_empty() || compat.len() > 500)
+    {
+        return Err("SKILL.md compatibility must be 1-500 characters".into());
+    }
 
     // Derive agent name (snake_case).
     let agent_name = normalise_skill_agent_name(&fm.name);
