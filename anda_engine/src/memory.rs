@@ -662,7 +662,7 @@ impl MemoryManagement {
 }
 
 /// KIP tool for memory management
-impl Tool<BaseCtx> for Arc<MemoryManagement> {
+impl Tool<BaseCtx> for MemoryManagement {
     type Args = Request;
     type Output = Response;
 

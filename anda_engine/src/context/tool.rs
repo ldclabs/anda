@@ -477,7 +477,6 @@ fn rank_search_items(
     fallback: bool,
 ) -> Vec<ToolsSearchItem> {
     let mut candidates: Vec<(bool, usize, String, ToolsSearchItem)> = Vec::new();
-    let mut fallback_items = Vec::new();
     for item in items {
         let normalized_name = item
             .name
@@ -511,12 +510,8 @@ fn rank_search_items(
         if score > 0 {
             candidates.push((exact_name_match, score, normalized_name, item));
         } else if fallback {
-            fallback_items.push(item);
+            candidates.push((false, 0, normalized_name, item));
         }
-    }
-
-    if fallback && candidates.is_empty() {
-        return fallback_items;
     }
 
     candidates.sort_by(|a, b| {

@@ -1,4 +1,4 @@
-use anda_core::{BoxError, FunctionDefinition, Json, Resource, Tool, ToolOutput};
+use anda_core::{BoxError, FunctionDefinition, Resource, Tool, ToolOutput};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{path::PathBuf, sync::Arc};
@@ -7,7 +7,7 @@ use super::{
     MAX_FILE_SIZE_BYTES, atomic_write_file, ensure_file_size_within_limit, ensure_regular_file,
     resolve_write_path,
 };
-use crate::{context::BaseCtx, hook::Hook};
+use crate::{context::BaseCtx, hook::ToolHook};
 
 /// Arguments for filesystem edit operations.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -37,8 +37,8 @@ pub struct FsEditOutput {
 #[derive(Clone)]
 pub struct FsEditTool {
     work_dir: PathBuf,
-    hook: Option<Arc<dyn Hook>>,
     description: String,
+    hook: Option<Arc<dyn ToolHook<FsEditArgs, ToolOutput<FsEditOutput>>>>,
 }
 
 impl FsEditTool {
@@ -46,7 +46,10 @@ impl FsEditTool {
     pub const NAME: &'static str = "fs_edit";
 
     /// Create a new `FsEditTool` with the specified working directory.
-    pub fn new(work_dir: PathBuf, hook: Option<Arc<dyn Hook>>) -> Self {
+    pub fn new(
+        work_dir: PathBuf,
+        hook: Option<Arc<dyn ToolHook<FsEditArgs, ToolOutput<FsEditOutput>>>>,
+    ) -> Self {
         let description = format!(
             "Atomically edit UTF-8 files in the workspace directory by replacing strings: {}",
             work_dir.display()
@@ -66,7 +69,7 @@ impl FsEditTool {
 
 impl Tool<BaseCtx> for FsEditTool {
     type Args = FsEditArgs;
-    type Output = Json;
+    type Output = FsEditOutput;
 
     fn name(&self) -> String {
         Self::NAME.to_string()
@@ -112,9 +115,11 @@ impl Tool<BaseCtx> for FsEditTool {
         args: Self::Args,
         _resources: Vec<Resource>,
     ) -> Result<ToolOutput<Self::Output>, BoxError> {
-        if let Some(hook) = &self.hook {
-            hook.on_tool_start(&ctx, &self.name()).await?;
-        }
+        let args = if let Some(hook) = &self.hook {
+            hook.before_tool_call(&ctx, args).await?
+        } else {
+            args
+        };
 
         if args.old_string.is_empty() {
             return Err("Old string must not be empty".into());
@@ -172,12 +177,10 @@ impl Tool<BaseCtx> for FsEditTool {
         };
 
         if let Some(hook) = &self.hook {
-            return hook
-                .on_tool_end(&ctx, &self.name(), ToolOutput::new(json!(output)))
-                .await;
+            return hook.after_tool_call(&ctx, ToolOutput::new(output)).await;
         }
 
-        Ok(ToolOutput::new(json!(output)))
+        Ok(ToolOutput::new(output))
     }
 }
 
@@ -240,9 +243,9 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.output["replacements"], 3);
-        assert_eq!(result.output["total_matches"], 3);
-        assert_eq!(result.output["size"], 22);
+        assert_eq!(result.output.replacements, 3);
+        assert_eq!(result.output.total_matches, 3);
+        assert_eq!(result.output.size, 22);
         let written = tokio::fs::read_to_string(&target).await.unwrap();
         assert_eq!(written, "omega beta omega\nomega");
     }
@@ -300,9 +303,9 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.output["replacements"], 1);
-        assert_eq!(result.output["total_matches"], 3);
-        assert_eq!(result.output["size"], 18);
+        assert_eq!(result.output.replacements, 1);
+        assert_eq!(result.output.total_matches, 3);
+        assert_eq!(result.output.size, 18);
         let written = tokio::fs::read_to_string(&target).await.unwrap();
         assert_eq!(written, "x beta alpha\nalpha");
     }
@@ -355,9 +358,9 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.output["replacements"], 0);
-        assert_eq!(result.output["total_matches"], 0);
-        assert_eq!(result.output["size"], 5);
+        assert_eq!(result.output.replacements, 0);
+        assert_eq!(result.output.total_matches, 0);
+        assert_eq!(result.output.size, 5);
         let written = tokio::fs::read_to_string(&target).await.unwrap();
         assert_eq!(written, "hello");
     }
@@ -419,8 +422,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.output["replacements"], 2);
-        assert_eq!(result.output["total_matches"], 2);
+        assert_eq!(result.output.replacements, 2);
+        assert_eq!(result.output.total_matches, 2);
 
         let mode = tokio::fs::metadata(&target)
             .await
@@ -459,8 +462,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.output["replacements"], 2);
-        assert_eq!(result.output["total_matches"], 2);
+        assert_eq!(result.output.replacements, 2);
+        assert_eq!(result.output.total_matches, 2);
         let written = tokio::fs::read_to_string(workspace.join("notes.txt"))
             .await
             .unwrap();

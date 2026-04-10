@@ -1,4 +1,4 @@
-use anda_core::{BoxError, FunctionDefinition, Json, Resource, Tool, ToolOutput};
+use anda_core::{BoxError, FunctionDefinition, Resource, Tool, ToolOutput};
 use ic_auth_types::ByteBufB64;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -8,7 +8,7 @@ use super::{
     BASE64_ENCODING, MAX_FILE_SIZE_BYTES, UTF8_ENCODING, ensure_file_size_within_limit,
     ensure_regular_file, resolve_read_path,
 };
-use crate::{context::BaseCtx, hook::Hook};
+use crate::{context::BaseCtx, hook::ToolHook};
 
 /// Arguments for filesystem read operations.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -43,8 +43,8 @@ pub struct FsReadOutput {
 #[derive(Clone)]
 pub struct FsReadTool {
     work_dir: PathBuf,
-    hook: Option<Arc<dyn Hook>>,
     description: String,
+    hook: Option<Arc<dyn ToolHook<FsReadArgs, ToolOutput<FsReadOutput>>>>,
 }
 
 impl FsReadTool {
@@ -52,7 +52,10 @@ impl FsReadTool {
     pub const NAME: &'static str = "fs_read";
 
     /// Create a new `FsReadTool` with the specified working directory.
-    pub fn new(work_dir: PathBuf, hook: Option<Arc<dyn Hook>>) -> Self {
+    pub fn new(
+        work_dir: PathBuf,
+        hook: Option<Arc<dyn ToolHook<FsReadArgs, ToolOutput<FsReadOutput>>>>,
+    ) -> Self {
         let description = format!(
             "Read files from the filesystem in the workspace directory: {}",
             work_dir.display()
@@ -72,7 +75,7 @@ impl FsReadTool {
 
 impl Tool<BaseCtx> for FsReadTool {
     type Args = FsReadArgs;
-    type Output = Json;
+    type Output = FsReadOutput;
 
     fn name(&self) -> String {
         Self::NAME.to_string()
@@ -114,9 +117,11 @@ impl Tool<BaseCtx> for FsReadTool {
         args: Self::Args,
         _resources: Vec<Resource>,
     ) -> Result<ToolOutput<Self::Output>, BoxError> {
-        if let Some(hook) = &self.hook {
-            hook.on_tool_start(&ctx, &self.name()).await?;
-        }
+        let args = if let Some(hook) = &self.hook {
+            hook.before_tool_call(&ctx, args).await?
+        } else {
+            args
+        };
 
         let resolved_path = resolve_read_path(&self.work_dir, &args.path).await?;
 
@@ -162,12 +167,10 @@ impl Tool<BaseCtx> for FsReadTool {
         }
 
         if let Some(hook) = &self.hook {
-            return hook
-                .on_tool_end(&ctx, &self.name(), ToolOutput::new(json!(output)))
-                .await;
+            return hook.after_tool_call(&ctx, ToolOutput::new(output)).await;
         }
 
-        Ok(ToolOutput::new(json!(output)))
+        Ok(ToolOutput::new(output))
     }
 }
 
@@ -228,8 +231,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.output["content"], "one\ntwo\nthree");
-        assert_eq!(result.output["encoding"], "utf8");
+        assert_eq!(result.output.content, "one\ntwo\nthree");
+        assert_eq!(result.output.encoding, "utf8");
     }
 
     #[tokio::test]
@@ -254,8 +257,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.output["content"], "one\ntwo");
-        assert_eq!(result.output["size"], 19);
+        assert_eq!(result.output.content, "one\ntwo");
+        assert_eq!(result.output.size, 19);
     }
 
     #[tokio::test]
@@ -281,9 +284,9 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.output["content"], ByteBufB64(binary).to_base64());
-        assert_eq!(result.output["encoding"], "base64");
-        assert_eq!(result.output["size"], 4);
+        assert_eq!(result.output.content, ByteBufB64(binary).to_base64());
+        assert_eq!(result.output.encoding, "base64");
+        assert_eq!(result.output.size, 4);
     }
 
     #[cfg(unix)]
@@ -313,8 +316,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.output["content"], "hello\nworld\n");
-        assert_eq!(result.output["encoding"], "utf8");
+        assert_eq!(result.output.content, "hello\nworld\n");
+        assert_eq!(result.output.encoding, "utf8");
     }
 
     #[cfg(unix)]

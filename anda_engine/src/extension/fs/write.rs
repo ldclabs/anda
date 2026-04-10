@@ -1,4 +1,4 @@
-use anda_core::{BoxError, FunctionDefinition, Json, Resource, Tool, ToolOutput};
+use anda_core::{BoxError, FunctionDefinition, Resource, Tool, ToolOutput};
 use ic_auth_types::ByteBufB64;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -8,7 +8,7 @@ use super::{
     BASE64_ENCODING, UTF8_ENCODING, atomic_write_file, default_write_encoding, ensure_regular_file,
     resolve_write_path,
 };
-use crate::{context::BaseCtx, hook::Hook};
+use crate::{context::BaseCtx, hook::ToolHook};
 
 /// Arguments for filesystem write operations.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -42,8 +42,8 @@ pub struct FsWriteOutput {
 #[derive(Clone)]
 pub struct FsWriteTool {
     work_dir: PathBuf,
-    hook: Option<Arc<dyn Hook>>,
     description: String,
+    hook: Option<Arc<dyn ToolHook<FsWriteArgs, ToolOutput<FsWriteOutput>>>>,
 }
 
 impl FsWriteTool {
@@ -51,7 +51,10 @@ impl FsWriteTool {
     pub const NAME: &'static str = "fs_write";
 
     /// Create a new `FsWriteTool` with the specified working directory.
-    pub fn new(work_dir: PathBuf, hook: Option<Arc<dyn Hook>>) -> Self {
+    pub fn new(
+        work_dir: PathBuf,
+        hook: Option<Arc<dyn ToolHook<FsWriteArgs, ToolOutput<FsWriteOutput>>>>,
+    ) -> Self {
         let description = format!(
             "Atomically write files to the filesystem in the workspace directory: {}",
             work_dir.display()
@@ -71,7 +74,7 @@ impl FsWriteTool {
 
 impl Tool<BaseCtx> for FsWriteTool {
     type Args = FsWriteArgs;
-    type Output = Json;
+    type Output = FsWriteOutput;
 
     fn name(&self) -> String {
         Self::NAME.to_string()
@@ -113,9 +116,11 @@ impl Tool<BaseCtx> for FsWriteTool {
         args: Self::Args,
         _resources: Vec<Resource>,
     ) -> Result<ToolOutput<Self::Output>, BoxError> {
-        if let Some(hook) = &self.hook {
-            hook.on_tool_start(&ctx, &self.name()).await?;
-        }
+        let args = if let Some(hook) = &self.hook {
+            hook.before_tool_call(&ctx, args).await?
+        } else {
+            args
+        };
 
         let resolved_path = resolve_write_path(&self.work_dir, &args.path).await?;
 
@@ -145,15 +150,11 @@ impl Tool<BaseCtx> for FsWriteTool {
 
         if let Some(hook) = &self.hook {
             return hook
-                .on_tool_end(
-                    &ctx,
-                    &self.name(),
-                    ToolOutput::new(json!(FsWriteOutput { size })),
-                )
+                .after_tool_call(&ctx, ToolOutput::new(FsWriteOutput { size }))
                 .await;
         }
 
-        Ok(ToolOutput::new(json!(FsWriteOutput { size })))
+        Ok(ToolOutput::new(FsWriteOutput { size }))
     }
 }
 /// Decodes content according to the requested encoding.
@@ -225,7 +226,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.output["size"], 5);
+        assert_eq!(result.output.size, 5);
         let written = tokio::fs::read_to_string(workspace.join("nested/dir/output.txt"))
             .await
             .unwrap();
@@ -276,7 +277,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.output["size"], 4);
+        assert_eq!(result.output.size, 4);
         let written = tokio::fs::read(workspace.join("payload.bin"))
             .await
             .unwrap();
@@ -394,7 +395,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.output["size"], 5);
+        assert_eq!(result.output.size, 5);
         let written = tokio::fs::read_to_string(workspace.join("notes.txt"))
             .await
             .unwrap();

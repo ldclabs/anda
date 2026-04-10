@@ -30,7 +30,7 @@ pub use native::NativeRuntime;
 /// Sandboxed runtime implementation.
 pub mod sandbox;
 
-use crate::context::BaseCtx;
+use crate::{context::BaseCtx, hook::ToolHook};
 
 /// Maximum shell command execution time before kill.
 pub const SHELL_TIMEOUT_SECS: u64 = 180;
@@ -205,6 +205,7 @@ pub struct ShellTool {
     runtime: Arc<dyn Executor>,
     envs: HashMap<String, String>,
     description: String,
+    hook: Option<Arc<dyn ToolHook<ExecArgs, ToolOutput<ExecOutput>>>>,
 }
 
 impl ShellTool {
@@ -212,7 +213,11 @@ impl ShellTool {
     pub const NAME: &'static str = "shell";
 
     /// Create a shell tool with a runtime and a fixed environment map.
-    pub fn new(runtime: Arc<dyn Executor>, envs: HashMap<String, String>) -> Self {
+    pub fn new(
+        runtime: Arc<dyn Executor>,
+        envs: HashMap<String, String>,
+        hook: Option<Arc<dyn ToolHook<ExecArgs, ToolOutput<ExecOutput>>>>,
+    ) -> Self {
         let description = format!(
             "Execute a shell command in the workspace directory (Runtime: {}, OS: {}, Shell: {})",
             runtime.name(),
@@ -223,6 +228,7 @@ impl ShellTool {
         Self {
             runtime,
             envs,
+            hook,
             description,
         }
     }
@@ -300,6 +306,11 @@ impl Tool<BaseCtx> for ShellTool {
         args: Self::Args,
         _resources: Vec<Resource>,
     ) -> Result<ToolOutput<Self::Output>, BoxError> {
+        let args = if let Some(hook) = &self.hook {
+            hook.before_tool_call(&ctx, args).await?
+        } else {
+            args
+        };
         let command = args.command.clone();
         let envs: HashMap<String, String> = args
             .env_keys
@@ -309,24 +320,30 @@ impl Tool<BaseCtx> for ShellTool {
 
         let result = tokio::time::timeout(
             Duration::from_secs(SHELL_TIMEOUT_SECS),
-            self.runtime.execute(ctx, args, envs),
+            self.runtime.execute(ctx.clone(), args, envs),
         )
         .await;
 
-        match result {
-            Ok(Ok(output)) => Ok(ToolOutput::new(output)),
-            Ok(Err(err)) => Ok(ToolOutput::new(ExecOutput {
+        let rt = match result {
+            Ok(Ok(output)) => ToolOutput::new(output),
+            Ok(Err(err)) => ToolOutput::new(ExecOutput {
                 stderr: Some(format!(
                     "Failed to execute command: {command}, error: {err}"
                 )),
                 ..Default::default()
-            })),
-            Err(_) => Ok(ToolOutput::new(ExecOutput {
+            }),
+            Err(_) => ToolOutput::new(ExecOutput {
                 stderr: Some(format!(
                     "Failed to execute command: {command}, error: timed out after {SHELL_TIMEOUT_SECS}s and was killed"
                 )),
                 ..Default::default()
-            })),
+            }),
+        };
+
+        if let Some(hook) = &self.hook {
+            hook.after_tool_call(&ctx, rt).await
+        } else {
+            Ok(rt)
         }
     }
 }

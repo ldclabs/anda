@@ -16,7 +16,7 @@ use std::{
 };
 
 use super::{AgentCtx, BaseCtx};
-use crate::hook::Hook;
+use crate::hook::AgentHook;
 
 #[derive(Clone, Default, Deserialize, Serialize)]
 pub struct SubAgent {
@@ -31,7 +31,7 @@ pub struct SubAgent {
     pub tags: Vec<String>,
 
     #[serde(skip)]
-    pub hook: Option<Arc<dyn Hook>>,
+    pub hook: Option<Arc<dyn AgentHook>>,
 }
 
 impl Agent<AgentCtx> for SubAgent {
@@ -80,9 +80,11 @@ impl Agent<AgentCtx> for SubAgent {
     ) -> impl Future<Output = Result<AgentOutput, BoxError>> + Send {
         let agent = self.clone();
         Box::pin(async move {
-            if let Some(hook) = &agent.hook {
-                hook.on_agent_start(&ctx, &agent.name).await?;
-            }
+            let (prompt, resources) = if let Some(hook) = &agent.hook {
+                hook.before_agent_run(&ctx, prompt, resources).await?
+            } else {
+                (prompt, resources)
+            };
 
             let req = CompletionRequest {
                 instructions: agent.instructions.clone(),
@@ -98,7 +100,7 @@ impl Agent<AgentCtx> for SubAgent {
 
             let rt = ctx.completion(req, Vec::new()).await?;
             if let Some(hook) = &agent.hook {
-                return hook.on_agent_end(&ctx, &agent.name, rt).await;
+                return hook.after_agent_run(&ctx, rt).await;
             }
 
             Ok(rt)
@@ -131,13 +133,13 @@ pub trait SubAgentSet: Send + Sync {
 pub struct SubAgentManager {
     root_ctx: BaseCtx,
     agents: RwLock<BTreeMap<String, SubAgent>>,
-    hook: Option<Arc<dyn Hook>>,
+    hook: Option<Arc<dyn AgentHook>>,
 }
 
 impl SubAgentManager {
     pub const NAME: &'static str = "subagents_manager";
 
-    pub fn new(root_ctx: BaseCtx, hook: Option<Arc<dyn Hook>>) -> Self {
+    pub fn new(root_ctx: BaseCtx, hook: Option<Arc<dyn AgentHook>>) -> Self {
         Self {
             root_ctx,
             agents: RwLock::new(BTreeMap::new()),

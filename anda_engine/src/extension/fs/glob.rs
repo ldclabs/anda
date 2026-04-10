@@ -1,4 +1,4 @@
-use anda_core::{BoxError, FunctionDefinition, Json, Resource, Tool, ToolOutput};
+use anda_core::{BoxError, FunctionDefinition, Resource, Tool, ToolOutput};
 use glob::{MatchOptions, glob_with};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -11,7 +11,7 @@ use super::{
     ensure_path_in_workspace, nearest_existing_ancestor, normalize_relative_path,
     resolve_workspace_path,
 };
-use crate::{context::BaseCtx, hook::Hook};
+use crate::{context::BaseCtx, hook::ToolHook};
 
 /// Arguments for filesystem glob operations.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -35,7 +35,7 @@ pub struct FsGlobOutput {
 #[derive(Clone)]
 pub struct FsGlobTool {
     work_dir: PathBuf,
-    hook: Option<Arc<dyn Hook>>,
+    hook: Option<Arc<dyn ToolHook<FsGlobArgs, ToolOutput<FsGlobOutput>>>>,
     description: String,
 }
 
@@ -44,7 +44,10 @@ impl FsGlobTool {
     pub const NAME: &'static str = "fs_glob";
 
     /// Create a new `FsGlobTool` with the specified working directory.
-    pub fn new(work_dir: PathBuf, hook: Option<Arc<dyn Hook>>) -> Self {
+    pub fn new(
+        work_dir: PathBuf,
+        hook: Option<Arc<dyn ToolHook<FsGlobArgs, ToolOutput<FsGlobOutput>>>>,
+    ) -> Self {
         let description = format!(
             "Match filesystem paths with glob patterns in the workspace directory: {}",
             work_dir.display()
@@ -64,7 +67,7 @@ impl FsGlobTool {
 
 impl Tool<BaseCtx> for FsGlobTool {
     type Args = FsGlobArgs;
-    type Output = Json;
+    type Output = FsGlobOutput;
 
     fn name(&self) -> String {
         Self::NAME.to_string()
@@ -102,9 +105,11 @@ impl Tool<BaseCtx> for FsGlobTool {
         args: Self::Args,
         _resources: Vec<Resource>,
     ) -> Result<ToolOutput<Self::Output>, BoxError> {
-        if let Some(hook) = &self.hook {
-            hook.on_tool_start(&ctx, &self.name()).await?;
-        }
+        let args = if let Some(hook) = &self.hook {
+            hook.before_tool_call(&ctx, args).await?
+        } else {
+            args
+        };
 
         let (resolved_work_dir, pattern) =
             resolve_glob_pattern(&self.work_dir, &args.pattern).await?;
@@ -141,12 +146,10 @@ impl Tool<BaseCtx> for FsGlobTool {
         };
 
         if let Some(hook) = &self.hook {
-            return hook
-                .on_tool_end(&ctx, &self.name(), ToolOutput::new(json!(output)))
-                .await;
+            return hook.after_tool_call(&ctx, ToolOutput::new(output)).await;
         }
 
-        Ok(ToolOutput::new(json!(output)))
+        Ok(ToolOutput::new(output))
     }
 }
 
@@ -300,8 +303,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.output["paths"], json!(["src/lib.rs", "src/main.rs"]));
-        assert_eq!(result.output["total_matches"], 2);
+        assert_eq!(result.output.paths, ["src/lib.rs", "src/main.rs"]);
+        assert_eq!(result.output.total_matches, 2);
     }
 
     #[tokio::test]
@@ -333,8 +336,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.output["paths"], json!(["logs/a.txt", "logs/b.txt"]));
-        assert_eq!(result.output["total_matches"], 3);
+        assert_eq!(result.output.paths, ["logs/a.txt", "logs/b.txt"]);
+        assert_eq!(result.output.total_matches, 3);
     }
 
     #[cfg(unix)]
@@ -363,8 +366,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.output["paths"], json!(["notes.txt"]));
-        assert_eq!(result.output["total_matches"], 1);
+        assert_eq!(result.output.paths, ["notes.txt"]);
+        assert_eq!(result.output.total_matches, 1);
     }
 
     #[cfg(unix)]
