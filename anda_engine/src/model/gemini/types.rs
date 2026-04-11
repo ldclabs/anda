@@ -199,7 +199,7 @@ impl From<ContentPart> for Part {
             ContentPart::InlineData { mime_type, data } => Part {
                 data: PartKind::InlineData {
                     mime_type,
-                    data: data.to_string(),
+                    data: data.to_base64(),
                 },
                 ..Default::default()
             },

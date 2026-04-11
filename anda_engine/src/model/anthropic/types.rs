@@ -373,7 +373,7 @@ impl From<ContentPart> for ContentBlock {
                 source: ImageSource {
                     r#type: "base64".to_string(),
                     media_type: mime_type,
-                    data: data.to_string(),
+                    data: data.to_base64(),
                 },
             },
             ContentPart::ToolCall {

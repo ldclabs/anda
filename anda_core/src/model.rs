@@ -228,6 +228,17 @@ pub enum ContentPart {
     Any(Json),
 }
 
+/// Converts a content part with inline data to a data URL string.
+///
+/// https://developer.mozilla.org/en-US/docs/Web/URI/Reference/Schemes/data
+pub fn part_to_data_url(data: &ByteBufB64, mime_type: Option<&String>) -> String {
+    format!(
+        "data:{};base64,{}",
+        mime_type.map(|m| m.as_str()).unwrap_or(""),
+        data.to_base64()
+    )
+}
+
 impl<'de> Deserialize<'de> for ContentPart {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -370,9 +381,7 @@ impl From<Resource> for ContentPart {
     fn from(res: Resource) -> Self {
         if let Some(data) = res.blob {
             match String::from_utf8(data.0) {
-                Ok(text) => {
-                    ContentPart::Text { text }
-                }
+                Ok(text) => ContentPart::Text { text },
                 Err(v) => ContentPart::InlineData {
                     mime_type: res
                         .mime_type

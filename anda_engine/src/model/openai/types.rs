@@ -1,4 +1,6 @@
-use anda_core::{AgentOutput, BoxError, ContentPart, Json, Message, Usage as ModelUsage};
+use anda_core::{
+    AgentOutput, BoxError, ContentPart, Json, Message, Usage as ModelUsage, part_to_data_url,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Map;
 
@@ -362,7 +364,7 @@ pub fn message_into(msg: Message) -> Vec<MessageItem> {
                 });
             }
             ContentPart::InlineData { mime_type, data } => content.push(ContentItem::File {
-                file_data: Some(format!("data:{};base64,{}", mime_type, data)),
+                file_data: Some(part_to_data_url(&data, Some(&mime_type))),
                 file_url: None,
                 file_id: None,
                 filename: None,
