@@ -211,6 +211,35 @@ impl Conversation {
     }
 }
 
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TextMessage {
+    pub role: String,
+
+    pub content: String,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<String>,
+}
+
+impl TextMessage {
+    pub fn try_from(msg: Message) -> Option<Self> {
+        let content = msg.text()?;
+        Some(Self {
+            role: msg.role.clone(),
+            content,
+            name: msg.name.clone(),
+            user: msg.user.map(|u| u.to_string()),
+            timestamp: msg.timestamp.and_then(rfc3339_datetime),
+        })
+    }
+}
+
 impl From<Conversation> for Document {
     fn from(conversation: Conversation) -> Self {
         let mut metadata = BTreeMap::from([
@@ -233,30 +262,17 @@ impl From<Conversation> for Document {
         if let Some(label) = conversation.label {
             metadata.insert("label".to_string(), label.into());
         }
-        let message: Vec<Json> = conversation
+        let message: Vec<TextMessage> = conversation
             .messages
             .iter()
             .filter_map(|v| {
                 serde_json::from_value::<Message>(v.clone())
                     .ok()
-                    .and_then(|m| {
-                        if let Some(text) = m.text() {
-                            Some(json!({
-                                "role": m.role,
-                                "content": text,
-                                "name": m.name,
-                                "user": m.user,
-                                "timestamp": m.timestamp.map(|ts| rfc3339_datetime(ts).unwrap_or_else(|| ts.to_string())),
-                            }))
-                        } else {
-                            // ignore non-text messages.
-                            None
-                        }
-                    })
+                    .and_then(TextMessage::try_from)
             })
             .collect();
         Self {
-            content: message.into(),
+            content: serde_json::to_value(message).unwrap_or_default(),
             metadata,
         }
     }

@@ -176,6 +176,27 @@ impl Message {
         }
         tool_calls
     }
+
+    pub fn prune_content(&mut self) {
+        let original_len = self.content.len();
+        self.content.retain(|part| {
+            matches!(
+                part,
+                ContentPart::Text { .. }
+                    | ContentPart::Reasoning { .. }
+                    | ContentPart::Action { .. }
+            )
+        });
+        let pruned = original_len - self.content.len();
+        if pruned > 0 {
+            self.content.push(ContentPart::Text {
+                text: format!(
+                    "[{} items (tool calls or files) pruned due to limits]",
+                    pruned
+                ),
+            });
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
