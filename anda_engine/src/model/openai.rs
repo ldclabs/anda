@@ -262,7 +262,7 @@ fn to_message_input(msg: &Message) -> MessageInput {
                         arr.push(json!({
                             "type": "image_url",
                             "image_url": {
-                                "url": part_to_data_url(data, Some(&mime_type)),
+                                "url": part_to_data_url(data, Some(mime_type)),
                             },
                         }));
                     }
@@ -270,7 +270,7 @@ fn to_message_input(msg: &Message) -> MessageInput {
                         arr.push(json!({
                             "type": "video_url",
                             "video_url": {
-                                "url": part_to_data_url(data, Some(&mime_type)),
+                                "url": part_to_data_url(data, Some(mime_type)),
                             },
                         }));
                     }
@@ -278,7 +278,7 @@ fn to_message_input(msg: &Message) -> MessageInput {
                         arr.push(json!({
                             "type": "input_audio",
                             "input_audio": {
-                                "data": part_to_data_url(data, Some(&mime_type)),
+                                "data": part_to_data_url(data, Some(mime_type)),
                                 "format": if mt.contains("wav") { "wav" } else { "mp3" },
                             },
                         }));

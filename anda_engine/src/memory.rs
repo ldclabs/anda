@@ -57,14 +57,13 @@ pub static FUNCTION_DEFINITION: LazyLock<FunctionDefinition> = LazyLock::new(|| 
 });
 
 /// A conversation between an agent and the system, stored in the database for memory management.
-/// Version 2
+/// Version 3
 #[derive(Debug, Clone, Deserialize, Serialize, AndaDBSchema)]
 pub struct Conversation {
     /// The unique identifier for this resource in the Anda DB collection "conversation".
     pub _id: u64,
 
     #[field_type = "Bytes"]
-    #[serde(default = "Principal::anonymous")]
     pub user: Principal,
 
     #[field_type = "Option<Bytes>"]
@@ -101,12 +100,17 @@ pub struct Conversation {
     pub follow_up_messages: Option<Vec<String>>,
 
     /// The ancestor conversation IDs, ordered from the closest to the farthest ancestor.
+    /// Should not be updated after creation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ancestors: Option<Vec<u64>>,
 
     /// An optional label for the conversation, which can be used for categorization or retrieval.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+
+    /// Extra information for future extensions. This field is not indexed and should not be used for filtering or searching.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extra: Option<Json>,
 
     /// The period when the conversation was created, in hours (timestamp / 3600 / 1000).
     /// It is used to index the conversation for faster retrieval by time.
@@ -135,6 +139,7 @@ impl Default for Conversation {
             follow_up_messages: None,
             ancestors: None,
             label: None,
+            extra: None,
             period: 0,
             created_at: 0,
             updated_at: 0,
@@ -186,6 +191,14 @@ impl Conversation {
                 "label".to_string(),
                 if let Some(label) = self.label.clone() {
                     label.into()
+                } else {
+                    Fv::Null
+                },
+            ),
+            (
+                "extra".to_string(),
+                if let Some(extra) = self.extra.clone() {
+                    extra.into()
                 } else {
                     Fv::Null
                 },
@@ -265,6 +278,7 @@ pub struct ConversationRef<'a> {
     pub follow_up_messages: &'a Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label: &'a Option<String>,
+    pub extra: &'a Option<Json>,
     pub period: u64,
     pub created_at: u64,
     pub updated_at: u64,
@@ -286,6 +300,7 @@ impl<'a> From<&'a Conversation> for ConversationRef<'a> {
             steering_messages: &conversation.steering_messages,
             follow_up_messages: &conversation.follow_up_messages,
             label: &conversation.label,
+            extra: &conversation.extra,
             period: conversation.period,
             created_at: conversation.created_at,
             updated_at: conversation.updated_at,
@@ -352,7 +367,7 @@ pub struct MemoryManagement {
 impl MemoryManagement {
     pub async fn connect(db: Arc<AndaDB>, nexus: Arc<CognitiveNexus>) -> Result<Self, BoxError> {
         let mut schema = Conversation::schema()?;
-        schema.with_version(2);
+        schema.with_version(3);
 
         let conversations = db
             .open_or_create_collection(
