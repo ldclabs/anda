@@ -4,14 +4,13 @@ use anda_core::{
     validate_function_name,
 };
 use ciborium::from_reader;
-use ic_auth_types::deterministic_cbor_into_vec;
+use ic_auth_types::{Xid, deterministic_cbor_into_vec};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
     any::{Any, TypeId},
     collections::BTreeMap,
-    future::Future,
     sync::Arc,
 };
 
@@ -29,6 +28,9 @@ pub struct SubAgent {
 
     #[serde(default)]
     pub tags: Vec<String>,
+
+    #[serde(default)]
+    pub background: bool,
 
     #[serde(skip)]
     pub hook: Option<Arc<dyn AgentHook>>,
@@ -72,39 +74,73 @@ impl Agent<AgentCtx> for SubAgent {
         self.tags.clone()
     }
 
-    fn run(
+    async fn run(
         &self,
         ctx: AgentCtx,
         prompt: String,
         resources: Vec<Resource>,
-    ) -> impl Future<Output = Result<AgentOutput, BoxError>> + Send {
-        let agent = self.clone();
-        Box::pin(async move {
-            let (prompt, resources) = if let Some(hook) = &agent.hook {
-                hook.before_agent_run(&ctx, prompt, resources).await?
-            } else {
-                (prompt, resources)
-            };
+    ) -> Result<AgentOutput, BoxError> {
+        let (prompt, resources) = if let Some(hook) = &self.hook {
+            hook.before_agent_run(&ctx, prompt, resources).await?
+        } else {
+            (prompt, resources)
+        };
 
-            let req = CompletionRequest {
-                instructions: agent.instructions.clone(),
-                prompt,
-                content: resources.into_iter().map(ContentPart::from).collect(),
-                tools: if agent.tools.is_empty() {
-                    vec![]
-                } else {
-                    ctx.tool_definitions(Some(&agent.tools))
-                },
+        let req = CompletionRequest {
+            instructions: self.instructions.clone(),
+            prompt,
+            content: resources.into_iter().map(ContentPart::from).collect(),
+            tools: if self.tools.is_empty() {
+                vec![]
+            } else {
+                ctx.definitions(Some(&self.tools)).await
+            },
+            ..Default::default()
+        };
+
+        if self.background {
+            let task_id = format!("{}:{}", self.name(), Xid::new());
+            let rt = AgentOutput {
+                content: format!(
+                    "sub-agent is running in the background with task ID: {}",
+                    task_id
+                ),
                 ..Default::default()
             };
 
+            let rt = if let Some(hook) = &self.hook {
+                hook.after_agent_run(&ctx, rt).await?
+            } else {
+                rt
+            };
+
+            let hook = self.hook.clone();
+            tokio::spawn(async move {
+                let mut rt = match ctx.completion(req, Vec::new()).await {
+                    Ok(rt) => rt,
+                    Err(err) => AgentOutput {
+                        content: format!("sub-agent background task {} error: {}", task_id, err),
+                        ..Default::default()
+                    },
+                };
+                rt.content = format!(
+                    "sub-agent background task {} completed with output:\n\n{}",
+                    task_id, rt.content
+                );
+
+                if let Some(hook) = hook {
+                    hook.on_background_end(ctx, rt).await;
+                }
+            });
+            Ok(rt)
+        } else {
             let rt = ctx.completion(req, Vec::new()).await?;
-            if let Some(hook) = &agent.hook {
+            if let Some(hook) = &self.hook {
                 return hook.after_agent_run(&ctx, rt).await;
             }
 
             Ok(rt)
-        })
+        }
     }
 }
 

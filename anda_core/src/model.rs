@@ -561,8 +561,13 @@ impl FunctionDefinition {
     }
 }
 
-/// Estimate the number of tokens in the given content in the simplest way.
+#[deprecated(note = "Use `estimate_tokens` instead.")]
 pub fn evaluate_tokens(content: &str) -> usize {
+    content.len() / 3
+}
+
+/// Estimate the number of tokens in the given content in the simplest way.
+pub fn estimate_tokens(content: &str) -> usize {
     content.len() / 3
 }
 

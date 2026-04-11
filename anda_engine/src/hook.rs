@@ -1,8 +1,7 @@
 //! Hook system for customizing engine behavior.
 
 use anda_core::{
-    AgentOutput, BoxError, CacheExpiry, CacheFeatures, CompletionRequest, Json, Resource,
-    StateFeatures, ToolOutput,
+    AgentOutput, BoxError, CacheExpiry, CacheFeatures, Json, Resource, StateFeatures, ToolOutput,
 };
 use async_trait::async_trait;
 use std::time::Duration;
@@ -65,6 +64,7 @@ where
 /// AgentHook trait for customizing agent execution behavior with more fine-grained control.
 #[async_trait]
 pub trait AgentHook: Send + Sync {
+    /// Called before an agent is executed, allowing you to modify the prompt and resources.
     async fn before_agent_run(
         &self,
         _ctx: &AgentCtx,
@@ -74,6 +74,8 @@ pub trait AgentHook: Send + Sync {
         Ok((prompt, resources))
     }
 
+    /// Called after an agent is executed, allowing you to modify the output.
+    /// If the agent is executed asynchronously in the background, this will be called immediately before the agent run is triggered, and the final output will be passed to `on_background_end`.
     async fn after_agent_run(
         &self,
         _ctx: &AgentCtx,
@@ -81,23 +83,10 @@ pub trait AgentHook: Send + Sync {
     ) -> Result<AgentOutput, BoxError> {
         Ok(output)
     }
+
+    /// This method can be called to handle the final output when the agent is executed asynchronously in the background.
+    async fn on_background_end(&self, _ctx: AgentCtx, _output: AgentOutput) {}
 }
-
-/// CompletionHook trait for customizing completion behavior with more fine-grained control.
-#[async_trait]
-pub trait CompletionHook: Send + Sync {
-    async fn on_completion_start(
-        &self,
-        req: CompletionRequest,
-    ) -> Result<CompletionRequest, BoxError> {
-        Ok(req)
-    }
-}
-
-pub struct NoopHook;
-
-impl AgentHook for NoopHook {}
-impl CompletionHook for NoopHook {}
 
 /// Hooks struct for managing multiple hooks.
 pub struct Hooks {

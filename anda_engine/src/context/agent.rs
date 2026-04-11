@@ -51,10 +51,7 @@ use super::{
     subagent::{SubAgentSet, SubAgentSetManager},
     tool::{ToolsSelectOutput, is_tools_select_name},
 };
-use crate::{
-    hook::{CompletionHook, NoopHook},
-    model::{Model, Models},
-};
+use crate::model::{Model, Models};
 
 pub static DYNAMIC_REMOTE_ENGINES: &str = "_engines";
 
@@ -203,7 +200,6 @@ impl AgentCtx {
             follow_up_message: None,
             done: false,
             step: 0,
-            hook: Arc::new(NoopHook),
         }
     }
 
@@ -946,7 +942,6 @@ pub struct CompletionRunner {
     follow_up_message: Option<String>,
     done: bool,
     step: usize,
-    hook: Arc<dyn CompletionHook>,
 }
 
 impl CompletionRunner {
@@ -972,11 +967,6 @@ impl CompletionRunner {
     /// No effect if the completion has finished.
     pub fn follow_up(&mut self, message: String) {
         self.follow_up_message = Some(message);
-    }
-
-    /// Sets a completion hook to customize the completion request before each turn.
-    pub fn set_hook(&mut self, hook: Arc<dyn CompletionHook>) {
-        self.hook = hook;
     }
 
     /// Execute the next step.
@@ -1006,7 +996,7 @@ impl CompletionRunner {
     async fn inner_next(&mut self) -> Result<Option<AgentOutput>, BoxError> {
         self.step += 1;
 
-        let req = self.hook.on_completion_start(self.req.clone()).await?;
+        let req = self.req.clone();
         let label = req.model.as_ref().unwrap_or(&self.ctx.label);
 
         let model = self

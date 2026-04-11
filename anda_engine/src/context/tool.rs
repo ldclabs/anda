@@ -66,7 +66,8 @@ impl Agent<AgentCtx> for ToolsSearch {
     }
 
     fn description(&self) -> String {
-        "Search callable tools and agents available to this turn, and return their names and descriptions".to_string()
+        "Search callable tools and agents by keyword, and return their names and descriptions"
+            .to_string()
     }
 
     fn definition(&self) -> FunctionDefinition {
