@@ -7,9 +7,9 @@ use structured_logger::unix_ms;
 use tokio::signal;
 use tokio_util::sync::CancellationToken;
 
-mod handler;
+pub mod handler;
 pub mod middleware;
-mod types;
+pub mod types;
 
 use handler::*;
 use middleware::*;
