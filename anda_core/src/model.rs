@@ -177,7 +177,7 @@ impl Message {
         tool_calls
     }
 
-    pub fn prune_content(&mut self) {
+    pub fn prune_content(&mut self) -> usize {
         let original_len = self.content.len();
         self.content.retain(|part| {
             matches!(
@@ -196,6 +196,7 @@ impl Message {
                 ),
             });
         }
+        pruned
     }
 }
 
