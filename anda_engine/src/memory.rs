@@ -1,6 +1,6 @@
 use anda_cognitive_nexus::{CognitiveNexus, ConceptPK};
 use anda_core::{
-    BoxError, Document, Documents, FunctionDefinition, Message, Resource, ResourceRef,
+    BoxError, ContentPart, Document, Documents, FunctionDefinition, Message, Resource, ResourceRef,
     StateFeatures, Tool, ToolOutput, Usage, Xid, gen_schema_for,
 };
 use anda_db::{
@@ -27,10 +27,7 @@ use std::{
     sync::{Arc, LazyLock},
 };
 
-use crate::{
-    context::BaseCtx, extension::fetch::FetchWebResourcesTool, rfc3339_datetime,
-    rfc3339_datetime_now, unix_ms,
-};
+use crate::{context::BaseCtx, extension::fetch::FetchWebResourcesTool, rfc3339_datetime, unix_ms};
 
 pub static FUNCTION_DEFINITION: LazyLock<FunctionDefinition> = LazyLock::new(|| {
     serde_json::from_value(json!({
@@ -212,10 +209,10 @@ impl Conversation {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
-pub struct TextMessage {
+pub struct PrunedMessage {
     pub role: String,
 
-    pub content: String,
+    pub content: Vec<ContentPart>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -227,13 +224,13 @@ pub struct TextMessage {
     pub timestamp: Option<String>,
 }
 
-impl TextMessage {
-    pub fn try_from(msg: Message) -> Option<Self> {
-        let content = msg.text()?;
+impl PrunedMessage {
+    pub fn try_from(mut msg: Message) -> Option<Self> {
+        msg.prune_content();
         Some(Self {
-            role: msg.role.clone(),
-            content,
-            name: msg.name.clone(),
+            role: msg.role,
+            content: msg.content,
+            name: msg.name,
             user: msg.user.map(|u| u.to_string()),
             timestamp: msg.timestamp.and_then(rfc3339_datetime),
         })
@@ -262,13 +259,13 @@ impl From<Conversation> for Document {
         if let Some(label) = conversation.label {
             metadata.insert("label".to_string(), label.into());
         }
-        let message: Vec<TextMessage> = conversation
+        let message: Vec<PrunedMessage> = conversation
             .messages
             .iter()
             .filter_map(|v| {
                 serde_json::from_value::<Message>(v.clone())
                     .ok()
-                    .and_then(TextMessage::try_from)
+                    .and_then(PrunedMessage::try_from)
             })
             .collect();
         Self {
@@ -369,6 +366,154 @@ impl fmt::Display for ConversationStatus {
             ConversationStatus::Cancelled => write!(f, "cancelled"),
             ConversationStatus::Failed => write!(f, "failed"),
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Conversations {
+    pub conversations: Arc<Collection>,
+}
+
+impl Conversations {
+    pub async fn connect(db: Arc<AndaDB>, name: String) -> Result<Self, BoxError> {
+        let mut schema = Conversation::schema()?;
+        schema.with_version(3);
+
+        let conversations = db
+            .open_or_create_collection(
+                schema,
+                CollectionConfig {
+                    name,
+                    description: "conversations collection".to_string(),
+                },
+                async |collection| {
+                    // set tokenizer
+                    collection.set_tokenizer(jieba_tokenizer());
+                    // create BTree indexes if not exists
+                    collection.create_btree_index_nx(&["user"]).await?;
+                    collection.create_btree_index_nx(&["thread"]).await?;
+                    collection.create_btree_index_nx(&["period"]).await?;
+                    collection
+                        .create_bm25_index_nx(&["messages", "resources", "artifacts"])
+                        .await?;
+
+                    Ok::<(), DBError>(())
+                },
+            )
+            .await?;
+
+        Ok(Self { conversations })
+    }
+
+    pub async fn add_conversation(
+        &self,
+        conversation: ConversationRef<'_>,
+    ) -> Result<u64, DBError> {
+        let id = self.conversations.add_from(&conversation).await?;
+        self.conversations.flush(unix_ms()).await?;
+        Ok(id)
+    }
+
+    pub async fn update_conversation(
+        &self,
+        id: u64,
+        fields: BTreeMap<String, Fv>,
+    ) -> Result<(), DBError> {
+        self.conversations.update(id, fields).await?;
+        self.conversations.flush(unix_ms()).await?;
+        Ok(())
+    }
+
+    pub async fn get_conversation(&self, id: u64) -> Result<Conversation, DBError> {
+        self.conversations.get_as(id).await
+    }
+
+    pub async fn delete_conversation(&self, id: u64) -> Result<bool, DBError> {
+        let doc = self.conversations.remove(id).await?;
+        self.conversations.flush(unix_ms()).await?;
+        Ok(doc.is_some())
+    }
+
+    pub async fn list_conversations_by_user(
+        &self,
+        user: &Principal,
+        cursor: Option<String>,
+        limit: Option<usize>,
+    ) -> Result<(Vec<Conversation>, Option<String>), BoxError> {
+        let limit = limit.unwrap_or(10).min(100);
+        let cursor = match BTree::from_cursor::<u64>(&cursor)? {
+            Some(cursor) => cursor,
+            None => self.conversations.max_document_id() + 1,
+        };
+        let filter = Some(Filter::And(vec![
+            Box::new(Filter::Field((
+                "user".to_string(),
+                RangeQuery::Eq(Fv::Bytes(user.as_slice().to_vec())),
+            ))),
+            Box::new(Filter::Field((
+                "_id".to_string(),
+                RangeQuery::Lt(Fv::U64(cursor)),
+            ))),
+        ]));
+
+        let rt: Vec<Conversation> = self
+            .conversations
+            .search_as(Query {
+                search: None,
+                filter,
+                limit: Some(limit),
+            })
+            .await?;
+        let cursor = if rt.len() >= limit {
+            BTree::to_cursor(&rt.first().unwrap()._id)
+        } else {
+            None
+        };
+        Ok((rt, cursor))
+    }
+
+    pub async fn search_conversations(
+        &self,
+        user: &Principal,
+        query: String,
+        limit: Option<usize>,
+    ) -> Result<Vec<Conversation>, BoxError> {
+        let rt = self
+            .conversations
+            .search_as(Query {
+                search: Some(Search {
+                    text: Some(query.to_string()),
+                    logical_search: true,
+                    ..Default::default()
+                }),
+                filter: Some(Filter::Field((
+                    "user".to_string(),
+                    RangeQuery::Eq(Fv::Bytes(user.as_slice().to_vec())),
+                ))),
+                limit,
+            })
+            .await?;
+        Ok(rt)
+    }
+
+    pub async fn delete_expired_conversations(&self, timestamp: u64) -> Result<u64, BoxError> {
+        let period = timestamp / 3600 / 1000;
+        let filter = Filter::Field(("period".to_string(), RangeQuery::Lt(Fv::U64(period))));
+        let ids = self
+            .conversations
+            .search_ids(Query {
+                search: None,
+                filter: Some(filter),
+                limit: None,
+            })
+            .await?;
+        let count = ids.len() as u64;
+        for id in ids {
+            let _ = self.conversations.remove(id).await;
+        }
+        let now_ms = unix_ms();
+        self.conversations.flush(now_ms).await?;
+        Ok(count)
     }
 }
 
@@ -833,7 +978,7 @@ impl Tool<BaseCtx> for GetResourceContentTool {
     }
 }
 
-/// Arguments for "list_prev_conversations" tool
+/// Arguments for "list_previous_conversations" tool
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 pub struct ListConversationsArgs {
     /// The cursor for pagination
@@ -846,17 +991,21 @@ pub struct ListConversationsArgs {
 
 #[derive(Debug, Clone)]
 pub struct ListConversationsTool {
-    memory: Arc<MemoryManagement>,
-    schema: Json,
+    conversations: Conversations,
+    description: String,
 }
 
 impl ListConversationsTool {
-    pub const NAME: &'static str = "list_prev_conversations";
+    pub const NAME: &'static str = "list_previous_conversations";
 
     /// Creates a new ListConversationsTool instance
-    pub fn new(memory: Arc<MemoryManagement>) -> Self {
-        let schema = gen_schema_for::<ListConversationsArgs>();
-        Self { memory, schema }
+    pub fn new(conversations: Conversations) -> Self {
+        Self { conversations, description: "Lists the current user's previous conversations in reverse chronological order with cursor-based pagination. Returns conversation metadata including status, timestamps, messages, and usage statistics. Use the cursor parameter to paginate through older conversations.".to_string() }
+    }
+
+    pub fn with_description(mut self, description: String) -> Self {
+        self.description = description;
+        self
     }
 }
 
@@ -869,14 +1018,31 @@ impl Tool<BaseCtx> for ListConversationsTool {
     }
 
     fn description(&self) -> String {
-        "Lists the current user's previous conversations in reverse chronological order with cursor-based pagination. Returns conversation metadata including status, timestamps, messages, and usage statistics. Use the cursor parameter to paginate through older conversations.".to_string()
+        self.description.clone()
     }
 
     fn definition(&self) -> FunctionDefinition {
         FunctionDefinition {
             name: self.name(),
-            description: self.description(),
-            parameters: self.schema.clone(),
+            description: self.description.clone(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "cursor": {
+                        "type": "string",
+                        "description": "The cursor for pagination, returned from the previous call. Use an empty string for the first page."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "The maximum number of conversations to return, between 1 and 100. Default is 10.",
+                        "default": 10,
+                        "minimum": 1,
+                        "maximum": 100
+                    }
+                },
+                "required": [],
+                "additionalProperties": false
+            }),
             strict: None,
         }
     }
@@ -888,7 +1054,7 @@ impl Tool<BaseCtx> for ListConversationsTool {
         _resources: Vec<Resource>,
     ) -> Result<ToolOutput<Self::Output>, BoxError> {
         let (conversations, next_cursor) = self
-            .memory
+            .conversations
             .list_conversations_by_user(
                 ctx.caller(),
                 if args.cursor.is_empty() {
@@ -904,14 +1070,8 @@ impl Tool<BaseCtx> for ListConversationsTool {
             )
             .await?;
         let docs: Vec<Document> = conversations.into_iter().map(Document::from).collect();
-        let result = format!(
-            "Current Datetime: {}\n\n---\n\n{}",
-            rfc3339_datetime_now(),
-            Documents::from(docs)
-        );
-
         Ok(ToolOutput::new(Response::Ok {
-            result: result.into(),
+            result: Documents::from(docs).to_string().into(),
             next_cursor,
         }))
     }
@@ -929,17 +1089,21 @@ pub struct SearchConversationsArgs {
 
 #[derive(Debug, Clone)]
 pub struct SearchConversationsTool {
-    memory: Arc<MemoryManagement>,
-    schema: Json,
+    conversations: Conversations,
+    description: String,
 }
 
 impl SearchConversationsTool {
     pub const NAME: &'static str = "search_conversations";
 
     /// Creates a new SearchConversationsTool instance
-    pub fn new(memory: Arc<MemoryManagement>) -> Self {
-        let schema = gen_schema_for::<SearchConversationsArgs>();
-        Self { memory, schema }
+    pub fn new(conversations: Conversations) -> Self {
+        Self { conversations, description: "Performs a full-text search across the current user's conversation history using a query string. Searches through messages, resources, and artifacts to find relevant past conversations. Use this to recall specific topics, instructions, or context from previous interactions.".to_string() }
+    }
+
+    pub fn with_description(mut self, description: String) -> Self {
+        self.description = description;
+        self
     }
 }
 
@@ -952,14 +1116,31 @@ impl Tool<BaseCtx> for SearchConversationsTool {
     }
 
     fn description(&self) -> String {
-        "Performs a full-text search across the current user's conversation history using a query string. Searches through messages, resources, and artifacts to find relevant past conversations. Use this to recall specific topics, instructions, or context from previous interactions.".to_string()
+        self.description.clone()
     }
 
     fn definition(&self) -> FunctionDefinition {
         FunctionDefinition {
             name: self.name(),
-            description: self.description(),
-            parameters: self.schema.clone(),
+            description: self.description.clone(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The query string to search for in the conversation history."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "The maximum number of conversations to return, between 1 and 100. Default is 10.",
+                        "default": 10,
+                        "minimum": 1,
+                        "maximum": 100
+                    }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }),
             strict: None,
         }
     }
@@ -971,7 +1152,7 @@ impl Tool<BaseCtx> for SearchConversationsTool {
         _resources: Vec<Resource>,
     ) -> Result<ToolOutput<Self::Output>, BoxError> {
         let conversations = self
-            .memory
+            .conversations
             .search_conversations(
                 ctx.caller(),
                 args.query,
@@ -984,14 +1165,8 @@ impl Tool<BaseCtx> for SearchConversationsTool {
             .await?;
 
         let docs: Vec<Document> = conversations.into_iter().map(Document::from).collect();
-        let result = format!(
-            "Current Datetime: {}\n\n---\n\n{}",
-            rfc3339_datetime_now(),
-            Documents::from(docs)
-        );
-
         Ok(ToolOutput::new(Response::Ok {
-            result: result.into(),
+            result: Documents::from(docs).to_string().into(),
             next_cursor: None,
         }))
     }
@@ -1270,12 +1445,5 @@ mod tests {
         assert_eq!(rt, r#"{"type":"GetConversation","_id":1}"#);
         let args1: MemoryToolArgs = serde_json::from_str(&rt).unwrap();
         assert_eq!(args, args1);
-    }
-
-    #[test]
-    fn test_list_prev_conversations_schema() {
-        let schema = gen_schema_for::<ListConversationsArgs>();
-        println!("{}", serde_json::to_string_pretty(&schema).unwrap());
-        assert!(schema.get("required").is_some());
     }
 }
