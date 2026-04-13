@@ -7,13 +7,13 @@ use std::{
 use tokio::io::AsyncWriteExt;
 
 mod edit;
-mod glob;
 mod read;
+mod search;
 mod write;
 
 pub use edit::*;
-pub use glob::*;
 pub use read::*;
+pub use search::*;
 pub use write::*;
 
 pub(crate) const MAX_FILE_SIZE_BYTES: u64 = 10 * 1024 * 1024;

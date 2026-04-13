@@ -15,7 +15,7 @@ use crate::{context::BaseCtx, hook::ToolHook};
 
 /// Arguments for filesystem glob operations.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct FsGlobArgs {
+pub struct SearchFileArgs {
     /// Relative or absolute glob pattern inside the workspace.
     pub pattern: String,
     /// Maximum number of matches to return. `0` means all matches.
@@ -25,7 +25,7 @@ pub struct FsGlobArgs {
 
 /// Normalized result returned by a filesystem glob operation.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct FsGlobOutput {
+pub struct SearchFileOutput {
     /// Matching paths relative to the workspace root.
     pub paths: Vec<String>,
     /// Total matches before applying `limit`.
@@ -33,20 +33,20 @@ pub struct FsGlobOutput {
 }
 
 #[derive(Clone)]
-pub struct FsGlobTool {
+pub struct SearchFileTool {
     work_dir: PathBuf,
-    hook: Option<Arc<dyn ToolHook<FsGlobArgs, ToolOutput<FsGlobOutput>>>>,
+    hook: Option<Arc<dyn ToolHook<SearchFileArgs, ToolOutput<SearchFileOutput>>>>,
     description: String,
 }
 
-impl FsGlobTool {
+impl SearchFileTool {
     /// Tool name used for registration and function definition.
-    pub const NAME: &'static str = "fs_glob";
+    pub const NAME: &'static str = "search_file";
 
-    /// Create a new `FsGlobTool` with the specified working directory.
+    /// Create a new `SearchFileTool` with the specified working directory.
     pub fn new(
         work_dir: PathBuf,
-        hook: Option<Arc<dyn ToolHook<FsGlobArgs, ToolOutput<FsGlobOutput>>>>,
+        hook: Option<Arc<dyn ToolHook<SearchFileArgs, ToolOutput<SearchFileOutput>>>>,
     ) -> Self {
         let description = format!(
             "Match filesystem paths with glob patterns in the workspace directory: {}",
@@ -65,9 +65,9 @@ impl FsGlobTool {
     }
 }
 
-impl Tool<BaseCtx> for FsGlobTool {
-    type Args = FsGlobArgs;
-    type Output = FsGlobOutput;
+impl Tool<BaseCtx> for SearchFileTool {
+    type Args = SearchFileArgs;
+    type Output = SearchFileOutput;
 
     fn name(&self) -> String {
         Self::NAME.to_string()
@@ -140,7 +140,7 @@ impl Tool<BaseCtx> for FsGlobTool {
             paths.truncate(args.limit);
         }
 
-        let output = FsGlobOutput {
+        let output = SearchFileOutput {
             paths,
             total_matches,
         };
@@ -270,8 +270,8 @@ mod tests {
         EngineBuilder::new().mock_ctx().base
     }
 
-    fn glob_tool(work_dir: &Path) -> FsGlobTool {
-        FsGlobTool::new(work_dir.to_path_buf(), None)
+    fn glob_tool(work_dir: &Path) -> SearchFileTool {
+        SearchFileTool::new(work_dir.to_path_buf(), None)
     }
 
     #[tokio::test]
@@ -294,7 +294,7 @@ mod tests {
         let result = glob_tool(&workspace)
             .call(
                 mock_ctx(),
-                FsGlobArgs {
+                SearchFileArgs {
                     pattern: "src/*.rs".to_string(),
                     limit: 0,
                 },
@@ -327,7 +327,7 @@ mod tests {
         let result = glob_tool(&workspace)
             .call(
                 mock_ctx(),
-                FsGlobArgs {
+                SearchFileArgs {
                     pattern: "logs/*.txt".to_string(),
                     limit: 2,
                 },
@@ -357,7 +357,7 @@ mod tests {
         let result = glob_tool(&workspace_link)
             .call(
                 mock_ctx(),
-                FsGlobArgs {
+                SearchFileArgs {
                     pattern: "*.txt".to_string(),
                     limit: 0,
                 },
@@ -388,7 +388,7 @@ mod tests {
         let err = glob_tool(&workspace)
             .call(
                 mock_ctx(),
-                FsGlobArgs {
+                SearchFileArgs {
                     pattern: "escape/*.txt".to_string(),
                     limit: 0,
                 },

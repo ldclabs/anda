@@ -66,7 +66,13 @@ pub struct SkillManager {
     default_skill_tools: Vec<String>,
 }
 
-static DEFAULT_SKILL_TOOLS: &[&str] = &["shell", "fs_read", "fs_glob", "fs_write", "fs_edit"];
+static DEFAULT_SKILL_TOOLS: &[&str] = &[
+    "shell",
+    "read_file",
+    "search_file",
+    "write_file",
+    "edit_file",
+];
 
 impl SkillManager {
     /// Tool name used for registration.
@@ -433,7 +439,12 @@ Beta instructions.
         assert_eq!(
             beta.tools,
             vec![
-                "shell", "fs_read", "fs_glob", "fs_write", "fs_edit", "fetch"
+                "shell",
+                "read_file",
+                "search_file",
+                "write_file",
+                "edit_file",
+                "fetch"
             ]
         );
         assert!(beta.instructions.contains("Beta instructions."));
@@ -481,7 +492,12 @@ Beta instructions.
         assert_eq!(
             alpha2.tools,
             vec![
-                "shell", "fs_read", "fs_glob", "fs_write", "fs_edit", "fetch"
+                "shell",
+                "read_file",
+                "search_file",
+                "write_file",
+                "edit_file",
+                "fetch"
             ]
         );
 

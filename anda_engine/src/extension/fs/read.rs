@@ -12,7 +12,7 @@ use crate::{context::BaseCtx, hook::ToolHook};
 
 /// Arguments for filesystem read operations.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct FsReadArgs {
+pub struct ReadFileArgs {
     /// Relative or absolute path to a file inside the workspace.
     pub path: String,
     /// Zero-based line offset for UTF-8 text output.
@@ -25,7 +25,7 @@ pub struct FsReadArgs {
 
 /// Normalized result returned by a filesystem read operation.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct FsReadOutput {
+pub struct ReadFileOutput {
     /// File content as UTF-8 text or base64-encoded bytes for non-UTF-8 files.
     pub content: String,
     /// The encoding of the file content.
@@ -41,20 +41,20 @@ pub struct FsReadOutput {
 }
 
 #[derive(Clone)]
-pub struct FsReadTool {
+pub struct ReadFileTool {
     work_dir: PathBuf,
     description: String,
-    hook: Option<Arc<dyn ToolHook<FsReadArgs, ToolOutput<FsReadOutput>>>>,
+    hook: Option<Arc<dyn ToolHook<ReadFileArgs, ToolOutput<ReadFileOutput>>>>,
 }
 
-impl FsReadTool {
+impl ReadFileTool {
     /// Tool name used for registration and function definition.
-    pub const NAME: &'static str = "fs_read";
+    pub const NAME: &'static str = "read_file";
 
-    /// Create a new `FsReadTool` with the specified working directory.
+    /// Create a new `ReadFileTool` with the specified working directory.
     pub fn new(
         work_dir: PathBuf,
-        hook: Option<Arc<dyn ToolHook<FsReadArgs, ToolOutput<FsReadOutput>>>>,
+        hook: Option<Arc<dyn ToolHook<ReadFileArgs, ToolOutput<ReadFileOutput>>>>,
     ) -> Self {
         let description = format!(
             "Read files from the filesystem in the workspace directory: {}",
@@ -73,9 +73,9 @@ impl FsReadTool {
     }
 }
 
-impl Tool<BaseCtx> for FsReadTool {
-    type Args = FsReadArgs;
-    type Output = FsReadOutput;
+impl Tool<BaseCtx> for ReadFileTool {
+    type Args = ReadFileArgs;
+    type Output = ReadFileOutput;
 
     fn name(&self) -> String {
         Self::NAME.to_string()
@@ -135,7 +135,7 @@ impl Tool<BaseCtx> for FsReadTool {
         let data = tokio::fs::read(&resolved_path)
             .await
             .map_err(|err| format!("Failed to read file: {err}"))?;
-        let mut output = FsReadOutput {
+        let mut output = ReadFileOutput {
             content: String::new(),
             encoding: UTF8_ENCODING.to_string(),
             size: meta.len(),
@@ -205,8 +205,8 @@ mod tests {
         EngineBuilder::new().mock_ctx().base
     }
 
-    fn read_tool(work_dir: &Path) -> FsReadTool {
-        FsReadTool::new(work_dir.to_path_buf(), None)
+    fn read_tool(work_dir: &Path) -> ReadFileTool {
+        ReadFileTool::new(work_dir.to_path_buf(), None)
     }
 
     #[tokio::test]
@@ -221,7 +221,7 @@ mod tests {
         let result = read_tool(&workspace)
             .call(
                 mock_ctx(),
-                FsReadArgs {
+                ReadFileArgs {
                     path: "notes.txt".to_string(),
                     offset: 1,
                     limit: 0,
@@ -247,7 +247,7 @@ mod tests {
         let result = read_tool(&workspace)
             .call(
                 mock_ctx(),
-                FsReadArgs {
+                ReadFileArgs {
                     path: "notes.txt".to_string(),
                     offset: 1,
                     limit: 2,
@@ -274,7 +274,7 @@ mod tests {
         let result = read_tool(&workspace)
             .call(
                 mock_ctx(),
-                FsReadArgs {
+                ReadFileArgs {
                     path: "payload.bin".to_string(),
                     offset: 0,
                     limit: 0,
@@ -306,7 +306,7 @@ mod tests {
         let result = read_tool(&workspace_link)
             .call(
                 mock_ctx(),
-                FsReadArgs {
+                ReadFileArgs {
                     path: "notes.txt".to_string(),
                     offset: 0,
                     limit: 0,
@@ -335,7 +335,7 @@ mod tests {
         let err = read_tool(&workspace)
             .call(
                 mock_ctx(),
-                FsReadArgs {
+                ReadFileArgs {
                     path: "secret-link.txt".to_string(),
                     offset: 0,
                     limit: 0,

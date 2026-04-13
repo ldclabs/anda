@@ -12,7 +12,7 @@ use crate::{context::BaseCtx, hook::ToolHook};
 
 /// Arguments for filesystem write operations.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct FsWriteArgs {
+pub struct WriteFileArgs {
     /// Relative or absolute path to a file inside the workspace.
     pub path: String,
     /// File content encoded as UTF-8 text or base64, depending on `encoding`.
@@ -22,7 +22,7 @@ pub struct FsWriteArgs {
     pub encoding: String,
 }
 
-impl Default for FsWriteArgs {
+impl Default for WriteFileArgs {
     fn default() -> Self {
         Self {
             path: String::new(),
@@ -34,26 +34,26 @@ impl Default for FsWriteArgs {
 
 /// Normalized result returned by a filesystem write operation.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct FsWriteOutput {
+pub struct WriteFileOutput {
     /// Number of bytes written to the target file.
     pub size: u64,
 }
 
 #[derive(Clone)]
-pub struct FsWriteTool {
+pub struct WriteFileTool {
     work_dir: PathBuf,
     description: String,
-    hook: Option<Arc<dyn ToolHook<FsWriteArgs, ToolOutput<FsWriteOutput>>>>,
+    hook: Option<Arc<dyn ToolHook<WriteFileArgs, ToolOutput<WriteFileOutput>>>>,
 }
 
-impl FsWriteTool {
+impl WriteFileTool {
     /// Tool name used for registration and function definition.
-    pub const NAME: &'static str = "fs_write";
+    pub const NAME: &'static str = "write_file";
 
-    /// Create a new `FsWriteTool` with the specified working directory.
+    /// Create a new `WriteFileTool` with the specified working directory.
     pub fn new(
         work_dir: PathBuf,
-        hook: Option<Arc<dyn ToolHook<FsWriteArgs, ToolOutput<FsWriteOutput>>>>,
+        hook: Option<Arc<dyn ToolHook<WriteFileArgs, ToolOutput<WriteFileOutput>>>>,
     ) -> Self {
         let description = format!(
             "Atomically write files to the filesystem in the workspace directory: {}",
@@ -72,9 +72,9 @@ impl FsWriteTool {
     }
 }
 
-impl Tool<BaseCtx> for FsWriteTool {
-    type Args = FsWriteArgs;
-    type Output = FsWriteOutput;
+impl Tool<BaseCtx> for WriteFileTool {
+    type Args = WriteFileArgs;
+    type Output = WriteFileOutput;
 
     fn name(&self) -> String {
         Self::NAME.to_string()
@@ -150,11 +150,11 @@ impl Tool<BaseCtx> for FsWriteTool {
 
         if let Some(hook) = &self.hook {
             return hook
-                .after_tool_call(&ctx, ToolOutput::new(FsWriteOutput { size }))
+                .after_tool_call(&ctx, ToolOutput::new(WriteFileOutput { size }))
                 .await;
         }
 
-        Ok(ToolOutput::new(FsWriteOutput { size }))
+        Ok(ToolOutput::new(WriteFileOutput { size }))
     }
 }
 /// Decodes content according to the requested encoding.
@@ -203,8 +203,8 @@ mod tests {
         EngineBuilder::new().mock_ctx().base
     }
 
-    fn write_tool(work_dir: &Path) -> FsWriteTool {
-        FsWriteTool::new(work_dir.to_path_buf(), None)
+    fn write_tool(work_dir: &Path) -> WriteFileTool {
+        WriteFileTool::new(work_dir.to_path_buf(), None)
     }
 
     #[tokio::test]
@@ -216,7 +216,7 @@ mod tests {
         let result = write_tool(&workspace)
             .call(
                 mock_ctx(),
-                FsWriteArgs {
+                WriteFileArgs {
                     path: "nested/dir/output.txt".to_string(),
                     content: "hello".to_string(),
                     encoding: UTF8_ENCODING.to_string(),
@@ -267,7 +267,7 @@ mod tests {
         let result = write_tool(&workspace)
             .call(
                 mock_ctx(),
-                FsWriteArgs {
+                WriteFileArgs {
                     path: "payload.bin".to_string(),
                     content: ByteBufB64(binary.clone()).to_base64(),
                     encoding: BASE64_ENCODING.to_string(),
@@ -293,7 +293,7 @@ mod tests {
         let err = write_tool(&workspace)
             .call(
                 mock_ctx(),
-                FsWriteArgs {
+                WriteFileArgs {
                     path: "notes.txt".to_string(),
                     content: "hello".to_string(),
                     encoding: "hex".to_string(),
@@ -352,7 +352,7 @@ mod tests {
         write_tool(&workspace)
             .call(
                 mock_ctx(),
-                FsWriteArgs {
+                WriteFileArgs {
                     path: "notes.txt".to_string(),
                     content: "after".to_string(),
                     encoding: UTF8_ENCODING.to_string(),
@@ -385,7 +385,7 @@ mod tests {
         let result = write_tool(&workspace_link)
             .call(
                 mock_ctx(),
-                FsWriteArgs {
+                WriteFileArgs {
                     path: "notes.txt".to_string(),
                     content: "hello".to_string(),
                     encoding: UTF8_ENCODING.to_string(),
@@ -417,7 +417,7 @@ mod tests {
         let err = write_tool(&workspace)
             .call(
                 mock_ctx(),
-                FsWriteArgs {
+                WriteFileArgs {
                     path: "alias.txt".to_string(),
                     content: "after".to_string(),
                     encoding: UTF8_ENCODING.to_string(),
@@ -448,7 +448,7 @@ mod tests {
         let err = write_tool(&workspace)
             .call(
                 mock_ctx(),
-                FsWriteArgs {
+                WriteFileArgs {
                     path: "escape/secret.txt".to_string(),
                     content: "secret".to_string(),
                     encoding: UTF8_ENCODING.to_string(),

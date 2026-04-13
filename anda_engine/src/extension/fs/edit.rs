@@ -11,7 +11,7 @@ use crate::{context::BaseCtx, hook::ToolHook};
 
 /// Arguments for filesystem edit operations.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct FsEditArgs {
+pub struct EditFileArgs {
     /// Relative or absolute path to a UTF-8 file inside the workspace.
     pub path: String,
     /// The old string to replace.
@@ -25,7 +25,7 @@ pub struct FsEditArgs {
 
 /// Normalized result returned by a filesystem edit operation.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct FsEditOutput {
+pub struct EditFileOutput {
     /// Number of non-overlapping replacements applied to the file.
     pub replacements: usize,
     /// Number of matches of the old string found in the file.
@@ -35,20 +35,20 @@ pub struct FsEditOutput {
 }
 
 #[derive(Clone)]
-pub struct FsEditTool {
+pub struct EditFileTool {
     work_dir: PathBuf,
     description: String,
-    hook: Option<Arc<dyn ToolHook<FsEditArgs, ToolOutput<FsEditOutput>>>>,
+    hook: Option<Arc<dyn ToolHook<EditFileArgs, ToolOutput<EditFileOutput>>>>,
 }
 
-impl FsEditTool {
+impl EditFileTool {
     /// Tool name used for registration and function definition.
-    pub const NAME: &'static str = "fs_edit";
+    pub const NAME: &'static str = "edit_file";
 
-    /// Create a new `FsEditTool` with the specified working directory.
+    /// Create a new `EditFileTool` with the specified working directory.
     pub fn new(
         work_dir: PathBuf,
-        hook: Option<Arc<dyn ToolHook<FsEditArgs, ToolOutput<FsEditOutput>>>>,
+        hook: Option<Arc<dyn ToolHook<EditFileArgs, ToolOutput<EditFileOutput>>>>,
     ) -> Self {
         let description = format!(
             "Atomically edit UTF-8 files in the workspace directory by replacing strings: {}",
@@ -67,9 +67,9 @@ impl FsEditTool {
     }
 }
 
-impl Tool<BaseCtx> for FsEditTool {
-    type Args = FsEditArgs;
-    type Output = FsEditOutput;
+impl Tool<BaseCtx> for EditFileTool {
+    type Args = EditFileArgs;
+    type Output = EditFileOutput;
 
     fn name(&self) -> String {
         Self::NAME.to_string()
@@ -151,7 +151,7 @@ impl Tool<BaseCtx> for FsEditTool {
         };
 
         let output = if total_matches == 0 || args.old_string == args.new_string {
-            FsEditOutput {
+            EditFileOutput {
                 replacements,
                 total_matches,
                 size: text.len() as u64,
@@ -169,7 +169,7 @@ impl Tool<BaseCtx> for FsEditTool {
                 Some(&meta.permissions()),
             )
             .await?;
-            FsEditOutput {
+            EditFileOutput {
                 replacements,
                 total_matches,
                 size,
@@ -215,8 +215,8 @@ mod tests {
         EngineBuilder::new().mock_ctx().base
     }
 
-    fn edit_tool(work_dir: &Path) -> FsEditTool {
-        FsEditTool::new(work_dir.to_path_buf(), None)
+    fn edit_tool(work_dir: &Path) -> EditFileTool {
+        EditFileTool::new(work_dir.to_path_buf(), None)
     }
 
     #[tokio::test]
@@ -232,7 +232,7 @@ mod tests {
         let result = edit_tool(&workspace)
             .call(
                 mock_ctx(),
-                FsEditArgs {
+                EditFileArgs {
                     path: "notes.txt".to_string(),
                     old_string: "alpha".to_string(),
                     new_string: "omega".to_string(),
@@ -292,7 +292,7 @@ mod tests {
         let result = edit_tool(&workspace)
             .call(
                 mock_ctx(),
-                FsEditArgs {
+                EditFileArgs {
                     path: "notes.txt".to_string(),
                     old_string: "alpha".to_string(),
                     new_string: "x".to_string(),
@@ -322,7 +322,7 @@ mod tests {
         let err = edit_tool(&workspace)
             .call(
                 mock_ctx(),
-                FsEditArgs {
+                EditFileArgs {
                     path: "notes.txt".to_string(),
                     old_string: String::new(),
                     new_string: "world".to_string(),
@@ -347,7 +347,7 @@ mod tests {
         let result = edit_tool(&workspace)
             .call(
                 mock_ctx(),
-                FsEditArgs {
+                EditFileArgs {
                     path: "notes.txt".to_string(),
                     old_string: "missing".to_string(),
                     new_string: "world".to_string(),
@@ -377,7 +377,7 @@ mod tests {
         let err = edit_tool(&workspace)
             .call(
                 mock_ctx(),
-                FsEditArgs {
+                EditFileArgs {
                     path: "payload.bin".to_string(),
                     old_string: "foo".to_string(),
                     new_string: "bar".to_string(),
@@ -411,7 +411,7 @@ mod tests {
         let result = edit_tool(&workspace)
             .call(
                 mock_ctx(),
-                FsEditArgs {
+                EditFileArgs {
                     path: "notes.txt".to_string(),
                     old_string: "before".to_string(),
                     new_string: "after".to_string(),
@@ -451,7 +451,7 @@ mod tests {
         let result = edit_tool(&workspace_link)
             .call(
                 mock_ctx(),
-                FsEditArgs {
+                EditFileArgs {
                     path: "notes.txt".to_string(),
                     old_string: "hello".to_string(),
                     new_string: "world".to_string(),
@@ -485,7 +485,7 @@ mod tests {
         let err = edit_tool(&workspace)
             .call(
                 mock_ctx(),
-                FsEditArgs {
+                EditFileArgs {
                     path: "alias.txt".to_string(),
                     old_string: "before".to_string(),
                     new_string: "after".to_string(),
