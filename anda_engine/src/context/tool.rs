@@ -43,6 +43,7 @@ pub struct ToolsSearchItem {
 }
 
 /// Searches the callable surface currently available to the model.
+/// The "tools_search" tool has been registered as a built-in agent with label "flash".
 pub struct ToolsSearch {
     tokenizer: TokenizerChain,
 }
@@ -191,6 +192,7 @@ struct ToolsSelectNamesOutput {
 }
 
 /// Loads a subset of callable definitions for the next reasoning turn.
+/// The "tools_select" tool has been registered as a built-in agent with label "flash".
 pub struct ToolsSelect {
     tokenizer: TokenizerChain,
 }

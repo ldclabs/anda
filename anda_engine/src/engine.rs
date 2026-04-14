@@ -316,13 +316,15 @@ impl Engine {
             info: self.info.clone(),
             agents: self.agents(Some(
                 self.export_agents
-                    .iter().cloned()
+                    .iter()
+                    .cloned()
                     .collect::<Vec<_>>()
                     .as_slice(),
             )),
             tools: self.tools(Some(
                 self.export_tools
-                    .iter().cloned()
+                    .iter()
+                    .cloned()
                     .collect::<Vec<_>>()
                     .as_slice(),
             )),
@@ -359,8 +361,12 @@ impl EngineBuilder {
     pub fn new() -> Self {
         let mstore = Arc::new(InMemory::new());
         let mut agents = AgentSet::new();
-        agents.add(Arc::new(ToolsSearch::new()), None).unwrap();
-        agents.add(Arc::new(ToolsSelect::new()), None).unwrap();
+        agents
+            .add(Arc::new(ToolsSearch::new()), Some("flash".to_string()))
+            .unwrap();
+        agents
+            .add(Arc::new(ToolsSelect::new()), Some("flash".to_string()))
+            .unwrap();
         EngineBuilder {
             info: AgentInfo {
                 handle: "anda".to_string(),

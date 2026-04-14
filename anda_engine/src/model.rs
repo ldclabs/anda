@@ -16,6 +16,7 @@
 
 use anda_core::{AgentOutput, BoxError, BoxPinFut, CONTENT_TYPE_JSON, CompletionRequest, ToolCall};
 use arc_swap::ArcSwap;
+use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 
@@ -28,6 +29,52 @@ pub use reqwest;
 pub use reqwest::Proxy;
 
 use crate::APP_USER_AGENT;
+
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+pub struct ModelConfig {
+    // "gemini", "anthropic", "openai", "deepseek" etc.
+    pub family: String,
+    pub model: String,
+    pub api_base: String,
+    pub api_key: String,
+    pub disabled: bool,
+    pub bearer_auth: bool,
+}
+
+impl ModelConfig {
+    pub fn build_model(self, http_client: reqwest::Client) -> Model {
+        if self.disabled {
+            return Model::not_implemented();
+        }
+
+        match self.family.as_str() {
+            "gemini" => Model::with_completer(Arc::new(
+                gemini::Client::new(&self.api_key, Some(self.api_base))
+                    .with_client(http_client)
+                    .completion_model(&self.model),
+            )),
+            "anthropic" => {
+                let mut cli = anthropic::Client::new(&self.api_key, Some(self.api_base))
+                    .with_client(http_client);
+                if self.bearer_auth {
+                    cli = cli.with_bearer_auth(true);
+                }
+                Model::with_completer(Arc::new(cli.completion_model(&self.model)))
+            }
+            "openai" => Model::with_completer(Arc::new(
+                openai::Client::new(&self.api_key, Some(self.api_base))
+                    .with_client(http_client)
+                    .completion_model_v2(&self.model),
+            )),
+            "deepseek" => Model::with_completer(Arc::new(
+                deepseek::Client::new(&self.api_key, Some(self.api_base))
+                    .with_client(http_client)
+                    .completion_model(&self.model),
+            )),
+            _ => Model::not_implemented(),
+        }
+    }
+}
 
 /// Thread-safe model registry used by the engine.
 ///
