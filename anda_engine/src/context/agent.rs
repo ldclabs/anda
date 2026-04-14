@@ -986,13 +986,11 @@ impl CompletionRunner {
         let pruned_len = prune_len.min(raw_history_len);
         for i in self.pruned..(self.pruned + pruned_len) {
             if let Ok(mut msg) = serde_json::from_value::<Message>(self.req.raw_history[i].clone())
-            {
-                if msg.prune_content() > 0
+                && msg.prune_content() > 0
                     && let Ok(raw) = serde_json::to_value(&msg)
                 {
                     self.req.raw_history[i] = raw;
                 }
-            }
         }
         self.pruned += pruned_len;
         pruned_len

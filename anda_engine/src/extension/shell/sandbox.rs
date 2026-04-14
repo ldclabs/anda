@@ -7,8 +7,7 @@ use boxlite::{
 use futures_util::stream::{Stream, StreamExt};
 use std::{
     collections::HashMap,
-    env::home_dir,
-    path::{Path, PathBuf},
+    path::PathBuf,
     pin::Pin,
     process::{ExitStatus, Output},
     sync::Arc,
@@ -32,22 +31,19 @@ pub struct SandboxRuntime {
 
 impl SandboxRuntime {
     /// Creates a new sandbox runtime instance with the specified directory for sandbox files.
-    pub async fn new(dir: &str) -> Result<Self, BoxError> {
-        let home_dir = sandbox_home_dir(dir);
-        let host_path = sandbox_host_path(&home_dir);
-
+    pub async fn new(home_dir: PathBuf) -> Result<Self, BoxError> {
         let runtime = BoxliteRuntime::new(BoxliteOptions {
-            home_dir,
+            home_dir: home_dir.clone(),
             image_registries: vec!["ghcr.io/ldclabs".to_string(), "docker.io".to_string()],
         })?;
 
-        tokio::fs::create_dir_all(&host_path).await?;
+        tokio::fs::create_dir_all(&home_dir).await?;
         let options = BoxOptions {
             rootfs: RootfsSpec::Image("alpine:latest".into()),
-            working_dir: Some("/app".to_string()),
+            working_dir: Some("/home".to_string()),
             volumes: vec![VolumeSpec {
-                host_path: host_path.to_string_lossy().to_string(),
-                guest_path: "/app".to_string(),
+                host_path: home_dir.to_string_lossy().to_string(),
+                guest_path: "/home".to_string(),
                 read_only: false,
             }],
             ..Default::default()
@@ -56,7 +52,7 @@ impl SandboxRuntime {
         let litebox = runtime.create(options, None).await?;
         Ok(Self {
             runner: Arc::new(BoxliteRunner { litebox }),
-            workdir: "/app".into(),
+            workdir: "/home".into(),
             tempdir: "/tmp".into(),
             hook: Arc::new(DefaultExecutorHook),
         })
@@ -264,16 +260,6 @@ impl SandboxExecutionHandle for BoxliteExecutionHandle {
     }
 }
 
-fn sandbox_home_dir(dir: &str) -> PathBuf {
-    home_dir()
-        .map(|home| home.join(dir))
-        .unwrap_or_else(|| PathBuf::from(dir))
-}
-
-fn sandbox_host_path(home_dir: &Path) -> PathBuf {
-    home_dir.join("app")
-}
-
 async fn wait_with_output(mut child: Box<dyn SandboxExecutionHandle>) -> Result<Output, BoxError> {
     async fn read_to_end(stream: Option<OutputStream>) -> Vec<u8> {
         let mut output = String::new();
@@ -328,6 +314,7 @@ mod tests {
     use super::*;
     use crate::engine::EngineBuilder;
     use futures_util::stream;
+    use std::path::Path;
     use std::{collections::VecDeque, sync::Mutex};
     use tokio::sync::oneshot;
 
@@ -507,36 +494,22 @@ mod tests {
     fn metadata_accessors_return_expected_values() {
         let runtime = SandboxRuntime::test(
             Arc::new(PanicRunner),
-            PathBuf::from("/app"),
+            PathBuf::from("/home"),
             PathBuf::from("/tmp"),
         );
 
         assert_eq!(runtime.name(), "sandbox");
         assert_eq!(runtime.os(), "Alpine Linux");
         assert_eq!(runtime.shell(), Some("sh"));
-        assert_eq!(runtime.work_dir(), &PathBuf::from("/app"));
+        assert_eq!(runtime.work_dir(), &PathBuf::from("/home"));
         assert_eq!(runtime.temp_dir(), &PathBuf::from("/tmp"));
-    }
-
-    #[test]
-    fn sandbox_paths_follow_expected_layout() {
-        let resolved_home = sandbox_home_dir("anda-sandbox-tests");
-        let expected_home = home_dir()
-            .map(|home| home.join("anda-sandbox-tests"))
-            .unwrap_or_else(|| PathBuf::from("anda-sandbox-tests"));
-
-        assert_eq!(resolved_home, expected_home);
-        assert_eq!(
-            sandbox_host_path(&resolved_home),
-            expected_home.join("./app")
-        );
     }
 
     #[test]
     fn build_command_sets_shell_env_workdir_and_timeout() {
         let runtime = SandboxRuntime::test(
             Arc::new(PanicRunner),
-            PathBuf::from("/app"),
+            PathBuf::from("/home"),
             PathBuf::from("/tmp"),
         );
         let mut envs = HashMap::new();
@@ -554,7 +527,7 @@ mod tests {
 
         assert_eq!(command.program, "sh");
         assert_eq!(command.args, vec!["-c", "echo hello"]);
-        assert_eq!(command.working_dir, "/app/nested");
+        assert_eq!(command.working_dir, "/home/nested");
         assert_eq!(
             command.envs,
             vec![
@@ -572,7 +545,7 @@ mod tests {
     fn build_command_skips_timeout_for_background_execution() {
         let runtime = SandboxRuntime::test(
             Arc::new(PanicRunner),
-            PathBuf::from("/app"),
+            PathBuf::from("/home"),
             PathBuf::from("/tmp"),
         );
 
@@ -587,7 +560,7 @@ mod tests {
         );
 
         assert_eq!(command.timeout, None);
-        assert_eq!(command.working_dir, "/app/");
+        assert_eq!(command.working_dir, "/home/");
     }
 
     #[tokio::test(flavor = "current_thread")]

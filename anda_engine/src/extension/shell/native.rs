@@ -2,7 +2,6 @@ use anda_core::BoxError;
 use async_trait::async_trait;
 use std::{
     collections::HashMap,
-    env::home_dir,
     fmt,
     path::{Path, PathBuf},
     process::Stdio,
@@ -21,12 +20,10 @@ pub struct NativeRuntime {
 }
 
 impl NativeRuntime {
-    pub fn new(dir: &str) -> Self {
+    pub fn new(workdir: PathBuf) -> Self {
         Self {
             shell: detect_native_shell(),
-            workdir: home_dir()
-                .map(|home| home.join(dir))
-                .unwrap_or_else(|| PathBuf::from(dir)),
+            workdir,
             tempdir: std::env::temp_dir(),
             hook: Arc::new(DefaultExecutorHook),
         }
@@ -369,13 +366,13 @@ mod tests {
 
     #[test]
     fn new_initializes_paths_and_shell() {
-        let runtime = NativeRuntime::new("anda-native-runtime-tests");
-        let expected_workdir = home_dir()
-            .map(|home| home.join("anda-native-runtime-tests"))
-            .unwrap_or_else(|| PathBuf::from("anda-native-runtime-tests"));
+        let runtime = NativeRuntime::new(PathBuf::from("/home/anda-native-runtime-tests"));
 
         assert_eq!(runtime.name(), "native");
-        assert_eq!(runtime.work_dir(), &expected_workdir);
+        assert_eq!(
+            runtime.work_dir(),
+            &PathBuf::from("/home/anda-native-runtime-tests")
+        );
         assert_eq!(runtime.temp_dir(), &std::env::temp_dir());
         assert_eq!(
             runtime.shell(),
