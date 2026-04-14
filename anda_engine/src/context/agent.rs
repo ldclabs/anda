@@ -987,10 +987,10 @@ impl CompletionRunner {
         for i in self.pruned..(self.pruned + pruned_len) {
             if let Ok(mut msg) = serde_json::from_value::<Message>(self.req.raw_history[i].clone())
                 && msg.prune_content() > 0
-                    && let Ok(raw) = serde_json::to_value(&msg)
-                {
-                    self.req.raw_history[i] = raw;
-                }
+                && let Ok(raw) = serde_json::to_value(&msg)
+            {
+                self.req.raw_history[i] = raw;
+            }
         }
         self.pruned += pruned_len;
         pruned_len
@@ -2290,7 +2290,7 @@ mod tests {
         let models = Arc::new(Models::default());
         models.set_model(Model::with_completer(Arc::new(completer)));
         models.set_model_by(
-            TOOLS_SELECT_NAME.to_string(),
+            "flash".to_string(),
             Model::with_completer(Arc::new(selector)),
         );
 
