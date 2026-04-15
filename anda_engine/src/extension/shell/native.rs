@@ -1,6 +1,7 @@
-use anda_core::BoxError;
+use anda_core::{BoxError, StateFeatures};
 use async_trait::async_trait;
 use std::{
+    borrow::Cow,
     collections::HashMap,
     fmt,
     path::{Path, PathBuf},
@@ -13,18 +14,18 @@ use crate::context::BaseCtx;
 
 /// Native runtime — full access, runs on Mac/Linux/Docker/Raspberry Pi
 pub struct NativeRuntime {
-    workdir: PathBuf,
-    tempdir: PathBuf,
+    work_dir: PathBuf,
+    temp_dir: PathBuf,
     shell: Option<ShellProgram>,
     hook: Arc<dyn ExecutorHook>,
 }
 
 impl NativeRuntime {
-    pub fn new(workdir: PathBuf) -> Self {
+    pub fn new(work_dir: PathBuf) -> Self {
         Self {
             shell: detect_native_shell(),
-            workdir,
-            tempdir: std::env::temp_dir(),
+            work_dir,
+            temp_dir: std::env::temp_dir(),
             hook: Arc::new(DefaultExecutorHook),
         }
     }
@@ -35,11 +36,11 @@ impl NativeRuntime {
     }
 
     #[cfg(test)]
-    fn test(shell: Option<ShellProgram>, workdir: PathBuf) -> Self {
+    fn test(shell: Option<ShellProgram>, work_dir: PathBuf) -> Self {
         Self {
             shell,
-            workdir,
-            tempdir: std::env::temp_dir(),
+            work_dir,
+            temp_dir: std::env::temp_dir(),
             hook: Arc::new(DefaultExecutorHook),
         }
     }
@@ -52,11 +53,11 @@ impl Executor for NativeRuntime {
     }
 
     fn work_dir(&self) -> &PathBuf {
-        &self.workdir
+        &self.work_dir
     }
 
     fn temp_dir(&self) -> &PathBuf {
-        &self.tempdir
+        &self.temp_dir
     }
 
     fn shell(&self) -> Option<&str> {
@@ -72,6 +73,14 @@ impl Executor for NativeRuntime {
         let shell = self.shell.as_ref().ok_or_else(|| missing_shell_error())?;
         self.hook.on_execution_start(&ctx, &input).await?;
 
+        let work_dir = ctx
+            .meta()
+            .extra
+            .get("work_dir")
+            .and_then(|v| v.as_str().map(PathBuf::from))
+            .map(Cow::Owned)
+            .unwrap_or_else(|| Cow::Borrowed(&self.work_dir));
+
         let mut cmd = tokio::process::Command::new(&shell.program);
         shell.add_shell_args(&mut cmd, &input.command);
         cmd.stdin(Stdio::null());
@@ -79,7 +88,7 @@ impl Executor for NativeRuntime {
         cmd.stderr(Stdio::piped());
         cmd.env_clear();
         cmd.envs(envs);
-        cmd.current_dir(self.workdir.join(&input.workdir));
+        cmd.current_dir(work_dir.join(&input.work_dir));
         cmd.kill_on_drop(true);
 
         let child = cmd.spawn()?;
@@ -539,8 +548,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn execute_returns_error_when_shell_is_missing() {
         let ctx = EngineBuilder::new().mock_ctx();
-        let workdir = TestTempDir::new("anda-native-no-shell").await;
-        let runtime = NativeRuntime::test(None, workdir.path().to_path_buf());
+        let work_dir = TestTempDir::new("anda-native-no-shell").await;
+        let runtime = NativeRuntime::test(None, work_dir.path().to_path_buf());
 
         let err = runtime
             .execute(
@@ -558,12 +567,12 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn execute_runs_foreground_command_with_envs_and_workdir() {
+    async fn execute_runs_foreground_command_with_envs_and_work_dir() {
         let ctx = EngineBuilder::new().mock_ctx();
-        let workdir = TestTempDir::new("anda-native-foreground").await;
-        let nested_dir = workdir.create_dir("nested").await;
+        let work_dir = TestTempDir::new("anda-native-foreground").await;
+        let nested_dir = work_dir.create_dir("nested").await;
         let shell = shell_for_tests();
-        let runtime = NativeRuntime::test(Some(shell.clone()), workdir.path().to_path_buf());
+        let runtime = NativeRuntime::test(Some(shell.clone()), work_dir.path().to_path_buf());
         let env_name = "ANDA_NATIVE_TEST_VALUE";
         let output_file = "env.txt";
         let mut envs = HashMap::new();
@@ -574,7 +583,7 @@ mod tests {
                 ctx.base,
                 ExecArgs {
                     command: foreground_command(shell.kind, env_name, output_file),
-                    workdir: "nested".to_string(),
+                    work_dir: "nested".to_string(),
                     ..Default::default()
                 },
                 envs,
@@ -595,16 +604,16 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn execute_returns_spawn_error_for_missing_workdir() {
         let ctx = EngineBuilder::new().mock_ctx();
-        let workdir = TestTempDir::new("anda-native-missing-workdir").await;
+        let work_dir = TestTempDir::new("anda-native-missing-workdir").await;
         let shell = shell_for_tests();
-        let runtime = NativeRuntime::test(Some(shell.clone()), workdir.path().to_path_buf());
+        let runtime = NativeRuntime::test(Some(shell.clone()), work_dir.path().to_path_buf());
 
         let err = runtime
             .execute(
                 ctx.base,
                 ExecArgs {
                     command: foreground_command(shell.kind, "IGNORED", "env.txt"),
-                    workdir: "missing".to_string(),
+                    work_dir: "missing".to_string(),
                     ..Default::default()
                 },
                 HashMap::new(),
@@ -621,15 +630,15 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn execute_reports_background_output_via_hook() {
         let ctx = EngineBuilder::new().mock_ctx();
-        let workdir = TestTempDir::new("anda-native-background").await;
+        let work_dir = TestTempDir::new("anda-native-background").await;
         let shell = shell_for_tests();
         let (sender, receiver) = oneshot::channel();
         let hook: Arc<dyn ExecutorHook> = Arc::new(TestHook::new(sender));
         let runtime =
-            NativeRuntime::test(Some(shell.clone()), workdir.path().to_path_buf()).with_hook(hook);
+            NativeRuntime::test(Some(shell.clone()), work_dir.path().to_path_buf()).with_hook(hook);
         let input = ExecArgs {
             command: background_command(shell.kind),
-            workdir: String::new(),
+            work_dir: String::new(),
             background: true,
             ..Default::default()
         };

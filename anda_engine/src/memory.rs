@@ -96,7 +96,7 @@ pub struct Conversation {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub follow_up_messages: Option<Vec<String>>,
 
-    /// The ancestor conversation IDs, ordered from the closest to the farthest ancestor.
+    /// The ancestor conversation IDs, ordered from root to parent.
     /// Should not be updated after creation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ancestors: Option<Vec<u64>>,

@@ -1,8 +1,9 @@
-use anda_core::{BoxError, FunctionDefinition, Resource, Tool, ToolOutput};
+use anda_core::{BoxError, FunctionDefinition, Resource, StateFeatures, Tool, ToolOutput};
 use glob::{MatchOptions, glob_with};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
+    borrow::Cow,
     path::{Component, Path, PathBuf},
     sync::Arc,
 };
@@ -43,15 +44,14 @@ impl SearchFileTool {
     /// Tool name used for registration and function definition.
     pub const NAME: &'static str = "search_file";
 
-    /// Create a new `SearchFileTool` with the specified working directory.
+    /// Create a new `SearchFileTool` with the default working directory.
+    /// You can override the working directory for each call by including a `work_dir` field in the tool call's context meta extra.
     pub fn new(
         work_dir: PathBuf,
         hook: Option<Arc<dyn ToolHook<SearchFileArgs, ToolOutput<SearchFileOutput>>>>,
     ) -> Self {
-        let description = format!(
-            "Match filesystem paths with glob patterns in the workspace directory: {}",
-            work_dir.display()
-        );
+        let description =
+            "Match filesystem paths with glob patterns in the workspace directory".to_string();
         Self {
             work_dir,
             hook,
@@ -111,8 +111,15 @@ impl Tool<BaseCtx> for SearchFileTool {
             args
         };
 
-        let (resolved_work_dir, pattern) =
-            resolve_glob_pattern(&self.work_dir, &args.pattern).await?;
+        let work_dir = ctx
+            .meta()
+            .extra
+            .get("work_dir")
+            .and_then(|v| v.as_str().map(PathBuf::from))
+            .map(Cow::Owned)
+            .unwrap_or_else(|| Cow::Borrowed(&self.work_dir));
+
+        let (resolved_work_dir, pattern) = resolve_glob_pattern(&work_dir, &args.pattern).await?;
 
         let mut paths = Vec::new();
         for entry in glob_with(&pattern, glob_match_options())
@@ -127,7 +134,7 @@ impl Tool<BaseCtx> for SearchFileTool {
             paths.push(relative_match_path(
                 &path,
                 &resolved_path,
-                &self.work_dir,
+                &work_dir,
                 &resolved_work_dir,
             )?);
         }

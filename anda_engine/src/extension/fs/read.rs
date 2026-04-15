@@ -1,8 +1,8 @@
-use anda_core::{BoxError, FunctionDefinition, Resource, Tool, ToolOutput};
+use anda_core::{BoxError, FunctionDefinition, Resource, StateFeatures, Tool, ToolOutput};
 use ic_auth_types::ByteBufB64;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::{path::PathBuf, sync::Arc};
+use std::{borrow::Cow, path::PathBuf, sync::Arc};
 
 use super::{
     BASE64_ENCODING, MAX_FILE_SIZE_BYTES, UTF8_ENCODING, ensure_file_size_within_limit,
@@ -51,15 +51,13 @@ impl ReadFileTool {
     /// Tool name used for registration and function definition.
     pub const NAME: &'static str = "read_file";
 
-    /// Create a new `ReadFileTool` with the specified working directory.
+    /// Create a new `ReadFileTool` with the default working directory.
+    /// You can override the working directory for each call by including a `work_dir` field in the tool call's context meta extra.
     pub fn new(
         work_dir: PathBuf,
         hook: Option<Arc<dyn ToolHook<ReadFileArgs, ToolOutput<ReadFileOutput>>>>,
     ) -> Self {
-        let description = format!(
-            "Read files from the filesystem in the workspace directory: {}",
-            work_dir.display()
-        );
+        let description = "Read files from the filesystem in the workspace directory".to_string();
         Self {
             work_dir,
             hook,
@@ -123,7 +121,15 @@ impl Tool<BaseCtx> for ReadFileTool {
             args
         };
 
-        let resolved_path = resolve_read_path(&self.work_dir, &args.path).await?;
+        let work_dir = ctx
+            .meta()
+            .extra
+            .get("work_dir")
+            .and_then(|v| v.as_str().map(PathBuf::from))
+            .map(Cow::Owned)
+            .unwrap_or_else(|| Cow::Borrowed(&self.work_dir));
+
+        let resolved_path = resolve_read_path(&work_dir, &args.path).await?;
 
         let meta = tokio::fs::metadata(&resolved_path)
             .await

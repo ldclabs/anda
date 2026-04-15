@@ -54,7 +54,7 @@ pub trait Executor: Send + Sync {
 
     /// Return the runtime base working directory.
     ///
-    /// The user-provided [`ExecArgs::workdir`] is resolved relative to this path.
+    /// The user-provided [`ExecArgs::work_dir`] is resolved relative to this path.
     fn work_dir(&self) -> &PathBuf;
 
     /// Return the temporary directory used by this runtime.
@@ -108,7 +108,7 @@ pub struct ExecArgs {
     pub command: String,
     /// The working directory to execute the command in (relative to runtime storage path)
     #[serde(default)]
-    pub workdir: String,
+    pub work_dir: String,
     /// Additional environment variable keys to set for the command
     #[serde(default)]
     pub env_keys: Vec<String>,
@@ -262,7 +262,7 @@ impl Tool<BaseCtx> for ShellTool {
                         "type": "string",
                         "description": "The shell command to execute"
                     },
-                    "workdir": {
+                    "work_dir": {
                         "type": "string",
                         "description": "The working directory to execute the command in (relative to runtime storage path)",
                         "default": ""
@@ -290,7 +290,7 @@ impl Tool<BaseCtx> for ShellTool {
     /// Execute a shell command and return structured output.
     ///
     /// # Arguments
-    /// * `_ctx` - Base context (currently unused).
+    /// * `ctx` - Base context.
     /// * `args` - Command arguments including command string and execution mode.
     /// * `_resources` - Additional resources (currently unused).
     ///

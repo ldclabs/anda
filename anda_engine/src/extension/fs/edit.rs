@@ -1,7 +1,7 @@
-use anda_core::{BoxError, FunctionDefinition, Resource, Tool, ToolOutput};
+use anda_core::{BoxError, FunctionDefinition, Resource, StateFeatures, Tool, ToolOutput};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::{path::PathBuf, sync::Arc};
+use std::{borrow::Cow, path::PathBuf, sync::Arc};
 
 use super::{
     MAX_FILE_SIZE_BYTES, atomic_write_file, ensure_file_size_within_limit, ensure_regular_file,
@@ -45,15 +45,14 @@ impl EditFileTool {
     /// Tool name used for registration and function definition.
     pub const NAME: &'static str = "edit_file";
 
-    /// Create a new `EditFileTool` with the specified working directory.
+    /// Create a new `EditFileTool` with the default working directory.
+    /// You can override the working directory for each call by including a `work_dir` field in the tool call's context meta extra.
     pub fn new(
         work_dir: PathBuf,
         hook: Option<Arc<dyn ToolHook<EditFileArgs, ToolOutput<EditFileOutput>>>>,
     ) -> Self {
-        let description = format!(
-            "Atomically edit UTF-8 files in the workspace directory by replacing strings: {}",
-            work_dir.display()
-        );
+        let description =
+            "Atomically edit UTF-8 files in the workspace directory by replacing strings".to_string();
         Self {
             work_dir,
             hook,
@@ -125,7 +124,15 @@ impl Tool<BaseCtx> for EditFileTool {
             return Err("Old string must not be empty".into());
         }
 
-        let resolved_path = resolve_write_path(&self.work_dir, &args.path).await?;
+        let work_dir = ctx
+            .meta()
+            .extra
+            .get("work_dir")
+            .and_then(|v| v.as_str().map(PathBuf::from))
+            .map(Cow::Owned)
+            .unwrap_or_else(|| Cow::Borrowed(&self.work_dir));
+
+        let resolved_path = resolve_write_path(&work_dir, &args.path).await?;
         let meta = match tokio::fs::metadata(&resolved_path).await {
             Ok(meta) => meta,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
