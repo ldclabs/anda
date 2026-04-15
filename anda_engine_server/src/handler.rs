@@ -7,17 +7,24 @@ use axum::{
 };
 use candid::Principal;
 use ciborium::from_reader;
-use ic_auth_types::deterministic_cbor_into_vec;
+use http::header::AUTHORIZATION;
+use ic_auth_types::{ByteBufB64, deterministic_cbor_into_vec};
 use ic_auth_verifier::{
     envelope::{ANONYMOUS_PRINCIPAL, SignedEnvelope},
     unix_timestamp,
+};
+use ic_cose_types::cose::{
+    SIGN1_TAG,
+    cwt::{ClaimsSet, cwt_from},
+    ed25519::VerifyingKey,
+    sign1::cose_sign1_from,
+    skip_prefix,
 };
 use ic_tee_agent::{
     RPCResponse,
     http::{Content, ContentWithSHA3},
 };
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::{collections::BTreeMap, str::FromStr, sync::Arc};
 
 use crate::types::*;
 
@@ -27,6 +34,47 @@ pub struct AppState {
     pub default_engine: Principal,
     pub start_time_ms: u64,
     pub extra_info: Arc<BTreeMap<String, Json>>,
+    pub ed25519_pubkeys: Arc<Vec<VerifyingKey>>,
+}
+
+impl AppState {
+    pub fn verify_user(
+        &self,
+        headers: &http::HeaderMap,
+        now_ms: u64,
+        expect_target: Option<Principal>,
+        expect_digest: Option<&[u8]>,
+    ) -> Principal {
+        if let Some(cwt) = self.verify_cwt(headers, now_ms) {
+            cwt.subject
+                .and_then(|s| Principal::from_text(&s).ok())
+                .unwrap_or(ANONYMOUS_PRINCIPAL)
+        } else if let Some(se) = SignedEnvelope::from_authorization(&headers)
+            .or_else(|| SignedEnvelope::from_headers(&headers))
+        {
+            match se.verify(now_ms, expect_target, expect_digest) {
+                Ok(_) => se.sender(),
+                Err(_) => ANONYMOUS_PRINCIPAL,
+            }
+        } else {
+            ANONYMOUS_PRINCIPAL
+        }
+    }
+
+    pub fn verify_cwt(&self, headers: &http::HeaderMap, now_ms: u64) -> Option<ClaimsSet> {
+        if !self.ed25519_pubkeys.is_empty()
+            && let Some(token) = headers.get(AUTHORIZATION)
+            && let Ok(token) = token.to_str()
+            && let Some(token) = token.strip_prefix("Bearer ")
+        {
+            let data = ByteBufB64::from_str(token).ok()?;
+            let data = skip_prefix(&SIGN1_TAG, &data);
+            let cs1 = cose_sign1_from(data, &[], &[], &self.ed25519_pubkeys).ok()?;
+            cwt_from(&cs1.payload.unwrap_or_default(), (now_ms / 1000) as i64).ok()
+        } else {
+            None
+        }
+    }
 }
 
 /// GET /.well-known/information
@@ -34,16 +82,7 @@ pub async fn get_information(
     State(app): State<AppState>,
     headers: http::HeaderMap,
 ) -> impl IntoResponse {
-    let caller = if let Some(se) = SignedEnvelope::from_authorization(&headers)
-        .or_else(|| SignedEnvelope::from_headers(&headers))
-    {
-        match se.verify(unix_timestamp().as_millis() as u64, None, None) {
-            Ok(_) => se.sender(),
-            Err(_) => ANONYMOUS_PRINCIPAL,
-        }
-    } else {
-        ANONYMOUS_PRINCIPAL
-    };
+    let caller = app.verify_user(&headers, unix_timestamp().as_millis() as u64, None, None);
 
     let info = AppInformation {
         engines: app.engines.values().map(|e| e.info().clone()).collect(),
@@ -117,20 +156,12 @@ pub async fn anda_engine(
         ContentWithSHA3::JSON(req, hash) => (req, hash),
     };
 
-    let caller = if let Some(se) = SignedEnvelope::from_authorization(&headers)
-        .or_else(|| SignedEnvelope::from_headers(&headers))
-    {
-        match se.verify(
-            unix_timestamp().as_millis() as u64,
-            Some(id),
-            Some(hash.as_slice()),
-        ) {
-            Ok(_) => se.sender(),
-            Err(_) => ANONYMOUS_PRINCIPAL,
-        }
-    } else {
-        ANONYMOUS_PRINCIPAL
-    };
+    let caller = app.verify_user(
+        &headers,
+        unix_timestamp().as_millis() as u64,
+        Some(id),
+        Some(hash.as_slice()),
+    );
 
     match &ct {
         ContentWithSHA3::CBOR(_, _) => {

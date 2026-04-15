@@ -3,7 +3,7 @@ name = "anda_engine_server"
 description = "A http server to serve multiple Anda engines."
 repository = "https://github.com/ldclabs/anda/tree/main/anda_engine_server"
 publish = true
-version = "0.11.1"
+version = "0.11.2"
 edition.workspace = true
 keywords.workspace = true
 categories.workspace = true
@@ -25,6 +25,7 @@ tokio = { workspace = true }
 log = { workspace = true }
 ic_auth_types = { workspace = true }
 ic_auth_verifier = { workspace = true, features = ["full"] }
+ic_cose_types = { workspace = true }
 tower-http = { workspace = true }
 
 [dev-dependencies]

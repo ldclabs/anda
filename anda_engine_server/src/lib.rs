@@ -2,6 +2,7 @@ use anda_core::{BoxError, Json};
 use anda_engine::engine::Engine;
 use axum::{Router, routing};
 use candid::Principal;
+use ic_cose_types::cose::ed25519::VerifyingKey;
 use std::{collections::BTreeMap, future::Future, net::SocketAddr, sync::Arc};
 use structured_logger::unix_ms;
 use tokio::signal;
@@ -25,6 +26,7 @@ pub struct ServerBuilder {
     engines: BTreeMap<Principal, Engine>,
     default_engine: Option<Principal>,
     middlewares: Vec<Arc<dyn HttpMiddleware>>,
+    ed25519_pubkeys: Vec<VerifyingKey>,
     extra_info: BTreeMap<String, Json>,
 }
 
@@ -47,6 +49,7 @@ impl ServerBuilder {
             engines: BTreeMap::new(),
             default_engine: None,
             middlewares: Vec::new(),
+            ed25519_pubkeys: Vec::new(),
             extra_info: BTreeMap::new(),
         }
     }
@@ -87,6 +90,11 @@ impl ServerBuilder {
 
         self.engines = engines;
         self.default_engine = default_engine;
+        self
+    }
+
+    pub fn with_ed25519_pubkeys(mut self, pubkeys: Vec<VerifyingKey>) -> Self {
+        self.ed25519_pubkeys = pubkeys;
         self
     }
 
@@ -171,6 +179,7 @@ impl ServerBuilder {
             default_engine,
             start_time_ms: unix_ms(),
             extra_info: Arc::new(self.extra_info),
+            ed25519_pubkeys: Arc::new(self.ed25519_pubkeys),
         };
 
         // Build a router that is still "missing" an `AppState`.
