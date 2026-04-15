@@ -19,7 +19,7 @@ use serde_json::json;
 use std::collections::HashSet;
 
 use crate::{
-    context::BaseCtx,
+    context::{AgentCtx, BaseCtx},
     hook::{DynToolHook, ToolHook},
 };
 
@@ -60,8 +60,8 @@ pub struct NoteArgs {
 pub struct NoteOutput {
     pub success: bool,
     pub notes: Vec<String>,
-    pub usage: String,
-    pub note_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -76,113 +76,129 @@ struct NoteStore {
 }
 
 impl NoteStore {
-    fn usage(&self) -> String {
+    fn usage(&self, char_limit: usize) -> String {
         let current = self.char_count();
-        let pct = ((current * 100) / NOTE_CHAR_LIMIT).min(100);
-        format!("{pct}% - {current}/{NOTE_CHAR_LIMIT} chars")
+        let pct = ((current * 100) / char_limit).min(100);
+        format!("{pct}% - {current}/{char_limit} chars")
     }
 
     fn char_count(&self) -> usize {
         joined_len(&self.notes)
     }
 
-    fn success_output(&self, message: Option<String>) -> NoteOutput {
+    fn success_output(&self, message: Option<String>, char_limit: Option<usize>) -> NoteOutput {
         NoteOutput {
             success: true,
             notes: self.notes.clone(),
-            usage: self.usage(),
-            note_count: self.notes.len(),
+            usage: char_limit.map(|limit| self.usage(limit)),
             message,
             error: None,
             matches: None,
         }
     }
 
-    fn failure_output(&self, error: String, matches: Option<Vec<String>>) -> NoteOutput {
+    fn failure_output(
+        &self,
+        error: String,
+        matches: Option<Vec<String>>,
+        char_limit: Option<usize>,
+    ) -> NoteOutput {
         NoteOutput {
             success: false,
             notes: self.notes.clone(),
-            usage: self.usage(),
-            note_count: self.notes.len(),
+            usage: char_limit.map(|limit| self.usage(limit)),
             message: None,
             error: Some(error),
             matches,
         }
     }
 
-    fn add(&mut self, content: String) -> NoteOutput {
+    fn add(&mut self, content: String, char_limit: usize) -> NoteOutput {
         let content = content.trim();
         if content.is_empty() {
-            return self.failure_output(NOTE_EMPTY_CONTENT.to_string(), None);
+            return self.failure_output(NOTE_EMPTY_CONTENT.to_string(), None, Some(char_limit));
         }
 
         if self.notes.iter().any(|entry| entry == content) {
-            return self.success_output(Some("Entry already exists (no duplicate added).".into()));
+            return self.success_output(
+                Some("Entry already exists (no duplicate added).".into()),
+                Some(char_limit),
+            );
         }
 
         let mut next = self.notes.clone();
         next.push(content.to_string());
         if let Err(error) = validate_note_size(&next) {
-            return self.failure_output(error, None);
+            return self.failure_output(error, None, Some(char_limit));
         }
 
         self.notes = next;
-        self.success_output(Some("Entry added.".into()))
+        self.success_output(Some("Entry added.".into()), Some(char_limit))
     }
 
-    fn replace(&mut self, old_text: String, content: String) -> NoteOutput {
+    fn replace(&mut self, old_text: String, content: String, char_limit: usize) -> NoteOutput {
         let old_text = old_text.trim();
         if old_text.is_empty() {
-            return self.failure_output(NOTE_EMPTY_OLD_TEXT.to_string(), None);
+            return self.failure_output(NOTE_EMPTY_OLD_TEXT.to_string(), None, Some(char_limit));
         }
 
         let content = content.trim();
         if content.is_empty() {
-            return self.failure_output(NOTE_EMPTY_CONTENT.to_string(), None);
+            return self.failure_output(NOTE_EMPTY_CONTENT.to_string(), None, Some(char_limit));
         }
 
         let matches = self.find_matches(old_text);
         let Some(index) = resolve_single_match(&matches) else {
             if matches.is_empty() {
-                return self.failure_output(format!("No entry matched {:?}.", old_text), None);
+                return self.failure_output(
+                    format!("No entry matched {:?}.", old_text),
+                    None,
+                    Some(char_limit),
+                );
             }
 
             return self.failure_output(
                 format!("Multiple entries matched {:?}. Be more specific.", old_text),
                 Some(preview_matches(&matches)),
+                Some(char_limit),
             );
         };
 
         let mut next = self.notes.clone();
         next[index] = content.to_string();
         if let Err(error) = validate_note_size(&next) {
-            return self.failure_output(error, None);
+            return self.failure_output(error, None, Some(char_limit));
         }
 
         self.notes = next;
-        self.success_output(Some("Entry replaced.".into()))
+        self.success_output(Some("Entry replaced.".into()), Some(char_limit))
     }
 
-    fn remove(&mut self, old_text: String) -> NoteOutput {
+    fn remove(&mut self, old_text: String, char_limit: usize) -> NoteOutput {
         let old_text = old_text.trim();
         if old_text.is_empty() {
-            return self.failure_output(NOTE_EMPTY_OLD_TEXT.to_string(), None);
+            return self.failure_output(NOTE_EMPTY_OLD_TEXT.to_string(), None, Some(char_limit));
         }
 
         let matches = self.find_matches(old_text);
         let Some(index) = resolve_single_match(&matches) else {
             if matches.is_empty() {
-                return self.failure_output(format!("No entry matched {:?}.", old_text), None);
+                return self.failure_output(
+                    format!("No entry matched {:?}.", old_text),
+                    None,
+                    Some(char_limit),
+                );
             }
 
             return self.failure_output(
                 format!("Multiple entries matched {:?}. Be more specific.", old_text),
                 Some(preview_matches(&matches)),
+                Some(char_limit),
             );
         };
 
         self.notes.remove(index);
-        self.success_output(Some("Entry removed.".into()))
+        self.success_output(Some("Entry removed.".into()), Some(char_limit))
     }
 
     fn find_matches(&self, needle: &str) -> Vec<(usize, String)> {
@@ -200,6 +216,7 @@ pub type NoteToolHook = DynToolHook<NoteArgs, ToolOutput<NoteOutput>>;
 /// Tool implementation that exposes a persistent agent-scoped note store.
 #[derive(Clone)]
 pub struct NoteTool {
+    char_limit: usize,
     description: String,
 }
 
@@ -216,6 +233,7 @@ impl NoteTool {
     /// Creates a note tool with the default behavioral guidance.
     pub fn new() -> Self {
         Self {
+            char_limit: NOTE_CHAR_LIMIT,
             description: concat!(
                 "Manage persistent notes for the current agent only. ",
                 "These notes are stored durably and are isolated by agent, ",
@@ -232,6 +250,11 @@ impl NoteTool {
             )
             .to_string(),
         }
+    }
+
+    pub fn with_char_limit(mut self, char_limit: usize) -> Self {
+        self.char_limit = char_limit;
+        self
     }
 
     pub fn with_description(mut self, description: String) -> Self {
@@ -261,6 +284,15 @@ impl NoteTool {
         .await?;
         Ok(())
     }
+}
+
+/// Public entrypoint for loading notes outside of the tool call interface, e.g. in agent.
+pub async fn load_notes(ctx: &AgentCtx) -> Option<NoteOutput> {
+    let base_ctx = ctx.child_base(NoteTool::NAME).ok()?;
+    NoteTool::load_store(&base_ctx)
+        .await
+        .ok()
+        .map(|store| store.success_output(None, None))
 }
 
 impl Tool<BaseCtx> for NoteTool {
@@ -325,37 +357,53 @@ impl Tool<BaseCtx> for NoteTool {
             .unwrap_or_else(|| NOTE_ACTION_READ.to_string());
 
         let output = match action.as_str() {
-            NOTE_ACTION_READ => store.success_output(None),
+            NOTE_ACTION_READ => store.success_output(None, Some(self.char_limit)),
             NOTE_ACTION_ADD => match args.content {
                 Some(content) => {
-                    let output = store.add(content);
+                    let output = store.add(content, self.char_limit);
                     if output.success {
                         Self::save_store(&ctx, &store).await?;
                     }
                     output
                 }
-                None => store.failure_output("content is required for add".into(), None),
+                None => store.failure_output(
+                    "content is required for add".into(),
+                    None,
+                    Some(self.char_limit),
+                ),
             },
             NOTE_ACTION_REPLACE => match (args.old_text, args.content) {
                 (Some(old_text), Some(content)) => {
-                    let output = store.replace(old_text, content);
+                    let output = store.replace(old_text, content, self.char_limit);
                     if output.success {
                         Self::save_store(&ctx, &store).await?;
                     }
                     output
                 }
-                (None, _) => store.failure_output("old_text is required for replace".into(), None),
-                (_, None) => store.failure_output("content is required for replace".into(), None),
+                (None, _) => store.failure_output(
+                    "old_text is required for replace".into(),
+                    None,
+                    Some(self.char_limit),
+                ),
+                (_, None) => store.failure_output(
+                    "content is required for replace".into(),
+                    None,
+                    Some(self.char_limit),
+                ),
             },
             NOTE_ACTION_REMOVE => match args.old_text {
                 Some(old_text) => {
-                    let output = store.remove(old_text);
+                    let output = store.remove(old_text, self.char_limit);
                     if output.success {
                         Self::save_store(&ctx, &store).await?;
                     }
                     output
                 }
-                None => store.failure_output("old_text is required for remove".into(), None),
+                None => store.failure_output(
+                    "old_text is required for remove".into(),
+                    None,
+                    Some(self.char_limit),
+                ),
             },
             _ => store.failure_output(
                 format!(
@@ -364,6 +412,7 @@ impl Tool<BaseCtx> for NoteTool {
                     VALID_ACTIONS.join(", ")
                 ),
                 None,
+                Some(self.char_limit),
             ),
         };
 
@@ -458,25 +507,29 @@ mod tests {
     fn store_add_replace_remove_match_memory_style() {
         let mut store = NoteStore::default();
 
-        let added = store.add("remember the release checklist".into());
+        let added = store.add("remember the release checklist".into(), NOTE_CHAR_LIMIT);
         assert!(added.success);
         assert_eq!(
             store.notes,
             vec!["remember the release checklist".to_string()]
         );
 
-        let duplicate = store.add("remember the release checklist".into());
+        let duplicate = store.add("remember the release checklist".into(), NOTE_CHAR_LIMIT);
         assert!(duplicate.success);
         assert_eq!(store.notes.len(), 1);
 
-        let replaced = store.replace("release".into(), "remember the launch checklist".into());
+        let replaced = store.replace(
+            "release".into(),
+            "remember the launch checklist".into(),
+            NOTE_CHAR_LIMIT,
+        );
         assert!(replaced.success);
         assert_eq!(
             store.notes,
             vec!["remember the launch checklist".to_string()]
         );
 
-        let removed = store.remove("launch".into());
+        let removed = store.remove("launch".into(), NOTE_CHAR_LIMIT);
         assert!(removed.success);
         assert!(store.notes.is_empty());
     }
@@ -490,7 +543,7 @@ mod tests {
             ],
         };
 
-        let output = store.replace("alpha".into(), "new note".into());
+        let output = store.replace("alpha".into(), "new note".into(), NOTE_CHAR_LIMIT);
         assert!(!output.success);
         assert_eq!(store.notes.len(), 2);
         assert_eq!(output.matches.unwrap().len(), 2);
@@ -506,7 +559,6 @@ mod tests {
 
         assert!(output.output.success);
         assert!(output.output.notes.is_empty());
-        assert_eq!(output.output.note_count, 0);
     }
 
     #[tokio::test]

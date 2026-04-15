@@ -434,6 +434,33 @@ impl Conversations {
         Ok(doc.is_some())
     }
 
+    pub async fn batch_get_conversations(
+        &self,
+        user: &Principal,
+        ids: Vec<u64>,
+    ) -> Result<Vec<Conversation>, BoxError> {
+        let filter = Some(Filter::And(vec![
+            Box::new(Filter::Field((
+                "_id".to_string(),
+                RangeQuery::Include(ids.into_iter().map(Fv::U64).collect()),
+            ))),
+            Box::new(Filter::Field((
+                "user".to_string(),
+                RangeQuery::Eq(Fv::Bytes(user.as_slice().to_vec())),
+            ))),
+        ]));
+
+        let rt: Vec<Conversation> = self
+            .conversations
+            .search_as(Query {
+                search: None,
+                filter,
+                limit: None,
+            })
+            .await?;
+        Ok(rt)
+    }
+
     pub async fn list_conversations_by_user(
         &self,
         user: &Principal,

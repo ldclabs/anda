@@ -107,7 +107,7 @@ impl AgentCtx {
     ///
     /// # Arguments
     /// * `agent_name` - Name of the agent to create context for.
-    pub(crate) fn child(&self, agent_name: &str, agent_label: &str) -> Result<Self, BoxError> {
+    pub fn child(&self, agent_name: &str, agent_label: &str) -> Result<Self, BoxError> {
         Ok(Self {
             base: self
                 .base
@@ -126,7 +126,7 @@ impl AgentCtx {
     ///
     /// # Arguments
     /// * `tool_name` - Name of the tool to create context for.
-    pub(crate) fn child_base(&self, tool_name: &str) -> Result<BaseCtx, BoxError> {
+    pub fn child_base(&self, tool_name: &str) -> Result<BaseCtx, BoxError> {
         self.base
             .child(format!("T:{}", tool_name.to_ascii_lowercase()))
     }
