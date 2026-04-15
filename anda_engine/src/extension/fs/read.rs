@@ -329,7 +329,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn rejects_symlink_escape_outside_workspace() {
+    async fn reads_files_through_symbolic_link_target() {
         use std::os::unix::fs::symlink;
 
         let temp_dir = TestTempDir::new().await;
@@ -339,11 +339,95 @@ mod tests {
         tokio::fs::write(&external, "secret").await.unwrap();
         symlink(&external, workspace.join("secret-link.txt")).unwrap();
 
-        let err = read_tool(&workspace)
+        let result = read_tool(&workspace)
             .call(
                 mock_ctx(),
                 ReadFileArgs {
                     path: "secret-link.txt".to_string(),
+                    offset: 0,
+                    limit: 0,
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.output.content, "secret");
+        assert_eq!(result.output.encoding, "utf8");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reads_files_through_symbolic_linked_directory_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = TestTempDir::new().await;
+        let workspace = temp_dir.path().join("workspace");
+        let external = temp_dir.path().join("external");
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+        tokio::fs::create_dir_all(&external).await.unwrap();
+        tokio::fs::write(external.join("secret.txt"), "secret")
+            .await
+            .unwrap();
+        symlink(&external, workspace.join("linked-dir")).unwrap();
+
+        let result = read_tool(&workspace)
+            .call(
+                mock_ctx(),
+                ReadFileArgs {
+                    path: "linked-dir/secret.txt".to_string(),
+                    offset: 0,
+                    limit: 0,
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.output.content, "secret");
+        assert_eq!(result.output.encoding, "utf8");
+    }
+
+    #[tokio::test]
+    async fn rejects_absolute_path_outside_workspace() {
+        let temp_dir = TestTempDir::new().await;
+        let workspace = temp_dir.path().join("workspace");
+        let external = temp_dir.path().join("secret.txt");
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+        tokio::fs::write(&external, "secret").await.unwrap();
+
+        let err = read_tool(&workspace)
+            .call(
+                mock_ctx(),
+                ReadFileArgs {
+                    path: external.to_string_lossy().into_owned(),
+                    offset: 0,
+                    limit: 0,
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("Access to paths outside the workspace is not allowed")
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_parent_dir_escape_outside_workspace() {
+        let temp_dir = TestTempDir::new().await;
+        let workspace = temp_dir.path().join("workspace");
+        let external = temp_dir.path().join("secret.txt");
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+        tokio::fs::write(&external, "secret").await.unwrap();
+
+        let err = read_tool(&workspace)
+            .call(
+                mock_ctx(),
+                ReadFileArgs {
+                    path: "../secret.txt".to_string(),
                     offset: 0,
                     limit: 0,
                 },

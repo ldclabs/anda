@@ -8,8 +8,8 @@ use std::{
 };
 
 use super::{
-    ensure_path_in_workspace, nearest_existing_ancestor, normalize_relative_path,
-    resolve_workspace_path,
+    ensure_path_in_workspace, ensure_path_in_workspace_namespace, nearest_existing_ancestor,
+    normalize_relative_path, path_contains_parent_reference, resolve_workspace_path,
 };
 use crate::{
     context::BaseCtx,
@@ -19,7 +19,7 @@ use crate::{
 /// Arguments for filesystem glob operations.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct SearchFileArgs {
-    /// Relative or absolute glob pattern inside the workspace.
+    /// Relative or absolute glob pattern inside the workspace namespace.
     pub pattern: String,
     /// Maximum number of matches to return. `0` means all matches.
     #[serde(default)]
@@ -85,7 +85,7 @@ impl Tool<BaseCtx> for SearchFileTool {
                 "properties": {
                     "pattern": {
                         "type": "string",
-                        "description": "Relative or absolute glob pattern. Matches are restricted to paths inside the workspace."
+                        "description": "Relative or absolute glob pattern. Matches are restricted to paths reachable from the workspace namespace."
                     },
                     "limit": {
                         "type": "integer",
@@ -119,7 +119,8 @@ impl Tool<BaseCtx> for SearchFileTool {
             .map(Cow::Owned)
             .unwrap_or_else(|| Cow::Borrowed(&self.work_dir));
 
-        let (resolved_work_dir, pattern) = resolve_glob_pattern(&work_dir, &args.pattern).await?;
+        let (resolved_work_dir, pattern, restrict_to_workspace_targets) =
+            resolve_glob_pattern(&work_dir, &args.pattern).await?;
 
         let mut paths = Vec::new();
         for entry in glob_with(&pattern, glob_match_options())
@@ -129,7 +130,9 @@ impl Tool<BaseCtx> for SearchFileTool {
             let resolved_path = tokio::fs::canonicalize(&path)
                 .await
                 .map_err(|err| format!("Failed to resolve matched path: {err}"))?;
-            ensure_path_in_workspace(&resolved_work_dir, &resolved_path)?;
+            if restrict_to_workspace_targets {
+                ensure_path_in_workspace(&resolved_work_dir, &resolved_path)?;
+            }
 
             paths.push(relative_match_path(
                 &path,
@@ -171,14 +174,26 @@ fn glob_match_options() -> MatchOptions {
 async fn resolve_glob_pattern(
     work_dir: &Path,
     pattern: &str,
-) -> Result<(PathBuf, String), BoxError> {
+) -> Result<(PathBuf, String, bool), BoxError> {
     if pattern.trim().is_empty() {
         return Err("Glob pattern must not be empty".into());
     }
 
     let resolved_work_dir = resolve_workspace_path(work_dir).await?;
-    let absolute_pattern = work_dir.join(pattern);
+    let requested_pattern = Path::new(pattern);
+    let absolute_pattern = work_dir.join(requested_pattern);
     let literal_prefix = literal_glob_prefix(&absolute_pattern);
+
+    if !path_contains_parent_reference(requested_pattern) {
+        ensure_path_in_workspace_namespace(work_dir, &resolved_work_dir, &literal_prefix)?;
+
+        return Ok((
+            resolved_work_dir,
+            absolute_pattern.to_string_lossy().into_owned(),
+            false,
+        ));
+    }
+
     let (existing_ancestor, _) = nearest_existing_ancestor(&literal_prefix).await?;
     let resolved_ancestor = tokio::fs::canonicalize(&existing_ancestor)
         .await
@@ -189,6 +204,7 @@ async fn resolve_glob_pattern(
     Ok((
         resolved_work_dir,
         absolute_pattern.to_string_lossy().into_owned(),
+        true,
     ))
 }
 
@@ -379,7 +395,35 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn rejects_symlink_escape_outside_workspace() {
+    async fn matches_files_through_symbolic_link_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = TestTempDir::new().await;
+        let workspace = temp_dir.path().join("workspace");
+        let external = temp_dir.path().join("secret.txt");
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+        tokio::fs::write(&external, "secret").await.unwrap();
+        symlink(&external, workspace.join("secret-link.txt")).unwrap();
+
+        let result = glob_tool(&workspace)
+            .call(
+                mock_ctx(),
+                SearchFileArgs {
+                    pattern: "*.txt".to_string(),
+                    limit: 0,
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.output.paths, ["secret-link.txt"]);
+        assert_eq!(result.output.total_matches, 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn matches_files_through_symbolic_linked_directory_target() {
         use std::os::unix::fs::symlink;
 
         let temp_dir = TestTempDir::new().await;
@@ -392,11 +436,67 @@ mod tests {
             .unwrap();
         symlink(&external, workspace.join("escape")).unwrap();
 
-        let err = glob_tool(&workspace)
+        let result = glob_tool(&workspace)
             .call(
                 mock_ctx(),
                 SearchFileArgs {
                     pattern: "escape/*.txt".to_string(),
+                    limit: 0,
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.output.paths, ["escape/secret.txt"]);
+        assert_eq!(result.output.total_matches, 1);
+    }
+
+    #[tokio::test]
+    async fn rejects_absolute_pattern_outside_workspace() {
+        let temp_dir = TestTempDir::new().await;
+        let workspace = temp_dir.path().join("workspace");
+        let external = temp_dir.path().join("external");
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+        tokio::fs::create_dir_all(&external).await.unwrap();
+        tokio::fs::write(external.join("secret.txt"), "secret")
+            .await
+            .unwrap();
+
+        let err = glob_tool(&workspace)
+            .call(
+                mock_ctx(),
+                SearchFileArgs {
+                    pattern: external.join("*.txt").to_string_lossy().into_owned(),
+                    limit: 0,
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("Access to paths outside the workspace is not allowed")
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_parent_dir_pattern_escape_outside_workspace() {
+        let temp_dir = TestTempDir::new().await;
+        let workspace = temp_dir.path().join("workspace");
+        let external = temp_dir.path().join("external");
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+        tokio::fs::create_dir_all(&external).await.unwrap();
+        tokio::fs::write(external.join("secret.txt"), "secret")
+            .await
+            .unwrap();
+
+        let err = glob_tool(&workspace)
+            .call(
+                mock_ctx(),
+                SearchFileArgs {
+                    pattern: "../external/*.txt".to_string(),
                     limit: 0,
                 },
                 Vec::new(),
