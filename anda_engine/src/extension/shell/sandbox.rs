@@ -15,9 +15,7 @@ use std::{
     time::Duration,
 };
 
-use super::{
-    DefaultExecutorHook, ExecArgs, ExecOutput, Executor, ExecutorHook, SHELL_TIMEOUT_SECS,
-};
+use super::{DynExecutorHook, ExecArgs, ExecOutput, Executor, ExecutorHook, SHELL_TIMEOUT_SECS};
 use crate::context::BaseCtx;
 
 type OutputStream = Pin<Box<dyn Stream<Item = String> + Send>>;
@@ -27,7 +25,6 @@ pub struct SandboxRuntime {
     work_dir: PathBuf,
     temp_dir: PathBuf,
     runner: Arc<dyn SandboxCommandRunner>,
-    hook: Arc<dyn ExecutorHook>,
 }
 
 impl SandboxRuntime {
@@ -55,13 +52,7 @@ impl SandboxRuntime {
             runner: Arc::new(BoxliteRunner { litebox }),
             work_dir: "/home".into(),
             temp_dir: "/tmp".into(),
-            hook: Arc::new(DefaultExecutorHook),
         })
-    }
-
-    pub fn with_hook(mut self, hook: Arc<dyn ExecutorHook>) -> Self {
-        self.hook = hook;
-        self
     }
 
     #[cfg(test)]
@@ -70,7 +61,6 @@ impl SandboxRuntime {
             work_dir,
             temp_dir,
             runner,
-            hook: Arc::new(DefaultExecutorHook),
         }
     }
 
@@ -121,13 +111,15 @@ impl Executor for SandboxRuntime {
         input: ExecArgs,
         envs: HashMap<String, String>,
     ) -> Result<ExecOutput, BoxError> {
-        self.hook.on_execution_start(&ctx, &input).await?;
+        let hook = ctx.get_state::<DynExecutorHook>();
+        if let Some(hook) = &hook {
+            hook.on_execution_start(&ctx, &input).await?;
+        }
 
         let work_dir = ctx
             .meta()
-            .extra
-            .get("work_dir")
-            .and_then(|v| v.as_str().map(PathBuf::from))
+            .get_extra_as::<String>("work_dir")
+            .map(PathBuf::from)
             .map(Cow::Owned)
             .unwrap_or_else(|| Cow::Borrowed(&self.work_dir));
 
@@ -140,7 +132,9 @@ impl Executor for SandboxRuntime {
             match wait_with_output(child).await {
                 Ok(output) => {
                     let exec_output = ExecOutput::from_output(None, Some(output), &temp_dir).await;
-                    self.hook.on_execution_end(&ctx, &input, &exec_output).await;
+                    if let Some(hook) = &hook {
+                        hook.on_execution_end(&ctx, &input, &exec_output).await;
+                    }
                     return Ok(exec_output);
                 }
                 Err(err) => {
@@ -148,30 +142,37 @@ impl Executor for SandboxRuntime {
                         stderr: Some(format!("Failed to execute background process: {err}")),
                         ..Default::default()
                     };
-                    self.hook.on_execution_end(&ctx, &input, &exec_output).await;
+                    if let Some(hook) = &hook {
+                        hook.on_execution_end(&ctx, &input, &exec_output).await;
+                    }
                     return Ok(exec_output);
                 }
             }
         }
         let temp_dir = self.temp_dir();
         let exec_output = ExecOutput::from_output(None, None, temp_dir).await;
-        self.hook.on_execution_end(&ctx, &input, &exec_output).await;
+        if let Some(hook) = &hook {
+            hook.on_execution_end(&ctx, &input, &exec_output).await;
+        }
         {
-            let hook = self.hook.clone();
             let temp_dir = temp_dir.clone();
             tokio::spawn(async move {
                 match wait_with_output(child).await {
                     Ok(output) => {
                         let exec_output =
                             ExecOutput::from_output(None, Some(output), &temp_dir).await;
-                        hook.on_background_end(ctx, input, exec_output).await;
+                        if let Some(hook) = &hook {
+                            hook.on_background_end(ctx, input, exec_output).await;
+                        }
                     }
                     Err(err) => {
                         let exec_output = ExecOutput {
                             stderr: Some(format!("Failed to execute background process: {err}")),
                             ..Default::default()
                         };
-                        hook.on_background_end(ctx, input, exec_output).await;
+                        if let Some(hook) = &hook {
+                            hook.on_background_end(ctx, input, exec_output).await;
+                        }
                     }
                 }
             });
@@ -667,13 +668,14 @@ mod tests {
             FakeExecution::success(&["bg-out"], &["bg-err"], 0),
         )]));
         let (sender, receiver) = oneshot::channel();
-        let hook: Arc<dyn ExecutorHook> = Arc::new(TestHook::new(sender));
+        let hook = DynExecutorHook::new(Arc::new(TestHook::new(sender)));
+        ctx.base.set_state(hook);
+
         let runtime = SandboxRuntime::test(
             runner,
             work_dir.path().to_path_buf(),
             temp_dir.path().to_path_buf(),
-        )
-        .with_hook(hook);
+        );
         let input = ExecArgs {
             command: "echo background".to_string(),
             work_dir: String::new(),

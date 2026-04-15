@@ -6,10 +6,9 @@ use std::{
     fmt,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::Arc,
 };
 
-use super::{DefaultExecutorHook, ExecArgs, ExecOutput, Executor, ExecutorHook};
+use super::{DynExecutorHook, ExecArgs, ExecOutput, Executor, ExecutorHook};
 use crate::context::BaseCtx;
 
 /// Native runtime — full access, runs on Mac/Linux/Docker/Raspberry Pi
@@ -17,7 +16,6 @@ pub struct NativeRuntime {
     work_dir: PathBuf,
     temp_dir: PathBuf,
     shell: Option<ShellProgram>,
-    hook: Arc<dyn ExecutorHook>,
 }
 
 impl NativeRuntime {
@@ -26,13 +24,7 @@ impl NativeRuntime {
             shell: detect_native_shell(),
             work_dir,
             temp_dir: std::env::temp_dir(),
-            hook: Arc::new(DefaultExecutorHook),
         }
-    }
-
-    pub fn with_hook(mut self, hook: Arc<dyn ExecutorHook>) -> Self {
-        self.hook = hook;
-        self
     }
 
     #[cfg(test)]
@@ -41,7 +33,6 @@ impl NativeRuntime {
             shell,
             work_dir,
             temp_dir: std::env::temp_dir(),
-            hook: Arc::new(DefaultExecutorHook),
         }
     }
 }
@@ -71,13 +62,15 @@ impl Executor for NativeRuntime {
         envs: HashMap<String, String>,
     ) -> Result<ExecOutput, BoxError> {
         let shell = self.shell.as_ref().ok_or_else(|| missing_shell_error())?;
-        self.hook.on_execution_start(&ctx, &input).await?;
+        let hook = ctx.get_state::<DynExecutorHook>();
+        if let Some(hook) = &hook {
+            hook.on_execution_start(&ctx, &input).await?;
+        }
 
         let work_dir = ctx
             .meta()
-            .extra
-            .get("work_dir")
-            .and_then(|v| v.as_str().map(PathBuf::from))
+            .get_extra_as::<String>("work_dir")
+            .map(PathBuf::from)
             .map(Cow::Owned)
             .unwrap_or_else(|| Cow::Borrowed(&self.work_dir));
 
@@ -98,7 +91,9 @@ impl Executor for NativeRuntime {
             match child.wait_with_output().await {
                 Ok(output) => {
                     let exec_output = ExecOutput::from_output(pid, Some(output), temp_dir).await;
-                    self.hook.on_execution_end(&ctx, &input, &exec_output).await;
+                    if let Some(hook) = &hook {
+                        hook.on_execution_end(&ctx, &input, &exec_output).await;
+                    }
                     return Ok(exec_output);
                 }
                 Err(err) => {
@@ -107,7 +102,9 @@ impl Executor for NativeRuntime {
                         stderr: Some(format!("Failed to execute background process: {err}")),
                         ..Default::default()
                     };
-                    self.hook.on_execution_end(&ctx, &input, &exec_output).await;
+                    if let Some(hook) = &hook {
+                        hook.on_execution_end(&ctx, &input, &exec_output).await;
+                    }
                     return Ok(exec_output);
                 }
             }
@@ -115,17 +112,20 @@ impl Executor for NativeRuntime {
 
         let temp_dir = self.temp_dir();
         let exec_output = ExecOutput::from_output(pid, None, temp_dir).await;
-        self.hook.on_execution_end(&ctx, &input, &exec_output).await;
+        if let Some(hook) = &hook {
+            hook.on_execution_end(&ctx, &input, &exec_output).await;
+        }
 
         {
-            let hook = self.hook.clone();
             let temp_dir = temp_dir.clone();
             tokio::spawn(async move {
                 match child.wait_with_output().await {
                     Ok(output) => {
                         let exec_output =
                             ExecOutput::from_output(pid, Some(output), &temp_dir).await;
-                        hook.on_background_end(ctx, input, exec_output).await;
+                        if let Some(hook) = &hook {
+                            hook.on_background_end(ctx, input, exec_output).await;
+                        }
                     }
                     Err(err) => {
                         let exec_output = ExecOutput {
@@ -133,7 +133,9 @@ impl Executor for NativeRuntime {
                             stderr: Some(format!("Failed to execute background process: {err}")),
                             ..Default::default()
                         };
-                        hook.on_background_end(ctx, input, exec_output).await;
+                        if let Some(hook) = &hook {
+                            hook.on_background_end(ctx, input, exec_output).await;
+                        }
                     }
                 }
             });
@@ -281,7 +283,12 @@ pub(super) fn missing_shell_error() -> BoxError {
 mod tests {
     use super::*;
     use crate::engine::EngineBuilder;
-    use std::{ffi::OsStr, io::ErrorKind, sync::Mutex, time::Duration};
+    use std::{
+        ffi::OsStr,
+        io::ErrorKind,
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
     use tokio::sync::oneshot;
 
     struct TestTempDir(PathBuf);
@@ -633,9 +640,9 @@ mod tests {
         let work_dir = TestTempDir::new("anda-native-background").await;
         let shell = shell_for_tests();
         let (sender, receiver) = oneshot::channel();
-        let hook: Arc<dyn ExecutorHook> = Arc::new(TestHook::new(sender));
-        let runtime =
-            NativeRuntime::test(Some(shell.clone()), work_dir.path().to_path_buf()).with_hook(hook);
+        let hook = DynExecutorHook::new(Arc::new(TestHook::new(sender)));
+        ctx.base.set_state(hook);
+        let runtime = NativeRuntime::test(Some(shell.clone()), work_dir.path().to_path_buf());
         let input = ExecArgs {
             command: background_command(shell.kind),
             work_dir: String::new(),

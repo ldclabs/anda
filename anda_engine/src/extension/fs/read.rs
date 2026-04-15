@@ -2,13 +2,16 @@ use anda_core::{BoxError, FunctionDefinition, Resource, StateFeatures, Tool, Too
 use ic_auth_types::ByteBufB64;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::{borrow::Cow, path::PathBuf, sync::Arc};
+use std::{borrow::Cow, path::PathBuf};
 
 use super::{
     BASE64_ENCODING, MAX_FILE_SIZE_BYTES, UTF8_ENCODING, ensure_file_size_within_limit,
     ensure_regular_file, resolve_read_path,
 };
-use crate::{context::BaseCtx, hook::ToolHook};
+use crate::{
+    context::BaseCtx,
+    hook::{DynToolHook, ToolHook},
+};
 
 /// Arguments for filesystem read operations.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -40,11 +43,12 @@ pub struct ReadFileOutput {
     pub total_lines: Option<usize>,
 }
 
+pub type ReadFileHook = DynToolHook<ReadFileArgs, ToolOutput<ReadFileOutput>>;
+
 #[derive(Clone)]
 pub struct ReadFileTool {
     work_dir: PathBuf,
     description: String,
-    hook: Option<Arc<dyn ToolHook<ReadFileArgs, ToolOutput<ReadFileOutput>>>>,
 }
 
 impl ReadFileTool {
@@ -53,14 +57,10 @@ impl ReadFileTool {
 
     /// Create a new `ReadFileTool` with the default working directory.
     /// You can override the working directory for each call by including a `work_dir` field in the tool call's context meta extra.
-    pub fn new(
-        work_dir: PathBuf,
-        hook: Option<Arc<dyn ToolHook<ReadFileArgs, ToolOutput<ReadFileOutput>>>>,
-    ) -> Self {
+    pub fn new(work_dir: PathBuf) -> Self {
         let description = "Read files from the filesystem in the workspace directory".to_string();
         Self {
             work_dir,
-            hook,
             description,
         }
     }
@@ -115,7 +115,9 @@ impl Tool<BaseCtx> for ReadFileTool {
         args: Self::Args,
         _resources: Vec<Resource>,
     ) -> Result<ToolOutput<Self::Output>, BoxError> {
-        let args = if let Some(hook) = &self.hook {
+        let hook = ctx.get_state::<ReadFileHook>();
+
+        let args = if let Some(hook) = &hook {
             hook.before_tool_call(&ctx, args).await?
         } else {
             args
@@ -123,9 +125,8 @@ impl Tool<BaseCtx> for ReadFileTool {
 
         let work_dir = ctx
             .meta()
-            .extra
-            .get("work_dir")
-            .and_then(|v| v.as_str().map(PathBuf::from))
+            .get_extra_as::<String>("work_dir")
+            .map(PathBuf::from)
             .map(Cow::Owned)
             .unwrap_or_else(|| Cow::Borrowed(&self.work_dir));
 
@@ -172,7 +173,7 @@ impl Tool<BaseCtx> for ReadFileTool {
             }
         }
 
-        if let Some(hook) = &self.hook {
+        if let Some(hook) = &hook {
             return hook.after_tool_call(&ctx, ToolOutput::new(output)).await;
         }
 
@@ -212,7 +213,7 @@ mod tests {
     }
 
     fn read_tool(work_dir: &Path) -> ReadFileTool {
-        ReadFileTool::new(work_dir.to_path_buf(), None)
+        ReadFileTool::new(work_dir.to_path_buf())
     }
 
     #[tokio::test]

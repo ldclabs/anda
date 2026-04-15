@@ -9,7 +9,7 @@
 //! - Core AI capabilities traits ([`CompletionFeatures`], [`EmbeddingFeatures`]).
 
 use candid::Principal;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, json};
 use std::collections::BTreeMap;
 
@@ -497,6 +497,18 @@ pub struct RequestMeta {
     #[serde(flatten)]
     #[serde(skip_serializing_if = "Map::is_empty")]
     pub extra: Map<String, Json>,
+}
+
+impl RequestMeta {
+    /// Gets an extra metadata value by key and deserializes it to the specified type.
+    pub fn get_extra_as<T>(&self, key: &str) -> Option<T>
+    where
+        T: DeserializeOwned,
+    {
+        self.extra
+            .get(key)
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+    }
 }
 
 /// Represents the usage statistics for the agent or tool execution.

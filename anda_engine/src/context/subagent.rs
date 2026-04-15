@@ -15,7 +15,7 @@ use std::{
 };
 
 use super::{AgentCtx, BaseCtx};
-use crate::hook::AgentHook;
+use crate::hook::{AgentHook, DynAgentHook};
 
 #[derive(Clone, Default, Deserialize, Serialize)]
 pub struct SubAgent {
@@ -31,9 +31,6 @@ pub struct SubAgent {
 
     #[serde(default)]
     pub background: bool,
-
-    #[serde(skip)]
-    pub hook: Option<Arc<dyn AgentHook>>,
 }
 
 impl Agent<AgentCtx> for SubAgent {
@@ -80,7 +77,9 @@ impl Agent<AgentCtx> for SubAgent {
         prompt: String,
         resources: Vec<Resource>,
     ) -> Result<AgentOutput, BoxError> {
-        let (prompt, resources) = if let Some(hook) = &self.hook {
+        let hook = ctx.base.get_state::<DynAgentHook>();
+
+        let (prompt, resources) = if let Some(hook) = &hook {
             hook.before_agent_run(&ctx, prompt, resources).await?
         } else {
             (prompt, resources)
@@ -90,11 +89,7 @@ impl Agent<AgentCtx> for SubAgent {
             instructions: self.instructions.clone(),
             prompt,
             content: resources.into_iter().map(ContentPart::from).collect(),
-            tools: if self.tools.is_empty() {
-                vec![]
-            } else {
-                ctx.definitions(Some(&self.tools)).await
-            },
+            tools: ctx.definitions(Some(&self.tools)).await,
             ..Default::default()
         };
 
@@ -108,13 +103,16 @@ impl Agent<AgentCtx> for SubAgent {
                 ..Default::default()
             };
 
-            let rt = if let Some(hook) = &self.hook {
+            let rt = if let Some(hook) = &hook {
                 hook.after_agent_run(&ctx, rt).await?
             } else {
                 rt
             };
 
-            let hook = self.hook.clone();
+            if let Some(hook) = &hook {
+                hook.on_background_start(&ctx, &task_id, &req).await;
+            }
+
             tokio::spawn(async move {
                 let mut rt = match ctx.completion(req, Vec::new()).await {
                     Ok(rt) => rt,
@@ -129,13 +127,13 @@ impl Agent<AgentCtx> for SubAgent {
                 );
 
                 if let Some(hook) = hook {
-                    hook.on_background_end(ctx, rt).await;
+                    hook.on_background_end(ctx, task_id, rt).await;
                 }
             });
             Ok(rt)
         } else {
             let rt = ctx.completion(req, Vec::new()).await?;
-            if let Some(hook) = &self.hook {
+            if let Some(hook) = &hook {
                 return hook.after_agent_run(&ctx, rt).await;
             }
 
@@ -169,17 +167,15 @@ pub trait SubAgentSet: Send + Sync {
 pub struct SubAgentManager {
     root_ctx: BaseCtx,
     agents: RwLock<BTreeMap<String, SubAgent>>,
-    hook: Option<Arc<dyn AgentHook>>,
 }
 
 impl SubAgentManager {
     pub const NAME: &'static str = "subagents_manager";
 
-    pub fn new(root_ctx: BaseCtx, hook: Option<Arc<dyn AgentHook>>) -> Self {
+    pub fn new(root_ctx: BaseCtx) -> Self {
         Self {
             root_ctx,
             agents: RwLock::new(BTreeMap::new()),
-            hook,
         }
     }
 
@@ -250,14 +246,7 @@ impl SubAgentSet for SubAgentManager {
     }
 
     fn get_lowercase(&self, lowercase_name: &str) -> Option<SubAgent> {
-        self.agents
-            .read()
-            .get(lowercase_name)
-            .cloned()
-            .map(|mut agent| {
-                agent.hook = self.hook.clone();
-                agent
-            })
+        self.agents.read().get(lowercase_name).cloned()
     }
 
     fn definitions(&self, names: Option<&[String]>) -> Vec<FunctionDefinition> {
@@ -428,6 +417,17 @@ impl Tool<BaseCtx> for SubAgentManager {
                         "description": "Optional whitelist of tool names the sub-agent may use. Include only the minimum tools it needs. Leave empty or omit this field to create a no-tool sub-agent.",
                         "default": [],
                         "uniqueItems": true
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional list of resource tags that are relevant to this sub-agent. When the sub-agent is called, resources with matching tags will be prioritized for selection and passed to the sub-agent in order of relevance.",
+                        "default": [],
+                        "uniqueItems": true
+                    },
+                    "background": {
+                        "type": "boolean",
+                        "description": "Whether this sub-agent should be executed asynchronously in the background. If true, the agent will return immediately with a message containing a unique task ID, and the final output will be passed to the `on_background_end` hook method when the task is completed. Use this for long-running tasks that don't need to return output immediately, or when you want to handle the final output separately in the hook (e.g. by storing it in a database or sending a notification)."
                     }
                 },
                 "required": ["name", "description", "instructions"],

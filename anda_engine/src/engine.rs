@@ -574,7 +574,7 @@ impl EngineBuilder {
             Arc::new(RemoteEngines::new()),
         );
 
-        let subagent_manager = Arc::new(SubAgentManager::new(ctx.clone(), None));
+        let subagent_manager = Arc::new(SubAgentManager::new(ctx.clone()));
         self.tools.add(subagent_manager.clone()).unwrap();
         let subagents = SubAgentSetManager::new();
         subagents.insert(subagent_manager);
@@ -648,7 +648,7 @@ impl EngineBuilder {
             Arc::new(remote),
         );
 
-        let subagent_manager = Arc::new(SubAgentManager::new(ctx.clone(), None));
+        let subagent_manager = Arc::new(SubAgentManager::new(ctx.clone()));
         subagent_manager.load().await?;
 
         self.tools.add(subagent_manager.clone())?;
@@ -721,7 +721,7 @@ impl EngineBuilder {
             self.store,
             Arc::new(RemoteEngines::new()),
         );
-        let subagent_manager = Arc::new(SubAgentManager::new(ctx.clone(), None));
+        let subagent_manager = Arc::new(SubAgentManager::new(ctx.clone()));
         self.tools.add(subagent_manager.clone()).unwrap();
         let subagents = SubAgentSetManager::new();
         subagents.insert(subagent_manager);

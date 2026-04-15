@@ -5,14 +5,16 @@ use serde_json::json;
 use std::{
     borrow::Cow,
     path::{Component, Path, PathBuf},
-    sync::Arc,
 };
 
 use super::{
     ensure_path_in_workspace, nearest_existing_ancestor, normalize_relative_path,
     resolve_workspace_path,
 };
-use crate::{context::BaseCtx, hook::ToolHook};
+use crate::{
+    context::BaseCtx,
+    hook::{DynToolHook, ToolHook},
+};
 
 /// Arguments for filesystem glob operations.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -33,10 +35,11 @@ pub struct SearchFileOutput {
     pub total_matches: usize,
 }
 
+pub type SearchFileHook = DynToolHook<SearchFileArgs, ToolOutput<SearchFileOutput>>;
+
 #[derive(Clone)]
 pub struct SearchFileTool {
     work_dir: PathBuf,
-    hook: Option<Arc<dyn ToolHook<SearchFileArgs, ToolOutput<SearchFileOutput>>>>,
     description: String,
 }
 
@@ -46,15 +49,11 @@ impl SearchFileTool {
 
     /// Create a new `SearchFileTool` with the default working directory.
     /// You can override the working directory for each call by including a `work_dir` field in the tool call's context meta extra.
-    pub fn new(
-        work_dir: PathBuf,
-        hook: Option<Arc<dyn ToolHook<SearchFileArgs, ToolOutput<SearchFileOutput>>>>,
-    ) -> Self {
+    pub fn new(work_dir: PathBuf) -> Self {
         let description =
             "Match filesystem paths with glob patterns in the workspace directory".to_string();
         Self {
             work_dir,
-            hook,
             description,
         }
     }
@@ -105,7 +104,9 @@ impl Tool<BaseCtx> for SearchFileTool {
         args: Self::Args,
         _resources: Vec<Resource>,
     ) -> Result<ToolOutput<Self::Output>, BoxError> {
-        let args = if let Some(hook) = &self.hook {
+        let hook = ctx.get_state::<SearchFileHook>();
+
+        let args = if let Some(hook) = &hook {
             hook.before_tool_call(&ctx, args).await?
         } else {
             args
@@ -113,9 +114,8 @@ impl Tool<BaseCtx> for SearchFileTool {
 
         let work_dir = ctx
             .meta()
-            .extra
-            .get("work_dir")
-            .and_then(|v| v.as_str().map(PathBuf::from))
+            .get_extra_as::<String>("work_dir")
+            .map(PathBuf::from)
             .map(Cow::Owned)
             .unwrap_or_else(|| Cow::Borrowed(&self.work_dir));
 
@@ -152,7 +152,7 @@ impl Tool<BaseCtx> for SearchFileTool {
             total_matches,
         };
 
-        if let Some(hook) = &self.hook {
+        if let Some(hook) = &hook {
             return hook.after_tool_call(&ctx, ToolOutput::new(output)).await;
         }
 
@@ -278,7 +278,7 @@ mod tests {
     }
 
     fn glob_tool(work_dir: &Path) -> SearchFileTool {
-        SearchFileTool::new(work_dir.to_path_buf(), None)
+        SearchFileTool::new(work_dir.to_path_buf())
     }
 
     #[tokio::test]

@@ -1,13 +1,16 @@
 use anda_core::{BoxError, FunctionDefinition, Resource, StateFeatures, Tool, ToolOutput};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::{borrow::Cow, path::PathBuf, sync::Arc};
+use std::{borrow::Cow, path::PathBuf};
 
 use super::{
     MAX_FILE_SIZE_BYTES, atomic_write_file, ensure_file_size_within_limit, ensure_regular_file,
     resolve_write_path,
 };
-use crate::{context::BaseCtx, hook::ToolHook};
+use crate::{
+    context::BaseCtx,
+    hook::{DynToolHook, ToolHook},
+};
 
 /// Arguments for filesystem edit operations.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -34,11 +37,12 @@ pub struct EditFileOutput {
     pub size: u64,
 }
 
+pub type EditFileHook = DynToolHook<EditFileArgs, ToolOutput<EditFileOutput>>;
+
 #[derive(Clone)]
 pub struct EditFileTool {
     work_dir: PathBuf,
     description: String,
-    hook: Option<Arc<dyn ToolHook<EditFileArgs, ToolOutput<EditFileOutput>>>>,
 }
 
 impl EditFileTool {
@@ -47,15 +51,12 @@ impl EditFileTool {
 
     /// Create a new `EditFileTool` with the default working directory.
     /// You can override the working directory for each call by including a `work_dir` field in the tool call's context meta extra.
-    pub fn new(
-        work_dir: PathBuf,
-        hook: Option<Arc<dyn ToolHook<EditFileArgs, ToolOutput<EditFileOutput>>>>,
-    ) -> Self {
+    pub fn new(work_dir: PathBuf) -> Self {
         let description =
-            "Atomically edit UTF-8 files in the workspace directory by replacing strings".to_string();
+            "Atomically edit UTF-8 files in the workspace directory by replacing strings"
+                .to_string();
         Self {
             work_dir,
-            hook,
             description,
         }
     }
@@ -114,7 +115,9 @@ impl Tool<BaseCtx> for EditFileTool {
         args: Self::Args,
         _resources: Vec<Resource>,
     ) -> Result<ToolOutput<Self::Output>, BoxError> {
-        let args = if let Some(hook) = &self.hook {
+        let hook = ctx.get_state::<EditFileHook>();
+
+        let args = if let Some(hook) = &hook {
             hook.before_tool_call(&ctx, args).await?
         } else {
             args
@@ -126,9 +129,8 @@ impl Tool<BaseCtx> for EditFileTool {
 
         let work_dir = ctx
             .meta()
-            .extra
-            .get("work_dir")
-            .and_then(|v| v.as_str().map(PathBuf::from))
+            .get_extra_as::<String>("work_dir")
+            .map(PathBuf::from)
             .map(Cow::Owned)
             .unwrap_or_else(|| Cow::Borrowed(&self.work_dir));
 
@@ -183,7 +185,7 @@ impl Tool<BaseCtx> for EditFileTool {
             }
         };
 
-        if let Some(hook) = &self.hook {
+        if let Some(hook) = &hook {
             return hook.after_tool_call(&ctx, ToolOutput::new(output)).await;
         }
 
@@ -223,7 +225,7 @@ mod tests {
     }
 
     fn edit_tool(work_dir: &Path) -> EditFileTool {
-        EditFileTool::new(work_dir.to_path_buf(), None)
+        EditFileTool::new(work_dir.to_path_buf())
     }
 
     #[tokio::test]

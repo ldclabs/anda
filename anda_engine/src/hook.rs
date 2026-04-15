@@ -1,10 +1,11 @@
 //! Hook system for customizing engine behavior.
 
 use anda_core::{
-    AgentOutput, BoxError, CacheExpiry, CacheFeatures, Json, Resource, StateFeatures, ToolOutput,
+    AgentOutput, BoxError, CacheExpiry, CacheFeatures, CompletionRequest, Json, Resource,
+    StateFeatures, ToolOutput,
 };
 use async_trait::async_trait;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 use structured_logger::unix_ms;
 
 use crate::context::{AgentCtx, BaseCtx};
@@ -61,6 +62,36 @@ where
     }
 }
 
+#[derive(Clone)]
+pub struct DynToolHook<I, O> {
+    inner: Arc<dyn ToolHook<I, O>>,
+}
+
+impl<I, O> DynToolHook<I, O>
+where
+    I: Send + 'static,
+    O: Send + 'static,
+{
+    pub fn new(inner: Arc<dyn ToolHook<I, O>>) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait]
+impl<I, O> ToolHook<I, O> for DynToolHook<I, O>
+where
+    I: Send + 'static,
+    O: Send + 'static,
+{
+    async fn before_tool_call(&self, ctx: &BaseCtx, args: I) -> Result<I, BoxError> {
+        self.inner.before_tool_call(ctx, args).await
+    }
+
+    async fn after_tool_call(&self, ctx: &BaseCtx, output: O) -> Result<O, BoxError> {
+        self.inner.after_tool_call(ctx, output).await
+    }
+}
+
 /// AgentHook trait for customizing agent execution behavior with more fine-grained control.
 #[async_trait]
 pub trait AgentHook: Send + Sync {
@@ -84,8 +115,51 @@ pub trait AgentHook: Send + Sync {
         Ok(output)
     }
 
+    /// This method can be called to handle the start of an agent execution when the agent is executed asynchronously in the background.
+    async fn on_background_start(&self, _ctx: &AgentCtx, _task_id: &str, _req: &CompletionRequest) {
+    }
+
     /// This method can be called to handle the final output when the agent is executed asynchronously in the background.
-    async fn on_background_end(&self, _ctx: AgentCtx, _output: AgentOutput) {}
+    async fn on_background_end(&self, _ctx: AgentCtx, _task_id: String, _output: AgentOutput) {}
+}
+
+#[derive(Clone)]
+pub struct DynAgentHook {
+    inner: Arc<dyn AgentHook>,
+}
+
+impl DynAgentHook {
+    pub fn new(inner: Arc<dyn AgentHook>) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait]
+impl AgentHook for DynAgentHook {
+    async fn before_agent_run(
+        &self,
+        ctx: &AgentCtx,
+        prompt: String,
+        resources: Vec<Resource>,
+    ) -> Result<(String, Vec<Resource>), BoxError> {
+        self.inner.before_agent_run(ctx, prompt, resources).await
+    }
+
+    async fn after_agent_run(
+        &self,
+        ctx: &AgentCtx,
+        output: AgentOutput,
+    ) -> Result<AgentOutput, BoxError> {
+        self.inner.after_agent_run(ctx, output).await
+    }
+
+    async fn on_background_start(&self, ctx: &AgentCtx, task_id: &str, req: &CompletionRequest) {
+        self.inner.on_background_start(ctx, task_id, req).await;
+    }
+
+    async fn on_background_end(&self, ctx: AgentCtx, task_id: String, output: AgentOutput) {
+        self.inner.on_background_end(ctx, task_id, output).await;
+    }
 }
 
 /// Hooks struct for managing multiple hooks.

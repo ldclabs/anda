@@ -30,7 +30,10 @@ pub use native::NativeRuntime;
 /// Sandboxed runtime implementation.
 pub mod sandbox;
 
-use crate::{context::BaseCtx, hook::ToolHook};
+use crate::{
+    context::BaseCtx,
+    hook::{DynToolHook, ToolHook},
+};
 
 /// Maximum shell command execution time before kill.
 pub const SHELL_TIMEOUT_SECS: u64 = 180;
@@ -97,9 +100,31 @@ pub trait ExecutorHook: Send + Sync {
     }
 }
 
-/// No-op hook implementation.
-pub struct DefaultExecutorHook;
-impl ExecutorHook for DefaultExecutorHook {}
+#[derive(Clone)]
+pub struct DynExecutorHook {
+    inner: Arc<dyn ExecutorHook>,
+}
+
+impl DynExecutorHook {
+    pub fn new(inner: Arc<dyn ExecutorHook>) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait]
+impl ExecutorHook for DynExecutorHook {
+    async fn on_execution_start(&self, ctx: &BaseCtx, input: &ExecArgs) -> Result<(), BoxError> {
+        self.inner.on_execution_start(ctx, input).await
+    }
+
+    async fn on_execution_end(&self, ctx: &BaseCtx, input: &ExecArgs, output: &ExecOutput) {
+        self.inner.on_execution_end(ctx, input, output).await
+    }
+
+    async fn on_background_end(&self, ctx: BaseCtx, input: ExecArgs, output: ExecOutput) {
+        self.inner.on_background_end(ctx, input, output).await
+    }
+}
 
 /// Arguments for process execution
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -199,13 +224,14 @@ impl ExecOutput {
     }
 }
 
+pub type ShellToolHook = DynToolHook<ExecArgs, ToolOutput<ExecOutput>>;
+
 /// Tool implementation that exposes shell command execution to the engine.
 #[derive(Clone)]
 pub struct ShellTool {
     runtime: Arc<dyn Executor>,
     envs: HashMap<String, String>,
     description: String,
-    hook: Option<Arc<dyn ToolHook<ExecArgs, ToolOutput<ExecOutput>>>>,
 }
 
 impl ShellTool {
@@ -213,11 +239,7 @@ impl ShellTool {
     pub const NAME: &'static str = "shell";
 
     /// Create a shell tool with a runtime and a fixed environment map.
-    pub fn new(
-        runtime: Arc<dyn Executor>,
-        envs: HashMap<String, String>,
-        hook: Option<Arc<dyn ToolHook<ExecArgs, ToolOutput<ExecOutput>>>>,
-    ) -> Self {
+    pub fn new(runtime: Arc<dyn Executor>, envs: HashMap<String, String>) -> Self {
         let description = format!(
             "Execute a shell command in the workspace directory (Runtime: {}, OS: {}, Shell: {})",
             runtime.name(),
@@ -228,7 +250,6 @@ impl ShellTool {
         Self {
             runtime,
             envs,
-            hook,
             description,
         }
     }
@@ -306,7 +327,8 @@ impl Tool<BaseCtx> for ShellTool {
         args: Self::Args,
         _resources: Vec<Resource>,
     ) -> Result<ToolOutput<Self::Output>, BoxError> {
-        let args = if let Some(hook) = &self.hook {
+        let hook = ctx.get_state::<ShellToolHook>();
+        let args = if let Some(hook) = &hook {
             hook.before_tool_call(&ctx, args).await?
         } else {
             args
@@ -340,7 +362,7 @@ impl Tool<BaseCtx> for ShellTool {
             }),
         };
 
-        if let Some(hook) = &self.hook {
+        if let Some(hook) = &hook {
             hook.after_tool_call(&ctx, rt).await
         } else {
             Ok(rt)

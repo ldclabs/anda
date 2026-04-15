@@ -243,6 +243,12 @@ impl AgentContext for AgentCtx {
         endpoint: Option<&str>,
         names: Option<&[String]>,
     ) -> Result<Vec<FunctionDefinition>, BoxError> {
+        if let Some(names) = names
+            && names.is_empty()
+        {
+            return Ok(Vec::new());
+        }
+
         let mut defs = self.base.remote.tool_definitions(endpoint, names);
         if let Ok((engines, _)) = self
             .root
@@ -297,6 +303,12 @@ impl AgentContext for AgentCtx {
     /// # Returns
     /// Vector of function definitions for the requested agents.
     fn agent_definitions(&self, names: Option<&[String]>) -> Vec<FunctionDefinition> {
+        if let Some(names) = names
+            && names.is_empty()
+        {
+            return Vec::new();
+        }
+
         let mut defs = self.agents.definitions(names);
         defs.extend(
             self.subagents
@@ -320,6 +332,12 @@ impl AgentContext for AgentCtx {
         endpoint: Option<&str>,
         names: Option<&[String]>,
     ) -> Result<Vec<FunctionDefinition>, BoxError> {
+        if let Some(names) = names
+            && names.is_empty()
+        {
+            return Ok(Vec::new());
+        }
+
         let mut defs = self.base.remote.agent_definitions(endpoint, names);
         if let Ok((engines, _)) = self
             .root
@@ -372,6 +390,12 @@ impl AgentContext for AgentCtx {
 
     /// Retrieves definitions for available tools and agents, including those from remote engines.
     async fn definitions(&self, names: Option<&[String]>) -> Vec<FunctionDefinition> {
+        if let Some(names) = names
+            && names.is_empty()
+        {
+            return Vec::new();
+        }
+
         let mut definitions = self.tool_definitions(names);
         definitions.extend(self.agent_definitions(names));
         if let Ok(remote) = self.remote_tool_definitions(None, names).await {
