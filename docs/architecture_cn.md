@@ -9,7 +9,6 @@
 **资源**:
 - [GitHub: 项目源代码](https://github.com/ldclabs/anda)
 - [扩展（Extensions）: 核心 agents & tools 的实现](https://github.com/ldclabs/anda/tree/main/anda_engine/src/extension)
-- [Anda Bot: 一个 AI Agent 智能体的完整实现](https://github.com/ldclabs/anda/tree/main/agents/anda_bot)
 - [Anda bot（X 平台应用）](https://x.com/AndaICP)
 
 ## 系统架构
@@ -20,9 +19,9 @@
 
 ### LLM 服务
 
-LLM 服务为 Anda 提供智能算力，就像一种 GPU 云服务，它是可以替换的。目前 Anda 框架内支持了 DeepSeek、Cohere 和 OpenAI，未来会支持更多的 LLM 服务，包括用 TEE GPU 运行开源的 LLMs。
+LLM 服务为 Anda 提供智能算力，就像一种 GPU 云服务，它是可以替换的。目前 Anda 框架内支持了 OpenAI、DeepSeek、Anthropic 和 Google Gemini，未来会支持更多的 LLM 服务，包括用 TEE GPU 运行开源的 LLMs。
 
-目前来说，DeepSeek 和 Cohere 是性价比最高的，以极低的价格提供了令人惊叹的智能算力。为了极致的安全和隐私，使用 TEE GPU 运行 DeepSeek 将是最佳选择。
+目前来说，DeepSeek 和 OpenAI 是性价比最高的，以极低的价格提供了令人惊叹的智能算力。为了极致的安全和隐私，使用 TEE GPU 运行 DeepSeek 将是最佳选择。
 
 ### TEE 计算
 

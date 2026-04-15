@@ -9,7 +9,6 @@ This article introduces the system architecture and core components of the Anda 
 **Resources**:
 - [GitHub: Source code](https://github.com/ldclabs/anda)
 - [Extensions: Core agents & tools implementations](https://github.com/ldclabs/anda/tree/main/anda_engine/src/extension)
-- [Anda Bot: Full AI agent implementation](https://github.com/ldclabs/anda/tree/main/agents/anda_bot)
 - [Anda bot (application on X)](https://x.com/AndaICP)
 
 ## System Architecture
@@ -29,9 +28,9 @@ To run a complete Anda AI Agent (referred to as Anda), the following three exter
 
 ### LLM Service
 
-The LLM service provides intelligent computing power to Anda, similar to GPU cloud services, and is replaceable. Currently, the Anda framework supports DeepSeek, Cohere, and OpenAI, with plans to support more LLM services in the future, including open-source LLMs running on TEE GPUs.
+The LLM service provides intelligent computing power to Anda, similar to GPU cloud services, and is replaceable. Currently, the Anda framework supports OpenAI, DeepSeek, Anthropic, and Google Gemini, with plans to support more LLM services in the future, including open-source LLMs running on TEE GPUs.
 
-- **DeepSeek and Cohere**: Currently offer the best cost-performance ratio, delivering exceptional intelligent computing power at a low cost.
+- **DeepSeek and OpenAI**: Currently offer the best cost-performance ratio, delivering exceptional intelligent computing power at a low cost.
 - **DeepSeek on TEE GPU**: For ultimate security and privacy, this is the optimal choice.
 
 ### TEE Computing

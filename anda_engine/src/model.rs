@@ -1,9 +1,10 @@
 //! Model integration module for Anda Engine
 //!
 //! This module provides implementations for various AI model providers, including:
-//! - OpenAI (completion and embedding models)
+//! - OpenAI (completion models)
 //! - DeepSeek (completion models)
-//! - Cohere (embedding models)
+//! - Anthropic (completion models)
+//! - Google Gemini (completion models)
 //!
 //! Each provider implementation includes:
 //! - Client configuration and management
@@ -11,8 +12,7 @@
 //! - Conversion to Anda's internal data structures
 //!
 //! The module is designed to be extensible, allowing easy addition of new model providers
-//! while maintaining a consistent interface through the `CompletionFeaturesDyn` and
-//! `EmbeddingFeaturesDyn` traits.
+//! while maintaining a consistent interface through the `CompletionFeaturesDyn` trait.
 
 use anda_core::{AgentOutput, BoxError, BoxPinFut, CONTENT_TYPE_JSON, CompletionRequest, ToolCall};
 use arc_swap::ArcSwap;

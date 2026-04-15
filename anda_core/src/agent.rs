@@ -25,12 +25,9 @@
 //! # Usage
 //!
 //! ## Reference Implementations
-//! 1. [`Extractor`](https://github.com/ldclabs/anda/blob/main/anda_engine/src/extension/extractor.rs) -
-//!    An agent for structured data extraction using LLMs
-//! 2. [`DocumentSegmenter`](https://github.com/ldclabs/anda/blob/main/anda_engine/src/extension/segmenter.rs) -
-//!    A document segmentation tool using LLMs
-//! 3. [`CharacterAgent`](https://github.com/ldclabs/anda/blob/main/anda_engine/src/extension/character.rs) -
-//!    A role-playing AI agent, also serving as the core agent for [`anda_bot`](https://github.com/ldclabs/anda/blob/main/agents/anda_bot/README.md)
+//! See the [`anda_engine`](https://github.com/ldclabs/anda/tree/main/anda_engine/src/extension) module
+//! for concrete agent implementations such as the [`Extractor`](https://github.com/ldclabs/anda/blob/main/anda_engine/src/extension/extractor.rs)
+//! for structured data extraction using LLMs.
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;

@@ -53,34 +53,24 @@ ICPanda DAO 是在互联网计算机协议（ICP）区块链上建立的 SNS DAO
 
 ```sh
 anda/
-├── anda_cli/    # 与 Anda 引擎服务交互的命令行工具
-├── anda_core/          # 核心库，包含基础类型与接口
-├── anda_engine/        # 智能体运行时与管理引擎实现
-├── anda_engine_server/ # 支持多个 Anda 引擎的 HTTP 服务
-├── anda_web3_client/   # 用于在非 TEE 环境的 Rust 语言 Web3 SDK。
-├── agents/             # 各类AI智能体实现
-│   ├── anda_bot/       # 示例智能体：Anda ICP
-│   └── .../            # 更多智能体将在后续版本推出
-├── tools/              # 工具库集合
-│   ├── anda_bnb/       # 提供与币安链（BNB）的集成工具
-│   ├── anda_icp/       # 提供与互联网计算机（ICP）的集成工具
-│   └── .../            # 更多工具将在后续版本推出
-├── characters/         # 角色设定示例库
-└── examples/           # AI agents 示例
+├── anda_cli/              # 与 Anda 引擎服务交互的命令行工具
+├── anda_core/             # 核心库，包含基础类型与接口
+├── anda_engine/           # 智能体运行时与管理引擎实现
+├── anda_engine_server/   # 支持多个 Anda 引擎的 HTTP 服务
+└── anda_web3_client/      # 用于在非 TEE 环境的 Rust 语言 Web3 SDK
 ```
 
 ### 如何使用和参与贡献
 
 #### 非开发者：
 
-可以关注 `agents` 目录下的智能体。比如 [`anda_bot`](https://github.com/ldclabs/anda/tree/main/agents/anda_bot)。
-目前部署流程还比较复杂，未来我们会推出云服务，实现一键部署。
+Anda 框架在 `anda_cli` 目录下提供了命令行工具，用于与 Anda 引擎服务交互。
 
 #### 开发者：
 
-- 可以在 `tools` 添加更多与外界其它服务的集成工具；
-- 也可以在 `agents` 添加更多智能体应用；
-- 或者完善 `anda_core` 和 `anda_engine` 核心引擎。
+- 完善 `anda_core` 和 `anda_engine` 核心引擎；
+- 使用 `anda_core` 的 trait 构建自定义智能体和工具；
+- 为 `anda_engine_server` HTTP 服务器实现做出贡献。
 
 ### 关联项目
 

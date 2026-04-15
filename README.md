@@ -53,34 +53,24 @@ Documents:
 
 ```sh
 anda/
-├── anda_cli/  # The command line interface for Anda engine server
-├── anda_core/        # Core library containing base types and interfaces
-├── anda_engine/      # Engine implementation for agent runtime and management
-├── anda_engine_server/ # A http server to serve multiple Anda engines
-├── anda_web3_client/ # The Rust SDK for Web3 integration in non-TEE environments
-├── agents/           # Various AI agent implementations
-│ ├── anda_bot/       # Example agent: Anda ICP
-│ └── .../            # More agents in future releases
-├── tools/            # Tool libraries
-│ ├── anda_bnb/       # Anda agent tools offers integration with the BNB Chain (BNB).
-│ ├── anda_icp/       # Anda agent tools offers integration with the Internet Computer (ICP).
-│ └── .../            # More tools in future releases
-├── characters/       # characters examples
-└── examples/         # AI agents examples
+├── anda_cli/              # Command line interface for Anda engine server
+├── anda_core/             # Core library containing base types and interfaces
+├── anda_engine/           # Engine implementation for agent runtime and management
+├── anda_engine_server/    # HTTP server to serve multiple Anda engines
+└── anda_web3_client/      # Rust SDK for Web3 integration in non-TEE environments
 ```
 
 ### How to Use and Contribute
 
 #### For Non-Developers:
 
-You can follow the agents in the `agents` directory. For example, [`anda_bot`](https://github.com/ldclabs/anda/tree/main/agents/anda_bot).
-The deployment process is currently complex, but we plan to launch a cloud service for one-click deployment in the future.
+The Anda framework provides a command-line interface in `anda_cli` for interacting with the Anda engine server.
 
 #### For Developers:
 
-- Add more integration tools with external services in `tools`;
-- Create more agent applications in `agents`;
-- Or enhance the core engines `anda_core` and `anda_engine`.
+- Enhance the core engines `anda_core` and `anda_engine`;
+- Build custom agents and tools using the `anda_core` traits;
+- Contribute to the `anda_engine_server` HTTP server implementation.
 
 ### Related Projects
 

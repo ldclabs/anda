@@ -15,17 +15,17 @@
 //! # Usage
 //!
 //! ## Reference Implementations
-//! 1. [`GoogleSearchTool`](https://github.com/ldclabs/anda/blob/main/anda_engine/src/extension/google.rs) -
-//!    A tool for performing web searches and retrieve results.
-//! 2. [`SubmitTool`](https://github.com/ldclabs/anda/blob/main/anda_engine/src/extension/extractor.rs) -
-//!    A tool for extracting structured data using LLMs.
-//! 3. [`TransferTool`](https://github.com/ldclabs/anda/blob/main/tools/anda_icp/src/ledger/transfer.rs) -
-//!    A tool for handling ICP blockchain transfers.
-//! 4. [`BalanceOfTool`](https://github.com/ldclabs/anda/blob/main/tools/anda_icp/src/ledger/balance.rs) -
-//!    A tool for querying ICP blockchain balances.
+//! See the [`anda_engine`](https://github.com/ldclabs/anda/tree/main/anda_engine/src/extension) module
+//! for concrete tool implementations such as:
+//! - [`GoogleSearchTool`](https://github.com/ldclabs/anda/blob/main/anda_engine/src/extension/google.rs) -
+//!   A tool for performing web searches and retrieving results.
+//! - [`Extractor`](https://github.com/ldclabs/anda/blob/main/anda_engine/src/extension/extractor.rs) -
+//!   A tool for extracting structured data using LLMs.
+//! - [`Shell`](https://github.com/ldclabs/anda/blob/main/anda_engine/src/extension/shell.rs) -
+//!   A tool for executing shell commands.
 //!
-//! These reference implementations share a common feature: they automatically generate the JSON Schema.
-//! required for LLMs Function Calling.
+//! These reference implementations share a common feature: they automatically generate the JSON Schema
+//! required for LLM Function Calling.
 
 use serde::{Serialize, de::DeserializeOwned};
 use std::{collections::BTreeMap, future::Future, marker::PhantomData, sync::Arc};

@@ -18,7 +18,7 @@ More information about this crate can be found in the [crate documentation][docs
 - **Tool Integration**: Register and manage tools that agents can utilize
 - **Context Management**: Handle execution contexts with cancellation support
 - **Storage System**: Persistent storage with object and vector search capabilities
-- **Model Integration**: Support for multiple AI model providers (OpenAI, DeepSeek, Cohere)
+- **Model Integration**: Support for multiple AI model providers (OpenAI, DeepSeek, Anthropic, Gemini)
 - **Extension System**: Additional capabilities including attention management and document processing
 
 ## License
