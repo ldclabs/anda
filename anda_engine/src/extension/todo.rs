@@ -6,7 +6,8 @@
 //! - and the public tool entrypoint ([`TodoTool`]).
 //!
 //! The todo list is session-scoped rather than durable. Repeated calls in the
-//! same context tree see the same ordered task list.
+//! same context tree, including sub-agents spawned from that session, see the
+//! same ordered task list.
 
 use anda_core::{BoxError, FunctionDefinition, Resource, Tool, ToolOutput};
 use parking_lot::RwLock;
@@ -328,6 +329,8 @@ impl TodoTool {
             description: concat!(
                 "Manage your task list for the current session. Use for complex tasks ",
                 "with 3+ steps or when the user provides multiple tasks. ",
+                "This list is shared across the current agent and its sub-agents ",
+                "within the same session/context tree. ",
                 "Call with no parameters to read the current list.\n\n",
                 "Writing:\n",
                 "- Provide 'todos' array to create/update items\n",
