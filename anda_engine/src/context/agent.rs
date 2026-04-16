@@ -1881,7 +1881,7 @@ mod tests {
                         "input": {"type": "string"}
                     }
                 }),
-                strict: None,
+                strict: Some(true),
             }
         }
 
@@ -1927,7 +1927,7 @@ mod tests {
                 name: "fail_tool".to_string(),
                 description: "Always fails".to_string(),
                 parameters: json!({"type": "object", "properties": {}}),
-                strict: None,
+                strict: Some(true),
             }
         }
 
@@ -3018,7 +3018,7 @@ mod tests {
                     name: "artifact_tool".to_string(),
                     description: "Returns artifacts".to_string(),
                     parameters: json!({"type": "object", "properties": {}}),
-                    strict: None,
+                    strict: Some(true),
                 }
             }
 

@@ -105,7 +105,7 @@ impl Tool<BaseCtx> for ReadFileTool {
                 },
                 "required": ["path"]
             }),
-            strict: None,
+            strict: Some(true),
         }
     }
 

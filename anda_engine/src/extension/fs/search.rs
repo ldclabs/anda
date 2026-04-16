@@ -94,7 +94,7 @@ impl Tool<BaseCtx> for SearchFileTool {
                 },
                 "required": ["pattern"]
             }),
-            strict: None,
+            strict: Some(true),
         }
     }
 

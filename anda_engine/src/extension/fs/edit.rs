@@ -105,7 +105,7 @@ impl Tool<BaseCtx> for EditFileTool {
                 },
                 "required": ["path", "old_string", "new_string"]
             }),
-            strict: None,
+            strict: Some(true),
         }
     }
 

@@ -90,7 +90,7 @@ where
                 "required": ["prompt"],
                 "additionalProperties": false
             }),
-            strict: None,
+            strict: Some(true),
         }
     }
 

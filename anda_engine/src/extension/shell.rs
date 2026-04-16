@@ -304,7 +304,7 @@ impl Tool<BaseCtx> for ShellTool {
                 },
                 "required": ["command"]
             }),
-            strict: None,
+            strict: Some(true),
         }
     }
 

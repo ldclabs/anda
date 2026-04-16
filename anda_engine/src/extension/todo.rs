@@ -405,7 +405,7 @@ impl Tool<BaseCtx> for TodoTool {
                 "required": [],
                 "additionalProperties": false
             }),
-            strict: None,
+            strict: Some(true),
         }
     }
 

@@ -59,7 +59,7 @@ impl Agent<AgentCtx> for SubAgent {
                 "required": ["prompt"],
                 "additionalProperties": false
             }),
-            strict: None,
+            strict: Some(true),
         }
     }
 
@@ -433,7 +433,7 @@ impl Tool<BaseCtx> for SubAgentManager {
                 "required": ["name", "description", "instructions"],
                 "additionalProperties": false
             }),
-            strict: None,
+            strict: Some(true),
         }
     }
 

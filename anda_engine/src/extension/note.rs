@@ -332,7 +332,7 @@ impl Tool<BaseCtx> for NoteTool {
                 "required": [],
                 "additionalProperties": false
             }),
-            strict: None,
+            strict: Some(true),
         }
     }
 

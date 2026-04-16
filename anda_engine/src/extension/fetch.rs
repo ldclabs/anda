@@ -198,7 +198,7 @@ impl Tool<BaseCtx> for FetchWebResourcesTool {
             name: self.name(),
             description: self.description(),
             parameters: self.schema.clone(),
-            strict: None,
+            strict: Some(true),
         }
     }
 

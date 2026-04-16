@@ -146,6 +146,9 @@ static DEFAULT_SKILL_TOOLS: &[&str] = &[
     "search_file",
     "write_file",
     "edit_file",
+    "todo",
+    "tools_search",
+    "tools_select",
 ];
 
 impl SkillManager {
@@ -996,7 +999,7 @@ impl Tool<BaseCtx> for SkillManager {
                 "required": ["action", "name"],
                 "additionalProperties": false
             }),
-            strict: None,
+            strict: Some(true),
         }
     }
 
@@ -1159,6 +1162,9 @@ Beta instructions.
                 "search_file",
                 "write_file",
                 "edit_file",
+                "todo",
+                "tools_search",
+                "tools_select",
                 "fetch"
             ]
         );
@@ -1210,6 +1216,9 @@ Beta instructions.
                 "search_file",
                 "write_file",
                 "edit_file",
+                "todo",
+                "tools_search",
+                "tools_select",
                 "fetch"
             ]
         );
@@ -1343,6 +1352,9 @@ Beta instructions.
                 "search_file",
                 "write_file",
                 "edit_file",
+                "todo",
+                "tools_search",
+                "tools_select",
                 "fetch"
             ]
         );

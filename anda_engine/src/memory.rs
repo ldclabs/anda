@@ -924,7 +924,7 @@ impl Tool<BaseCtx> for MemoryReadonly {
             name: self.name(),
             description: self.description(),
             parameters: self.memory.kip_function_definitions.parameters.clone(),
-            strict: None,
+            strict: Some(true),
         }
     }
 
@@ -979,7 +979,7 @@ impl Tool<BaseCtx> for GetResourceContentTool {
             name: self.name(),
             description: self.description(),
             parameters: self.schema.clone(),
-            strict: None,
+            strict: Some(true),
         }
     }
 
@@ -1070,7 +1070,7 @@ impl Tool<BaseCtx> for ListConversationsTool {
                 "required": [],
                 "additionalProperties": false
             }),
-            strict: None,
+            strict: Some(true),
         }
     }
 
@@ -1168,7 +1168,7 @@ impl Tool<BaseCtx> for SearchConversationsTool {
                 "required": ["query"],
                 "additionalProperties": false
             }),
-            strict: None,
+            strict: Some(true),
         }
     }
 
@@ -1284,7 +1284,7 @@ impl Tool<BaseCtx> for MemoryTool {
             name: self.name(),
             description: self.description(),
             parameters: self.schema.clone(),
-            strict: None,
+            strict: Some(true),
         }
     }
 

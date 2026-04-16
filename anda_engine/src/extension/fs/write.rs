@@ -105,7 +105,7 @@ impl Tool<BaseCtx> for WriteFileTool {
                 },
                 "required": ["path", "content"]
             }),
-            strict: None,
+            strict: Some(true),
         }
     }
 

@@ -93,7 +93,7 @@ impl Agent<AgentCtx> for ToolsSearch {
                 "required": ["query"],
                 "additionalProperties": false
             }),
-            strict: None,
+            strict: Some(true),
         }
     }
 
@@ -324,7 +324,7 @@ impl Agent<AgentCtx> for ToolsSelect {
                 "required": [],
                 "additionalProperties": false
             }),
-            strict: None,
+            strict: Some(true),
         }
     }
 
@@ -606,7 +606,7 @@ mod tests {
                     },
                     "additionalProperties": false
                 }),
-                strict: None,
+                strict: Some(true),
             }
         }
 
@@ -649,7 +649,7 @@ mod tests {
                     "properties": {},
                     "additionalProperties": false
                 }),
-                strict: None,
+                strict: Some(true),
             }
         }
 
