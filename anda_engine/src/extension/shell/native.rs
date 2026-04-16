@@ -1,5 +1,6 @@
 use anda_core::{BoxError, StateFeatures};
 use async_trait::async_trait;
+use ic_auth_types::Xid;
 use std::{
     borrow::Cow,
     collections::HashMap,
@@ -8,8 +9,8 @@ use std::{
     process::Stdio,
 };
 
-use super::{DynExecutorHook, ExecArgs, ExecOutput, Executor, ExecutorHook};
-use crate::context::BaseCtx;
+use super::{ExecArgs, ExecOutput, Executor, ShellToolHook};
+use crate::{context::BaseCtx, hook::ToolHook};
 
 /// Native runtime — full access, runs on Mac/Linux/Docker/Raspberry Pi
 pub struct NativeRuntime {
@@ -62,11 +63,7 @@ impl Executor for NativeRuntime {
         envs: HashMap<String, String>,
     ) -> Result<ExecOutput, BoxError> {
         let shell = self.shell.as_ref().ok_or_else(|| missing_shell_error())?;
-        let hook = ctx.get_state::<DynExecutorHook>();
-        if let Some(hook) = &hook {
-            hook.on_execution_start(&ctx, &input).await?;
-        }
-
+        let hook = ctx.get_state::<ShellToolHook>();
         let work_dir = ctx
             .meta()
             .get_extra_as::<String>("work_dir")
@@ -91,9 +88,6 @@ impl Executor for NativeRuntime {
             match child.wait_with_output().await {
                 Ok(output) => {
                     let exec_output = ExecOutput::from_output(pid, Some(output), temp_dir).await;
-                    if let Some(hook) = &hook {
-                        hook.on_execution_end(&ctx, &input, &exec_output).await;
-                    }
                     return Ok(exec_output);
                 }
                 Err(err) => {
@@ -102,18 +96,16 @@ impl Executor for NativeRuntime {
                         stderr: Some(format!("Failed to execute background process: {err}")),
                         ..Default::default()
                     };
-                    if let Some(hook) = &hook {
-                        hook.on_execution_end(&ctx, &input, &exec_output).await;
-                    }
                     return Ok(exec_output);
                 }
             }
         }
 
+        let task_id = format!("{}:{}", self.name(), Xid::new());
         let temp_dir = self.temp_dir();
         let exec_output = ExecOutput::from_output(pid, None, temp_dir).await;
         if let Some(hook) = &hook {
-            hook.on_execution_end(&ctx, &input, &exec_output).await;
+            hook.on_background_start(&ctx, &task_id, &input).await;
         }
 
         {
@@ -124,7 +116,7 @@ impl Executor for NativeRuntime {
                         let exec_output =
                             ExecOutput::from_output(pid, Some(output), &temp_dir).await;
                         if let Some(hook) = &hook {
-                            hook.on_background_end(ctx, input, exec_output).await;
+                            hook.on_background_end(ctx, task_id, exec_output).await;
                         }
                     }
                     Err(err) => {
@@ -134,7 +126,7 @@ impl Executor for NativeRuntime {
                             ..Default::default()
                         };
                         if let Some(hook) = &hook {
-                            hook.on_background_end(ctx, input, exec_output).await;
+                            hook.on_background_end(ctx, task_id, exec_output).await;
                         }
                     }
                 }
@@ -319,11 +311,11 @@ mod tests {
     }
 
     struct TestHook {
-        sender: Mutex<Option<oneshot::Sender<(ExecArgs, ExecOutput)>>>,
+        sender: Mutex<Option<oneshot::Sender<(String, ExecOutput)>>>,
     }
 
     impl TestHook {
-        fn new(sender: oneshot::Sender<(ExecArgs, ExecOutput)>) -> Self {
+        fn new(sender: oneshot::Sender<(String, ExecOutput)>) -> Self {
             Self {
                 sender: Mutex::new(Some(sender)),
             }
@@ -331,10 +323,10 @@ mod tests {
     }
 
     #[async_trait]
-    impl ExecutorHook for TestHook {
-        async fn on_background_end(&self, _ctx: BaseCtx, input: ExecArgs, output: ExecOutput) {
+    impl ToolHook<ExecArgs, ExecOutput> for TestHook {
+        async fn on_background_end(&self, _ctx: BaseCtx, task_id: String, output: ExecOutput) {
             if let Some(sender) = self.sender.lock().unwrap().take() {
-                let _ = sender.send((input, output));
+                let _ = sender.send((task_id, output));
             }
         }
     }
@@ -640,7 +632,7 @@ mod tests {
         let work_dir = TestTempDir::new("anda-native-background").await;
         let shell = shell_for_tests();
         let (sender, receiver) = oneshot::channel();
-        let hook = DynExecutorHook::new(Arc::new(TestHook::new(sender)));
+        let hook = ShellToolHook::new(Arc::new(TestHook::new(sender)));
         ctx.base.set_state(hook);
         let runtime = NativeRuntime::test(Some(shell.clone()), work_dir.path().to_path_buf());
         let input = ExecArgs {
@@ -660,13 +652,12 @@ mod tests {
         assert_eq!(output.stdout, None);
         assert_eq!(output.stderr, None);
 
-        let (hook_input, hook_output) = tokio::time::timeout(Duration::from_secs(5), receiver)
+        let (task_id, hook_output) = tokio::time::timeout(Duration::from_secs(5), receiver)
             .await
             .unwrap()
             .unwrap();
 
-        assert_eq!(hook_input.command, input.command);
-        assert_eq!(hook_input.background, input.background);
+        assert!(task_id.contains("native"));
         assert_eq!(hook_output.process_id, output.process_id);
         assert_eq!(hook_output.stdout.as_deref().map(str::trim), Some("bg-out"));
         assert_eq!(hook_output.stderr.as_deref().map(str::trim), Some("bg-err"));

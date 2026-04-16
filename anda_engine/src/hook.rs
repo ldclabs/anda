@@ -50,16 +50,28 @@ pub trait Hook: Send + Sync {
 #[async_trait]
 pub trait ToolHook<I, O>: Send + Sync
 where
-    I: Send + 'static,
-    O: Send + 'static,
+    I: Send + Sync + 'static,
+    O: Send + Sync + 'static,
 {
+    /// This method is called before a tool is called, allowing you to modify the input arguments.
     async fn before_tool_call(&self, _ctx: &BaseCtx, args: I) -> Result<I, BoxError> {
         Ok(args)
     }
 
-    async fn after_tool_call(&self, _ctx: &BaseCtx, output: O) -> Result<O, BoxError> {
+    /// This method is called after a tool is called, allowing you to modify the output.
+    async fn after_tool_call(
+        &self,
+        _ctx: &BaseCtx,
+        output: ToolOutput<O>,
+    ) -> Result<ToolOutput<O>, BoxError> {
         Ok(output)
     }
+
+    /// This method can be called to handle the start of an asynchronous tool execution when the tool is executed in the background.
+    async fn on_background_start(&self, _ctx: &BaseCtx, _task_id: &str, _args: &I) {}
+
+    /// This method can be called to handle the final output when the tool is executed asynchronously in the background.
+    async fn on_background_end(&self, _ctx: BaseCtx, _task_id: String, _output: O) {}
 }
 
 #[derive(Clone)]
@@ -69,8 +81,8 @@ pub struct DynToolHook<I, O> {
 
 impl<I, O> DynToolHook<I, O>
 where
-    I: Send + 'static,
-    O: Send + 'static,
+    I: Send + Sync + 'static,
+    O: Send + Sync + 'static,
 {
     pub fn new(inner: Arc<dyn ToolHook<I, O>>) -> Self {
         Self { inner }
@@ -80,15 +92,27 @@ where
 #[async_trait]
 impl<I, O> ToolHook<I, O> for DynToolHook<I, O>
 where
-    I: Send + 'static,
-    O: Send + 'static,
+    I: Send + Sync + 'static,
+    O: Send + Sync + 'static,
 {
     async fn before_tool_call(&self, ctx: &BaseCtx, args: I) -> Result<I, BoxError> {
         self.inner.before_tool_call(ctx, args).await
     }
 
-    async fn after_tool_call(&self, ctx: &BaseCtx, output: O) -> Result<O, BoxError> {
+    async fn after_tool_call(
+        &self,
+        ctx: &BaseCtx,
+        output: ToolOutput<O>,
+    ) -> Result<ToolOutput<O>, BoxError> {
         self.inner.after_tool_call(ctx, output).await
+    }
+
+    async fn on_background_start(&self, ctx: &BaseCtx, task_id: &str, args: &I) {
+        self.inner.on_background_start(ctx, task_id, args).await;
+    }
+
+    async fn on_background_end(&self, ctx: BaseCtx, task_id: String, output: O) {
+        self.inner.on_background_end(ctx, task_id, output).await;
     }
 }
 

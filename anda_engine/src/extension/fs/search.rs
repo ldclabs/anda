@@ -35,7 +35,7 @@ pub struct SearchFileOutput {
     pub total_matches: usize,
 }
 
-pub type SearchFileHook = DynToolHook<SearchFileArgs, ToolOutput<SearchFileOutput>>;
+pub type SearchFileHook = DynToolHook<SearchFileArgs, SearchFileOutput>;
 
 #[derive(Clone)]
 pub struct SearchFileTool {

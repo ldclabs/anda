@@ -43,7 +43,7 @@ pub struct ReadFileOutput {
     pub total_lines: Option<usize>,
 }
 
-pub type ReadFileHook = DynToolHook<ReadFileArgs, ToolOutput<ReadFileOutput>>;
+pub type ReadFileHook = DynToolHook<ReadFileArgs, ReadFileOutput>;
 
 #[derive(Clone)]
 pub struct ReadFileTool {

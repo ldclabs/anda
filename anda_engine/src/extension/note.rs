@@ -211,7 +211,7 @@ impl NoteStore {
     }
 }
 
-pub type NoteToolHook = DynToolHook<NoteArgs, ToolOutput<NoteOutput>>;
+pub type NoteToolHook = DynToolHook<NoteArgs, NoteOutput>;
 
 /// Tool implementation that exposes a persistent agent-scoped note store.
 #[derive(Clone)]

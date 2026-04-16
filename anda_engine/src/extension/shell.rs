@@ -78,53 +78,53 @@ pub trait Executor: Send + Sync {
     ) -> Result<ExecOutput, BoxError>;
 }
 
-/// Hook for receiving callbacks when a background command finishes.
-#[async_trait]
-pub trait ExecutorHook: Send + Sync {
-    /// Called before any command execution (foreground or background).
-    /// The execution will be cancelled if this returns an error.
-    async fn on_execution_start(&self, _ctx: &BaseCtx, _input: &ExecArgs) -> Result<(), BoxError> {
-        Ok(())
-    }
+// /// Hook for receiving callbacks when a background command finishes.
+// #[async_trait]
+// pub trait ExecutorHook: Send + Sync {
+//     /// Called before any command execution (foreground or background).
+//     /// The execution will be cancelled if this returns an error.
+//     async fn on_execution_start(&self, _ctx: &BaseCtx, _input: &ExecArgs) -> Result<(), BoxError> {
+//         Ok(())
+//     }
 
-    /// Called after any command execution (foreground or background).
-    async fn on_execution_end(&self, _ctx: &BaseCtx, _input: &ExecArgs, _output: &ExecOutput) {
-        // Default implementation does nothing.
-    }
+//     /// Called after any command execution (foreground or background).
+//     async fn on_execution_end(&self, _ctx: &BaseCtx, _input: &ExecArgs, _output: &ExecOutput) {
+//         // Default implementation does nothing.
+//     }
 
-    /// Called after a background execution ends.
-    ///
-    /// The default implementation is a no-op.
-    async fn on_background_end(&self, _ctx: BaseCtx, _input: ExecArgs, _output: ExecOutput) {
-        // Default implementation does nothing.
-    }
-}
+//     /// Called after a background execution ends.
+//     ///
+//     /// The default implementation is a no-op.
+//     async fn on_background_end(&self, _ctx: BaseCtx, _input: ExecArgs, _output: ExecOutput) {
+//         // Default implementation does nothing.
+//     }
+// }
 
-#[derive(Clone)]
-pub struct DynExecutorHook {
-    inner: Arc<dyn ExecutorHook>,
-}
+// #[derive(Clone)]
+// pub struct DynExecutorHook {
+//     inner: Arc<dyn ExecutorHook>,
+// }
 
-impl DynExecutorHook {
-    pub fn new(inner: Arc<dyn ExecutorHook>) -> Self {
-        Self { inner }
-    }
-}
+// impl DynExecutorHook {
+//     pub fn new(inner: Arc<dyn ExecutorHook>) -> Self {
+//         Self { inner }
+//     }
+// }
 
-#[async_trait]
-impl ExecutorHook for DynExecutorHook {
-    async fn on_execution_start(&self, ctx: &BaseCtx, input: &ExecArgs) -> Result<(), BoxError> {
-        self.inner.on_execution_start(ctx, input).await
-    }
+// #[async_trait]
+// impl ExecutorHook for DynExecutorHook {
+//     async fn on_execution_start(&self, ctx: &BaseCtx, input: &ExecArgs) -> Result<(), BoxError> {
+//         self.inner.on_execution_start(ctx, input).await
+//     }
 
-    async fn on_execution_end(&self, ctx: &BaseCtx, input: &ExecArgs, output: &ExecOutput) {
-        self.inner.on_execution_end(ctx, input, output).await
-    }
+//     async fn on_execution_end(&self, ctx: &BaseCtx, input: &ExecArgs, output: &ExecOutput) {
+//         self.inner.on_execution_end(ctx, input, output).await
+//     }
 
-    async fn on_background_end(&self, ctx: BaseCtx, input: ExecArgs, output: ExecOutput) {
-        self.inner.on_background_end(ctx, input, output).await
-    }
-}
+//     async fn on_background_end(&self, ctx: BaseCtx, input: ExecArgs, output: ExecOutput) {
+//         self.inner.on_background_end(ctx, input, output).await
+//     }
+// }
 
 /// Arguments for process execution
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -224,7 +224,7 @@ impl ExecOutput {
     }
 }
 
-pub type ShellToolHook = DynToolHook<ExecArgs, ToolOutput<ExecOutput>>;
+pub type ShellToolHook = DynToolHook<ExecArgs, ExecOutput>;
 
 /// Tool implementation that exposes shell command execution to the engine.
 #[derive(Clone)]

@@ -305,7 +305,7 @@ pub struct TodoOutput {
     pub summary: TodoSummary,
 }
 
-pub type TodoToolHook = DynToolHook<TodoArgs, ToolOutput<TodoOutput>>;
+pub type TodoToolHook = DynToolHook<TodoArgs, TodoOutput>;
 
 /// Tool implementation that exposes the session todo list to the agent.
 #[derive(Clone)]

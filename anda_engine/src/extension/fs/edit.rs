@@ -37,7 +37,7 @@ pub struct EditFileOutput {
     pub size: u64,
 }
 
-pub type EditFileHook = DynToolHook<EditFileArgs, ToolOutput<EditFileOutput>>;
+pub type EditFileHook = DynToolHook<EditFileArgs, EditFileOutput>;
 
 #[derive(Clone)]
 pub struct EditFileTool {

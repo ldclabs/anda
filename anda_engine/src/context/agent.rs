@@ -200,7 +200,8 @@ impl AgentCtx {
             steering_message: Vec::new(),
             follow_up_message: VecDeque::new(),
             done: false,
-            step: 0,
+            unbound: false,
+            turns: 0,
             pruned: 0,
         }
     }
@@ -967,7 +968,8 @@ pub struct CompletionRunner {
     steering_message: Vec<String>,
     follow_up_message: VecDeque<String>,
     done: bool,
-    step: usize,
+    unbound: bool,
+    turns: usize,
     pruned: usize,
 }
 
@@ -977,9 +979,23 @@ impl CompletionRunner {
         self.done
     }
 
-    /// Returns the number of steps executed.
-    pub fn steps(&self) -> usize {
-        self.step
+    /// Returns the number of turns executed.
+    pub fn turns(&self) -> usize {
+        self.turns
+    }
+
+    /// Enables or disables unbound mode.
+    ///
+    /// In unbound mode, reaching an idle boundary does not finalize the runner. The step still
+    /// returns its latest [`AgentOutput`], and later calls to [`Self::next`] return `Ok(None)`
+    /// while the runner is idle until new input is queued via [`Self::follow_up`] or
+    /// [`Self::steer`]. Terminal failures still finalize the runner.
+    ///
+    /// This mode is primarily useful when driving [`CompletionRunner`] directly. A
+    /// [`CompletionStream`] still terminates permanently after it yields `None`, per the [`Stream`]
+    /// contract.
+    pub fn set_unbound(&mut self, unbound: bool) {
+        self.unbound = unbound;
     }
 
     /// Queue a steering message to interrupt the agent mid-run.
@@ -989,23 +1005,41 @@ impl CompletionRunner {
         self.steering_message.push(message);
     }
 
-    // Drains all pending steering messages and follow-up messages, and returns them as a single string to be injected into the next prompt.
+    /// Queue a follow-up message to be processed after the agent finishes.
+    /// Delivered only when agent has no more tool calls or steering messages.
+    /// No effect if the completion has finished.
+    pub fn follow_up(&mut self, message: String) {
+        self.follow_up_message.push_back(message);
+    }
+
+    // Drains all queued steering messages into a single user turn. When steering exists, queued
+    // follow-up messages are prepended so the next round sees one combined instruction.
     fn drain_steering_message(&mut self) -> Option<String> {
         if self.steering_message.is_empty() {
             None
         } else {
-            // Combine follow-up messages and steering messages, with follow-up messages placed before steering messages, to ensure follow-up instructions are delivered even when there are steering messages.
+            // Follow-up messages are placed before steering messages to preserve the deferred user
+            // intent when an operator also injects steering.
             let mut msgs: Vec<String> = self.follow_up_message.drain(..).collect();
             msgs.append(&mut self.steering_message);
             Some(msgs.join("\n\n"))
         }
     }
 
-    /// Queue a follow-up message to be processed after the agent finishes.
-    /// Delivered only when agent has no more tool calls or steering messages.
-    /// No effect if the completion has finished.
-    pub fn follow_up(&mut self, message: String) {
-        self.follow_up_message.push_back(message);
+    fn take_queued_user_message(&mut self) -> Option<String> {
+        self.drain_steering_message()
+            .or_else(|| self.follow_up_message.pop_front())
+    }
+
+    fn set_next_user_prompt(&mut self, prompt: String) {
+        self.req.prompt = prompt;
+        self.req.role = Some("user".to_string());
+    }
+
+    fn intermediate_output(&self, mut output: AgentOutput) -> AgentOutput {
+        output.usage = self.usage.clone();
+        output.chat_history = self.chat_history.clone();
+        output
     }
 
     /// Prune the raw history of the completion request to reduce tokens usage.
@@ -1037,7 +1071,9 @@ impl CompletionRunner {
     /// - Calls the model completion.
     /// - Automatically handles tool/agent calls and writes the results back to the conversation history.
     /// - If there are more steps, it constructs the next request and returns the current intermediate result.
-    /// - If completed or failed, it returns the final result; the next call will return Ok(None).
+    /// - If completed or failed, it returns the final result; the next call will return `Ok(None)`.
+    /// - In unbound mode, an idle boundary returns the latest step output without finalizing. A
+    ///   later call returns `Ok(None)` until new input is queued.
     ///
     pub async fn next(&mut self) -> Result<Option<AgentOutput>, BoxError> {
         if self.done {
@@ -1058,18 +1094,25 @@ impl CompletionRunner {
     }
 
     async fn inner_next(&mut self) -> Result<Option<AgentOutput>, BoxError> {
-        self.step += 1;
+        if self.req.prompt.is_empty() && self.req.content.is_empty() {
+            if let Some(prompt) = self.take_queued_user_message() {
+                self.set_next_user_prompt(prompt);
+            } else {
+                return Ok(None);
+            }
+        }
 
+        self.turns += 1;
         let req = self.req.clone();
-        let label = req.model.as_ref().unwrap_or(&self.ctx.label);
 
+        let label = req.model.as_ref().unwrap_or(&self.ctx.label);
         let model = self
             .ctx
             .models
             .get_model_by(label)
             .unwrap_or_else(|| self.ctx.model.clone());
 
-        let mut output = model.completion(req.clone()).await?;
+        let mut output = model.completion(req).await?;
         output.model = Some(model.model_name());
 
         self.usage.accumulate(&output.usage);
@@ -1085,7 +1128,7 @@ impl CompletionRunner {
                 .clone()
                 .unwrap_or_else(|| "unknown error".to_string());
 
-            let mut output2 = fallback.completion(req).await?;
+            let mut output2 = fallback.completion(self.req.clone()).await?;
             output2.model = Some(fallback.model_name());
             self.usage.accumulate(&output2.usage);
 
@@ -1100,34 +1143,32 @@ impl CompletionRunner {
             output = output2;
         }
 
-        // 关闭下一轮模型输出中的工具调用强制需求（如果有的话）
+        if output.failed_reason.is_some() {
+            return Ok(Some(self.final_output(output)));
+        }
+
+        // Clear one-shot constraints before preparing the next turn.
         self.req.tool_choice_required = false;
         self.req.output_schema = None;
-        // 累计所有原始对话历史（包含初始的 req.raw_history 和 req.chat_history）
+        self.req.chat_history.clear();
+        self.req.documents.clear();
+        self.req.content.clear();
+        self.req.prompt.clear();
+        self.req.role = None;
+        // Accumulate all raw history, including the original request history.
         self.req.raw_history.append(&mut output.raw_history);
-        // 累计所有对话历史（不包含初始的 req.chat_history）
+        // Accumulate all generated chat history, excluding the original request history.
         self.chat_history.append(&mut output.chat_history);
 
         if let Some(prompt) = self.drain_steering_message() {
-            // 把所有转向消息作为下一轮的用户输入，直接注入到 prompt 中，确保模型能正确接收到转向指令；同时清空工具调用需求，避免模型继续要求调用工具
             if !output.tool_calls.is_empty() {
-                // 去掉模型最后的 tool_calls 输出，避免对后续轮次造成干扰
+                // Drop the raw tool-call assistant turn so the redirected round does not inherit
+                // an unfinished tool-call requirement.
                 self.req.raw_history.pop();
             }
 
-            self.req.chat_history.clear();
-            self.req.documents.clear();
-            self.req.content.clear();
-            self.req.prompt = prompt;
-            self.req.role = Some("user".to_string());
-
-            // 返回本轮的中间结果（带当前累计 usage；不强制覆盖 artifacts/tool_calls，
-            // 让调用方查看模型本轮原始输出；最终轮会附带汇总）
-            output.usage = self.usage.clone();
-            // 本次 output 也包含当前所有对话
-            output.chat_history = self.chat_history.clone();
-
-            return Ok(Some(output));
+            self.set_next_user_prompt(prompt);
+            return Ok(Some(self.intermediate_output(output)));
         }
 
         // 自动执行工具/代理调用
@@ -1294,45 +1335,18 @@ impl CompletionRunner {
 
         // 如果有需要继续调用工具
         if !tool_calls_continue.is_empty() {
-            // 准备下一轮请求
-            self.req.chat_history.clear();
-            self.req.documents.clear();
-            self.req.content.clear();
-            self.req.prompt.clear();
-            // 追加到下一轮请求
             self.req.role = Some("tool".to_string());
             self.req.content.append(&mut tool_calls_continue);
-
-            // 返回本轮的中间结果（带当前累计 usage；不强制覆盖 artifacts/tool_calls，
-            // 让调用方查看模型本轮原始输出；最终轮会附带汇总）
-            // // output.tool_calls = self.tool_calls_result.clone();
-            // // output.artifacts = self.artifacts.clone();
-            output.usage = self.usage.clone();
-            // 本次 output 也包含当前所有对话
-            output.chat_history = self.chat_history.clone();
-
-            return Ok(Some(output));
+            return Ok(Some(self.intermediate_output(output)));
         }
 
-        // 如果有 steering_message / follow_up_message 则继续下一轮对话
-        if let Some(prompt) = self
-            .drain_steering_message()
-            .or_else(|| self.follow_up_message.pop_front())
-        {
-            // 准备下一轮 steering 请求
-            self.req.chat_history.clear();
-            self.req.documents.clear();
-            self.req.content.clear();
-            self.req.prompt = prompt;
-            self.req.role = Some("user".to_string());
+        if let Some(prompt) = self.take_queued_user_message() {
+            self.set_next_user_prompt(prompt);
+            return Ok(Some(self.intermediate_output(output)));
+        }
 
-            // 返回本轮的中间结果（带当前累计 usage；不强制覆盖 artifacts/tool_calls，
-            // 让调用方查看模型本轮原始输出；最终轮会附带汇总）
-            output.usage = self.usage.clone();
-            // 本次 output 也包含当前所有对话
-            output.chat_history = self.chat_history.clone();
-
-            return Ok(Some(output));
+        if self.unbound {
+            return Ok(Some(self.intermediate_output(output)));
         }
 
         Ok(Some(self.final_output(output)))
@@ -1350,6 +1364,10 @@ impl CompletionRunner {
     }
 }
 
+/// Stream wrapper for [`CompletionRunner`].
+///
+/// Note that a stream is terminal after yielding `None`. If you need resumable idle behavior via
+/// `set_unbound(true)`, drive [`CompletionRunner::next`] directly instead of using this stream.
 pub struct CompletionStream {
     pub runner: CompletionRunner,
 }
@@ -1992,11 +2010,11 @@ mod tests {
         let mut runner = ctx.completion_iter(req, Vec::new());
 
         assert!(!runner.is_done());
-        assert_eq!(runner.steps(), 0);
+        assert_eq!(runner.turns(), 0);
 
         let output = runner.next().await.unwrap().unwrap();
         assert!(runner.is_done());
-        assert_eq!(runner.steps(), 1);
+        assert_eq!(runner.turns(), 1);
         assert_eq!(output.content, "hello world");
         assert!(output.failed_reason.is_none());
         assert_eq!(output.model, Some("echo".to_string()));
@@ -2026,6 +2044,80 @@ mod tests {
 
         // Further calls return None.
         assert!(runner.next().await.unwrap().is_none());
+        assert!(runner.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_unbound_returns_none_only_after_becoming_idle() {
+        let model = Model::with_completer(Arc::new(EchoCompleter));
+        let ctx = EngineBuilder::new().with_model(model).mock_ctx();
+
+        let req = CompletionRequest {
+            prompt: "initial".to_string(),
+            ..Default::default()
+        };
+
+        let mut runner = ctx.completion_iter(req, Vec::new());
+        runner.set_unbound(true);
+
+        let step1 = runner.next().await.unwrap().unwrap();
+        assert_eq!(step1.content, "initial");
+        assert!(!runner.is_done());
+        assert_eq!(runner.turns(), 1);
+
+        let idle = runner.next().await.unwrap();
+        assert!(idle.is_none());
+        assert!(!runner.is_done());
+        assert_eq!(runner.turns(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_unbound_can_resume_after_idle_with_follow_up() {
+        let model = Model::with_completer(Arc::new(EchoCompleter));
+        let ctx = EngineBuilder::new().with_model(model).mock_ctx();
+
+        let req = CompletionRequest {
+            prompt: "initial".to_string(),
+            ..Default::default()
+        };
+
+        let mut runner = ctx.completion_iter(req, Vec::new());
+        runner.set_unbound(true);
+
+        let step1 = runner.next().await.unwrap().unwrap();
+        assert_eq!(step1.content, "initial");
+        assert!(!runner.is_done());
+
+        assert!(runner.next().await.unwrap().is_none());
+
+        runner.follow_up("resume".to_string());
+
+        let step2 = runner.next().await.unwrap().unwrap();
+        assert_eq!(step2.content, "resume");
+        assert_eq!(step2.usage.input_tokens, 10);
+        assert_eq!(step2.usage.output_tokens, 20);
+        assert!(!runner.is_done());
+
+        assert!(runner.next().await.unwrap().is_none());
+        assert!(!runner.is_done());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_unbound_still_finishes_on_failed_reason() {
+        let model = Model::with_completer(Arc::new(AlwaysFailCompleter));
+        let ctx = EngineBuilder::new().with_model(model).mock_ctx();
+
+        let req = CompletionRequest {
+            prompt: "initial".to_string(),
+            ..Default::default()
+        };
+
+        let mut runner = ctx.completion_iter(req, Vec::new());
+        runner.set_unbound(true);
+
+        let output = runner.next().await.unwrap().unwrap();
+        assert!(runner.is_done());
+        assert_eq!(output.failed_reason.as_deref(), Some("primary failed"));
         assert!(runner.next().await.unwrap().is_none());
     }
 
@@ -2865,13 +2957,13 @@ mod tests {
         };
 
         let mut runner = ctx.completion_iter(req, Vec::new());
-        assert_eq!(runner.steps(), 0);
+        assert_eq!(runner.turns(), 0);
 
-        runner.next().await.unwrap(); // step 1
-        assert_eq!(runner.steps(), 1);
+        runner.next().await.unwrap(); // turn 1
+        assert_eq!(runner.turns(), 1);
 
-        runner.next().await.unwrap(); // step 2 (final)
-        assert_eq!(runner.steps(), 2);
+        runner.next().await.unwrap(); // turn 2 (final)
+        assert_eq!(runner.turns(), 2);
     }
 
     // ── Chat history accumulation tests ──

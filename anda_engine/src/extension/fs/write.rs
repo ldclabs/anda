@@ -42,7 +42,7 @@ pub struct WriteFileOutput {
     pub size: u64,
 }
 
-pub type WriteFileHook = DynToolHook<WriteFileArgs, ToolOutput<WriteFileOutput>>;
+pub type WriteFileHook = DynToolHook<WriteFileArgs, WriteFileOutput>;
 
 #[derive(Clone)]
 pub struct WriteFileTool {
