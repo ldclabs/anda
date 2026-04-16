@@ -69,7 +69,7 @@ TEE 启动后，IC-TEE Gateway 会做如下工作：
 #### [代理（Agents）](https://docs.rs/anda_core/latest/anda_core/agent/index.html)
 
 - 使用 `Agent` 特性定义 AI 代理，该特性指定了执行逻辑、依赖关系和元数据等能力。
-- 使用 `AgentSet` 管理多个代理，并通过 `AgentDyn` 实现动态分发，以实现运行时的灵活性。
+- 使用 `AgentSet` 管理多个代理，并通过 `DynAgent` 实现动态分发，以实现运行时的灵活性。
 - 示例用例：数据提取、文档分割、角色扮演 AI。
 
 ```rust
@@ -99,7 +99,7 @@ pub trait Agent<C: AgentContext> {
 #### [工具（Tools）](https://docs.rs/anda_core/latest/anda_core/tool/index.html)
 
 - 通过 `Tool` 特性实现可重用的工具（例如 API、区块链交互）。工具强制执行类型安全的输入/输出，并自动生成 JSON 函数定义以便与 LLM 集成。
-- 使用 `ToolSet` 管理工具，并通过 `ToolDyn` 动态调用它们。
+- 使用 `ToolSet` 管理工具，并通过 `DynTool` 动态调用它们。
 
 ```rust
 // 简化的 Tool 特性定义

@@ -85,7 +85,7 @@ The Anda Engine is the core scheduling engine of Anda. An Anda AI agent can incl
 #### [Agents](https://docs.rs/anda_core/latest/anda_core/agent/index.html)
 
 - Define AI agents using the `Agent` trait, which specifies capabilities like execution logic, dependencies, and metadata.
-- Use `AgentSet` to manage multiple agents and enable dynamic dispatch via `AgentDyn` for runtime flexibility.
+- Use `AgentSet` to manage multiple agents and enable dynamic dispatch via `DynAgent` for runtime flexibility.
 - Example use cases: Data extraction, document segmentation, role-playing AI.
 
 ```rust
@@ -115,7 +115,7 @@ pub trait Agent<C: AgentContext> {
 #### [Tools](https://docs.rs/anda_core/latest/anda_core/tool/index.html)
 
 - Implement reusable utilities (e.g., APIs, blockchain interactions) via the `Tool` trait. Tools enforce type-safe inputs/outputs and automatically generate JSON function definitions for seamless integration with LLMs.
-- Manage tools with `ToolSet` and invoke them dynamically using `ToolDyn`.
+- Manage tools with `ToolSet` and invoke them dynamically using `DynTool`.
 
 ```rust
 // simplified Tool trait definition

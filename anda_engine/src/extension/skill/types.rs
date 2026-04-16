@@ -172,7 +172,7 @@ impl From<&Skill> for SubAgent {
             name: skill.agent_name.clone(),
             description: skill.frontmatter.description.clone(),
             instructions: format!(
-                "Base directory for this skill: {}\n\nYou are a sub-agent specialised in {:?} skill. Follow these instructions:\n\n{}",
+                "Base directory for this skill: {}\n\nYou are a subagent specialised in {:?} skill. Follow these instructions:\n\n{}",
                 skill.base_dir.display(),
                 skill.frontmatter.name,
                 skill.instructions,
@@ -467,7 +467,7 @@ Research instructions here.
         assert_eq!(agent.tools, vec!["shell", "google_web_search"]);
         assert_eq!(
             agent.instructions,
-            "Base directory for this skill: /test_dir\n\nYou are a sub-agent specialised in \"research\" skill. Follow these instructions:\n\nResearch instructions here."
+            "Base directory for this skill: /test_dir\n\nYou are a subagent specialised in \"research\" skill. Follow these instructions:\n\nResearch instructions here."
         );
 
         let def = agent.definition();

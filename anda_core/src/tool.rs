@@ -3,7 +3,7 @@
 //! This module defines the core traits and structures for creating and managing tools
 //! that can be used by AI Agents. It provides:
 //! - The [`Tool`] trait for defining custom tools with typed arguments and outputs.
-//! - Dynamic dispatch capabilities through [`ToolDyn`] trait.
+//! - Dynamic dispatch capabilities through [`DynTool`] trait.
 //! - A [`ToolSet`] collection for managing multiple tools.
 //!
 //! # Key Features
@@ -140,7 +140,7 @@ where
 ///
 /// This trait allows for runtime polymorphism of tools, enabling different tool implementations.
 /// to be stored and called through a common interface.
-pub trait ToolDyn<C>: Send + Sync
+pub trait DynTool<C>: Send + Sync
 where
     C: BaseContext + Send + Sync,
 {
@@ -166,7 +166,7 @@ where
     T: Tool<C> + 'static,
     C: BaseContext + Send + Sync + 'static;
 
-impl<T, C> ToolDyn<C> for ToolWrapper<T, C>
+impl<T, C> DynTool<C> for ToolWrapper<T, C>
 where
     T: Tool<C> + 'static,
     C: BaseContext + Send + Sync + 'static,
@@ -205,7 +205,7 @@ where
 /// - `C`: The context type that implements [`BaseContext`].
 #[derive(Default)]
 pub struct ToolSet<C: BaseContext> {
-    pub set: BTreeMap<String, Box<dyn ToolDyn<C>>>,
+    pub set: BTreeMap<String, Arc<dyn DynTool<C>>>,
 }
 
 impl<C> ToolSet<C>
@@ -323,17 +323,17 @@ where
         }
 
         let tool_dyn = ToolWrapper(tool, PhantomData);
-        self.set.insert(name, Box::new(tool_dyn));
+        self.set.insert(name, Arc::new(tool_dyn));
         Ok(())
     }
 
     /// Retrieves a tool by name
-    pub fn get(&self, name: &str) -> Option<&dyn ToolDyn<C>> {
-        self.set.get(&name.to_ascii_lowercase()).map(|v| &**v)
+    pub fn get(&self, name: &str) -> Option<Arc<dyn DynTool<C>>> {
+        self.set.get(&name.to_ascii_lowercase()).cloned()
     }
 
     /// Retrieves a tool by lowercase name.
-    pub fn get_lowercase(&self, lowercase_name: &str) -> Option<&dyn ToolDyn<C>> {
-        self.set.get(lowercase_name).map(|v| &**v)
+    pub fn get_lowercase(&self, lowercase_name: &str) -> Option<Arc<dyn DynTool<C>>> {
+        self.set.get(lowercase_name).cloned()
     }
 }

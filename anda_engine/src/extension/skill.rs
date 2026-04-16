@@ -1200,7 +1200,7 @@ Beta instructions.
         assert_eq!(alpha2.description, "Alpha v2 for testing.");
         assert!(
             alpha2.instructions.contains(
-            "You are a sub-agent specialised in \"alpha\" skill. Follow these instructions:\n\nUpdated.")
+            "You are a subagent specialised in \"alpha\" skill. Follow these instructions:\n\nUpdated.")
         );
         assert_eq!(
             alpha2.tools,

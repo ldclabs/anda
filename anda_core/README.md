@@ -24,13 +24,13 @@ More information about this crate can be found in the [crate documentation][docs
 ### 1. Agent Module [`agent.rs`](https://github.com/ldclabs/anda/blob/main/anda_core/src/agent.rs)
 Provides core functionality for creating and managing AI agents:
 - `Agent` trait for defining custom agents
-- `AgentDyn` trait for runtime polymorphism
+- `DynAgent` trait for runtime polymorphism
 - `AgentSet` for managing multiple agents
 
 ### 2. Tool Module [`tool.rs`](https://github.com/ldclabs/anda/blob/main/anda_core/src/tool.rs)
 Defines the core functionality for creating and managing tools:
 - `Tool` trait for defining custom tools with typed arguments
-- `ToolDyn` trait for runtime polymorphism
+- `DynTool` trait for runtime polymorphism
 - `ToolSet` for managing multiple tools
 
 ### 3. Context Module [`context.rs`](https://github.com/ldclabs/anda/blob/main/anda_core/src/context.rs)

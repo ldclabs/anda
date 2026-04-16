@@ -1556,7 +1556,7 @@ mod tests {
             Box::pin(futures::future::ready(Ok(AgentOutput {
                 tool_calls: vec![ToolCall {
                     name: agent_name,
-                    args: json!({"prompt": "sub-agent task"}),
+                    args: json!({"prompt": "subagent task"}),
                     call_id: Some("agent_call_1".into()),
                     result: None,
                     remote_id: None,
@@ -2259,7 +2259,7 @@ mod tests {
                 .output
                 .as_str()
                 .unwrap()
-                .contains("agent_echoed:sub-agent task")
+                .contains("agent_echoed:subagent task")
         );
     }
 

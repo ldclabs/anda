@@ -2,7 +2,7 @@
 //!
 //! This module defines the core traits and structures for creating and managing AI agents. It provides:
 //! - The [`Agent`] trait for defining custom agents with specific capabilities.
-//! - Dynamic dispatch capabilities through [`AgentDyn`] trait.
+//! - Dynamic dispatch capabilities through [`DynAgent`] trait.
 //! - An [`AgentSet`] collection for managing multiple agents.
 //!
 //! # Key Features
@@ -15,7 +15,7 @@
 //! # Architecture Overview
 //! The module follows a dual-trait pattern:
 //! 1. [`Agent`] - Static trait for defining concrete agent implementations.
-//! 2. [`AgentDyn`] - Dynamic trait for runtime polymorphism.
+//! 2. [`DynAgent`] - Dynamic trait for runtime polymorphism.
 //!
 //! The [`AgentSet`] acts as a registry and execution manager for agents, providing:
 //! - Agent registration and lookup.
@@ -143,7 +143,7 @@ where
 ///
 /// This trait allows for runtime polymorphism of agents, enabling dynamic agent selection
 /// and execution without knowing the concrete type at compile time.
-pub trait AgentDyn<C>: Send + Sync
+pub trait DynAgent<C>: Send + Sync
 where
     C: AgentContext + Send + Sync,
 {
@@ -178,7 +178,7 @@ where
     _phantom: PhantomData<C>,
 }
 
-impl<T, C> AgentDyn<C> for AgentWrapper<T, C>
+impl<T, C> DynAgent<C> for AgentWrapper<T, C>
 where
     T: Agent<C> + 'static,
     C: AgentContext + Send + Sync + 'static,
@@ -225,7 +225,7 @@ where
 /// - `C`: The context type that implements [`AgentContext`].
 #[derive(Default)]
 pub struct AgentSet<C: AgentContext> {
-    pub set: BTreeMap<String, Box<dyn AgentDyn<C>>>,
+    pub set: BTreeMap<String, Arc<dyn DynAgent<C>>>,
 }
 
 impl<C> AgentSet<C>
@@ -351,17 +351,17 @@ where
             label: label.unwrap_or_else(|| name.clone()),
             _phantom: PhantomData,
         };
-        self.set.insert(name, Box::new(agent_dyn));
+        self.set.insert(name, Arc::new(agent_dyn));
         Ok(())
     }
 
     /// Retrieves an agent by name.
-    pub fn get(&self, name: &str) -> Option<&dyn AgentDyn<C>> {
-        self.set.get(&name.to_ascii_lowercase()).map(|v| &**v)
+    pub fn get(&self, name: &str) -> Option<Arc<dyn DynAgent<C>>> {
+        self.set.get(&name.to_ascii_lowercase()).cloned()
     }
 
     /// Retrieves an agent by lowercase name.
-    pub fn get_lowercase(&self, lowercase_name: &str) -> Option<&dyn AgentDyn<C>> {
-        self.set.get(lowercase_name).map(|v| &**v)
+    pub fn get_lowercase(&self, lowercase_name: &str) -> Option<Arc<dyn DynAgent<C>>> {
+        self.set.get(lowercase_name).cloned()
     }
 }

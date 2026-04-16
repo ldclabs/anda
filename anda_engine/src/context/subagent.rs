@@ -48,11 +48,11 @@ impl Agent<AgentCtx> for SubAgent {
             description: self.description(),
             parameters: json!({
                 "type": "object",
-                "description": "Run this sub-agent on a focused task. Provide a self-contained prompt with the goal, relevant context, constraints, and expected output.",
+                "description": "Run this subagent on a focused task. Provide a self-contained prompt with the goal, relevant context, constraints, and expected output.",
                 "properties": {
                     "prompt": {
                         "type": "string",
-                        "description": "The task for this sub-agent. Include the objective, relevant context, constraints, preferred workflow or deliverable, and any success criteria needed to complete the work.",
+                        "description": "The task for this subagent. Include the objective, relevant context, constraints, preferred workflow or deliverable, and any success criteria needed to complete the work.",
                         "minLength": 1
                     },
                 },
@@ -97,7 +97,7 @@ impl Agent<AgentCtx> for SubAgent {
             let task_id = format!("{}:{}", self.name(), Xid::new());
             let rt = AgentOutput {
                 content: format!(
-                    "sub-agent is running in the background with task ID: {}",
+                    "subagent is running in the background with task ID: {}",
                     task_id
                 ),
                 ..Default::default()
@@ -117,12 +117,12 @@ impl Agent<AgentCtx> for SubAgent {
                 let mut rt = match ctx.completion(req, Vec::new()).await {
                     Ok(rt) => rt,
                     Err(err) => AgentOutput {
-                        content: format!("sub-agent background task {} error: {}", task_id, err),
+                        content: format!("subagent background task {} error: {}", task_id, err),
                         ..Default::default()
                     },
                 };
                 rt.content = format!(
-                    "sub-agent background task {} completed with output:\n\n{}",
+                    "subagent background task {} completed with output:\n\n{}",
                     task_id, rt.content
                 );
 
@@ -145,10 +145,10 @@ impl Agent<AgentCtx> for SubAgent {
 pub trait SubAgentSet: Send + Sync {
     fn into_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync>;
 
-    /// Checks if a sub-agent with the given lowercase name exists.
+    /// Checks if a subagent with the given lowercase name exists.
     fn contains_lowercase(&self, lowercase_name: &str) -> bool;
 
-    /// Retrieves a sub-agent by lowercase name.
+    /// Retrieves a subagent by lowercase name.
     fn get_lowercase(&self, lowercase_name: &str) -> Option<SubAgent>;
 
     /// Returns definitions for all or specified agents.
@@ -157,10 +157,10 @@ pub trait SubAgentSet: Send + Sync {
     /// - `names`: Optional slice of agent names to filter by.
     ///
     /// # Returns
-    /// - Vec<[`FunctionDefinition`]>: Vector of agent definitions. The name in each definition is prefixed with "SA_" to avoid conflicts and indicate it's a sub-agent.
+    /// - Vec<[`FunctionDefinition`]>: Vector of agent definitions. The name in each definition is prefixed with "SA_" to avoid conflicts and indicate it's a subagent.
     fn definitions(&self, names: Option<&[String]>) -> Vec<FunctionDefinition>;
 
-    /// Selects and returns resources relevant to the specified sub-agent name from the provided list.
+    /// Selects and returns resources relevant to the specified subagent name from the provided list.
     fn select_resources(&self, name: &str, resources: &mut Vec<Resource>) -> Vec<Resource>;
 }
 
@@ -188,7 +188,7 @@ impl SubAgentManager {
         Ok(())
     }
 
-    /// Creates or updates a sub-agent. The name is normalised to lowercase and validated. If an agent with the same name exists, it will be overwritten.
+    /// Creates or updates a subagent. The name is normalised to lowercase and validated. If an agent with the same name exists, it will be overwritten.
     pub async fn upsert(&self, agent: SubAgent) -> Result<(), BoxError> {
         let mut agent = agent;
         let name = agent.name.to_ascii_lowercase();
@@ -210,7 +210,7 @@ impl SubAgentManager {
         Ok(())
     }
 
-    /// Appends new sub-agents without overwriting existing ones. Invalid or duplicate names are skipped.
+    /// Appends new subagents without overwriting existing ones. Invalid or duplicate names are skipped.
     pub async fn try_append(&self, new_agents: Vec<SubAgent>) -> Result<(), BoxError> {
         let data = {
             let mut agents = self.agents.write();
@@ -385,7 +385,7 @@ impl Tool<BaseCtx> for SubAgentManager {
     }
 
     fn description(&self) -> String {
-        "Create or update a reusable sub-agent for a specific scenario. Use this when a task would benefit from a dedicated role, stable instructions, or a restricted toolset. The sub-agent becomes callable later by its name and can handle repeated, domain-specific, or multi-step work with its own instructions and optional tool whitelist.".to_string()
+        "Create or update a reusable subagent for a specific scenario. Use this when a task would benefit from a dedicated role, stable instructions, or a restricted toolset. The subagent becomes callable later by its name and can handle repeated, domain-specific, or multi-step work with its own instructions and optional tool whitelist.".to_string()
     }
 
     fn definition(&self) -> FunctionDefinition {
@@ -394,40 +394,40 @@ impl Tool<BaseCtx> for SubAgentManager {
             description: self.description(),
             parameters: json!({
                 "type": "object",
-                "description": "Create or update a reusable sub-agent configuration.",
+                "description": "Create or update a reusable subagent configuration.",
                 "properties": {
                     "name": {
                         "type": "string",
-                        "description": "Unique callable sub-agent name. Must be lowercase snake_case, start with a letter, contain only letters, digits, or underscores, and be no longer than 64 characters. Choose a short, task-oriented name such as 'research_assistant' or 'tweet_writer'.",
+                        "description": "Unique callable subagent name. Must be lowercase snake_case, start with a letter, contain only letters, digits, or underscores, and be no longer than 64 characters. Choose a short, task-oriented name such as 'research_assistant' or 'tweet_writer'.",
                         "pattern": "^[a-z][a-z0-9_]{0,63}$"
                     },
                     "description": {
                         "type": "string",
-                        "description": "Short routing description shown to the model when deciding whether to call this sub-agent. State when it should be used and what outcome it produces.",
+                        "description": "Short routing description shown to the model when deciding whether to call this subagent. State when it should be used and what outcome it produces.",
                         "minLength": 1
                     },
                     "instructions": {
                         "type": "string",
-                        "description": "Durable system-style instructions for the sub-agent. Define its role, scope, workflow, constraints, decision rules, and expected output style. Write reusable guidance, not a one-off task prompt.",
+                        "description": "Durable system-style instructions for the subagent. Define its role, scope, workflow, constraints, decision rules, and expected output style. Write reusable guidance, not a one-off task prompt.",
                         "minLength": 1
                     },
                     "tools": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Optional whitelist of tool names the sub-agent may use. Include only the minimum tools it needs. Leave empty or omit this field to create a no-tool sub-agent.",
+                        "description": "Optional whitelist of tool names the subagent may use. Include only the minimum tools it needs. Leave empty or omit this field to create a no-tool subagent.",
                         "default": [],
                         "uniqueItems": true
                     },
                     "tags": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Optional list of resource tags that are relevant to this sub-agent. When the sub-agent is called, resources with matching tags will be prioritized for selection and passed to the sub-agent in order of relevance.",
+                        "description": "Optional list of resource tags that are relevant to this subagent. When the subagent is called, resources with matching tags will be prioritized for selection and passed to the subagent in order of relevance.",
                         "default": [],
                         "uniqueItems": true
                     },
                     "background": {
                         "type": "boolean",
-                        "description": "Whether this sub-agent should be executed asynchronously in the background. If true, the agent will return immediately with a message containing a unique task ID, and the final output will be passed to the `on_background_end` hook method when the task is completed. Use this for long-running tasks that don't need to return output immediately, or when you want to handle the final output separately in the hook (e.g. by storing it in a database or sending a notification)."
+                        "description": "Whether this subagent should be executed asynchronously in the background. If true, the agent will return immediately with a message containing a unique task ID, and the final output will be passed to the `on_background_end` hook method when the task is completed. Use this for long-running tasks that don't need to return output immediately, or when you want to handle the final output separately in the hook (e.g. by storing it in a database or sending a notification)."
                     }
                 },
                 "required": ["name", "description", "instructions"],
@@ -474,7 +474,7 @@ mod tests {
         assert_eq!(
             definition.parameters["description"],
             json!(
-                "Run this sub-agent on a focused task. Provide a self-contained prompt with the goal, relevant context, constraints, and expected output."
+                "Run this subagent on a focused task. Provide a self-contained prompt with the goal, relevant context, constraints, and expected output."
             )
         );
         assert_eq!(
@@ -492,7 +492,7 @@ mod tests {
         let definition = tool.definition();
 
         assert_eq!(definition.name, "subagents_manager");
-        assert!(definition.description.contains("reusable sub-agent"));
+        assert!(definition.description.contains("reusable subagent"));
         assert_eq!(
             definition.parameters["properties"]["name"]["pattern"],
             json!("^[a-z][a-z0-9_]{0,63}$")

@@ -261,7 +261,7 @@ impl Engine {
         self.ctx.tools.functions(names)
     }
 
-    /// Returns a reference to the sub-agents manager.
+    /// Returns a reference to the subagents manager.
     pub fn sub_agents_manager(&self) -> Arc<SubAgentSetManager> {
         self.ctx.subagents.clone()
     }
