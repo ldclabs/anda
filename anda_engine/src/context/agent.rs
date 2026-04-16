@@ -38,6 +38,7 @@ use futures_util::Stream;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::json;
 use std::{
+    collections::VecDeque,
     future::Future,
     pin::Pin,
     sync::Arc,
@@ -196,8 +197,8 @@ impl AgentCtx {
             tool_calls: Vec::new(),
             usage: Usage::default(),
             artifacts: Vec::new(),
-            steering_message: None,
-            follow_up_message: None,
+            steering_message: Vec::new(),
+            follow_up_message: VecDeque::new(),
             done: false,
             step: 0,
             pruned: 0,
@@ -963,8 +964,8 @@ pub struct CompletionRunner {
     tool_calls: Vec<ToolCall>,
     usage: Usage,
     artifacts: Vec<Resource>,
-    steering_message: Option<String>,
-    follow_up_message: Option<String>,
+    steering_message: Vec<String>,
+    follow_up_message: VecDeque<String>,
     done: bool,
     step: usize,
     pruned: usize,
@@ -985,14 +986,26 @@ impl CompletionRunner {
     /// Delivered after current tool execution, skips remaining tools.
     /// No effect if the completion has finished.
     pub fn steer(&mut self, message: String) {
-        self.steering_message = Some(message);
+        self.steering_message.push(message);
+    }
+
+    // Drains all pending steering messages and follow-up messages, and returns them as a single string to be injected into the next prompt.
+    fn drain_steering_message(&mut self) -> Option<String> {
+        if self.steering_message.is_empty() {
+            None
+        } else {
+            // Combine follow-up messages and steering messages, with follow-up messages placed before steering messages, to ensure follow-up instructions are delivered even when there are steering messages.
+            let mut msgs: Vec<String> = self.follow_up_message.drain(..).collect();
+            msgs.append(&mut self.steering_message);
+            Some(msgs.join("\n\n"))
+        }
     }
 
     /// Queue a follow-up message to be processed after the agent finishes.
     /// Delivered only when agent has no more tool calls or steering messages.
     /// No effect if the completion has finished.
     pub fn follow_up(&mut self, message: String) {
-        self.follow_up_message = Some(message);
+        self.follow_up_message.push_back(message);
     }
 
     /// Prune the raw history of the completion request to reduce tokens usage.
@@ -1095,8 +1108,8 @@ impl CompletionRunner {
         // 累计所有对话历史（不包含初始的 req.chat_history）
         self.chat_history.append(&mut output.chat_history);
 
-        if let Some(steering) = self.steering_message.take() {
-            // 准备下一轮转向请求
+        if let Some(prompt) = self.drain_steering_message() {
+            // 把所有转向消息作为下一轮的用户输入，直接注入到 prompt 中，确保模型能正确接收到转向指令；同时清空工具调用需求，避免模型继续要求调用工具
             if !output.tool_calls.is_empty() {
                 // 去掉模型最后的 tool_calls 输出，避免对后续轮次造成干扰
                 self.req.raw_history.pop();
@@ -1105,7 +1118,7 @@ impl CompletionRunner {
             self.req.chat_history.clear();
             self.req.documents.clear();
             self.req.content.clear();
-            self.req.prompt = steering;
+            self.req.prompt = prompt;
             self.req.role = Some("user".to_string());
 
             // 返回本轮的中间结果（带当前累计 usage；不强制覆盖 artifacts/tool_calls，
@@ -1122,7 +1135,8 @@ impl CompletionRunner {
         let tool_calls = std::mem::take(&mut output.tool_calls);
         for mut tool in tool_calls.into_iter() {
             if self.ctx.cancellation_token().is_cancelled() {
-                return Err("operation cancelled".into());
+                output.failed_reason = Some("operation cancelled".into());
+                return Ok(Some(self.final_output(output)));
             }
 
             let tool_name = tool.name.to_ascii_lowercase();
@@ -1302,9 +1316,8 @@ impl CompletionRunner {
 
         // 如果有 steering_message / follow_up_message 则继续下一轮对话
         if let Some(prompt) = self
-            .steering_message
-            .take()
-            .or_else(|| self.follow_up_message.take())
+            .drain_steering_message()
+            .or_else(|| self.follow_up_message.pop_front())
         {
             // 准备下一轮 steering 请求
             self.req.chat_history.clear();
@@ -2552,20 +2565,126 @@ mod tests {
         runner.steer("steering".to_string());
         runner.follow_up("follow_up".to_string());
 
-        // Step 1: steering intercepts.
+        // Step 1: drain_steering_message() drains both follow_up and steering together
+        // (follow_up placed before steering per drain_steering_message logic).
         let step1 = runner.next().await.unwrap().unwrap();
         assert!(!runner.is_done());
         assert_eq!(step1.content, "initial");
 
-        // Step 2: processes the steering prompt.
+        // Step 2: processes the combined prompt "follow_up\n\nsteering".
+        let step2 = runner.next().await.unwrap().unwrap();
+        assert!(runner.is_done());
+        assert_eq!(step2.content, "follow_up\n\nsteering");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_multiple_steering_messages_combined() {
+        let model = Model::with_completer(Arc::new(EchoCompleter));
+        let ctx = EngineBuilder::new().with_model(model).mock_ctx();
+
+        let req = CompletionRequest {
+            prompt: "initial".to_string(),
+            ..Default::default()
+        };
+
+        let mut runner = ctx.completion_iter(req, Vec::new());
+        runner.steer("first steer".to_string());
+        runner.steer("second steer".to_string());
+
+        // Step 1: initial completion, steering intercepts.
+        let step1 = runner.next().await.unwrap().unwrap();
+        assert!(!runner.is_done());
+        assert_eq!(step1.content, "initial");
+
+        // Step 2: processes both steering messages combined.
+        let step2 = runner.next().await.unwrap().unwrap();
+        assert!(runner.is_done());
+        assert_eq!(step2.content, "first steer\n\nsecond steer");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_multiple_follow_up_messages_drained_sequentially() {
+        let model = Model::with_completer(Arc::new(EchoCompleter));
+        let ctx = EngineBuilder::new().with_model(model).mock_ctx();
+
+        let req = CompletionRequest {
+            prompt: "initial".to_string(),
+            ..Default::default()
+        };
+
+        let mut runner = ctx.completion_iter(req, Vec::new());
+        runner.follow_up("first follow".to_string());
+        runner.follow_up("second follow".to_string());
+
+        // Step 1: initial completion, first follow_up is delivered.
+        let step1 = runner.next().await.unwrap().unwrap();
+        assert!(!runner.is_done());
+        assert_eq!(step1.content, "initial");
+
+        // Step 2: processes first follow_up.
         let step2 = runner.next().await.unwrap().unwrap();
         assert!(!runner.is_done());
-        assert_eq!(step2.content, "steering");
+        assert_eq!(step2.content, "first follow");
 
-        // Step 3: processes the follow-up prompt.
+        // Step 3: processes second follow_up.
         let step3 = runner.next().await.unwrap().unwrap();
         assert!(runner.is_done());
-        assert_eq!(step3.content, "follow_up");
+        assert_eq!(step3.content, "second follow");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_multiple_steering_and_follow_up_combined() {
+        let model = Model::with_completer(Arc::new(EchoCompleter));
+        let ctx = EngineBuilder::new().with_model(model).mock_ctx();
+
+        let req = CompletionRequest {
+            prompt: "initial".to_string(),
+            ..Default::default()
+        };
+
+        let mut runner = ctx.completion_iter(req, Vec::new());
+        runner.steer("steer 1".to_string());
+        runner.follow_up("follow 1".to_string());
+        runner.steer("steer 2".to_string());
+        runner.follow_up("follow 2".to_string());
+
+        // Step 1: drain_steering_message drains all follow_up first (in order),
+        // then all steering (in order): follow_1, follow_2, steer_1, steer_2.
+        let step1 = runner.next().await.unwrap().unwrap();
+        assert!(!runner.is_done());
+        assert_eq!(step1.content, "initial");
+
+        // Step 2: processes combined prompt.
+        let step2 = runner.next().await.unwrap().unwrap();
+        assert!(runner.is_done());
+        assert_eq!(step2.content, "follow 1\n\nfollow 2\n\nsteer 1\n\nsteer 2");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_steering_empty_drains_follow_up_only() {
+        // When steering_message is empty but follow_up has messages,
+        // drain_steering_message returns None and follow_up is popped via pop_front.
+        let model = Model::with_completer(Arc::new(EchoCompleter));
+        let ctx = EngineBuilder::new().with_model(model).mock_ctx();
+
+        let req = CompletionRequest {
+            prompt: "initial".to_string(),
+            ..Default::default()
+        };
+
+        let mut runner = ctx.completion_iter(req, Vec::new());
+        runner.follow_up("follow only".to_string());
+
+        // Step 1: drain_steering_message returns None (steering empty),
+        // so follow_up_message.pop_front() is used.
+        let step1 = runner.next().await.unwrap().unwrap();
+        assert!(!runner.is_done());
+        assert_eq!(step1.content, "initial");
+
+        // Step 2: processes follow_up.
+        let step2 = runner.next().await.unwrap().unwrap();
+        assert!(runner.is_done());
+        assert_eq!(step2.content, "follow only");
     }
 
     // ── Cancellation tests ──
