@@ -24,7 +24,22 @@ pub type BoxPinFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
 /// Converts a path to lowercase path.
 pub fn path_lowercase(path: &Path) -> Path {
-    Path::from(path.as_ref().to_ascii_lowercase())
+    let mut path = path.to_string();
+    path.make_ascii_lowercase();
+    path.into()
+}
+
+/// Joins two paths together without percent-encoding, and ensures the result is in lowercase.
+pub fn path_join(a: &Path, b: &Path) -> Path {
+    let mut path = if a.is_root() {
+        b.to_string()
+    } else if b.is_root() {
+        a.to_string()
+    } else {
+        format!("{}{}{}", a, DELIMITER, b)
+    };
+    path.make_ascii_lowercase();
+    path.into()
 }
 
 /// Validates a path part to ensure it doesn't contain the path delimiter

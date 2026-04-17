@@ -30,7 +30,7 @@
 //! let (content, meta) = store.store_get(&namespace, &path).await?;
 //! ```
 
-use anda_core::{BoxError, BoxPinFut, ObjectMeta, Path, PutMode, PutResult, path_lowercase};
+use anda_core::{BoxError, BoxPinFut, ObjectMeta, Path, PutMode, PutResult, path_join};
 use futures::TryStreamExt;
 use object_store::PutOptions;
 use std::sync::Arc;
@@ -175,7 +175,7 @@ impl Store {
         namespace: &Path,
         path: &Path,
     ) -> Result<(bytes::Bytes, ObjectMeta), BoxError> {
-        let path = path_lowercase(&(namespace.clone().join(path.as_ref())));
+        let path = path_join(namespace, path);
         let res = self.store.get_opts(&path, Default::default()).await?;
         let data = match res.payload {
             object_store::GetResultPayload::Stream(mut stream) => {
@@ -201,9 +201,14 @@ impl Store {
         prefix: Option<&Path>,
         offset: &Path,
     ) -> Result<Vec<ObjectMeta>, BoxError> {
-        let prefix = prefix.map(|p| path_lowercase(&(namespace.clone().join(p.as_ref()))));
-        let offset = path_lowercase(&(namespace.clone().join(offset.as_ref())));
-        let mut res = self.store.list_with_offset(prefix.as_ref(), &offset);
+        let prefix = prefix.map(|p| path_join(namespace, p));
+        let offset = path_join(namespace, offset);
+
+        let mut res = if offset.is_root() {
+            self.store.list(prefix.as_ref())
+        } else {
+            self.store.list_with_offset(prefix.as_ref(), &offset)
+        };
         let mut metas = Vec::new();
         while let Some(meta) = res.try_next().await? {
             metas.push(meta)
@@ -225,11 +230,11 @@ impl Store {
         mode: PutMode,
         val: bytes::Bytes,
     ) -> Result<PutResult, BoxError> {
-        let path = path_lowercase(&(namespace.clone().join(path.as_ref())));
+        let full_path = path_join(namespace, path);
         let res = self
             .store
             .put_opts(
-                &path,
+                &full_path,
                 val.into(),
                 PutOptions {
                     mode,
@@ -251,8 +256,8 @@ impl Store {
         from: &Path,
         to: &Path,
     ) -> Result<(), BoxError> {
-        let from = path_lowercase(&(namespace.clone().join(from.as_ref())));
-        let to = path_lowercase(&(namespace.clone().join(to.as_ref())));
+        let from = path_join(namespace, from);
+        let to = path_join(namespace, to);
         self.store.rename_if_not_exists(&from, &to).await?;
         Ok(())
     }
@@ -262,7 +267,7 @@ impl Store {
     /// # Arguments
     /// * `path` - Path of the object to delete
     pub async fn store_delete(&self, namespace: &Path, path: &Path) -> Result<(), BoxError> {
-        let path = path_lowercase(&(namespace.clone().join(path.as_ref())));
+        let path = path_join(namespace, path);
         self.store.delete(&path).await?;
         Ok(())
     }

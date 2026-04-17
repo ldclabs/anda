@@ -1,7 +1,7 @@
 use anda_core::{
     Agent, AgentContext, AgentOutput, BoxError, CompletionFeatures, CompletionRequest, ContentPart,
-    FunctionDefinition, PutMode, Resource, StoreFeatures, Tool, ToolOutput, select_resources,
-    validate_function_name,
+    FunctionDefinition, Json, Path, PutMode, Resource, StoreFeatures, Tool, ToolOutput,
+    select_resources, validate_function_name,
 };
 use ciborium::from_reader;
 use ic_auth_types::{Xid, deterministic_cbor_into_vec};
@@ -31,6 +31,8 @@ pub struct SubAgent {
 
     #[serde(default)]
     pub background: bool,
+
+    pub output_schema: Option<Json>,
 }
 
 impl Agent<AgentCtx> for SubAgent {
@@ -90,6 +92,7 @@ impl Agent<AgentCtx> for SubAgent {
             prompt,
             content: resources.into_iter().map(ContentPart::from).collect(),
             tools: ctx.definitions(Some(&self.tools)).await,
+            output_schema: self.output_schema.clone(),
             ..Default::default()
         };
 
@@ -180,9 +183,20 @@ impl SubAgentManager {
     }
 
     pub async fn load(&self) -> Result<(), BoxError> {
-        if let Ok((data, _)) = self.root_ctx.store_get(&Self::NAME.into()).await {
-            let agents: BTreeMap<String, SubAgent> = from_reader(&data[..])?;
-            *self.agents.write() = agents;
+        let offset = Path::from("");
+        if let Ok(agents) = self
+            .root_ctx
+            .store_list(Some(&Self::NAME.into()), &offset)
+            .await
+        {
+            for meta in agents {
+                let (data, _) = self.root_ctx.store_get(&meta.location).await?;
+                if let Ok(agent) = from_reader::<SubAgent, _>(&data[..]) {
+                    self.agents
+                        .write()
+                        .insert(agent.name.to_ascii_lowercase(), agent);
+                }
+            }
         };
 
         Ok(())
@@ -190,47 +204,15 @@ impl SubAgentManager {
 
     /// Creates or updates a subagent. The name is normalised to lowercase and validated. If an agent with the same name exists, it will be overwritten.
     pub async fn upsert(&self, agent: SubAgent) -> Result<(), BoxError> {
-        let mut agent = agent;
         let name = agent.name.to_ascii_lowercase();
         validate_function_name(&name)?;
-        agent.name = name.clone();
 
-        let data = {
-            let mut agents = self.agents.write();
-            agents.insert(name, agent);
-            deterministic_cbor_into_vec(&*agents)?
-        };
-        self.root_ctx
-            .store_put(
-                &SubAgentManager::NAME.into(),
-                PutMode::Overwrite,
-                data.into(),
-            )
-            .await?;
-        Ok(())
-    }
-
-    /// Appends new subagents without overwriting existing ones. Invalid or duplicate names are skipped.
-    pub async fn try_append(&self, new_agents: Vec<SubAgent>) -> Result<(), BoxError> {
-        let data = {
-            let mut agents = self.agents.write();
-            for mut agent in new_agents {
-                agent.name = agent.name.to_ascii_lowercase();
-                if validate_function_name(&agent.name).is_err() || agents.contains_key(&agent.name)
-                {
-                    continue;
-                }
-                agents.insert(agent.name.clone(), agent);
-            }
-            deterministic_cbor_into_vec(&*agents)?
-        };
+        let data = deterministic_cbor_into_vec(&agent)?;
+        let path = Path::from(Self::NAME).join(name.clone());
+        self.agents.write().insert(name, agent);
 
         self.root_ctx
-            .store_put(
-                &SubAgentManager::NAME.into(),
-                PutMode::Overwrite,
-                data.into(),
-            )
+            .store_put(&path, PutMode::Overwrite, data.into())
             .await?;
         Ok(())
     }
@@ -425,6 +407,10 @@ impl Tool<BaseCtx> for SubAgentManager {
                         "default": [],
                         "uniqueItems": true
                     },
+                    "output_schema": {
+                        "type": "object",
+                        "description": "Optional JSON schema that the subagent's output must conform to. If provided, the model will be guided to produce output in the specified format, and outputs that don't match the schema may be rejected or cause an error. Use this to enforce structured output, such as a JSON object with specific fields, when the subagent's response needs to be machine-readable or follow a strict format."
+                    },
                     "background": {
                         "type": "boolean",
                         "description": "Whether this subagent should be executed asynchronously in the background. If true, the agent will return immediately with a message containing a unique task ID, and the final output will be passed to the `on_background_end` hook method when the task is completed. Use this for long-running tasks that don't need to return output immediately, or when you want to handle the final output separately in the hook (e.g. by storing it in a database or sending a notification)."
@@ -514,6 +500,83 @@ mod tests {
         .unwrap();
 
         let agent = tool.get_lowercase("research_assistant").unwrap();
-        assert_eq!(agent.name, "research_assistant");
+        assert_eq!(agent.name, "Research_Assistant");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn load_restores_all_persisted_subagents() {
+        let engine = EngineBuilder::new().empty();
+        let tool: Arc<SubAgentManager> = engine.sub_agents_manager().get().unwrap();
+
+        let agents = vec![
+            SubAgent {
+                name: "Research_Assistant".to_string(),
+                description: "Handles recurring research tasks with concise synthesis.".to_string(),
+                instructions: "Research carefully and synthesize findings.".to_string(),
+                tools: vec!["google_web_search".to_string()],
+                tags: vec!["research".to_string()],
+                ..Default::default()
+            },
+            SubAgent {
+                name: "code_reviewer".to_string(),
+                description: "Reviews code for correctness and risks.".to_string(),
+                instructions: "Review code changes and summarize findings.".to_string(),
+                tools: vec!["read_file".to_string(), "grep_search".to_string()],
+                tags: vec!["code".to_string(), "review".to_string()],
+                background: true,
+                ..Default::default()
+            },
+            SubAgent {
+                name: "writer_helper".to_string(),
+                description: "Drafts concise written content.".to_string(),
+                instructions: "Write clearly and keep the response concise.".to_string(),
+                tags: vec!["writing".to_string()],
+                output_schema: Some(json!({
+                    "type": "object",
+                    "properties": {
+                        "summary": { "type": "string" }
+                    },
+                    "required": ["summary"],
+                    "additionalProperties": false
+                })),
+                ..Default::default()
+            },
+        ];
+
+        for agent in agents.clone() {
+            tool.upsert(agent).await.unwrap();
+        }
+
+        let stored = tool
+            .root_ctx
+            .store_list(Some(&SubAgentManager::NAME.into()), &Path::from("/"))
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), agents.len());
+
+        for meta in &stored {
+            let (data, _) = tool.root_ctx.store_get(&meta.location).await.unwrap();
+            let loaded = from_reader::<SubAgent, _>(&data[..]).unwrap();
+            assert!(agents.iter().any(|agent| agent.name == loaded.name));
+        }
+
+        let reloaded = SubAgentManager::new(tool.root_ctx.clone());
+        reloaded.load().await.unwrap();
+
+        assert_eq!(reloaded.definitions(None).len(), agents.len());
+
+        for expected in agents {
+            let loaded = reloaded
+                .get_lowercase(&expected.name.to_ascii_lowercase())
+                .unwrap();
+
+            assert_eq!(loaded.name, expected.name);
+            assert_eq!(loaded.description, expected.description);
+            assert_eq!(loaded.instructions, expected.instructions);
+            assert_eq!(loaded.tools, expected.tools);
+            assert_eq!(loaded.tags, expected.tags);
+            assert_eq!(loaded.background, expected.background);
+            assert_eq!(loaded.output_schema, expected.output_schema);
+        }
     }
 }
