@@ -71,7 +71,7 @@ where
     async fn on_background_start(&self, _ctx: &BaseCtx, _task_id: &str, _args: &I) {}
 
     /// This method can be called to handle the final output when the tool is executed asynchronously in the background.
-    async fn on_background_end(&self, _ctx: BaseCtx, _task_id: String, _output: O) {}
+    async fn on_background_end(&self, _ctx: BaseCtx, _task_id: String, _output: ToolOutput<O>) {}
 }
 
 #[derive(Clone)]
@@ -111,7 +111,7 @@ where
         self.inner.on_background_start(ctx, task_id, args).await;
     }
 
-    async fn on_background_end(&self, ctx: BaseCtx, task_id: String, output: O) {
+    async fn on_background_end(&self, ctx: BaseCtx, task_id: String, output: ToolOutput<O>) {
         self.inner.on_background_end(ctx, task_id, output).await;
     }
 }

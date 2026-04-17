@@ -1,4 +1,4 @@
-use anda_core::{BoxError, StateFeatures};
+use anda_core::{BoxError, StateFeatures, ToolOutput};
 use async_trait::async_trait;
 use boxlite::{
     BoxCommand, BoxOptions, BoxliteOptions, BoxliteRuntime, ExecResult, Execution, LiteBox,
@@ -157,7 +157,8 @@ impl Executor for SandboxRuntime {
                         let exec_output =
                             ExecOutput::from_output(None, Some(output), &temp_dir).await;
                         if let Some(hook) = &hook {
-                            hook.on_background_end(ctx, task_id, exec_output).await;
+                            hook.on_background_end(ctx, task_id, ToolOutput::new(exec_output))
+                                .await;
                         }
                     }
                     Err(err) => {
@@ -166,7 +167,8 @@ impl Executor for SandboxRuntime {
                             ..Default::default()
                         };
                         if let Some(hook) = &hook {
-                            hook.on_background_end(ctx, task_id, exec_output).await;
+                            hook.on_background_end(ctx, task_id, ToolOutput::new(exec_output))
+                                .await;
                         }
                     }
                 }
@@ -479,11 +481,11 @@ mod tests {
     }
 
     struct TestHook {
-        sender: Mutex<Option<oneshot::Sender<(String, ExecOutput)>>>,
+        sender: Mutex<Option<oneshot::Sender<(String, ToolOutput<ExecOutput>)>>>,
     }
 
     impl TestHook {
-        fn new(sender: oneshot::Sender<(String, ExecOutput)>) -> Self {
+        fn new(sender: oneshot::Sender<(String, ToolOutput<ExecOutput>)>) -> Self {
             Self {
                 sender: Mutex::new(Some(sender)),
             }
@@ -492,7 +494,12 @@ mod tests {
 
     #[async_trait]
     impl ToolHook<ExecArgs, ExecOutput> for TestHook {
-        async fn on_background_end(&self, _ctx: BaseCtx, task_id: String, output: ExecOutput) {
+        async fn on_background_end(
+            &self,
+            _ctx: BaseCtx,
+            task_id: String,
+            output: ToolOutput<ExecOutput>,
+        ) {
             if let Some(sender) = self.sender.lock().unwrap().take() {
                 let _ = sender.send((task_id, output));
             }
@@ -688,7 +695,13 @@ mod tests {
         assert_eq!(output.stdout, None);
         assert_eq!(output.stderr, None);
 
-        let (task_id, hook_output) = tokio::time::timeout(Duration::from_secs(5), receiver)
+        let (
+            task_id,
+            ToolOutput {
+                output: hook_output,
+                ..
+            },
+        ) = tokio::time::timeout(Duration::from_secs(5), receiver)
             .await
             .unwrap()
             .unwrap();

@@ -1012,6 +1012,11 @@ impl CompletionRunner {
         self.follow_up_message.push_back(message);
     }
 
+    /// Accumulate usage from an intermediate step into the runner's total usage.
+    pub fn accumulate(&mut self, other: &Usage) {
+        self.usage.accumulate(other);
+    }
+
     // Drains all queued steering messages into a single user turn. When steering exists, queued
     // follow-up messages are prepended so the next round sees one combined instruction.
     fn drain_steering_message(&mut self) -> Option<String> {
@@ -1115,7 +1120,7 @@ impl CompletionRunner {
         let mut output = model.completion(req).await?;
         output.model = Some(model.model_name());
 
-        self.usage.accumulate(&output.usage);
+        self.accumulate(&output.usage);
 
         // If the primary model returns a failed result (failed_reason exists),
         // and a fallback model is configured, switch to the fallback model and retry.
@@ -1130,7 +1135,7 @@ impl CompletionRunner {
 
             let mut output2 = fallback.completion(self.req.clone()).await?;
             output2.model = Some(fallback.model_name());
-            self.usage.accumulate(&output2.usage);
+            self.accumulate(&output2.usage);
 
             if let Some(fallback_reason) = output2.failed_reason {
                 output2.failed_reason = Some(format!(
@@ -1284,7 +1289,7 @@ impl CompletionRunner {
                 if let Some(mut tool) = tool
                     && let Some(res) = &mut tool.result
                 {
-                    self.usage.accumulate(&res.usage);
+                    self.accumulate(&res.usage);
                     if is_tools_select_name(&tool.name) {
                         // 从模型输出或工具调用结果中获取实际被选中的工具定义，传递给下一轮模型调用
                         if let Ok(selected) =
