@@ -30,7 +30,7 @@ use crate::types::*;
 
 #[derive(Clone)]
 pub struct AppState {
-    pub engines: Arc<BTreeMap<Principal, Engine>>,
+    pub engines: Arc<BTreeMap<Principal, Arc<Engine>>>,
     pub default_engine: Principal,
     pub start_time_ms: u64,
     pub extra_info: Arc<BTreeMap<String, Json>>,

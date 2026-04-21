@@ -39,7 +39,7 @@ use ic_tee_cdk::AttestationRequest;
 use object_store::memory::InMemory;
 use std::{
     collections::{BTreeSet, HashMap},
-    sync::Arc,
+    sync::{Arc, OnceLock, Weak},
 };
 use structured_logger::unix_ms;
 use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
@@ -59,7 +59,6 @@ pub use crate::context::{AgentInfo, EngineCard, RemoteEngineArgs, RemoteEngines}
 
 /// Engine is the core component that manages agents, tools, and execution context.
 /// It provides methods to interact with agents, call tools, and manage execution.
-#[derive(Clone)]
 pub struct Engine {
     id: Principal,
     ctx: AgentCtx,
@@ -769,5 +768,35 @@ impl Agent<AgentCtx> for EchoEngineInfo {
             content: self.content.clone(),
             ..Default::default()
         })
+    }
+}
+
+/// EngineRef is a helper struct that allows for late binding of an Engine instance.
+pub struct EngineRef {
+    inner: OnceLock<Weak<Engine>>,
+}
+
+impl Default for EngineRef {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EngineRef {
+    pub fn new() -> Self {
+        Self {
+            inner: OnceLock::new(),
+        }
+    }
+
+    /// Binds the EngineRef to an actual Engine instance using a weak reference.
+    pub fn bind(&self, engine: Weak<Engine>) {
+        let _ = self.inner.set(engine);
+    }
+
+    /// Attempts to upgrade the weak reference to a strong reference and returns it.
+    /// Returns `None` if the Engine has not been bound or has been dropped.
+    pub fn get(&self) -> Option<Arc<Engine>> {
+        self.inner.get().and_then(Weak::upgrade)
     }
 }

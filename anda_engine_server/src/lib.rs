@@ -23,7 +23,7 @@ pub struct ServerBuilder {
     app_version: String,
     addr: String,
     origin: String,
-    engines: BTreeMap<Principal, Engine>,
+    engines: BTreeMap<Principal, Arc<Engine>>,
     default_engine: Option<Principal>,
     middlewares: Vec<Arc<dyn HttpMiddleware>>,
     ed25519_pubkeys: Vec<VerifyingKey>,
@@ -81,13 +81,9 @@ impl ServerBuilder {
 
     pub fn with_engines(
         mut self,
-        mut engines: BTreeMap<Principal, Engine>,
+        engines: BTreeMap<Principal, Arc<Engine>>,
         default_engine: Option<Principal>,
     ) -> Self {
-        for (id, engine) in engines.iter_mut() {
-            engine.info_mut().endpoint = format!("{}/{}", self.origin, id.to_text());
-        }
-
         self.engines = engines;
         self.default_engine = default_engine;
         self
