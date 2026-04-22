@@ -199,6 +199,7 @@ impl AgentCtx {
             artifacts: Vec::new(),
             steering_message: Vec::new(),
             follow_up_message: VecDeque::new(),
+            pending_tool_calls: Vec::new(),
             done: false,
             unbound: false,
             turns: 0,
@@ -967,6 +968,7 @@ pub struct CompletionRunner {
     artifacts: Vec<Resource>,
     steering_message: Vec<String>,
     follow_up_message: VecDeque<String>,
+    pending_tool_calls: Vec<ToolCall>,
     done: bool,
     unbound: bool,
     turns: usize,
@@ -1100,7 +1102,175 @@ impl CompletionRunner {
 
     async fn inner_next(&mut self) -> Result<Option<AgentOutput>, BoxError> {
         if self.req.prompt.is_empty() && self.req.content.is_empty() {
-            if let Some(prompt) = self.take_queued_user_message() {
+            // 自动执行工具/代理调用
+            let tool_calls = std::mem::take(&mut self.pending_tool_calls);
+            if !tool_calls.is_empty() {
+                let mut tool_call_futs: Vec<BoxPinFut<(Option<ToolCall>, Option<String>)>> =
+                    Vec::new();
+                for mut tool in tool_calls.into_iter() {
+                    let tool_name = tool.name.to_ascii_lowercase();
+                    if self.ctx.tools.contains_lowercase(&tool_name) || tool_name.starts_with("rt_")
+                    {
+                        let ctx = self.ctx.clone();
+                        let input = ToolInput {
+                            name: tool.name.clone(),
+                            args: tool.args.clone(),
+                            resources: self
+                                .ctx
+                                .select_tool_resources(&tool.name, &mut self.resources)
+                                .await,
+                            meta: None,
+                        };
+                        tool_call_futs.push(Box::pin(async move {
+                            match ctx.tool_call(input).await {
+                                Ok((res, remote_id)) => {
+                                    tool.remote_id = remote_id;
+                                    tool.result = Some(res);
+                                    (Some(tool), None)
+                                }
+                                Err(err) => {
+                                    // 工具调用失败了，但我们不一定要因此终止整个对话流程，可以让 LLM 尝试纠正错误并继续对话
+                                    {
+                                        tool.result = Some(ToolOutput {
+                                            output: Json::String(format!(
+                                                "tool call error: {}",
+                                                err
+                                            )),
+                                            ..Default::default()
+                                        });
+                                        (Some(tool), None)
+                                    }
+                                }
+                            }
+                        }));
+                    } else if self.ctx.agents.contains_lowercase(&tool_name)
+                        || self.ctx.subagents.contains_lowercase(&tool_name)
+                        || tool_name.starts_with("sa_")
+                        || tool_name.starts_with("ra_")
+                    {
+                        // 代理调用的 prompt 可能在 args 中的 "prompt" 字段，也可能直接在 args 的 JSON 中（如果 args 是一个字符串的话），也可能整个 args 就是 prompt（如果没有 "prompt" 字段的话）
+                        let prompt = if let Some(args) = tool.args.as_str() {
+                            args.to_string()
+                        } else if let Some(args) = tool.args.get("prompt")
+                            && let Some(prompt) = args.as_str()
+                        {
+                            prompt.to_string()
+                        } else {
+                            serde_json::to_string(&tool.args)
+                                .unwrap_or_else(|_| tool.args.to_string())
+                        };
+
+                        let ctx = self.ctx.clone();
+                        let input = AgentInput {
+                            name: tool.name.clone(),
+                            prompt,
+                            resources: self
+                                .ctx
+                                .select_agent_resources(&tool.name, &mut self.resources)
+                                .await,
+                            ..Default::default()
+                        };
+                        tool_call_futs.push(Box::pin(async move {
+                            match ctx.agent_run(input).await {
+                                Ok((res, remote_id)) => {
+                                    tool.remote_id = remote_id;
+                                    tool.result = Some(ToolOutput {
+                                        output: if (res.content.starts_with("{")
+                                            || res.content.starts_with("["))
+                                            && let Ok(val) = serde_json::from_str(&res.content)
+                                        {
+                                            val
+                                        } else {
+                                            res.content.into()
+                                        },
+                                        artifacts: res.artifacts,
+                                        usage: res.usage,
+                                    });
+                                    if let Some(reason) = res.failed_reason {
+                                        (Some(tool), Some(reason))
+                                    } else {
+                                        (Some(tool), None)
+                                    }
+                                }
+                                Err(err) => (None, Some(err.to_string())),
+                            }
+                        }));
+                    } else {
+                        tool_call_futs.push(Box::pin(async move {
+                            tool.result = Some(ToolOutput {
+                                output: Json::String(format!(
+                                    "tool call error: {} not found",
+                                    tool.name
+                                )),
+                                ..Default::default()
+                            });
+                            (Some(tool), None)
+                        }));
+                    }
+                }
+
+                let mut tool_calls: Vec<ToolCall> = Vec::new();
+                let mut tool_calls_continue: Vec<ContentPart> = Vec::new();
+                let mut tool_call_errors: Vec<String> = Vec::new();
+                if !tool_call_futs.is_empty() {
+                    let results = futures::future::join_all(tool_call_futs).await;
+
+                    let mut selected_tools: Vec<FunctionDefinition> = Vec::new();
+                    for (tool, err) in results {
+                        if let Some(mut tool) = tool
+                            && let Some(res) = &mut tool.result
+                        {
+                            self.accumulate(&res.usage);
+                            if is_tools_select_name(&tool.name) {
+                                // 从模型输出或工具调用结果中获取实际被选中的工具定义，传递给下一轮模型调用
+                                if let Ok(selected) =
+                                    serde_json::from_value::<ToolsSelectOutput>(res.output.clone())
+                                {
+                                    // 仅把选中的工具名称反馈给模型
+                                    res.output = json!(
+                                        selected
+                                            .tools
+                                            .iter()
+                                            .map(|t| t.name.clone())
+                                            .collect::<Vec<String>>()
+                                    );
+                                    selected_tools.extend(selected.tools);
+                                }
+                            }
+                            // We can not ignore some tool calls.
+                            // GPT-5: An assistant message with 'tool_calls' must be followed by tool messages responding to each 'tool_call_id'.
+                            tool_calls_continue.push(ContentPart::ToolOutput {
+                                name: tool.name.clone(),
+                                output: res.output.clone(),
+                                call_id: tool.call_id.clone(),
+                                remote_id: tool.remote_id,
+                            });
+
+                            self.artifacts.append(&mut res.artifacts);
+                            tool_calls.push(tool);
+                        }
+                        if let Some(err) = err {
+                            tool_call_errors.push(err);
+                        }
+                    }
+
+                    for tool in selected_tools {
+                        if !self.req.tools.iter().any(|t| t.name == tool.name) {
+                            self.req.tools.push(tool);
+                        }
+                    }
+                }
+
+                // 累计当前轮的 tool_calls
+                self.tool_calls.append(&mut tool_calls);
+                self.req.role = Some("tool".to_string());
+                if !tool_calls_continue.is_empty() {
+                    self.req.content.append(&mut tool_calls_continue);
+                }
+                if !tool_call_errors.is_empty() {
+                    self.req.content.push(tool_call_errors.join("; ").into());
+                }
+            } else if let Some(prompt) = self.take_queued_user_message() {
                 self.set_next_user_prompt(prompt);
             } else {
                 return Ok(None);
@@ -1171,177 +1341,15 @@ impl CompletionRunner {
                 // an unfinished tool-call requirement.
                 self.req.raw_history.pop();
             }
-
+            // Clear pending tool calls since the operator's steering should take priority and interrupt the current flow, even if there are still pending tool calls.
+            self.pending_tool_calls.clear();
             self.set_next_user_prompt(prompt);
             return Ok(Some(self.intermediate_output(output)));
         }
 
-        // 自动执行工具/代理调用
-        let mut tool_call_futs: Vec<BoxPinFut<(Option<ToolCall>, Option<String>)>> = Vec::new();
-        let tool_calls = std::mem::take(&mut output.tool_calls);
-        for mut tool in tool_calls.into_iter() {
-            if self.ctx.cancellation_token().is_cancelled() {
-                output.failed_reason = Some("operation cancelled".into());
-                return Ok(Some(self.final_output(output)));
-            }
-
-            let tool_name = tool.name.to_ascii_lowercase();
-            if self.ctx.tools.contains_lowercase(&tool_name) || tool_name.starts_with("rt_") {
-                let ctx = self.ctx.clone();
-                let input = ToolInput {
-                    name: tool.name.clone(),
-                    args: tool.args.clone(),
-                    resources: self
-                        .ctx
-                        .select_tool_resources(&tool.name, &mut self.resources)
-                        .await,
-                    meta: None,
-                };
-                tool_call_futs.push(Box::pin(async move {
-                    match ctx.tool_call(input).await {
-                        Ok((res, remote_id)) => {
-                            tool.remote_id = remote_id;
-                            tool.result = Some(res);
-                            (Some(tool), None)
-                        }
-                        Err(err) => {
-                            // 工具调用失败了，但我们不一定要因此终止整个对话流程，可以让 LLM 尝试纠正错误并继续对话
-                            {
-                                tool.result = Some(ToolOutput {
-                                    output: Json::String(format!("tool call error: {}", err)),
-                                    ..Default::default()
-                                });
-                                (Some(tool), None)
-                            }
-                        }
-                    }
-                }));
-            } else if self.ctx.agents.contains_lowercase(&tool_name)
-                || self.ctx.subagents.contains_lowercase(&tool_name)
-                || tool_name.starts_with("sa_")
-                || tool_name.starts_with("ra_")
-            {
-                // 代理调用的 prompt 可能在 args 中的 "prompt" 字段，也可能直接在 args 的 JSON 中（如果 args 是一个字符串的话），也可能整个 args 就是 prompt（如果没有 "prompt" 字段的话）
-                let prompt = if let Some(args) = tool.args.as_str() {
-                    args.to_string()
-                } else if let Some(args) = tool.args.get("prompt")
-                    && let Some(prompt) = args.as_str()
-                {
-                    prompt.to_string()
-                } else {
-                    serde_json::to_string(&tool.args).unwrap_or_else(|_| tool.args.to_string())
-                };
-
-                let ctx = self.ctx.clone();
-                let input = AgentInput {
-                    name: tool.name.clone(),
-                    prompt,
-                    resources: self
-                        .ctx
-                        .select_agent_resources(&tool.name, &mut self.resources)
-                        .await,
-                    ..Default::default()
-                };
-                tool_call_futs.push(Box::pin(async move {
-                    match ctx.agent_run(input).await {
-                        Ok((res, remote_id)) => {
-                            tool.remote_id = remote_id;
-                            tool.result = Some(ToolOutput {
-                                output: if (res.content.starts_with("{")
-                                    || res.content.starts_with("["))
-                                    && let Ok(val) = serde_json::from_str(&res.content)
-                                {
-                                    val
-                                } else {
-                                    res.content.into()
-                                },
-                                artifacts: res.artifacts,
-                                usage: res.usage,
-                            });
-                            if let Some(reason) = res.failed_reason {
-                                (Some(tool), Some(reason))
-                            } else {
-                                (Some(tool), None)
-                            }
-                        }
-                        Err(err) => (None, Some(err.to_string())),
-                    }
-                }));
-            } else {
-                tool_call_futs.push(Box::pin(async move {
-                    tool.result = Some(ToolOutput {
-                        output: Json::String(format!("tool call error: {} not found", tool.name)),
-                        ..Default::default()
-                    });
-                    (Some(tool), None)
-                }));
-            }
-        }
-
-        let mut tool_calls: Vec<ToolCall> = Vec::new();
-        let mut tool_calls_continue: Vec<ContentPart> = Vec::new();
-        let mut tool_call_errors: Vec<String> = Vec::new();
-        if !tool_call_futs.is_empty() {
-            let results = futures::future::join_all(tool_call_futs).await;
-
-            let mut selected_tools: Vec<FunctionDefinition> = Vec::new();
-            for (tool, err) in results {
-                if let Some(mut tool) = tool
-                    && let Some(res) = &mut tool.result
-                {
-                    self.accumulate(&res.usage);
-                    if is_tools_select_name(&tool.name) {
-                        // 从模型输出或工具调用结果中获取实际被选中的工具定义，传递给下一轮模型调用
-                        if let Ok(selected) =
-                            serde_json::from_value::<ToolsSelectOutput>(res.output.clone())
-                        {
-                            // 仅把选中的工具名称反馈给模型
-                            res.output = json!(
-                                selected
-                                    .tools
-                                    .iter()
-                                    .map(|t| t.name.clone())
-                                    .collect::<Vec<String>>()
-                            );
-                            selected_tools.extend(selected.tools);
-                        }
-                    }
-                    // We can not ignore some tool calls.
-                    // GPT-5: An assistant message with 'tool_calls' must be followed by tool messages responding to each 'tool_call_id'.
-                    tool_calls_continue.push(ContentPart::ToolOutput {
-                        name: tool.name.clone(),
-                        output: res.output.clone(),
-                        call_id: tool.call_id.clone(),
-                        remote_id: tool.remote_id,
-                    });
-
-                    self.artifacts.append(&mut res.artifacts);
-                    tool_calls.push(tool);
-                }
-                if let Some(err) = err {
-                    tool_call_errors.push(err);
-                }
-            }
-
-            for tool in selected_tools {
-                if !self.req.tools.iter().any(|t| t.name == tool.name) {
-                    self.req.tools.push(tool);
-                }
-            }
-        }
-
-        // 累计当前轮的 tool_calls
-        self.tool_calls.append(&mut tool_calls);
-
-        if !tool_call_errors.is_empty() {
-            output.failed_reason = Some(tool_call_errors.join("; "));
-            return Ok(Some(self.final_output(output)));
-        }
-
-        // 如果有需要继续调用工具
-        if !tool_calls_continue.is_empty() {
-            self.req.role = Some("tool".to_string());
-            self.req.content.append(&mut tool_calls_continue);
+        self.pending_tool_calls.extend(output.tool_calls.clone());
+        if !self.pending_tool_calls.is_empty() {
+            // run tool calls in next turn
             return Ok(Some(self.intermediate_output(output)));
         }
 

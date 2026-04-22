@@ -238,7 +238,7 @@ pub async fn load_skills_from_dir(dir: &Path) -> Result<BTreeMap<String, Skill>,
             match parse_skill_md(base_dir.to_path_buf(), &content) {
                 Ok(skill) => {
                     if skills.contains_key(&skill.agent_name) {
-                        log::error!(
+                        log::warn!(
                             "duplicate skill name {} at {}, skipping",
                             skill.agent_name,
                             path.display()
