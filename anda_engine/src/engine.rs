@@ -127,7 +127,7 @@ impl Engine {
         Ok(())
     }
 
-    /// Creates a new [`AgentCtx`] with the specified agent name, user, and caller.
+    /// Creates a new [`AgentCtx`] with the specified agent name and caller.
     /// Returns an error if the agent is not found or if the user name is invalid.
     pub fn ctx_with(
         &self,
@@ -146,6 +146,32 @@ impl Engine {
         }
 
         self.ctx.child_with(caller, &name, agent_label, meta)
+    }
+
+    /// Creates a new [`BaseCtx`] for a tool with the specified tool name and caller.
+    /// Returns an error if the tool is not found or if the user name is invalid.
+    pub fn base_ctx_with(
+        &self,
+        caller: Principal,
+        agent_name: &str,
+        tool_name: &str,
+        meta: RequestMeta,
+    ) -> Result<BaseCtx, BoxError> {
+        let name = tool_name.to_ascii_lowercase();
+
+        // manager can access any tool
+        if (!self.export_tools.contains(&name) && !self.management.is_manager(&caller))
+            || !self.ctx.tools.contains(&name)
+        {
+            return Err(format!("tool {} not found", name).into());
+        }
+
+        self.ctx.child_base_with(
+            caller,
+            agent_name.to_ascii_lowercase().as_str(),
+            &name,
+            meta,
+        )
     }
 
     /// Executes an agent with the specified parameters.
@@ -338,6 +364,7 @@ pub struct EngineBuilder {
     info: AgentInfo,
     tools: ToolSet<BaseCtx>,
     agents: AgentSet<AgentCtx>,
+    subagents: SubAgentSetManager,
     remote: HashMap<String, RemoteEngineArgs>,
     models: Arc<Models>,
     store: Store,
@@ -359,6 +386,13 @@ impl EngineBuilder {
     /// Creates a new EngineBuilder with default values.
     pub fn new() -> Self {
         let mstore = Arc::new(InMemory::new());
+        let subagent_manager = Arc::new(SubAgentManager::new());
+        let subagents = SubAgentSetManager::new();
+        subagents.insert(subagent_manager.clone());
+
+        let mut tools = ToolSet::new();
+        tools.add(subagent_manager).unwrap();
+
         let mut agents = AgentSet::new();
         agents
             .add(Arc::new(ToolsSearch::new()), Some("flash".to_string()))
@@ -374,8 +408,9 @@ impl EngineBuilder {
                 endpoint: "https://localhost:8443/default".to_string(),
                 ..Default::default()
             },
-            tools: ToolSet::new(),
+            tools,
             agents,
+            subagents,
             remote: HashMap::new(),
             models: Arc::new(Models::default()),
             store: Store::new(mstore),
@@ -547,7 +582,7 @@ impl EngineBuilder {
     }
 
     /// Creates an empty Engine instance.
-    pub fn empty(mut self) -> Engine {
+    pub async fn empty(self) -> Result<Engine, BoxError> {
         let id = self.web3.as_ref().get_principal();
         let mut names: BTreeSet<Path> = self
             .tools
@@ -573,20 +608,29 @@ impl EngineBuilder {
             Arc::new(RemoteEngines::new()),
         );
 
-        let subagent_manager = Arc::new(SubAgentManager::new(ctx.clone()));
-        self.tools.add(subagent_manager.clone()).unwrap();
-        let subagents = SubAgentSetManager::new();
-        subagents.insert(subagent_manager);
+        let tools = Arc::new(self.tools);
+        let agents = Arc::new(self.agents);
 
         let ctx = AgentCtx::new(
             ctx,
             self.models,
-            Arc::new(self.tools),
-            Arc::new(self.agents),
-            Arc::new(subagents),
+            tools.clone(),
+            agents.clone(),
+            Arc::new(self.subagents),
         );
 
-        Engine {
+        let meta = RequestMeta::default();
+        for (name, tool) in &tools.set {
+            let ct = ctx.child_base_with(id, "", name, meta.clone())?;
+            tool.init(ct).await?;
+        }
+
+        for (name, agent) in &agents.set {
+            let ct = ctx.child_with(id, name, agent.label(), meta.clone())?;
+            agent.init(ct).await?;
+        }
+
+        Ok(Engine {
             id,
             ctx,
             info: self.info,
@@ -601,7 +645,7 @@ impl EngineBuilder {
                     visibility: Visibility::Private, // default visibility
                 })
             }),
-        }
+        })
     }
 
     /// Finalizes the builder and creates an Engine instance.
@@ -647,13 +691,6 @@ impl EngineBuilder {
             Arc::new(remote),
         );
 
-        let subagent_manager = Arc::new(SubAgentManager::new(ctx.clone()));
-        subagent_manager.load().await?;
-
-        self.tools.add(subagent_manager.clone())?;
-        let subagents = SubAgentSetManager::new();
-        subagents.insert(subagent_manager);
-
         let tools = Arc::new(self.tools);
         let agents = Arc::new(self.agents);
 
@@ -662,7 +699,7 @@ impl EngineBuilder {
             self.models,
             tools.clone(),
             agents.clone(),
-            Arc::new(subagents),
+            Arc::new(self.subagents),
         );
 
         let meta = RequestMeta::default();
@@ -696,7 +733,7 @@ impl EngineBuilder {
 
     /// Creates a mock context for testing purposes.
     // #[cfg(test)]
-    pub fn mock_ctx(mut self) -> AgentCtx {
+    pub fn mock_ctx(self) -> AgentCtx {
         let mut names: BTreeSet<Path> = self
             .tools
             .set
@@ -720,16 +757,13 @@ impl EngineBuilder {
             self.store,
             Arc::new(RemoteEngines::new()),
         );
-        let subagent_manager = Arc::new(SubAgentManager::new(ctx.clone()));
-        self.tools.add(subagent_manager.clone()).unwrap();
-        let subagents = SubAgentSetManager::new();
-        subagents.insert(subagent_manager);
+
         AgentCtx::new(
             ctx,
             self.models,
             Arc::new(self.tools),
             Arc::new(self.agents),
-            Arc::new(subagents),
+            Arc::new(self.subagents),
         )
     }
 }

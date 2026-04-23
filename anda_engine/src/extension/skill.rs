@@ -1572,7 +1572,7 @@ Body.
         let tmp =
             std::env::temp_dir().join(format!("anda-skills-val-{:016x}", rand::random::<u64>()));
         let tool = SkillManager::new(tmp.clone());
-        let engine = EngineBuilder::new().empty();
+        let engine = EngineBuilder::new().empty().await.unwrap();
         assert!(engine.sub_agents_manager().insert(Arc::new(tool)).is_none());
     }
 }

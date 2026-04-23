@@ -34,6 +34,7 @@ use http::Extensions;
 use parking_lot::RwLock;
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
+    borrow::Cow,
     collections::BTreeSet,
     future::Future,
     sync::Arc,
@@ -129,7 +130,8 @@ impl BaseCtx {
     ///
     /// # Errors
     /// Returns an error if the context depth exceeds CONTEXT_MAX_DEPTH.
-    pub(crate) fn child(&self, path: String) -> Result<Self, BoxError> {
+    pub(crate) fn child(&self, mut path: String) -> Result<Self, BoxError> {
+        path.make_ascii_lowercase();
         let path = Path::parse(path)?;
         let child = Self {
             id: self.id,
@@ -171,9 +173,10 @@ impl BaseCtx {
         &self,
         caller: Principal,
         agent: String,
-        path: String,
+        mut path: String,
         meta: RequestMeta,
     ) -> Result<Self, BoxError> {
+        path.make_ascii_lowercase();
         let path = Path::parse(path)?;
         let child = Self {
             id: self.id,
@@ -219,6 +222,14 @@ impl BaseCtx {
         T: Clone + Send + Sync + 'static,
     {
         self.state.write().insert(v)
+    }
+
+    pub fn try_strip_prefix_path<'a>(&'a self, path: &'a Path) -> Cow<'a, Path> {
+        if let Some(p) = path.prefix_match(&self.path) {
+            Cow::Owned(Path::from_iter(p))
+        } else {
+            Cow::Borrowed(path)
+        }
     }
 }
 
@@ -499,7 +510,9 @@ impl KeysFeatures for BaseCtx {
 impl StoreFeatures for BaseCtx {
     /// Retrieves data from storage at the specified path.
     async fn store_get(&self, path: &Path) -> Result<(bytes::Bytes, ObjectMeta), BoxError> {
-        self.store.store_get(&self.path, path).await
+        self.store
+            .store_get(&self.path, &self.try_strip_prefix_path(path))
+            .await
     }
 
     /// Lists objects in storage with optional prefix and offset filters.
@@ -527,7 +540,9 @@ impl StoreFeatures for BaseCtx {
         mode: PutMode,
         value: bytes::Bytes,
     ) -> Result<PutResult, BoxError> {
-        self.store.store_put(&self.path, path, mode, value).await
+        self.store
+            .store_put(&self.path, &self.try_strip_prefix_path(path), mode, value)
+            .await
     }
 
     /// Renames a storage object if the target path doesn't exist.
@@ -537,7 +552,11 @@ impl StoreFeatures for BaseCtx {
     /// * `to` - Destination path.
     async fn store_rename_if_not_exists(&self, from: &Path, to: &Path) -> Result<(), BoxError> {
         self.store
-            .store_rename_if_not_exists(&self.path, from, to)
+            .store_rename_if_not_exists(
+                &self.path,
+                &self.try_strip_prefix_path(from),
+                &self.try_strip_prefix_path(to),
+            )
             .await
     }
 
@@ -546,7 +565,9 @@ impl StoreFeatures for BaseCtx {
     /// # Arguments
     /// * `path` - Path of the object to delete.
     async fn store_delete(&self, path: &Path) -> Result<(), BoxError> {
-        self.store.store_delete(&self.path, path).await
+        self.store
+            .store_delete(&self.path, &self.try_strip_prefix_path(path))
+            .await
     }
 }
 

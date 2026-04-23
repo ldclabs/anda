@@ -168,29 +168,29 @@ pub trait SubAgentSet: Send + Sync {
 }
 
 pub struct SubAgentManager {
-    root_ctx: BaseCtx,
     agents: RwLock<BTreeMap<String, SubAgent>>,
+}
+
+impl Default for SubAgentManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SubAgentManager {
     pub const NAME: &'static str = "subagents_manager";
 
-    pub fn new(root_ctx: BaseCtx) -> Self {
+    pub fn new() -> Self {
         Self {
-            root_ctx,
             agents: RwLock::new(BTreeMap::new()),
         }
     }
 
-    pub async fn load(&self) -> Result<(), BoxError> {
+    pub async fn load(&self, ctx: BaseCtx) -> Result<(), BoxError> {
         let offset = Path::from("");
-        if let Ok(agents) = self
-            .root_ctx
-            .store_list(Some(&Self::NAME.into()), &offset)
-            .await
-        {
+        if let Ok(agents) = ctx.store_list(None, &offset).await {
             for meta in agents {
-                let (data, _) = self.root_ctx.store_get(&meta.location).await?;
+                let (data, _) = ctx.store_get(&meta.location).await?;
                 if let Ok(agent) = from_reader::<SubAgent, _>(&data[..]) {
                     self.agents
                         .write()
@@ -203,16 +203,14 @@ impl SubAgentManager {
     }
 
     /// Creates or updates a subagent. The name is normalised to lowercase and validated. If an agent with the same name exists, it will be overwritten.
-    pub async fn upsert(&self, agent: SubAgent) -> Result<(), BoxError> {
+    pub async fn upsert(&self, ctx: BaseCtx, agent: SubAgent) -> Result<(), BoxError> {
         let name = agent.name.to_ascii_lowercase();
         validate_function_name(&name)?;
 
         let data = deterministic_cbor_into_vec(&agent)?;
-        let path = Path::from(Self::NAME).join(name.clone());
-        self.agents.write().insert(name, agent);
+        self.agents.write().insert(name.clone(), agent);
 
-        self.root_ctx
-            .store_put(&path, PutMode::Overwrite, data.into())
+        ctx.store_put(&Path::from(name), PutMode::Overwrite, data.into())
             .await?;
         Ok(())
     }
@@ -360,7 +358,7 @@ impl SubAgentSet for SubAgentSetManager {
 
 impl Tool<BaseCtx> for SubAgentManager {
     type Args = SubAgent;
-    type Output = String;
+    type Output = Json;
 
     fn name(&self) -> String {
         Self::NAME.to_string()
@@ -423,14 +421,18 @@ impl Tool<BaseCtx> for SubAgentManager {
         }
     }
 
+    async fn init(&self, ctx: BaseCtx) -> Result<(), BoxError> {
+        self.load(ctx).await
+    }
+
     async fn call(
         &self,
-        _ctx: BaseCtx,
+        ctx: BaseCtx,
         args: Self::Args,
         _resources: Vec<Resource>,
     ) -> Result<ToolOutput<Self::Output>, BoxError> {
-        self.upsert(args).await?;
-        Ok(ToolOutput::new("Success".to_string()))
+        self.upsert(ctx, args).await?;
+        Ok(ToolOutput::new(json!({"result": "success"})))
     }
 }
 
@@ -438,6 +440,7 @@ impl Tool<BaseCtx> for SubAgentManager {
 mod tests {
     use super::*;
     use crate::engine::EngineBuilder;
+    use anda_core::RequestMeta;
     use serde_json::json;
 
     #[test]
@@ -472,7 +475,15 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn subagents_tool_definition_guides_reusable_configs_and_normalizes_names() {
-        let engine = EngineBuilder::new().empty();
+        let engine = EngineBuilder::new().empty().await.unwrap();
+        let ctx = engine
+            .base_ctx_with(
+                engine.id(),
+                "",
+                SubAgentManager::NAME,
+                RequestMeta::default(),
+            )
+            .unwrap();
         let tool: Arc<SubAgentManager> = engine.sub_agents_manager().get().unwrap();
 
         let definition = tool.definition();
@@ -489,13 +500,16 @@ mod tests {
         );
         assert_eq!(definition.parameters["additionalProperties"], json!(false));
 
-        tool.upsert(SubAgent {
-            name: "Research_Assistant".to_string(),
-            description: "Handles recurring research tasks with concise synthesis.".to_string(),
-            instructions: "Research carefully and synthesize findings.".to_string(),
-            tools: vec!["google_web_search".to_string()],
-            ..Default::default()
-        })
+        tool.upsert(
+            ctx,
+            SubAgent {
+                name: "Research_Assistant".to_string(),
+                description: "Handles recurring research tasks with concise synthesis.".to_string(),
+                instructions: "Research carefully and synthesize findings.".to_string(),
+                tools: vec!["google_web_search".to_string()],
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
 
@@ -505,7 +519,15 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn load_restores_all_persisted_subagents() {
-        let engine = EngineBuilder::new().empty();
+        let engine = EngineBuilder::new().empty().await.unwrap();
+        let ctx = engine
+            .base_ctx_with(
+                engine.id(),
+                "",
+                SubAgentManager::NAME,
+                RequestMeta::default(),
+            )
+            .unwrap();
         let tool: Arc<SubAgentManager> = engine.sub_agents_manager().get().unwrap();
 
         let agents = vec![
@@ -544,24 +566,20 @@ mod tests {
         ];
 
         for agent in agents.clone() {
-            tool.upsert(agent).await.unwrap();
+            tool.upsert(ctx.clone(), agent).await.unwrap();
         }
 
-        let stored = tool
-            .root_ctx
-            .store_list(Some(&SubAgentManager::NAME.into()), &Path::from("/"))
-            .await
-            .unwrap();
+        let stored = ctx.store_list(None, &Path::from("")).await.unwrap();
         assert_eq!(stored.len(), agents.len());
 
         for meta in &stored {
-            let (data, _) = tool.root_ctx.store_get(&meta.location).await.unwrap();
+            let (data, _) = ctx.store_get(&meta.location).await.unwrap();
             let loaded = from_reader::<SubAgent, _>(&data[..]).unwrap();
             assert!(agents.iter().any(|agent| agent.name == loaded.name));
         }
 
-        let reloaded = SubAgentManager::new(tool.root_ctx.clone());
-        reloaded.load().await.unwrap();
+        let reloaded = SubAgentManager::new();
+        reloaded.load(ctx).await.unwrap();
 
         assert_eq!(reloaded.definitions(None).len(), agents.len());
 
