@@ -9,7 +9,7 @@ use std::{
     process::Stdio,
 };
 
-use super::{ExecArgs, ExecOutput, Executor, ShellToolHook};
+use super::{ExecArgs, ExecOutput, Executor, ShellToolHook, join_current_dir};
 use crate::{context::BaseCtx, hook::ToolHook};
 
 /// Native runtime — full access, runs on Mac/Linux/Docker/Raspberry Pi
@@ -72,13 +72,15 @@ impl Executor for NativeRuntime {
             .unwrap_or_else(|| Cow::Borrowed(&self.work_dir));
 
         let mut cmd = tokio::process::Command::new(&shell.program);
+        let work_dir = join_current_dir(&work_dir, &input.work_dir);
+        let work_dir_str = work_dir.to_string_lossy().to_string();
         shell.add_shell_args(&mut cmd, &input.command);
         cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
         cmd.env_clear();
         cmd.envs(envs);
-        cmd.current_dir(work_dir.join(&input.work_dir));
+        cmd.current_dir(work_dir);
         cmd.kill_on_drop(true);
 
         let child = cmd.spawn()?;
@@ -87,11 +89,14 @@ impl Executor for NativeRuntime {
             let temp_dir = self.temp_dir();
             match child.wait_with_output().await {
                 Ok(output) => {
-                    let exec_output = ExecOutput::from_output(pid, Some(output), temp_dir).await;
+                    let mut exec_output =
+                        ExecOutput::from_output(pid, Some(output), temp_dir).await;
+                    exec_output.work_dir = Some(work_dir_str);
                     return Ok(exec_output);
                 }
                 Err(err) => {
                     let exec_output = ExecOutput {
+                        work_dir: Some(work_dir_str),
                         process_id: pid,
                         stderr: Some(format!("Failed to execute background process: {err}")),
                         ..Default::default()
@@ -113,8 +118,9 @@ impl Executor for NativeRuntime {
             tokio::spawn(async move {
                 match child.wait_with_output().await {
                     Ok(output) => {
-                        let exec_output =
+                        let mut exec_output =
                             ExecOutput::from_output(pid, Some(output), &temp_dir).await;
+                        exec_output.work_dir = Some(work_dir_str);
                         if let Some(hook) = &hook {
                             hook.on_background_end(ctx, task_id, ToolOutput::new(exec_output))
                                 .await;
@@ -122,6 +128,7 @@ impl Executor for NativeRuntime {
                     }
                     Err(err) => {
                         let exec_output = ExecOutput {
+                            work_dir: Some(work_dir_str),
                             process_id: pid,
                             stderr: Some(format!("Failed to execute background process: {err}")),
                             ..Default::default()

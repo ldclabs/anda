@@ -1,4 +1,4 @@
-use anda_core::{BoxError, StateFeatures, ToolOutput};
+use anda_core::{BoxError, ToolOutput};
 use async_trait::async_trait;
 use boxlite::{
     BoxCommand, BoxOptions, BoxliteOptions, BoxliteRuntime, ExecResult, Execution, LiteBox,
@@ -7,7 +7,6 @@ use boxlite::{
 use futures_util::stream::{Stream, StreamExt};
 use ic_auth_types::Xid;
 use std::{
-    borrow::Cow,
     collections::HashMap,
     path::PathBuf,
     pin::Pin,
@@ -16,7 +15,7 @@ use std::{
     time::Duration,
 };
 
-use super::{ExecArgs, ExecOutput, Executor, SHELL_TIMEOUT_SECS, ShellToolHook};
+use super::{ExecArgs, ExecOutput, Executor, SHELL_TIMEOUT_SECS, ShellToolHook, join_current_dir};
 use crate::{context::BaseCtx, hook::ToolHook};
 
 type OutputStream = Pin<Box<dyn Stream<Item = String> + Send>>;
@@ -77,7 +76,9 @@ impl SandboxRuntime {
         SandboxCommandSpec {
             program: "sh".to_string(),
             args: vec!["-c".to_string(), input.command.clone()],
-            working_dir: work_dir.join(&input.work_dir).to_string_lossy().to_string(),
+            working_dir: join_current_dir(work_dir, &input.work_dir)
+                .to_string_lossy()
+                .to_string(),
             envs,
             timeout: (!input.background).then_some(Duration::from_secs(SHELL_TIMEOUT_SECS)),
         }
@@ -113,27 +114,22 @@ impl Executor for SandboxRuntime {
         envs: HashMap<String, String>,
     ) -> Result<ExecOutput, BoxError> {
         let hook = ctx.get_state::<ShellToolHook>();
-        let work_dir = ctx
-            .meta()
-            .get_extra_as::<String>("work_dir")
-            .map(PathBuf::from)
-            .map(Cow::Owned)
-            .unwrap_or_else(|| Cow::Borrowed(&self.work_dir));
-
-        let child = self
-            .runner
-            .exec(self.build_command(&work_dir, &input, envs))
-            .await?;
+        let cmd = self.build_command(&self.work_dir, &input, envs);
+        let work_dir_str = cmd.working_dir.clone();
+        let child = self.runner.exec(cmd).await?;
         if !input.background {
             let temp_dir = self.temp_dir();
             match wait_with_output(child).await {
                 Ok(output) => {
-                    let exec_output = ExecOutput::from_output(None, Some(output), &temp_dir).await;
+                    let mut exec_output =
+                        ExecOutput::from_output(None, Some(output), &temp_dir).await;
+                    exec_output.work_dir = Some(work_dir_str);
 
                     return Ok(exec_output);
                 }
                 Err(err) => {
                     let exec_output = ExecOutput {
+                        work_dir: Some(work_dir_str),
                         stderr: Some(format!("Failed to execute background process: {err}")),
                         ..Default::default()
                     };
@@ -154,8 +150,9 @@ impl Executor for SandboxRuntime {
             tokio::spawn(async move {
                 match wait_with_output(child).await {
                     Ok(output) => {
-                        let exec_output =
+                        let mut exec_output =
                             ExecOutput::from_output(None, Some(output), &temp_dir).await;
+                        exec_output.work_dir = Some(work_dir_str);
                         if let Some(hook) = &hook {
                             hook.on_background_end(ctx, task_id, ToolOutput::new(exec_output))
                                 .await;
@@ -163,6 +160,7 @@ impl Executor for SandboxRuntime {
                     }
                     Err(err) => {
                         let exec_output = ExecOutput {
+                            work_dir: Some(work_dir_str),
                             stderr: Some(format!("Failed to execute background process: {err}")),
                             ..Default::default()
                         };

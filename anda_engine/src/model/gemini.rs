@@ -141,9 +141,15 @@ impl CompletionFeaturesDyn for CompletionModel {
     ///
     /// Gemini messages have shape `{role?, parts: [Part, ...]}` where each
     /// part is one of `text`, `functionCall`, `functionResponse`, `fileData`,
-    /// `inlineData`, … distinguished by which field is present. We retain
-    /// only parts that carry a `text` field (regular text or reasoning) and
-    /// append a single placeholder text part summarizing what was dropped.
+    /// `inlineData`, … distinguished by which field is present.
+    ///
+    /// `functionCall` and `functionResponse` parts must stay paired across
+    /// turns (each `functionResponse.name` refers to a prior `functionCall`),
+    /// so pruning must not drop either side — otherwise the API rejects the
+    /// request. We therefore preserve those parts' envelope (name / id) and
+    /// only shrink their heavy payload (`args` / `response`). Other
+    /// non-text parts (files, inline data, …) are dropped and summarized by
+    /// a single placeholder text part.
     fn prune_raw_message(&self, value: &mut Json) -> usize {
         let Some(obj) = value.as_object_mut() else {
             return 0;
@@ -151,16 +157,49 @@ impl CompletionFeaturesDyn for CompletionModel {
         let Some(parts) = obj.get_mut("parts").and_then(|v| v.as_array_mut()) else {
             return 0;
         };
-        let original = parts.len();
-        parts.retain(|part| {
-            part.as_object()
-                .and_then(|m| m.get("text"))
-                .map(|t| t.is_string())
-                .unwrap_or(false)
+        let mut pruned = 0usize;
+        let mut dropped = 0usize;
+        parts.retain_mut(|part| {
+            let Some(map) = part.as_object_mut() else {
+                dropped += 1;
+                return false;
+            };
+            if map.get("text").map(|t| t.is_string()).unwrap_or(false) {
+                return true;
+            }
+            if let Some(fc) = map.get_mut("functionCall")
+                && let Some(fc_obj) = fc.as_object_mut()
+            {
+                if let Some(args) = fc_obj.get_mut("args") {
+                    let already = matches!(args, Json::Object(m) if m.is_empty());
+                    if !already {
+                        *args = json!({});
+                        pruned += 1;
+                    }
+                }
+                return true;
+            }
+            if let Some(fr) = map.get_mut("functionResponse")
+                && let Some(fr_obj) = fr.as_object_mut()
+            {
+                if let Some(resp) = fr_obj.get_mut("response") {
+                    let placeholder = pruned_placeholder(1);
+                    let already = matches!(resp, Json::Object(m)
+                        if m.get("output").and_then(|v| v.as_str()) == Some(placeholder.as_str())
+                            && m.len() == 1);
+                    if !already {
+                        *resp = json!({ "output": placeholder });
+                        pruned += 1;
+                    }
+                }
+                return true;
+            }
+            dropped += 1;
+            false
         });
-        let pruned = original - parts.len();
-        if pruned > 0 {
-            parts.push(json!({ "text": pruned_placeholder(pruned) }));
+        if dropped > 0 {
+            parts.push(json!({ "text": pruned_placeholder(dropped) }));
+            pruned += dropped;
         }
         pruned
     }

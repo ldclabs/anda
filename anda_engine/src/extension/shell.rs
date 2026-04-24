@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
     collections::HashMap,
-    path::{Path, PathBuf},
+    path::{MAIN_SEPARATOR, Path, PathBuf},
     process::Output,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -145,6 +145,8 @@ pub struct ExecArgs {
 /// Normalized result returned by a shell execution.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ExecOutput {
+    /// The working directory the command was executed.
+    pub work_dir: Option<String>,
     /// Process identifier, if provided by the runtime.
     pub process_id: Option<u32>,
     /// The status (exit code) of the process.
@@ -367,6 +369,19 @@ impl Tool<BaseCtx> for ShellTool {
         } else {
             Ok(rt)
         }
+    }
+}
+
+pub(crate) fn join_current_dir(base: &Path, relative: &str) -> PathBuf {
+    let relative_path = Path::new(relative);
+    if relative_path.is_relative() {
+        base.join(relative_path)
+    } else {
+        base.join(
+            relative_path
+                .strip_prefix(MAIN_SEPARATOR.to_string())
+                .unwrap_or(relative_path),
+        )
     }
 }
 
