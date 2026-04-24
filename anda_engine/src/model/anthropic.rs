@@ -10,8 +10,9 @@ use anda_core::{
     Resource,
 };
 use log::{Level::Debug, log_enabled};
+use serde_json::json;
 
-use super::{CompletionFeaturesDyn, request_client_builder};
+use super::{CompletionFeaturesDyn, pruned_placeholder, request_client_builder};
 use crate::{rfc3339_datetime, unix_ms};
 
 pub mod types;
@@ -161,6 +162,40 @@ impl CompletionFeatures for CompletionModel {
 impl CompletionFeaturesDyn for CompletionModel {
     fn model_name(&self) -> String {
         self.model.clone()
+    }
+
+    /// Prune an Anthropic-native message JSON in-place.
+    ///
+    /// Anthropic messages have shape `{role, content: "..." | [block, ...]}`
+    /// where each block is tagged by `type`. We retain only the text-like
+    /// blocks (`text`, `thinking`, `redacted_thinking`) and replace the
+    /// dropped ones with a single placeholder text block. If `content` is
+    /// already a plain string nothing is pruned.
+    fn prune_raw_message(&self, value: &mut Json) -> usize {
+        let Some(obj) = value.as_object_mut() else {
+            return 0;
+        };
+        let Some(content) = obj.get_mut("content") else {
+            return 0;
+        };
+        let Some(arr) = content.as_array_mut() else {
+            return 0;
+        };
+        let original = arr.len();
+        arr.retain(|block| {
+            matches!(
+                block.get("type").and_then(|t| t.as_str()),
+                Some("text" | "thinking" | "redacted_thinking")
+            )
+        });
+        let pruned = original - arr.len();
+        if pruned > 0 {
+            arr.push(json!({
+                "type": "text",
+                "text": pruned_placeholder(pruned),
+            }));
+        }
+        pruned
     }
 
     fn completion(&self, mut req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {

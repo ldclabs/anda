@@ -17,7 +17,7 @@ use std::collections::HashMap;
 
 pub mod types;
 
-use super::{CompletionFeaturesDyn, request_client_builder};
+use super::{CompletionFeaturesDyn, pruned_placeholder, request_client_builder};
 use crate::{rfc3339_datetime, unix_ms};
 
 // ================================================================
@@ -410,6 +410,47 @@ impl CompletionFeaturesDyn for CompletionModel {
         self.model.clone()
     }
 
+    /// Prune a legacy OpenAI chat-completions message JSON in-place.
+    ///
+    /// Chat messages have shape
+    /// `{role, content, tool_calls?: [...], tool_call_id?: "..."}` where the
+    /// bulk of tokens come from tool-call arguments and tool outputs. We
+    /// preserve the envelope (so assistant tool_calls still pair with their
+    /// `role: "tool"` outputs) but replace the argument/output payloads with
+    /// a compact placeholder.
+    fn prune_raw_message(&self, value: &mut Json) -> usize {
+        let Some(obj) = value.as_object_mut() else {
+            return 0;
+        };
+        let mut pruned = 0;
+
+        if let Some(tc) = obj.get_mut("tool_calls")
+            && let Some(arr) = tc.as_array_mut()
+        {
+            for call in arr.iter_mut() {
+                if let Some(func) = call.get_mut("function")
+                    && let Some(args) = func.get_mut("arguments")
+                    && args.as_str() != Some("{}")
+                {
+                    *args = Json::String("{}".to_string());
+                    pruned += 1;
+                }
+            }
+        }
+
+        let is_tool_output = obj.get("role").and_then(|r| r.as_str()) == Some("tool")
+            || obj.contains_key("tool_call_id");
+        if is_tool_output && let Some(c) = obj.get_mut("content") {
+            let placeholder = pruned_placeholder(1);
+            if c.as_str() != Some(placeholder.as_str()) {
+                *c = Json::String(placeholder);
+                pruned += 1;
+            }
+        }
+
+        pruned
+    }
+
     fn completion(&self, mut req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
         let model = self.model.clone();
         let client = self.client.clone();
@@ -602,6 +643,73 @@ impl CompletionModelV2 {
 impl CompletionFeaturesDyn for CompletionModelV2 {
     fn model_name(&self) -> String {
         self.model.clone()
+    }
+
+    /// Prune an OpenAI Responses-API item JSON in-place.
+    ///
+    /// The Responses API represents history as a flat list of tagged items
+    /// (`message`, `function_call`, `function_call_output`, `reasoning`).
+    /// Items are referenced by `call_id`, so we must not remove them; instead
+    /// we shrink their heavy fields:
+    /// - `function_call`: replace `arguments` with `{}`
+    /// - `function_call_output`: replace `output` with a short placeholder
+    /// - `message`: drop non-text content items (images, files, audio)
+    /// - `reasoning`: kept as-is (already concise, and signatures matter)
+    fn prune_raw_message(&self, value: &mut Json) -> usize {
+        let Some(obj) = value.as_object_mut() else {
+            return 0;
+        };
+        let ty = obj
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        match ty.as_str() {
+            "function_call" => {
+                if let Some(args) = obj.get_mut("arguments")
+                    && args.as_str() != Some("{}")
+                {
+                    *args = Json::String("{}".to_string());
+                    return 1;
+                }
+                0
+            }
+            "function_call_output" => {
+                let placeholder = pruned_placeholder(1);
+                if let Some(output) = obj.get_mut("output") {
+                    let already = match output {
+                        Json::String(s) => s == &placeholder,
+                        _ => false,
+                    };
+                    if !already {
+                        *output = Json::String(placeholder);
+                        return 1;
+                    }
+                }
+                0
+            }
+            "message" => {
+                let Some(arr) = obj.get_mut("content").and_then(|v| v.as_array_mut()) else {
+                    return 0;
+                };
+                let original = arr.len();
+                arr.retain(|c| {
+                    matches!(
+                        c.get("type").and_then(|v| v.as_str()),
+                        Some("input_text" | "output_text" | "refusal")
+                    )
+                });
+                let pruned = original - arr.len();
+                if pruned > 0 {
+                    arr.push(json!({
+                        "type": "input_text",
+                        "text": pruned_placeholder(pruned),
+                    }));
+                }
+                pruned
+            }
+            _ => 0,
+        }
     }
 
     fn completion(&self, req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {

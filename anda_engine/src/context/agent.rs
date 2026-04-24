@@ -1051,6 +1051,14 @@ impl CompletionRunner {
 
     /// Prune the raw history of the completion request to reduce tokens usage.
     /// Only prunes messages that have tool calls (intermediate steps), and keeps the final response intact.
+    ///
+    /// Because `raw_history` stores provider-native JSON (Anthropic blocks,
+    /// Gemini parts, OpenAI items, …) and each provider has its own shape,
+    /// pruning is delegated to the active model via
+    /// [`Model::prune_raw_message`]. Each implementation preserves structural
+    /// invariants (e.g. tool_call ↔ tool_output pairing) and only shrinks
+    /// heavy payloads to a compact placeholder.
+    ///
     /// # Arguments
     /// * `un_pruned_len` - The minimum length of raw history to keep un-pruned. Only when the current un-pruned length reaches or exceeds this threshold, pruning will be performed.
     /// * `prune_len` - The maximum number of messages to prune in this call. This is a soft limit, actual pruned messages may be less if it is greater than un-pruned messages.
@@ -1062,13 +1070,14 @@ impl CompletionRunner {
             return 0;
         }
         let pruned_len = prune_len.min(raw_history_len);
+        let label = self.req.model.as_ref().unwrap_or(&self.ctx.label);
+        let model = self
+            .ctx
+            .models
+            .get_model_by(label)
+            .unwrap_or_else(|| self.ctx.model.clone());
         for i in self.pruned..(self.pruned + pruned_len) {
-            if let Ok(mut msg) = serde_json::from_value::<Message>(self.req.raw_history[i].clone())
-                && msg.prune_content() > 0
-                && let Ok(raw) = serde_json::to_value(&msg)
-            {
-                self.req.raw_history[i] = raw;
-            }
+            model.prune_raw_message(&mut self.req.raw_history[i]);
         }
         self.pruned += pruned_len;
         pruned_len

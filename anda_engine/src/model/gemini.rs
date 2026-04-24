@@ -10,8 +10,9 @@ use anda_core::{
     Resource,
 };
 use log::{Level::Debug, log_enabled};
+use serde_json::json;
 
-use super::{CompletionFeaturesDyn, request_client_builder};
+use super::{CompletionFeaturesDyn, pruned_placeholder, request_client_builder};
 use crate::{rfc3339_datetime, unix_ms};
 
 pub mod types;
@@ -134,6 +135,34 @@ impl CompletionFeatures for CompletionModel {
 impl CompletionFeaturesDyn for CompletionModel {
     fn model_name(&self) -> String {
         self.model.clone()
+    }
+
+    /// Prune a Gemini-native content JSON in-place.
+    ///
+    /// Gemini messages have shape `{role?, parts: [Part, ...]}` where each
+    /// part is one of `text`, `functionCall`, `functionResponse`, `fileData`,
+    /// `inlineData`, … distinguished by which field is present. We retain
+    /// only parts that carry a `text` field (regular text or reasoning) and
+    /// append a single placeholder text part summarizing what was dropped.
+    fn prune_raw_message(&self, value: &mut Json) -> usize {
+        let Some(obj) = value.as_object_mut() else {
+            return 0;
+        };
+        let Some(parts) = obj.get_mut("parts").and_then(|v| v.as_array_mut()) else {
+            return 0;
+        };
+        let original = parts.len();
+        parts.retain(|part| {
+            part.as_object()
+                .and_then(|m| m.get("text"))
+                .map(|t| t.is_string())
+                .unwrap_or(false)
+        });
+        let pruned = original - parts.len();
+        if pruned > 0 {
+            parts.push(json!({ "text": pruned_placeholder(pruned) }));
+        }
+        pruned
     }
 
     fn completion(&self, mut req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {

@@ -13,7 +13,7 @@ use log::{Level::Debug, log_enabled};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::{CompletionFeaturesDyn, request_client_builder};
+use super::{CompletionFeaturesDyn, pruned_placeholder, request_client_builder};
 use crate::{rfc3339_datetime, unix_ms};
 
 // ================================================================
@@ -322,6 +322,33 @@ impl CompletionFeatures for CompletionModel {
 impl CompletionFeaturesDyn for CompletionModel {
     fn model_name(&self) -> String {
         self.model.clone()
+    }
+
+    /// Prune a DeepSeek chat-completions message JSON in-place.
+    ///
+    /// DeepSeek uses the same flat shape as legacy OpenAI chat-completions:
+    /// `{role, content: String, tool_call_id?}`. Tool outputs carry
+    /// `tool_call_id`; we truncate their `content` to a short placeholder.
+    /// Other messages (user/assistant text) are left alone since `content` is
+    /// already a plain string.
+    fn prune_raw_message(&self, value: &mut Json) -> usize {
+        let Some(obj) = value.as_object_mut() else {
+            return 0;
+        };
+        let is_tool_output = obj.get("role").and_then(|r| r.as_str()) == Some("tool")
+            || obj.contains_key("tool_call_id");
+        if !is_tool_output {
+            return 0;
+        }
+        let Some(c) = obj.get_mut("content") else {
+            return 0;
+        };
+        let placeholder = pruned_placeholder(1);
+        if c.as_str() == Some(placeholder.as_str()) {
+            return 0;
+        }
+        *c = Json::String(placeholder);
+        1
     }
 
     fn completion(&self, mut req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
