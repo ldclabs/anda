@@ -506,6 +506,7 @@ impl EngineBuilder {
     /// Registers a single agent with optional label to the engine.
     /// Verifies that all required tools are registered before adding the agent.
     /// Returns an error if any dependency is missing or if the agent cannot be added.
+    /// Recommended labels: "pro", "flash", "lite", "fallback"
     pub fn register_agent<T>(
         mut self,
         agent: Arc<T>,

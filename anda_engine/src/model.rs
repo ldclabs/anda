@@ -34,29 +34,33 @@ use crate::APP_USER_AGENT;
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct ModelConfig {
-    // "gemini", "anthropic", "openai", "deepseek" etc.
+    /// "gemini", "anthropic", "openai", "deepseek" etc.
     pub family: String,
     pub model: String,
     pub api_base: String,
     pub api_key: String,
+    /// Optional label for selecting this model in the engine.
+    /// It will use the model name as default if not provided, but a custom label can be used to abstract away provider-specific model names and allow for more flexible configuration.
+    /// Recommended labels: "pro", "flash", "lite", "fallback"
+    pub label: Option<String>,
     pub disabled: bool,
     pub bearer_auth: bool,
 }
 
 impl ModelConfig {
-    pub fn build_model(self, http_client: reqwest::Client) -> Model {
+    pub fn build_model(&self, http_client: reqwest::Client) -> Model {
         if self.disabled {
             return Model::not_implemented();
         }
 
         match self.family.as_str() {
             "gemini" => Model::with_completer(Arc::new(
-                gemini::Client::new(&self.api_key, Some(self.api_base))
+                gemini::Client::new(&self.api_key, Some(self.api_base.clone()))
                     .with_client(http_client)
                     .completion_model(&self.model),
             )),
             "anthropic" => {
-                let mut cli = anthropic::Client::new(&self.api_key, Some(self.api_base))
+                let mut cli = anthropic::Client::new(&self.api_key, Some(self.api_base.clone()))
                     .with_client(http_client);
                 if self.bearer_auth {
                     cli = cli.with_bearer_auth(true);
@@ -64,12 +68,12 @@ impl ModelConfig {
                 Model::with_completer(Arc::new(cli.completion_model(&self.model)))
             }
             "openai" => Model::with_completer(Arc::new(
-                openai::Client::new(&self.api_key, Some(self.api_base))
+                openai::Client::new(&self.api_key, Some(self.api_base.clone()))
                     .with_client(http_client)
                     .completion_model_v2(&self.model),
             )),
             "deepseek" => Model::with_completer(Arc::new(
-                deepseek::Client::new(&self.api_key, Some(self.api_base))
+                deepseek::Client::new(&self.api_key, Some(self.api_base.clone()))
                     .with_client(http_client)
                     .completion_model(&self.model),
             )),
@@ -128,6 +132,16 @@ impl Models {
         }
     }
 
+    pub fn from_configs(configs: &[ModelConfig], http_client: reqwest::Client) -> Self {
+        let mut models = HashMap::new();
+        for config in configs {
+            let label = config.label.clone().unwrap_or_else(|| config.model.clone());
+            let model = config.build_model(http_client.clone());
+            models.insert(label, model);
+        }
+        Self::from(models)
+    }
+
     /// Sets the primary default model.
     pub fn set_model(&self, model: Model) {
         self.model.store(Arc::new(Some(model)));
@@ -150,13 +164,19 @@ impl Models {
     ///
     /// If no primary model is configured yet, this inserted model becomes the
     /// primary default model.
+    /// Recommended labels: "pro", "flash", "lite", "fallback"
     pub fn set_model_by(&self, label: String, model: Model) {
-        let mut models = self.models.load().as_ref().clone();
-        models.insert(label, model.clone());
-        self.models.store(Arc::new(models));
-        if self.model.load().is_none() {
-            self.model.store(Arc::new(Some(model)));
+        let a_model = Arc::new(Some(model.clone()));
+        if &label == "fallback" {
+            self.fallback_model.store(a_model.clone());
         }
+        if self.model.load().is_none() {
+            self.model.store(a_model);
+        }
+
+        let mut models = self.models.load().as_ref().clone();
+        models.insert(label, model);
+        self.models.store(Arc::new(models));
     }
 
     /// Sets the fallback model used when primary lookup fails.
@@ -188,7 +208,7 @@ impl Models {
         if let Some(m) = self.fallback_model.load().as_ref() {
             return Some(m.clone());
         }
-        None
+        self.get_model()
     }
 
     /// Returns the fallback model if configured.
@@ -444,7 +464,13 @@ mod tests {
                 .model_name(),
             "primary"
         );
-        assert!(models.get_model_by("missing").is_none());
+        assert_eq!(
+            models
+                .get_model_by("missing")
+                .expect("primary model should exist")
+                .model_name(),
+            "primary"
+        );
     }
 
     #[test]
