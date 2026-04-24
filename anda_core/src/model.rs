@@ -992,6 +992,86 @@ mod tests {
     }
 
     #[test]
+    fn test_message_text_collects_only_text_parts_in_order() {
+        let msg = Message {
+            role: "assistant".into(),
+            content: vec![
+                ContentPart::Reasoning {
+                    text: "first thought".into(),
+                },
+                ContentPart::Text {
+                    text: "first text".into(),
+                },
+                ContentPart::ToolCall {
+                    name: "sum".into(),
+                    args: serde_json::json!({"x":1, "y":2}),
+                    call_id: Some("call_1".into()),
+                },
+                ContentPart::Text {
+                    text: "second text".into(),
+                },
+                ContentPart::Action {
+                    name: "notify".into(),
+                    payload: serde_json::json!({"ok": true}),
+                    recipients: None,
+                    signature: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(msg.text().as_deref(), Some("first text\n\nsecond text"));
+
+        let no_text = Message {
+            role: "assistant".into(),
+            content: vec![ContentPart::Reasoning {
+                text: "thought only".into(),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(no_text.text(), None);
+    }
+
+    #[test]
+    fn test_message_thoughts_collects_only_reasoning_parts_in_order() {
+        let msg = Message {
+            role: "assistant".into(),
+            content: vec![
+                ContentPart::Text {
+                    text: "visible text".into(),
+                },
+                ContentPart::Reasoning {
+                    text: "first thought".into(),
+                },
+                ContentPart::ToolOutput {
+                    name: "sum".into(),
+                    output: serde_json::json!({"result": 3}),
+                    call_id: Some("call_1".into()),
+                    remote_id: None,
+                },
+                ContentPart::Reasoning {
+                    text: "second thought".into(),
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            msg.thoughts().as_deref(),
+            Some("first thought\n\nsecond thought")
+        );
+
+        let no_reasoning = Message {
+            role: "assistant".into(),
+            content: vec![ContentPart::Text {
+                text: "text only".into(),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(no_reasoning.thoughts(), None);
+    }
+
+    #[test]
     fn test_message_tool_calls_extract_from_content_parts() {
         let parts = vec![
             ContentPart::Text {
@@ -1007,20 +1087,90 @@ mod tests {
                 args: serde_json::json!({"text":"hi"}),
                 call_id: None,
             },
+            ContentPart::ToolOutput {
+                name: "sum".into(),
+                output: serde_json::json!({"result": 3}),
+                call_id: Some("abc".into()),
+                remote_id: None,
+            },
         ];
         let msg = Message {
             role: "assistant".into(),
             content: parts,
             ..Default::default()
         };
-        println!("{:#?}", json!(msg));
 
         let calls = msg.tool_calls();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].name, "sum");
         assert_eq!(calls[0].args, serde_json::json!({"x":1, "y":2}));
+        assert_eq!(calls[0].call_id.as_deref(), Some("abc"));
+        assert!(calls[0].result.is_none());
+        assert!(calls[0].remote_id.is_none());
         assert_eq!(calls[1].name, "echo");
         assert_eq!(calls[1].args, serde_json::json!({"text":"hi"}));
+        assert!(calls[1].call_id.is_none());
+        assert!(calls[1].result.is_none());
+        assert!(calls[1].remote_id.is_none());
+    }
+
+    #[test]
+    fn test_message_prune_content_keeps_visible_parts_and_is_idempotent() {
+        let action = ContentPart::Action {
+            name: "delegate".into(),
+            payload: serde_json::json!({"agent": "planner"}),
+            recipients: None,
+            signature: None,
+        };
+        let mut msg = Message {
+            role: "assistant".into(),
+            content: vec![
+                ContentPart::Text {
+                    text: "visible text".into(),
+                },
+                ContentPart::ToolCall {
+                    name: "sum".into(),
+                    args: serde_json::json!({"x":1, "y":2}),
+                    call_id: Some("call_1".into()),
+                },
+                ContentPart::Reasoning {
+                    text: "visible thought".into(),
+                },
+                ContentPart::FileData {
+                    file_uri: "file:///tmp/a.txt".into(),
+                    mime_type: None,
+                },
+                action.clone(),
+                ContentPart::ToolOutput {
+                    name: "sum".into(),
+                    output: serde_json::json!({"result": 3}),
+                    call_id: Some("call_1".into()),
+                    remote_id: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(msg.prune_content(), 3);
+        assert_eq!(
+            msg.content,
+            vec![
+                ContentPart::Text {
+                    text: "visible text".into(),
+                },
+                ContentPart::Reasoning {
+                    text: "visible thought".into(),
+                },
+                action,
+                ContentPart::Text {
+                    text: "[3 items (tool calls or files) pruned due to limits]".into(),
+                },
+            ]
+        );
+
+        let pruned = msg.content.clone();
+        assert_eq!(msg.prune_content(), 0);
+        assert_eq!(msg.content, pruned);
     }
 
     #[test]

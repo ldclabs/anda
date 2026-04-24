@@ -860,25 +860,27 @@ impl SubAgentSet for SkillManager {
     }
 
     fn definitions(&self, names: Option<&[String]>) -> Vec<FunctionDefinition> {
-        let names: Option<Vec<String>> =
-            names.map(|names| names.iter().map(|n| n.to_ascii_lowercase()).collect());
-        self.skills
-            .read()
-            .iter()
-            .filter_map(|(name, skill): (&String, &Skill)| {
-                let agent = SubAgent::from(skill);
-                match &names {
-                    Some(names) => {
-                        if names.contains(name) {
-                            Some(agent.definition())
-                        } else {
-                            None
-                        }
-                    }
-                    None => Some(agent.definition()),
-                }
-            })
-            .collect()
+        match names {
+            None => self
+                .skills
+                .read()
+                .values()
+                .map(SubAgent::from)
+                .map(|agent| agent.definition())
+                .collect(),
+            Some(names) => {
+                let skills = self.skills.read();
+                names
+                    .iter()
+                    .filter_map(|name| {
+                        skills
+                            .get(&name.to_ascii_lowercase())
+                            .map(SubAgent::from)
+                            .map(|agent| agent.definition())
+                    })
+                    .collect()
+            }
+        }
     }
 
     fn select_resources(

@@ -249,21 +249,17 @@ where
     /// # Returns
     /// - Vec<[`FunctionDefinition`]>: Vector of tool definitions.
     pub fn definitions(&self, names: Option<&[String]>) -> Vec<FunctionDefinition> {
-        let names: Option<Vec<String>> =
-            names.map(|names| names.iter().map(|n| n.to_ascii_lowercase()).collect());
-        self.set
-            .iter()
-            .filter_map(|(name, tool)| match &names {
-                Some(names) => {
-                    if names.contains(name) {
-                        Some(tool.definition())
-                    } else {
-                        None
-                    }
-                }
-                None => Some(tool.definition()),
-            })
-            .collect()
+        match names {
+            None => self.set.values().map(|tool| tool.definition()).collect(),
+            Some(names) => names
+                .iter()
+                .filter_map(|name| {
+                    self.set
+                        .get(&name.to_ascii_lowercase())
+                        .map(|tool| tool.definition())
+                })
+                .collect(),
+        }
     }
 
     /// Returns a list of functions for all or specified tools.
@@ -274,27 +270,27 @@ where
     /// # Returns
     /// - Vec<[`Function`]>: Vector of tool functions.
     pub fn functions(&self, names: Option<&[String]>) -> Vec<Function> {
-        let names: Option<Vec<String>> =
-            names.map(|names| names.iter().map(|n| n.to_ascii_lowercase()).collect());
-        self.set
-            .iter()
-            .filter_map(|(name, tool)| match &names {
-                Some(names) => {
-                    if names.contains(name) {
-                        Some(Function {
+        match names {
+            None => self
+                .set
+                .values()
+                .map(|tool| Function {
+                    definition: tool.definition(),
+                    supported_resource_tags: tool.supported_resource_tags(),
+                })
+                .collect(),
+            Some(names) => names
+                .iter()
+                .filter_map(|name| {
+                    self.set
+                        .get(&name.to_ascii_lowercase())
+                        .map(|tool| Function {
                             definition: tool.definition(),
                             supported_resource_tags: tool.supported_resource_tags(),
                         })
-                    } else {
-                        None
-                    }
-                }
-                None => Some(Function {
-                    definition: tool.definition(),
-                    supported_resource_tags: tool.supported_resource_tags(),
-                }),
-            })
-            .collect()
+                })
+                .collect(),
+        }
     }
 
     /// Extracts resources from the provided list based on the tool's supported tags.

@@ -269,21 +269,17 @@ where
     /// # Returns
     /// - Vec<[`FunctionDefinition`]>: Vector of agent definitions.
     pub fn definitions(&self, names: Option<&[String]>) -> Vec<FunctionDefinition> {
-        let names: Option<Vec<String>> =
-            names.map(|names| names.iter().map(|n| n.to_ascii_lowercase()).collect());
-        self.set
-            .iter()
-            .filter_map(|(name, agent)| match &names {
-                Some(names) => {
-                    if names.contains(name) {
-                        Some(agent.definition())
-                    } else {
-                        None
-                    }
-                }
-                None => Some(agent.definition()),
-            })
-            .collect()
+        match names {
+            None => self.set.values().map(|agent| agent.definition()).collect(),
+            Some(names) => names
+                .iter()
+                .filter_map(|name| {
+                    self.set
+                        .get(&name.to_ascii_lowercase())
+                        .map(|agent| agent.definition())
+                })
+                .collect(),
+        }
     }
 
     /// Returns a list of functions for all or specified agents.
@@ -294,27 +290,27 @@ where
     /// # Returns
     /// - Vec<[`Function`]>: Vector of agent functions.
     pub fn functions(&self, names: Option<&[String]>) -> Vec<Function> {
-        let names: Option<Vec<String>> =
-            names.map(|names| names.iter().map(|n| n.to_ascii_lowercase()).collect());
-        self.set
-            .iter()
-            .filter_map(|(name, agent)| match &names {
-                Some(names) => {
-                    if names.contains(name) {
-                        Some(Function {
+        match names {
+            None => self
+                .set
+                .values()
+                .map(|agent| Function {
+                    definition: agent.definition(),
+                    supported_resource_tags: agent.supported_resource_tags(),
+                })
+                .collect(),
+            Some(names) => names
+                .iter()
+                .filter_map(|name| {
+                    self.set
+                        .get(&name.to_ascii_lowercase())
+                        .map(|agent| Function {
                             definition: agent.definition(),
                             supported_resource_tags: agent.supported_resource_tags(),
                         })
-                    } else {
-                        None
-                    }
-                }
-                None => Some(Function {
-                    definition: agent.definition(),
-                    supported_resource_tags: agent.supported_resource_tags(),
-                }),
-            })
-            .collect()
+                })
+                .collect(),
+        }
     }
 
     /// Extracts resources from the provided list based on the agent's supported tags.

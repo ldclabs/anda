@@ -230,22 +230,25 @@ impl SubAgentSet for SubAgentManager {
     }
 
     fn definitions(&self, names: Option<&[String]>) -> Vec<FunctionDefinition> {
-        let names: Option<Vec<String>> =
-            names.map(|names| names.iter().map(|n| n.to_ascii_lowercase()).collect());
-        self.agents
-            .read()
-            .iter()
-            .filter_map(|(name, agent)| match &names {
-                Some(names) => {
-                    if names.contains(name) {
-                        Some(agent.definition().name_with_prefix("SA_"))
-                    } else {
-                        None
-                    }
-                }
-                None => Some(agent.definition().name_with_prefix("SA_")),
-            })
-            .collect()
+        match names {
+            None => self
+                .agents
+                .read()
+                .values()
+                .map(|agent| agent.definition().name_with_prefix("SA_"))
+                .collect(),
+            Some(names) => {
+                let agents = self.agents.read();
+                names
+                    .iter()
+                    .filter_map(|name| {
+                        agents
+                            .get(&name.to_ascii_lowercase())
+                            .map(|agent| agent.definition().name_with_prefix("SA_"))
+                    })
+                    .collect()
+            }
+        }
     }
 
     fn select_resources(
