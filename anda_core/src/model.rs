@@ -153,7 +153,20 @@ impl Message {
         if texts.is_empty() {
             return None;
         }
-        Some(texts.join("\n"))
+        Some(texts.join("\n\n"))
+    }
+
+    pub fn thoughts(&self) -> Option<String> {
+        let mut thoughts: Vec<&str> = Vec::new();
+        for part in &self.content {
+            if let ContentPart::Reasoning { text } = part {
+                thoughts.push(text);
+            }
+        }
+        if thoughts.is_empty() {
+            return None;
+        }
+        Some(thoughts.join("\n\n"))
     }
 
     pub fn tool_calls(&self) -> Vec<ToolCall> {
