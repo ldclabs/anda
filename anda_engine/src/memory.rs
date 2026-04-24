@@ -352,6 +352,7 @@ pub enum ConversationStatus {
     #[default]
     Submitted,
     Working,
+    Idle,
     Completed,
     Cancelled,
     Failed,
@@ -362,6 +363,7 @@ impl fmt::Display for ConversationStatus {
         match self {
             ConversationStatus::Submitted => write!(f, "submitted"),
             ConversationStatus::Working => write!(f, "working"),
+            ConversationStatus::Idle => write!(f, "idle"),
             ConversationStatus::Completed => write!(f, "completed"),
             ConversationStatus::Cancelled => write!(f, "cancelled"),
             ConversationStatus::Failed => write!(f, "failed"),
