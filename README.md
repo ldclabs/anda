@@ -77,6 +77,83 @@ The Anda framework provides a command-line interface in `anda_cli` for interacti
 - [IC-TEE](https://github.com/ldclabs/ic-tee): 🔐 Make Trusted Execution Environments (TEEs) work with the Internet Computer.
 - [IC-COSE](https://github.com/ldclabs/ic-cose): ⚙️ A decentralized COnfiguration service with Signing and Encryption on the Internet Computer.
 
+
+## ❓ FAQ
+
+### General
+
+**Q: What is Anda?**
+Anda is an AI agent framework built with Rust, featuring ICP blockchain integration and Trusted Execution Environment (TEE) support. It enables creating composable, autonomous agents with perpetual memory.
+
+**Q: What is dTEE?**
+Decentralized Trusted Execution Environment (dTEE) combines Trusted Execution Environments with blockchain to provide a secure, private, and verifiable computation layer for AI agents. It ensures data integrity and computational trustworthiness.
+
+**Q: Why ICP blockchain?**
+ICP provides agents with permanent identities, cryptographic capabilities, and perpetual memory storage. This enables agents to operate autonomously and persistently across the network.
+
+### Getting Started
+
+**Q: How do I install Anda?**
+```bash
+# Clone the repository
+git clone https://github.com/ldclabs/anda.git
+cd anda
+
+# Build with Cargo
+cargo build --release
+```
+Ensure you have Rust 1.75+ installed. See [Rust installation](https://rustup.rs/).
+
+**Q: What are the main components?**
+- `anda_cli`: Command-line interface for interacting with the engine server
+- `anda_core`: Core library with base types and agent traits
+- `anda_engine`: Agent runtime and management engine
+- `anda_engine_server`: HTTP server for multiple Anda engines
+- `anda_web3_client`: Rust SDK for Web3 integration
+
+### Agent Development
+
+**Q: How do I create a custom agent?**
+Implement the `anda_core` traits to define your agent's behavior, tools, and interaction patterns. See the [architecture documentation](./docs/architecture.md) for details.
+
+**Q: Can I use Anda without TEE?**
+Yes. The `anda_web3_client` provides Web3 integration for non-TEE environments, allowing agents to interact with ICP blockchain without hardware-based trust.
+
+**Q: How does agent composability work?**
+Anda agents specialize in domain-specific problems and can flexibly combine with other agents. When a single agent cannot solve a problem alone, it collaborates with others to form a robust problem-solving network.
+
+### ICP Integration
+
+**Q: How do agents get their identity?**
+Agents derive permanent identities and cryptographic capabilities from the ICP blockchain, enabling autonomous and persistent operation.
+
+**Q: What is perpetual memory?**
+Agent memory states are stored on the ICP blockchain and within dTEE trusted storage, ensuring continuous knowledge accumulation and evolution even across restarts.
+
+### Troubleshooting
+
+**Q: Build fails with Rust version error**
+Ensure you have Rust 1.75 or later:
+```bash
+rustup update stable
+rustc --version  # Should show 1.75+
+```
+
+**Q: Cannot connect to ICP network**
+- Verify your network connectivity to the ICP blockchain
+- Check that the IC-TEE dependency is properly configured
+- See [IC-TEE documentation](https://github.com/ldclabs/ic-tee) for setup details
+
+**Q: Agent fails to start**
+- Check the engine server logs for error details
+- Verify the agent configuration matches the expected format
+- Ensure all required dependencies (ICP, TEE) are accessible
+
+**Q: High memory usage**
+- Limit the number of concurrent agents
+- Adjust the memory retention policy in agent configuration
+- Monitor dTEE storage usage
+
 ## 📝 License
 
 Copyright © 2026 [LDC Labs](https://github.com/ldclabs).
