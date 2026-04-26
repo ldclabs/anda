@@ -10,7 +10,9 @@ use anda_db::{
     index::BTree,
     query::{Filter, Query, RangeQuery, Search},
 };
-use anda_db_schema::{AndaDBSchema, FieldEntry, FieldType, Ft, Fv, Json, Schema, SchemaError};
+use anda_db_schema::{
+    AndaDBSchema, FieldEntry, FieldKey, FieldType, Ft, Fv, Json, Schema, SchemaError,
+};
 use anda_db_tfs::jieba_tokenizer;
 use anda_kip::{
     DescribeTarget, KipError, META_SYSTEM_NAME, MetaCommand, PERSON_TYPE, Request, Response,
