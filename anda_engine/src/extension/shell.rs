@@ -67,7 +67,7 @@ pub trait Executor: Send + Sync {
     fn temp_dir(&self) -> &PathBuf;
 
     /// Return the shell program name used by this runtime, if any.
-    fn shell(&self) -> Option<&str>;
+    fn shell(&self) -> &str;
 
     /// Execute a shell command in this runtime environment, returning the output.
     async fn execute(
@@ -246,7 +246,7 @@ impl ShellTool {
             "Execute a shell command in the workspace directory (Runtime: {}, OS: {}, Shell: {})",
             runtime.name(),
             runtime.os(),
-            runtime.shell().unwrap_or("none")
+            runtime.shell()
         );
 
         Self {

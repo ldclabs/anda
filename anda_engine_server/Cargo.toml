@@ -28,7 +28,6 @@ ic_auth_verifier = { workspace = true, features = ["full"] }
 ic_cose_types = { workspace = true }
 tower-http = { workspace = true }
 
-[dev-dependencies]
-
 [lib]
 test = false
+doctest = false

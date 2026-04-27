@@ -99,8 +99,8 @@ impl Executor for SandboxRuntime {
         "Alpine Linux"
     }
 
-    fn shell(&self) -> Option<&str> {
-        Some("sh")
+    fn shell(&self) -> &str {
+        "sh"
     }
 
     fn temp_dir(&self) -> &PathBuf {
@@ -514,7 +514,7 @@ mod tests {
 
         assert_eq!(runtime.name(), "sandbox");
         assert_eq!(runtime.os(), "Alpine Linux");
-        assert_eq!(runtime.shell(), Some("sh"));
+        assert_eq!(runtime.shell(), "sh");
         assert_eq!(runtime.work_dir(), &PathBuf::from("/home"));
         assert_eq!(runtime.temp_dir(), &PathBuf::from("/tmp"));
     }

@@ -16,12 +16,14 @@ use crate::{
     hook::{DynToolHook, ToolHook},
 };
 
+const DEFAULT_LIMIT: usize = 1000;
+
 /// Arguments for filesystem glob operations.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct SearchFileArgs {
     /// Relative or absolute glob pattern inside the workspace namespace.
     pub pattern: String,
-    /// Maximum number of matches to return. `0` means all matches.
+    /// Maximum number of matches to return. Defaults to 1000.
     #[serde(default)]
     pub limit: usize,
 }
@@ -89,7 +91,7 @@ impl Tool<BaseCtx> for SearchFileTool {
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Maximum number of matches to return (default: 0, all matches)"
+                        "description": "Maximum number of matches to return (default: 1000)"
                     }
                 },
                 "required": ["pattern"]
@@ -146,9 +148,11 @@ impl Tool<BaseCtx> for SearchFileTool {
         paths.dedup();
 
         let total_matches = paths.len();
-        if args.limit > 0 {
-            paths.truncate(args.limit);
-        }
+        paths.truncate(if args.limit == 0 {
+            DEFAULT_LIMIT
+        } else {
+            args.limit
+        });
 
         let output = SearchFileOutput {
             paths,
