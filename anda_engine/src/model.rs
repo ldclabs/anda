@@ -23,7 +23,6 @@ use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 
 pub mod anthropic;
-pub mod deepseek;
 pub mod gemini;
 pub mod openai;
 
@@ -34,16 +33,19 @@ use crate::APP_USER_AGENT;
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct ModelConfig {
-    /// "gemini", "anthropic", "openai", "deepseek" etc.
+    /// "gemini", "anthropic", "openai" etc.
     pub family: String,
     pub model: String,
     pub api_base: String,
     pub api_key: String,
-    /// Optional label for selecting this model in the engine.
-    /// It will use the model name as default if not provided, but a custom label can be used to abstract away provider-specific model names and allow for more flexible configuration.
+    /// Optional labels for selecting this model in the engine.
+    /// It will use the model name as default if not provided, but custom labels can be used to abstract away provider-specific model names and allow for more flexible configuration.
     /// Recommended labels: "pro", "flash", "lite", "fallback"
-    pub label: Option<String>,
+    #[serde(default)]
+    pub labels: Vec<String>,
+    #[serde(default)]
     pub disabled: bool,
+    #[serde(default)]
     pub bearer_auth: bool,
 }
 
@@ -71,11 +73,6 @@ impl ModelConfig {
                 openai::Client::new(&self.api_key, Some(self.api_base.clone()))
                     .with_client(http_client)
                     .completion_model_v2(&self.model),
-            )),
-            "deepseek" => Model::with_completer(Arc::new(
-                deepseek::Client::new(&self.api_key, Some(self.api_base.clone()))
-                    .with_client(http_client)
-                    .completion_model(&self.model),
             )),
             _ => Model::not_implemented(),
         }
@@ -106,7 +103,10 @@ impl Default for Models {
 
 impl From<HashMap<String, Model>> for Models {
     fn from(models: HashMap<String, Model>) -> Self {
-        let model = models.values().next().cloned();
+        let model = models
+            .get("pro")
+            .or_else(|| models.values().next())
+            .cloned();
         Self {
             model: ArcSwap::new(Arc::new(model)),
             models: ArcSwap::new(Arc::new(models)),
@@ -133,13 +133,19 @@ impl Models {
     }
 
     pub fn from_configs(configs: &[ModelConfig], http_client: reqwest::Client) -> Self {
-        let mut models = HashMap::new();
+        let models = Self::default();
         for config in configs {
-            let label = config.label.clone().unwrap_or_else(|| config.model.clone());
+            let labels = if config.labels.is_empty() {
+                vec![config.model.clone()]
+            } else {
+                config.labels.clone()
+            };
             let model = config.build_model(http_client.clone());
-            models.insert(label, model);
+            for label in labels {
+                models.set_model_by(label, model.clone());
+            }
         }
-        Self::from(models)
+        models
     }
 
     /// Sets the primary default model.
@@ -192,7 +198,7 @@ impl Models {
         if let Some(m) = self.fallback_model.load().as_ref() {
             return Some(m.clone());
         }
-        None
+        self.models.load().values().next().cloned()
     }
 
     /// Returns a model by label.
