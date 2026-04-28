@@ -447,24 +447,18 @@ impl EngineBuilder {
         self
     }
 
+    /// Sets the models.
+    pub fn with_models(mut self, models: Arc<Models>) -> Self {
+        self.models = models;
+        self
+    }
+
     /// Sets a global fallback model.
     ///
     /// The fallback model will be used when the primary model returns an `AgentOutput`
     /// with `failed_reason`.
     pub fn with_fallback_model(self, model: Model) -> Self {
         self.models.set_fallback_model(model);
-        self
-    }
-
-    /// Sets multiple models with labels for the engine.
-    pub fn with_models(self, models: HashMap<String, Model>) -> Self {
-        self.models.set_models(models);
-        self
-    }
-
-    /// Sets the models.
-    pub fn set_models(mut self, models: Arc<Models>) -> Self {
-        self.models = models;
         self
     }
 

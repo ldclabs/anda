@@ -1074,7 +1074,7 @@ impl CompletionRunner {
         let model = self
             .ctx
             .models
-            .get_model_by(label)
+            .get(label)
             .unwrap_or_else(|| self.ctx.model.clone());
         for i in self.pruned..(self.pruned + pruned_len) {
             model.prune_raw_message(&mut self.req.raw_history[i]);
@@ -1293,7 +1293,7 @@ impl CompletionRunner {
         let model = self
             .ctx
             .models
-            .get_model_by(label)
+            .get(label)
             .unwrap_or_else(|| self.ctx.model.clone());
 
         let mut output = model.completion(req).await?;
@@ -2440,13 +2440,13 @@ mod tests {
 
         let models = Arc::new(Models::default());
         models.set_model(Model::with_completer(Arc::new(completer)));
-        models.set_model_by(
+        models.set(
             "flash".to_string(),
             Model::with_completer(Arc::new(selector)),
         );
 
         let engine = EngineBuilder::new()
-            .set_models(models)
+            .with_models(models)
             .register_agent(Arc::new(EchoAgent), None)
             .unwrap()
             .build("echo_agent".to_string())

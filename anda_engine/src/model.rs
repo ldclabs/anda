@@ -40,7 +40,7 @@ pub struct ModelConfig {
     pub api_key: String,
     /// Optional labels for selecting this model in the engine.
     /// It will use the model name as default if not provided, but custom labels can be used to abstract away provider-specific model names and allow for more flexible configuration.
-    /// Recommended labels: "pro", "flash", "lite", "fallback"
+    /// Recommended labels: "primary", "fallback", "pro", "flash", "lite"
     #[serde(default)]
     pub labels: Vec<String>,
     #[serde(default)]
@@ -50,6 +50,57 @@ pub struct ModelConfig {
 }
 
 impl ModelConfig {
+    pub fn model(&self, http_client: reqwest::Client) -> Result<Model, BoxError> {
+        if self.disabled {
+            return Err("model is disabled".into());
+        }
+        if self.model.is_empty() {
+            return Err(format!("{}: model name is required", self.model).into());
+        }
+        if self.family.is_empty() {
+            return Err(format!("{}: model family is required", self.model).into());
+        }
+        if self.api_base.is_empty() {
+            return Err(format!("{}: api_base is required", self.model).into());
+        }
+        if self.api_key.is_empty() {
+            return Err(format!("{}: api_key is required", self.model).into());
+        }
+
+        let model = match self.family.as_str() {
+            "gemini" => Model::with_completer(Arc::new(
+                gemini::Client::new(&self.api_key, Some(self.api_base.clone()))
+                    .with_client(http_client)
+                    .completion_model(&self.model),
+            )),
+            "anthropic" => {
+                let mut cli = anthropic::Client::new(&self.api_key, Some(self.api_base.clone()))
+                    .with_client(http_client);
+                if self.bearer_auth {
+                    cli = cli.with_bearer_auth(true);
+                }
+                Model::with_completer(Arc::new(cli.completion_model(&self.model)))
+            }
+            "openai" => Model::with_completer(Arc::new(
+                openai::Client::new(&self.api_key, Some(self.api_base.clone()))
+                    .with_client(http_client)
+                    .completion_model_v2(&self.model),
+            )),
+            _ => return Err(format!("unsupported model family: {}", self.family).into()),
+        };
+
+        let labels = if self.labels.is_empty() {
+            vec![self.model.clone()]
+        } else {
+            self.labels.clone()
+        };
+        Ok(model.with_labels(labels))
+    }
+
+    #[deprecated(
+        since = "0.11.22",
+        note = "use the `model` method which returns a Result and allows error handling instead of silently returning a not_implemented model"
+    )]
     pub fn build_model(&self, http_client: reqwest::Client) -> Model {
         if self.disabled {
             return Model::not_implemented();
@@ -85,6 +136,11 @@ impl ModelConfig {
 /// - `model`: the primary default model for general requests
 /// - `models`: a label-based map for selecting specific models
 /// - `fallback_model`: a safety fallback when primary lookup is missing
+///
+/// The dedicated primary and fallback slots can be set explicitly via
+/// [`Models::set_model`] and [`Models::set_fallback_model`], or derived from the
+/// special labels `primary` and `fallback` in the label map. This keeps direct
+/// lookup (`get`) separate from default-routing (`get_model`).
 pub struct Models {
     model: ArcSwap<Option<Model>>,
     models: ArcSwap<HashMap<String, Model>>,
@@ -96,20 +152,6 @@ impl Default for Models {
         Self {
             model: ArcSwap::new(Arc::new(None)),
             models: ArcSwap::new(Arc::new(HashMap::new())),
-            fallback_model: ArcSwap::new(Arc::new(None)),
-        }
-    }
-}
-
-impl From<HashMap<String, Model>> for Models {
-    fn from(models: HashMap<String, Model>) -> Self {
-        let model = models
-            .get("pro")
-            .or_else(|| models.values().next())
-            .cloned();
-        Self {
-            model: ArcSwap::new(Arc::new(model)),
-            models: ArcSwap::new(Arc::new(models)),
             fallback_model: ArcSwap::new(Arc::new(None)),
         }
     }
@@ -132,65 +174,67 @@ impl Models {
         }
     }
 
+    /// Builds a registry from model configs by registering every resolved label.
     pub fn from_configs(configs: &[ModelConfig], http_client: reqwest::Client) -> Self {
         let models = Self::default();
         for config in configs {
-            let labels = if config.labels.is_empty() {
-                vec![config.model.clone()]
-            } else {
-                config.labels.clone()
-            };
-            let model = config.build_model(http_client.clone());
-            for label in labels {
-                models.set_model_by(label, model.clone());
+            if let Ok(model) = config.model(http_client.clone()) {
+                for label in &model.labels {
+                    models.set(label.clone(), model.clone());
+                }
             }
         }
         models
     }
 
-    /// Sets the primary default model.
+    /// Returns whether a label exists in the direct lookup table.
+    pub fn contains(&self, label: &str) -> bool {
+        self.models.load().contains_key(label)
+    }
+
+    /// Sets the primary default model without mutating the label map.
     pub fn set_model(&self, model: Model) {
         self.model.store(Arc::new(Some(model)));
     }
 
-    /// Replaces all labeled models.
-    ///
-    /// If no primary model is configured yet, the first model in the provided
-    /// map is promoted to the primary default model.
-    pub fn set_models(&self, models: HashMap<String, Model>) {
-        if self.model.load().is_none()
-            && let Some((_, m)) = models.iter().next()
-        {
-            self.model.store(Arc::new(Some(m.clone())));
-        }
-        self.models.store(Arc::new(models));
-    }
-
-    /// Inserts or updates a model by label.
-    ///
-    /// If no primary model is configured yet, this inserted model becomes the
-    /// primary default model.
-    /// Recommended labels: "pro", "flash", "lite", "fallback"
-    pub fn set_model_by(&self, label: String, model: Model) {
-        let a_model = Arc::new(Some(model.clone()));
-        if &label == "fallback" {
-            self.fallback_model.store(a_model.clone());
-        }
-        if self.model.load().is_none() {
-            self.model.store(a_model);
-        }
-
-        let mut models = self.models.load().as_ref().clone();
-        models.insert(label, model);
-        self.models.store(Arc::new(models));
-    }
-
-    /// Sets the fallback model used when primary lookup fails.
+    /// Sets the fallback model used when primary lookup fails without mutating
+    /// the label map.
     pub fn set_fallback_model(&self, model: Model) {
         self.fallback_model.store(Arc::new(Some(model)));
     }
 
-    /// Returns the primary model if available; otherwise returns the fallback model.
+    /// Inserts or updates a single labeled model.
+    ///
+    /// The special labels `primary` and `fallback` also update the dedicated
+    /// routing slots. If no primary exists yet, any inserted model is promoted
+    /// to become the primary default.
+    pub fn set(&self, label: String, model: Model) {
+        let mut models = self.models.load().as_ref().clone();
+        models.insert(label.clone(), model.clone());
+
+        let model = Arc::new(Some(model));
+        if label == "primary" {
+            self.model.store(model.clone());
+        } else if label == "fallback" {
+            self.fallback_model.store(model.clone());
+        }
+
+        if self.model.load().is_none() {
+            self.model.store(model);
+        }
+        self.models.store(Arc::new(models));
+    }
+
+    /// Returns a model by label if it exists.
+    ///
+    /// This is a direct lookup only and never falls back to the primary or
+    /// fallback slots.
+    pub fn get(&self, label: &str) -> Option<Model> {
+        self.models.load().get(label).cloned()
+    }
+
+    /// Returns the primary model if available; otherwise returns the fallback
+    /// model, and finally any remaining labeled model.
     pub fn get_model(&self) -> Option<Model> {
         if let Some(m) = self.model.load().as_ref() {
             return Some(m.clone());
@@ -201,25 +245,24 @@ impl Models {
         self.models.load().values().next().cloned()
     }
 
-    /// Returns a model by label.
+    /// Returns the configured fallback model if one exists.
+    pub fn fallback_model(&self) -> Option<Model> {
+        self.fallback_model.load().as_ref().clone()
+    }
+
+    /// Resolves a model for label-aware routing.
     ///
-    /// If the label is not found, returns the fallback model when configured.
-    pub fn get_model_by(&self, label: &str) -> Option<Model> {
+    /// Resolution order is:
+    /// - the exact label match when `label` is non-empty
+    /// - the configured fallback model
+    /// - the default routing result from [`Models::get_model`]
+    pub fn resolve(&self, label: &str) -> Option<Model> {
         if label.is_empty() {
             return self.get_model();
         }
-        if let Some(m) = self.models.load().get(label) {
-            return Some(m.clone());
-        }
-        if let Some(m) = self.fallback_model.load().as_ref() {
-            return Some(m.clone());
-        }
-        self.get_model()
-    }
-
-    /// Returns the fallback model if configured.
-    pub fn fallback_model(&self) -> Option<Model> {
-        self.fallback_model.load().as_ref().clone()
+        self.get(label)
+            .or_else(|| self.fallback_model())
+            .or_else(|| self.models.load().values().next().cloned())
     }
 }
 
@@ -321,23 +364,36 @@ impl CompletionFeaturesDyn for MockImplemented {
 pub struct Model {
     /// Completion feature implementation
     pub completer: Arc<dyn CompletionFeaturesDyn>,
+    pub labels: Vec<String>,
 }
 
 impl Model {
     /// Creates a new Model with specified embedder and completer
     pub fn new(completer: Arc<dyn CompletionFeaturesDyn>) -> Self {
-        Self { completer }
+        Self {
+            completer,
+            labels: Vec::new(),
+        }
     }
 
     /// Creates a Model with only completion features
     pub fn with_completer(completer: Arc<dyn CompletionFeaturesDyn>) -> Self {
-        Self { completer }
+        Self {
+            completer,
+            labels: Vec::new(),
+        }
+    }
+
+    pub fn with_labels(mut self, labels: Vec<String>) -> Self {
+        self.labels = labels;
+        self
     }
 
     /// Creates a Model with unimplemented features (returns errors for all operations)
     pub fn not_implemented() -> Self {
         Self {
             completer: Arc::new(NotImplemented),
+            labels: Vec::new(),
         }
     }
 
@@ -345,6 +401,7 @@ impl Model {
     pub fn mock_implemented() -> Self {
         Self {
             completer: Arc::new(MockImplemented),
+            labels: Vec::new(),
         }
     }
 
@@ -455,11 +512,13 @@ mod tests {
         let models = Models::default();
 
         assert!(models.get_model().is_none());
-        assert!(models.get_model_by("missing").is_none());
+        assert!(models.get("missing").is_none());
+        assert!(models.resolve("missing").is_none());
+        assert!(models.fallback_model().is_none());
     }
 
     #[test]
-    fn set_model_sets_primary_and_fallback() {
+    fn set_model_sets_primary_without_registering_a_label() {
         let models = Models::default();
         models.set_model(test_model("primary"));
 
@@ -470,56 +529,17 @@ mod tests {
                 .model_name(),
             "primary"
         );
-        assert_eq!(
-            models
-                .get_model_by("missing")
-                .expect("primary model should exist")
-                .model_name(),
-            "primary"
-        );
+        assert!(models.get("primary").is_none());
+        assert!(models.fallback_model().is_none());
     }
 
     #[test]
-    fn set_models_updates_map_and_promotes_one_when_primary_absent() {
+    fn set_promotes_first_inserted_model_to_primary() {
         let models = Models::default();
-        let mut map = HashMap::new();
-        map.insert("a".to_string(), test_model("A"));
-        map.insert("b".to_string(), test_model("B"));
-
-        models.set_models(map);
-
-        let primary = models
-            .get_model()
-            .expect("primary model should be promoted from set_models")
-            .model_name();
-        assert!(primary == "A" || primary == "B");
+        models.set("x".to_string(), test_model("X"));
 
         assert_eq!(
-            models
-                .get_model_by("a")
-                .expect("label a should exist")
-                .model_name(),
-            "A"
-        );
-        assert_eq!(
-            models
-                .get_model_by("b")
-                .expect("label b should exist")
-                .model_name(),
-            "B"
-        );
-    }
-
-    #[test]
-    fn set_model_by_inserts_and_sets_primary_when_empty() {
-        let models = Models::default();
-        models.set_model_by("x".to_string(), test_model("X"));
-
-        assert_eq!(
-            models
-                .get_model_by("x")
-                .expect("label x should exist")
-                .model_name(),
+            models.get("x").expect("label x should exist").model_name(),
             "X"
         );
         assert_eq!(
@@ -545,10 +565,47 @@ mod tests {
         );
         assert_eq!(
             models
-                .get_model_by("unknown")
+                .resolve("unknown")
                 .expect("fallback should be returned when label is missing")
                 .model_name(),
             "fallback"
+        );
+        assert_eq!(
+            models
+                .fallback_model()
+                .expect("fallback slot should be set")
+                .model_name(),
+            "fallback"
+        );
+    }
+
+    #[test]
+    fn resolve_prefers_exact_label_then_fallback_then_default() {
+        let models = Models::default();
+        models.set_model(test_model("primary"));
+        models.set_fallback_model(test_model("fallback"));
+        models.set("flash".to_string(), test_model("flash"));
+
+        assert_eq!(
+            models
+                .resolve("flash")
+                .expect("exact label should win")
+                .model_name(),
+            "flash"
+        );
+        assert_eq!(
+            models
+                .resolve("missing")
+                .expect("missing label should use fallback")
+                .model_name(),
+            "fallback"
+        );
+        assert_eq!(
+            models
+                .resolve("")
+                .expect("empty label should use default routing")
+                .model_name(),
+            "primary"
         );
     }
 }

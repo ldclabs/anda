@@ -926,7 +926,7 @@ mod tests {
     async fn tools_select_query_falls_back_to_ranked_candidates_on_invalid_selector_output() {
         let models = Arc::new(Models::default());
         models.set_model(Model::not_implemented());
-        models.set_model_by(
+        models.set(
             TOOLS_SELECT_NAME.to_string(),
             Model::with_completer(Arc::new(SelectorCompleter {
                 content: "not json".to_string(),
@@ -935,7 +935,7 @@ mod tests {
 
         let engine = build_engine(
             EngineBuilder::new()
-                .set_models(models)
+                .with_models(models)
                 .register_tool(Arc::new(EchoTool))
                 .unwrap()
                 .register_tool(Arc::new(HelpTool))
