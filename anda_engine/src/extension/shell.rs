@@ -37,8 +37,8 @@ use crate::{
 
 /// Maximum shell command execution time before kill.
 pub const SHELL_TIMEOUT_SECS: u64 = 180;
-/// Maximum output size in bytes (128KB).
-pub const MAX_OUTPUT_BYTES: usize = 128 * 1024;
+/// Maximum output size in bytes (256KB).
+pub const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 
 /// Runtime abstraction used by [`ShellTool`] to execute shell commands.
 #[async_trait]
@@ -57,8 +57,8 @@ pub trait Executor: Send + Sync {
 
     /// Return the runtime base working directory.
     ///
-    /// The user-provided [`ExecArgs::work_dir`] is resolved relative to this path.
-    fn work_dir(&self) -> &PathBuf;
+    /// The user-provided [`ExecArgs::workspace`] is resolved relative to this path.
+    fn workspace(&self) -> &PathBuf;
 
     /// Return the temporary directory used by this runtime.
     ///
@@ -133,7 +133,7 @@ pub struct ExecArgs {
     pub command: String,
     /// The working directory to execute the command in (relative to runtime storage path)
     #[serde(default)]
-    pub work_dir: String,
+    pub workspace: String,
     /// Additional environment variable keys to set for the command
     #[serde(default)]
     pub env_keys: Vec<String>,
@@ -146,7 +146,7 @@ pub struct ExecArgs {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ExecOutput {
     /// The working directory the command was executed.
-    pub work_dir: Option<String>,
+    pub workspace: Option<String>,
     /// Process identifier, if provided by the runtime.
     pub process_id: Option<u32>,
     /// The status (exit code) of the process.
@@ -285,7 +285,7 @@ impl Tool<BaseCtx> for ShellTool {
                         "type": "string",
                         "description": "The shell command to execute"
                     },
-                    "work_dir": {
+                    "workspace": {
                         "type": "string",
                         "description": "The working directory to execute the command in (relative to runtime storage path)",
                         "default": ""
@@ -374,7 +374,9 @@ impl Tool<BaseCtx> for ShellTool {
 
 pub(crate) fn join_current_dir(base: &Path, relative: &str) -> PathBuf {
     let relative_path = Path::new(relative);
-    if relative_path.is_relative() {
+    if relative_path.starts_with(base) {
+        relative_path.to_path_buf()
+    } else if relative_path.is_relative() {
         base.join(relative_path)
     } else {
         base.join(

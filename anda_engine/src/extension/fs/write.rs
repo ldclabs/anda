@@ -46,7 +46,7 @@ pub type WriteFileHook = DynToolHook<WriteFileArgs, WriteFileOutput>;
 
 #[derive(Clone)]
 pub struct WriteFileTool {
-    work_dir: PathBuf,
+    workspace: PathBuf,
     description: String,
 }
 
@@ -55,12 +55,12 @@ impl WriteFileTool {
     pub const NAME: &'static str = "write_file";
 
     /// Create a new `WriteFileTool` with the default working directory.
-    /// You can override the working directory for each call by including a `work_dir` field in the tool call's context meta extra.
-    pub fn new(work_dir: PathBuf) -> Self {
+    /// You can override the working directory for each call by including a `workspace` field in the tool call's context meta extra.
+    pub fn new(workspace: PathBuf) -> Self {
         let description =
             "Atomically write files to the filesystem in the workspace directory".to_string();
         Self {
-            work_dir,
+            workspace,
             description,
         }
     }
@@ -123,14 +123,14 @@ impl Tool<BaseCtx> for WriteFileTool {
             args
         };
 
-        let work_dir = ctx
+        let workspace = ctx
             .meta()
-            .get_extra_as::<String>("work_dir")
+            .get_extra_as::<String>("workspace")
             .map(PathBuf::from)
             .map(Cow::Owned)
-            .unwrap_or_else(|| Cow::Borrowed(&self.work_dir));
+            .unwrap_or_else(|| Cow::Borrowed(&self.workspace));
 
-        let resolved_path = resolve_write_path(&work_dir, &args.path).await?;
+        let resolved_path = resolve_write_path(&workspace, &args.path).await?;
 
         let data = decode_content(args.content, &args.encoding)?;
 
@@ -211,8 +211,8 @@ mod tests {
         EngineBuilder::new().mock_ctx().base
     }
 
-    fn write_tool(work_dir: &Path) -> WriteFileTool {
-        WriteFileTool::new(work_dir.to_path_buf())
+    fn write_tool(workspace: &Path) -> WriteFileTool {
+        WriteFileTool::new(workspace.to_path_buf())
     }
 
     #[tokio::test]

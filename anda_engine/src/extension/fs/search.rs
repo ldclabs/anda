@@ -41,7 +41,7 @@ pub type SearchFileHook = DynToolHook<SearchFileArgs, SearchFileOutput>;
 
 #[derive(Clone)]
 pub struct SearchFileTool {
-    work_dir: PathBuf,
+    workspace: PathBuf,
     description: String,
 }
 
@@ -50,12 +50,12 @@ impl SearchFileTool {
     pub const NAME: &'static str = "search_file";
 
     /// Create a new `SearchFileTool` with the default working directory.
-    /// You can override the working directory for each call by including a `work_dir` field in the tool call's context meta extra.
-    pub fn new(work_dir: PathBuf) -> Self {
+    /// You can override the working directory for each call by including a `workspace` field in the tool call's context meta extra.
+    pub fn new(workspace: PathBuf) -> Self {
         let description =
             "Match filesystem paths with glob patterns in the workspace directory".to_string();
         Self {
-            work_dir,
+            workspace,
             description,
         }
     }
@@ -114,15 +114,15 @@ impl Tool<BaseCtx> for SearchFileTool {
             args
         };
 
-        let work_dir = ctx
+        let workspace = ctx
             .meta()
-            .get_extra_as::<String>("work_dir")
+            .get_extra_as::<String>("workspace")
             .map(PathBuf::from)
             .map(Cow::Owned)
-            .unwrap_or_else(|| Cow::Borrowed(&self.work_dir));
+            .unwrap_or_else(|| Cow::Borrowed(&self.workspace));
 
-        let (resolved_work_dir, pattern, restrict_to_workspace_targets) =
-            resolve_glob_pattern(&work_dir, &args.pattern).await?;
+        let (resolved_workspace, pattern, restrict_to_workspace_targets) =
+            resolve_glob_pattern(&workspace, &args.pattern).await?;
 
         let mut paths = Vec::new();
         for entry in glob_with(&pattern, glob_match_options())
@@ -133,14 +133,14 @@ impl Tool<BaseCtx> for SearchFileTool {
                 .await
                 .map_err(|err| format!("Failed to resolve matched path: {err}"))?;
             if restrict_to_workspace_targets {
-                ensure_path_in_workspace(&resolved_work_dir, &resolved_path)?;
+                ensure_path_in_workspace(&resolved_workspace, &resolved_path)?;
             }
 
             paths.push(relative_match_path(
                 &path,
                 &resolved_path,
-                &work_dir,
-                &resolved_work_dir,
+                &workspace,
+                &resolved_workspace,
             )?);
         }
 
@@ -176,23 +176,23 @@ fn glob_match_options() -> MatchOptions {
 }
 
 async fn resolve_glob_pattern(
-    work_dir: &Path,
+    workspace: &Path,
     pattern: &str,
 ) -> Result<(PathBuf, String, bool), BoxError> {
     if pattern.trim().is_empty() {
         return Err("Glob pattern must not be empty".into());
     }
 
-    let resolved_work_dir = resolve_workspace_path(work_dir).await?;
+    let resolved_workspace = resolve_workspace_path(workspace).await?;
     let requested_pattern = Path::new(pattern);
-    let absolute_pattern = work_dir.join(requested_pattern);
+    let absolute_pattern = workspace.join(requested_pattern);
     let literal_prefix = literal_glob_prefix(&absolute_pattern);
 
     if !path_contains_parent_reference(requested_pattern) {
-        ensure_path_in_workspace_namespace(work_dir, &resolved_work_dir, &literal_prefix)?;
+        ensure_path_in_workspace_namespace(workspace, &resolved_workspace, &literal_prefix)?;
 
         return Ok((
-            resolved_work_dir,
+            resolved_workspace,
             absolute_pattern.to_string_lossy().into_owned(),
             false,
         ));
@@ -203,10 +203,10 @@ async fn resolve_glob_pattern(
         .await
         .map_err(|err| format!("Failed to resolve glob path: {err}"))?;
 
-    ensure_path_in_workspace(&resolved_work_dir, &resolved_ancestor)?;
+    ensure_path_in_workspace(&resolved_workspace, &resolved_ancestor)?;
 
     Ok((
-        resolved_work_dir,
+        resolved_workspace,
         absolute_pattern.to_string_lossy().into_owned(),
         true,
     ))
@@ -249,19 +249,19 @@ fn has_glob_metacharacters(component: &std::ffi::OsStr) -> bool {
 fn relative_match_path(
     path: &Path,
     resolved_path: &Path,
-    work_dir: &Path,
-    resolved_work_dir: &Path,
+    workspace: &Path,
+    resolved_workspace: &Path,
 ) -> Result<String, BoxError> {
-    if let Ok(relative) = path.strip_prefix(work_dir) {
+    if let Ok(relative) = path.strip_prefix(workspace) {
         return Ok(normalize_relative_path(relative));
     }
 
-    if let Ok(relative) = path.strip_prefix(resolved_work_dir) {
+    if let Ok(relative) = path.strip_prefix(resolved_workspace) {
         return Ok(normalize_relative_path(relative));
     }
 
     let relative = resolved_path
-        .strip_prefix(resolved_work_dir)
+        .strip_prefix(resolved_workspace)
         .map_err(|err| format!("Failed to normalize matched path: {err}"))?;
     Ok(normalize_relative_path(relative))
 }
@@ -297,8 +297,8 @@ mod tests {
         EngineBuilder::new().mock_ctx().base
     }
 
-    fn glob_tool(work_dir: &Path) -> SearchFileTool {
-        SearchFileTool::new(work_dir.to_path_buf())
+    fn glob_tool(workspace: &Path) -> SearchFileTool {
+        SearchFileTool::new(workspace.to_path_buf())
     }
 
     #[tokio::test]

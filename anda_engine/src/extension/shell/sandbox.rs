@@ -22,7 +22,7 @@ type OutputStream = Pin<Box<dyn Stream<Item = String> + Send>>;
 
 /// Sandbox runtime — restricted access, runs in a sandboxed environment
 pub struct SandboxRuntime {
-    work_dir: PathBuf,
+    workspace: PathBuf,
     temp_dir: PathBuf,
     runner: Arc<dyn SandboxCommandRunner>,
 }
@@ -50,15 +50,15 @@ impl SandboxRuntime {
         let litebox = runtime.create(options, None).await?;
         Ok(Self {
             runner: Arc::new(BoxliteRunner { litebox }),
-            work_dir: "/home".into(),
+            workspace: "/home".into(),
             temp_dir: "/tmp".into(),
         })
     }
 
     #[cfg(test)]
-    fn test(runner: Arc<dyn SandboxCommandRunner>, work_dir: PathBuf, temp_dir: PathBuf) -> Self {
+    fn test(runner: Arc<dyn SandboxCommandRunner>, workspace: PathBuf, temp_dir: PathBuf) -> Self {
         Self {
-            work_dir,
+            workspace,
             temp_dir,
             runner,
         }
@@ -66,7 +66,7 @@ impl SandboxRuntime {
 
     fn build_command(
         &self,
-        work_dir: &PathBuf,
+        workspace: &PathBuf,
         input: &ExecArgs,
         envs: HashMap<String, String>,
     ) -> SandboxCommandSpec {
@@ -76,7 +76,7 @@ impl SandboxRuntime {
         SandboxCommandSpec {
             program: "sh".to_string(),
             args: vec!["-c".to_string(), input.command.clone()],
-            working_dir: join_current_dir(work_dir, &input.work_dir)
+            working_dir: join_current_dir(workspace, &input.workspace)
                 .to_string_lossy()
                 .to_string(),
             envs,
@@ -91,8 +91,8 @@ impl Executor for SandboxRuntime {
         "sandbox"
     }
 
-    fn work_dir(&self) -> &PathBuf {
-        &self.work_dir
+    fn workspace(&self) -> &PathBuf {
+        &self.workspace
     }
 
     fn os(&self) -> &str {
@@ -114,8 +114,8 @@ impl Executor for SandboxRuntime {
         envs: HashMap<String, String>,
     ) -> Result<ExecOutput, BoxError> {
         let hook = ctx.get_state::<ShellToolHook>();
-        let cmd = self.build_command(&self.work_dir, &input, envs);
-        let work_dir_str = cmd.working_dir.clone();
+        let cmd = self.build_command(&self.workspace, &input, envs);
+        let workspace_str = cmd.working_dir.clone();
         let child = self.runner.exec(cmd).await?;
         if !input.background {
             let temp_dir = self.temp_dir();
@@ -123,13 +123,13 @@ impl Executor for SandboxRuntime {
                 Ok(output) => {
                     let mut exec_output =
                         ExecOutput::from_output(None, Some(output), &temp_dir).await;
-                    exec_output.work_dir = Some(work_dir_str);
+                    exec_output.workspace = Some(workspace_str);
 
                     return Ok(exec_output);
                 }
                 Err(err) => {
                     let exec_output = ExecOutput {
-                        work_dir: Some(work_dir_str),
+                        workspace: Some(workspace_str),
                         stderr: Some(format!("Failed to execute background process: {err}")),
                         ..Default::default()
                     };
@@ -152,7 +152,7 @@ impl Executor for SandboxRuntime {
                     Ok(output) => {
                         let mut exec_output =
                             ExecOutput::from_output(None, Some(output), &temp_dir).await;
-                        exec_output.work_dir = Some(work_dir_str);
+                        exec_output.workspace = Some(workspace_str);
                         if let Some(hook) = &hook {
                             hook.on_background_end(ctx, task_id, ToolOutput::new(exec_output))
                                 .await;
@@ -160,7 +160,7 @@ impl Executor for SandboxRuntime {
                     }
                     Err(err) => {
                         let exec_output = ExecOutput {
-                            work_dir: Some(work_dir_str),
+                            workspace: Some(workspace_str),
                             stderr: Some(format!("Failed to execute background process: {err}")),
                             ..Default::default()
                         };
@@ -515,12 +515,12 @@ mod tests {
         assert_eq!(runtime.name(), "sandbox");
         assert_eq!(runtime.os(), "Alpine Linux");
         assert_eq!(runtime.shell(), "sh");
-        assert_eq!(runtime.work_dir(), &PathBuf::from("/home"));
+        assert_eq!(runtime.workspace(), &PathBuf::from("/home"));
         assert_eq!(runtime.temp_dir(), &PathBuf::from("/tmp"));
     }
 
     #[test]
-    fn build_command_sets_shell_env_work_dir_and_timeout() {
+    fn build_command_sets_shell_env_workspace_and_timeout() {
         let runtime = SandboxRuntime::test(
             Arc::new(PanicRunner),
             PathBuf::from("/home"),
@@ -534,7 +534,7 @@ mod tests {
             &PathBuf::from("/home"),
             &ExecArgs {
                 command: "echo hello".to_string(),
-                work_dir: "nested".to_string(),
+                workspace: "nested".to_string(),
                 ..Default::default()
             },
             envs,
@@ -568,7 +568,7 @@ mod tests {
             &PathBuf::from("/home"),
             &ExecArgs {
                 command: "echo hello".to_string(),
-                work_dir: String::new(),
+                workspace: String::new(),
                 background: true,
                 ..Default::default()
             },
@@ -582,15 +582,15 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn execute_runs_foreground_command() {
         let ctx = EngineBuilder::new().mock_ctx();
-        let work_dir = TestTempDir::new("anda-sandbox-foreground-workdir").await;
+        let workspace = TestTempDir::new("anda-sandbox-foreground-workdir").await;
         let tempdir = TestTempDir::new("anda-sandbox-foreground-temp").await;
-        work_dir.create_dir("nested").await;
+        workspace.create_dir("nested").await;
         let runner = Arc::new(TestRunner::new(vec![RunnerOutcome::Execution(
             FakeExecution::success(&["done"], &["warn"], 0),
         )]));
         let runtime = SandboxRuntime::test(
             runner.clone(),
-            work_dir.path().to_path_buf(),
+            workspace.path().to_path_buf(),
             tempdir.path().to_path_buf(),
         );
         let mut envs = HashMap::new();
@@ -601,7 +601,7 @@ mod tests {
                 ctx.base,
                 ExecArgs {
                     command: "echo hello".to_string(),
-                    work_dir: "nested".to_string(),
+                    workspace: "nested".to_string(),
                     ..Default::default()
                 },
                 envs,
@@ -623,7 +623,7 @@ mod tests {
         assert_eq!(recorded.len(), 1);
         assert_eq!(
             recorded[0].working_dir,
-            work_dir.path().join("nested").to_string_lossy()
+            workspace.path().join("nested").to_string_lossy()
         );
         assert_eq!(
             recorded[0].envs,
@@ -634,13 +634,13 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn execute_propagates_runner_errors() {
         let ctx = EngineBuilder::new().mock_ctx();
-        let work_dir = TestTempDir::new("anda-sandbox-runner-error-workdir").await;
+        let workspace = TestTempDir::new("anda-sandbox-runner-error-workdir").await;
         let temp_dir = TestTempDir::new("anda-sandbox-runner-error-temp").await;
         let runtime = SandboxRuntime::test(
             Arc::new(TestRunner::new(vec![RunnerOutcome::Error(
                 "sandbox unavailable".to_string(),
             )])),
-            work_dir.path().to_path_buf(),
+            workspace.path().to_path_buf(),
             temp_dir.path().to_path_buf(),
         );
 
@@ -662,7 +662,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn execute_reports_background_output_via_hook() {
         let ctx = EngineBuilder::new().mock_ctx();
-        let work_dir = TestTempDir::new("anda-sandbox-background-workdir").await;
+        let workspace = TestTempDir::new("anda-sandbox-background-workdir").await;
         let temp_dir = TestTempDir::new("anda-sandbox-background-temp").await;
         let runner = Arc::new(TestRunner::new(vec![RunnerOutcome::Execution(
             FakeExecution::success(&["bg-out"], &["bg-err"], 0),
@@ -673,12 +673,12 @@ mod tests {
 
         let runtime = SandboxRuntime::test(
             runner,
-            work_dir.path().to_path_buf(),
+            workspace.path().to_path_buf(),
             temp_dir.path().to_path_buf(),
         );
         let input = ExecArgs {
             command: "echo background".to_string(),
-            work_dir: String::new(),
+            workspace: String::new(),
             background: true,
             ..Default::default()
         };
@@ -718,13 +718,13 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn execute_returns_exec_output_when_wait_fails() {
         let ctx = EngineBuilder::new().mock_ctx();
-        let work_dir = TestTempDir::new("anda-sandbox-wait-error-workdir").await;
+        let workspace = TestTempDir::new("anda-sandbox-wait-error-workdir").await;
         let temp_dir = TestTempDir::new("anda-sandbox-wait-error-temp").await;
         let runtime = SandboxRuntime::test(
             Arc::new(TestRunner::new(vec![RunnerOutcome::Execution(
                 FakeExecution::wait_error("broken pipe"),
             )])),
-            work_dir.path().to_path_buf(),
+            workspace.path().to_path_buf(),
             temp_dir.path().to_path_buf(),
         );
 

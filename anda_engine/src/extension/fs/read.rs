@@ -47,7 +47,7 @@ pub type ReadFileHook = DynToolHook<ReadFileArgs, ReadFileOutput>;
 
 #[derive(Clone)]
 pub struct ReadFileTool {
-    work_dir: PathBuf,
+    workspace: PathBuf,
     description: String,
 }
 
@@ -56,11 +56,11 @@ impl ReadFileTool {
     pub const NAME: &'static str = "read_file";
 
     /// Create a new `ReadFileTool` with the default working directory.
-    /// You can override the working directory for each call by including a `work_dir` field in the tool call's context meta extra.
-    pub fn new(work_dir: PathBuf) -> Self {
+    /// You can override the working directory for each call by including a `workspace` field in the tool call's context meta extra.
+    pub fn new(workspace: PathBuf) -> Self {
         let description = "Read files from the filesystem in the workspace directory".to_string();
         Self {
-            work_dir,
+            workspace,
             description,
         }
     }
@@ -123,14 +123,14 @@ impl Tool<BaseCtx> for ReadFileTool {
             args
         };
 
-        let work_dir = ctx
+        let workspace = ctx
             .meta()
-            .get_extra_as::<String>("work_dir")
+            .get_extra_as::<String>("workspace")
             .map(PathBuf::from)
             .map(Cow::Owned)
-            .unwrap_or_else(|| Cow::Borrowed(&self.work_dir));
+            .unwrap_or_else(|| Cow::Borrowed(&self.workspace));
 
-        let resolved_path = resolve_read_path(&work_dir, &args.path).await?;
+        let resolved_path = resolve_read_path(&workspace, &args.path).await?;
 
         let meta = tokio::fs::metadata(&resolved_path)
             .await
@@ -212,8 +212,8 @@ mod tests {
         EngineBuilder::new().mock_ctx().base
     }
 
-    fn read_tool(work_dir: &Path) -> ReadFileTool {
-        ReadFileTool::new(work_dir.to_path_buf())
+    fn read_tool(workspace: &Path) -> ReadFileTool {
+        ReadFileTool::new(workspace.to_path_buf())
     }
 
     #[tokio::test]

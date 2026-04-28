@@ -22,13 +22,13 @@ pub(crate) const UTF8_ENCODING: &str = "utf8";
 pub(crate) const BASE64_ENCODING: &str = "base64";
 
 /// Resolves an existing read target reachable from the workspace namespace.
-pub async fn resolve_read_path(work_dir: &Path, user_path: &str) -> Result<PathBuf, BoxError> {
-    let resolved_work_dir = resolve_workspace_path(work_dir).await?;
+pub async fn resolve_read_path(workspace: &Path, user_path: &str) -> Result<PathBuf, BoxError> {
+    let resolved_workspace = resolve_workspace_path(workspace).await?;
     let requested_path = Path::new(user_path);
-    let path = work_dir.join(requested_path);
+    let path = workspace.join(requested_path);
 
     if !path_contains_parent_reference(requested_path) {
-        ensure_path_in_workspace_namespace(work_dir, &resolved_work_dir, &path)?;
+        ensure_path_in_workspace_namespace(workspace, &resolved_workspace, &path)?;
 
         return tokio::fs::canonicalize(&path)
             .await
@@ -39,15 +39,15 @@ pub async fn resolve_read_path(work_dir: &Path, user_path: &str) -> Result<PathB
         .await
         .map_err(|err| format!("Failed to resolve file path: {err}"))?;
 
-    ensure_path_in_workspace(&resolved_work_dir, &resolved_path)?;
+    ensure_path_in_workspace(&resolved_workspace, &resolved_path)?;
 
     Ok(resolved_path)
 }
 
 /// Resolves a write target inside the workspace, even when the destination does not yet exist.
-pub async fn resolve_write_path(work_dir: &Path, user_path: &str) -> Result<PathBuf, BoxError> {
-    let resolved_work_dir = resolve_workspace_path(work_dir).await?;
-    let path = work_dir.join(user_path);
+pub async fn resolve_write_path(workspace: &Path, user_path: &str) -> Result<PathBuf, BoxError> {
+    let resolved_workspace = resolve_workspace_path(workspace).await?;
+    let path = workspace.join(user_path);
 
     match tokio::fs::symlink_metadata(&path).await {
         Ok(meta) => {
@@ -58,7 +58,7 @@ pub async fn resolve_write_path(work_dir: &Path, user_path: &str) -> Result<Path
             let resolved_path = tokio::fs::canonicalize(&path)
                 .await
                 .map_err(|err| format!("Failed to resolve file path: {err}"))?;
-            ensure_path_in_workspace(&resolved_work_dir, &resolved_path)?;
+            ensure_path_in_workspace(&resolved_workspace, &resolved_path)?;
 
             Ok(resolved_path)
         }
@@ -67,7 +67,7 @@ pub async fn resolve_write_path(work_dir: &Path, user_path: &str) -> Result<Path
             let resolved_ancestor = tokio::fs::canonicalize(&existing_ancestor)
                 .await
                 .map_err(|err| format!("Failed to resolve file path: {err}"))?;
-            ensure_path_in_workspace(&resolved_work_dir, &resolved_ancestor)?;
+            ensure_path_in_workspace(&resolved_workspace, &resolved_ancestor)?;
 
             Ok(missing_components
                 .into_iter()
@@ -78,17 +78,17 @@ pub async fn resolve_write_path(work_dir: &Path, user_path: &str) -> Result<Path
     }
 }
 
-pub(crate) async fn resolve_workspace_path(work_dir: &Path) -> Result<PathBuf, BoxError> {
-    tokio::fs::canonicalize(work_dir)
+pub(crate) async fn resolve_workspace_path(workspace: &Path) -> Result<PathBuf, BoxError> {
+    tokio::fs::canonicalize(workspace)
         .await
         .map_err(|err| format!("Failed to resolve workspace path: {err}").into())
 }
 
 pub(crate) fn ensure_path_in_workspace(
-    resolved_work_dir: &Path,
+    resolved_workspace: &Path,
     resolved_path: &Path,
 ) -> Result<(), BoxError> {
-    if !resolved_path.starts_with(resolved_work_dir) {
+    if !resolved_path.starts_with(resolved_workspace) {
         return Err("Access to paths outside the workspace is not allowed".into());
     }
 
@@ -103,11 +103,11 @@ pub(crate) fn path_contains_parent_reference(path: &Path) -> bool {
 
 /// Ensures the requested path stays within the workspace namespace before following symlinks.
 pub(crate) fn ensure_path_in_workspace_namespace(
-    work_dir: &Path,
-    resolved_work_dir: &Path,
+    workspace: &Path,
+    resolved_workspace: &Path,
     requested_path: &Path,
 ) -> Result<(), BoxError> {
-    if requested_path.starts_with(work_dir) || requested_path.starts_with(resolved_work_dir) {
+    if requested_path.starts_with(workspace) || requested_path.starts_with(resolved_workspace) {
         return Ok(());
     }
 

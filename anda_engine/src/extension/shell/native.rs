@@ -13,14 +13,14 @@ use crate::{context::BaseCtx, hook::ToolHook};
 
 /// Native runtime — full access, runs on Mac/Linux/Docker/Raspberry Pi
 pub struct NativeRuntime {
-    work_dir: PathBuf,
+    workspace: PathBuf,
     temp_dir: PathBuf,
 }
 
 impl NativeRuntime {
-    pub fn new(work_dir: PathBuf) -> Self {
+    pub fn new(workspace: PathBuf) -> Self {
         Self {
-            work_dir,
+            workspace,
             temp_dir: std::env::temp_dir(),
         }
     }
@@ -42,9 +42,9 @@ impl NativeRuntime {
     }
 
     #[cfg(test)]
-    fn test(work_dir: PathBuf) -> Self {
+    fn test(workspace: PathBuf) -> Self {
         Self {
-            work_dir,
+            workspace,
             temp_dir: std::env::temp_dir(),
         }
     }
@@ -56,8 +56,8 @@ impl Executor for NativeRuntime {
         "native"
     }
 
-    fn work_dir(&self) -> &PathBuf {
-        &self.work_dir
+    fn workspace(&self) -> &PathBuf {
+        &self.workspace
     }
 
     fn temp_dir(&self) -> &PathBuf {
@@ -83,17 +83,17 @@ impl Executor for NativeRuntime {
         envs: HashMap<String, String>,
     ) -> Result<ExecOutput, BoxError> {
         let hook = ctx.get_state::<ShellToolHook>();
-        let work_dir = ctx
+        let workspace = ctx
             .meta()
-            .get_extra_as::<String>("work_dir")
+            .get_extra_as::<String>("workspace")
             .map(PathBuf::from)
             .map(Cow::Owned)
-            .unwrap_or_else(|| Cow::Borrowed(&self.work_dir));
+            .unwrap_or_else(|| Cow::Borrowed(&self.workspace));
 
-        let work_dir = join_current_dir(&work_dir, &input.work_dir);
-        let work_dir_str = work_dir.to_string_lossy().to_string();
+        let workspace = join_current_dir(&workspace, &input.workspace);
+        let workspace_str = workspace.to_string_lossy().to_string();
 
-        let mut cmd = self.build_shell_command(&input.command, &work_dir);
+        let mut cmd = self.build_shell_command(&input.command, &workspace);
         cmd.env_clear();
         cmd.envs(envs);
         cmd.stdin(Stdio::null());
@@ -109,12 +109,12 @@ impl Executor for NativeRuntime {
                 Ok(output) => {
                     let mut exec_output =
                         ExecOutput::from_output(pid, Some(output), temp_dir).await;
-                    exec_output.work_dir = Some(work_dir_str);
+                    exec_output.workspace = Some(workspace_str);
                     return Ok(exec_output);
                 }
                 Err(err) => {
                     let exec_output = ExecOutput {
-                        work_dir: Some(work_dir_str),
+                        workspace: Some(workspace_str),
                         process_id: pid,
                         stderr: Some(format!("Failed to execute background process: {err}")),
                         ..Default::default()
@@ -138,7 +138,7 @@ impl Executor for NativeRuntime {
                     Ok(output) => {
                         let mut exec_output =
                             ExecOutput::from_output(pid, Some(output), &temp_dir).await;
-                        exec_output.work_dir = Some(work_dir_str);
+                        exec_output.workspace = Some(workspace_str);
                         if let Some(hook) = &hook {
                             hook.on_background_end(ctx, task_id, ToolOutput::new(exec_output))
                                 .await;
@@ -146,7 +146,7 @@ impl Executor for NativeRuntime {
                     }
                     Err(err) => {
                         let exec_output = ExecOutput {
-                            work_dir: Some(work_dir_str),
+                            workspace: Some(workspace_str),
                             process_id: pid,
                             stderr: Some(format!("Failed to execute background process: {err}")),
                             ..Default::default()
@@ -255,18 +255,18 @@ mod tests {
 
         assert_eq!(runtime.name(), "native");
         assert_eq!(
-            runtime.work_dir(),
+            runtime.workspace(),
             &PathBuf::from("/home/anda-native-runtime-tests")
         );
         assert_eq!(runtime.temp_dir(), &std::env::temp_dir());
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn execute_runs_foreground_command_with_envs_and_work_dir() {
+    async fn execute_runs_foreground_command_with_envs_and_workspace() {
         let ctx = EngineBuilder::new().mock_ctx();
-        let work_dir = TestTempDir::new("anda-native-foreground").await;
-        let nested_dir = work_dir.create_dir("nested").await;
-        let runtime = NativeRuntime::test(work_dir.path().to_path_buf());
+        let workspace = TestTempDir::new("anda-native-foreground").await;
+        let nested_dir = workspace.create_dir("nested").await;
+        let runtime = NativeRuntime::test(workspace.path().to_path_buf());
         let env_name = "ANDA_NATIVE_TEST_VALUE";
         let output_file = "env.txt";
         let mut envs = HashMap::new();
@@ -277,7 +277,7 @@ mod tests {
                 ctx.base,
                 ExecArgs {
                     command: foreground_command(&runtime, env_name, output_file),
-                    work_dir: "nested".to_string(),
+                    workspace: "nested".to_string(),
                     ..Default::default()
                 },
                 envs,
@@ -298,15 +298,15 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn execute_returns_spawn_error_for_missing_workdir() {
         let ctx = EngineBuilder::new().mock_ctx();
-        let work_dir = TestTempDir::new("anda-native-missing-workdir").await;
-        let runtime = NativeRuntime::test(work_dir.path().to_path_buf());
+        let workspace = TestTempDir::new("anda-native-missing-workdir").await;
+        let runtime = NativeRuntime::test(workspace.path().to_path_buf());
 
         let err = runtime
             .execute(
                 ctx.base,
                 ExecArgs {
                     command: foreground_command(&runtime, "IGNORED", "env.txt"),
-                    work_dir: "missing".to_string(),
+                    workspace: "missing".to_string(),
                     ..Default::default()
                 },
                 HashMap::new(),
@@ -323,14 +323,14 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn execute_reports_background_output_via_hook() {
         let ctx = EngineBuilder::new().mock_ctx();
-        let work_dir = TestTempDir::new("anda-native-background").await;
+        let workspace = TestTempDir::new("anda-native-background").await;
         let (sender, receiver) = oneshot::channel();
         let hook = ShellToolHook::new(Arc::new(TestHook::new(sender)));
         ctx.base.set_state(hook);
-        let runtime = NativeRuntime::test(work_dir.path().to_path_buf());
+        let runtime = NativeRuntime::test(workspace.path().to_path_buf());
         let input = ExecArgs {
             command: background_command(&runtime),
-            work_dir: String::new(),
+            workspace: String::new(),
             background: true,
             ..Default::default()
         };
