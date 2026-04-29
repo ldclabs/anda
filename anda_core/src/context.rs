@@ -581,12 +581,13 @@ pub trait CacheStoreFeatures: StoreFeatures + CacheFeatures + Send + Sync + 'sta
             Ok(ver)
         } else {
             let res = self.store_put(&p, PutMode::Overwrite, data.into()).await?;
-            // delete cache for fetching on next get
-            self.cache_delete(key).await;
-            Ok(UpdateVersion {
+            let ver = UpdateVersion {
                 e_tag: res.e_tag,
                 version: res.version,
-            })
+            };
+            self.cache_set(key, (CacheStoreValue(val, ver.clone()), None))
+                .await;
+            Ok(ver)
         }
     }
 
@@ -604,4 +605,242 @@ pub fn derivation_path_with(path: &Path, derivation_path: Vec<Vec<u8>>) -> Vec<V
     dp.push(path.as_ref().as_bytes().to_vec());
     dp.extend(derivation_path);
     dp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::executor::block_on;
+    use std::{
+        collections::BTreeMap,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    type TestCacheValue = Arc<(Bytes, Option<CacheExpiry>)>;
+    type TestCacheMap = BTreeMap<String, TestCacheValue>;
+
+    #[derive(Default)]
+    struct TestCacheStore {
+        cache: Mutex<TestCacheMap>,
+        store: Mutex<BTreeMap<String, (Bytes, UpdateVersion)>>,
+        store_gets: AtomicUsize,
+        versions: AtomicUsize,
+    }
+
+    impl TestCacheStore {
+        fn put_serialized(&self, key: &str, value: Vec<u8>, version: UpdateVersion) {
+            self.store
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), (value.into(), version));
+        }
+
+        fn next_version(&self) -> UpdateVersion {
+            let version = self.versions.fetch_add(1, Ordering::SeqCst) + 1;
+            UpdateVersion {
+                e_tag: Some(format!("etag-{version}")),
+                version: Some(version.to_string()),
+            }
+        }
+    }
+
+    impl CacheFeatures for TestCacheStore {
+        fn cache_contains(&self, key: &str) -> bool {
+            self.cache.lock().unwrap().contains_key(key)
+        }
+
+        async fn cache_get<T>(&self, key: &str) -> Result<T, BoxError>
+        where
+            T: DeserializeOwned,
+        {
+            let value = self
+                .cache
+                .lock()
+                .unwrap()
+                .get(key)
+                .cloned()
+                .ok_or_else(|| format!("key {key} not found"))?;
+            from_reader(&value.0[..]).map_err(|err| err.into())
+        }
+
+        async fn cache_get_with<T, F>(&self, key: &str, init: F) -> Result<T, BoxError>
+        where
+            T: Sized + DeserializeOwned + Serialize + Send,
+            F: Future<Output = Result<(T, Option<CacheExpiry>), BoxError>> + Send + 'static,
+        {
+            if let Some(value) = self.cache.lock().unwrap().get(key).cloned() {
+                return from_reader(&value.0[..]).map_err(|err| err.into());
+            }
+
+            let (value, expiry) = init.await?;
+            let data = deterministic_cbor_into_vec(&value)?;
+            self.cache
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), Arc::new((data.into(), expiry)));
+            Ok(value)
+        }
+
+        async fn cache_set<T>(&self, key: &str, val: (T, Option<CacheExpiry>))
+        where
+            T: Sized + Serialize + Send,
+        {
+            let data = deterministic_cbor_into_vec(&val.0).unwrap();
+            self.cache
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), Arc::new((data.into(), val.1)));
+        }
+
+        async fn cache_set_if_not_exists<T>(&self, key: &str, val: (T, Option<CacheExpiry>)) -> bool
+        where
+            T: Sized + Serialize + Send,
+        {
+            let mut cache = self.cache.lock().unwrap();
+            if cache.contains_key(key) {
+                return false;
+            }
+
+            let data = deterministic_cbor_into_vec(&val.0).unwrap();
+            cache.insert(key.to_string(), Arc::new((data.into(), val.1)));
+            true
+        }
+
+        async fn cache_delete(&self, key: &str) -> bool {
+            self.cache.lock().unwrap().remove(key).is_some()
+        }
+
+        fn cache_raw_iter(
+            &self,
+        ) -> impl Iterator<Item = (Arc<String>, Arc<(Bytes, Option<CacheExpiry>)>)> {
+            self.cache
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(key, value)| (Arc::new(key.clone()), value.clone()))
+                .collect::<Vec<_>>()
+                .into_iter()
+        }
+    }
+
+    impl StoreFeatures for TestCacheStore {
+        async fn store_get(&self, path: &Path) -> Result<(bytes::Bytes, ObjectMeta), BoxError> {
+            self.store_gets.fetch_add(1, Ordering::SeqCst);
+            let (value, version) = self
+                .store
+                .lock()
+                .unwrap()
+                .get(path.as_ref())
+                .cloned()
+                .ok_or_else(|| format!("path {path} not found"))?;
+
+            Ok((
+                value.clone(),
+                ObjectMeta {
+                    location: path.clone(),
+                    last_modified: chrono::Utc::now(),
+                    size: value.len() as u64,
+                    e_tag: version.e_tag,
+                    version: version.version,
+                },
+            ))
+        }
+
+        async fn store_list(
+            &self,
+            _prefix: Option<&Path>,
+            _offset: &Path,
+        ) -> Result<Vec<ObjectMeta>, BoxError> {
+            Ok(Vec::new())
+        }
+
+        async fn store_put(
+            &self,
+            path: &Path,
+            mode: PutMode,
+            value: bytes::Bytes,
+        ) -> Result<PutResult, BoxError> {
+            let key = path.as_ref().to_string();
+            let mut store = self.store.lock().unwrap();
+            match mode {
+                PutMode::Create if store.contains_key(&key) => {
+                    return Err(format!("path {path} already exists").into());
+                }
+                PutMode::Update(expected) => {
+                    let Some((_, current)) = store.get(&key) else {
+                        return Err(format!("path {path} not found").into());
+                    };
+                    if current.e_tag != expected.e_tag || current.version != expected.version {
+                        return Err(format!("path {path} version mismatch").into());
+                    }
+                }
+                _ => {}
+            }
+
+            let version = self.next_version();
+            store.insert(key, (value, version.clone()));
+            Ok(PutResult {
+                e_tag: version.e_tag,
+                version: version.version,
+            })
+        }
+
+        async fn store_rename_if_not_exists(&self, from: &Path, to: &Path) -> Result<(), BoxError> {
+            let mut store = self.store.lock().unwrap();
+            let to = to.as_ref().to_string();
+            if store.contains_key(&to) {
+                return Err(format!("path {to} already exists").into());
+            }
+            let value = store
+                .remove(from.as_ref())
+                .ok_or_else(|| format!("path {from} not found"))?;
+            store.insert(to, value);
+            Ok(())
+        }
+
+        async fn store_delete(&self, path: &Path) -> Result<(), BoxError> {
+            self.store.lock().unwrap().remove(path.as_ref());
+            Ok(())
+        }
+    }
+
+    impl CacheStoreFeatures for TestCacheStore {}
+
+    #[test]
+    fn cache_store_get_populates_cache_without_second_store_read() {
+        let ctx = TestCacheStore::default();
+        let stored_version = UpdateVersion {
+            e_tag: Some("etag-stored".to_string()),
+            version: Some("1".to_string()),
+        };
+        let data = deterministic_cbor_into_vec(&123_u32).unwrap();
+        ctx.put_serialized("answer", data, stored_version.clone());
+
+        let (value, version) = block_on(ctx.cache_store_get::<u32>("answer")).unwrap();
+        assert_eq!(value, 123);
+        assert_eq!(version.e_tag, stored_version.e_tag);
+        assert_eq!(version.version, stored_version.version);
+        assert_eq!(ctx.store_gets.load(Ordering::SeqCst), 1);
+
+        let (value, _) = block_on(ctx.cache_store_get::<u32>("answer")).unwrap();
+        assert_eq!(value, 123);
+        assert_eq!(ctx.store_gets.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn cache_store_set_overwrite_updates_cache() {
+        let ctx = TestCacheStore::default();
+
+        let version = block_on(ctx.cache_store_set("answer", 42_u32, None)).unwrap();
+        assert_eq!(ctx.store_gets.load(Ordering::SeqCst), 0);
+
+        let (value, cached_version) = block_on(ctx.cache_store_get::<u32>("answer")).unwrap();
+        assert_eq!(value, 42);
+        assert_eq!(cached_version.e_tag, version.e_tag);
+        assert_eq!(cached_version.version, version.version);
+        assert_eq!(ctx.store_gets.load(Ordering::SeqCst), 0);
+    }
 }

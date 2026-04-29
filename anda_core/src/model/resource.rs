@@ -3,6 +3,7 @@ use chrono::prelude::*;
 use ic_auth_types::{ByteArrayB64, ByteBufB64};
 use ic_cose_types::cose::sha3_256;
 use serde::Serialize;
+use std::collections::BTreeSet;
 
 use anda_db_schema::{Json, Map};
 
@@ -106,17 +107,81 @@ pub fn select_resources(resources: &mut Vec<Resource>, tags: &[String]) -> Vec<R
     //     if res.is_empty() { None } else { Some(res) }
     // }
 
-    {
-        let mut res = Vec::new();
-        let mut i = 0;
+    let tag_set: BTreeSet<&str> = tags.iter().map(String::as_str).collect();
+    let mut selected = Vec::new();
+    let mut remaining = Vec::with_capacity(resources.len());
 
-        while i < resources.len() {
-            if resources[i].tags.iter().any(|tag| tags.contains(tag)) {
-                res.push(resources.remove(i));
-            } else {
-                i += 1;
-            }
+    for resource in std::mem::take(resources) {
+        if resource
+            .tags
+            .iter()
+            .any(|tag| tag_set.contains(tag.as_str()))
+        {
+            selected.push(resource);
+        } else {
+            remaining.push(resource);
         }
-        res
+    }
+
+    *resources = remaining;
+    selected
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn resource(id: u64, tags: &[&str]) -> Resource {
+        Resource {
+            _id: id,
+            name: format!("resource-{id}"),
+            tags: tags.iter().map(|tag| tag.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn select_resources_preserves_selected_and_remaining_order() {
+        let mut resources = vec![
+            resource(1, &["text"]),
+            resource(2, &["image"]),
+            resource(3, &["text", "code"]),
+            resource(4, &["audio"]),
+        ];
+        let tags = vec!["text".to_string(), "audio".to_string()];
+
+        let selected = select_resources(&mut resources, &tags);
+
+        assert_eq!(
+            selected
+                .iter()
+                .map(|resource| resource._id)
+                .collect::<Vec<_>>(),
+            vec![1, 3, 4]
+        );
+        assert_eq!(
+            resources
+                .iter()
+                .map(|resource| resource._id)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+    }
+
+    #[test]
+    fn select_resources_wildcard_takes_all_resources() {
+        let mut resources = vec![resource(1, &["text"]), resource(2, &["image"])];
+        let tags = vec!["*".to_string()];
+
+        let selected = select_resources(&mut resources, &tags);
+
+        assert_eq!(
+            selected
+                .iter()
+                .map(|resource| resource._id)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(resources.is_empty());
     }
 }

@@ -108,6 +108,7 @@ where
 {
     let value = Json::deserialize(deserializer)?;
     match value {
+        Json::Null => Ok(Vec::new()),
         Json::String(s) => Ok(vec![ContentPart::Text { text: s }]),
         Json::Array(_) => Vec::<ContentPart>::deserialize(value).map_err(serde::de::Error::custom),
         _ => Err(serde::de::Error::custom(
@@ -1205,6 +1206,14 @@ mod tests {
         }))
         .unwrap();
         assert!(msg3.content.is_empty());
+
+        // null content is treated as empty content for provider compatibility
+        let msg4: Message = serde_json::from_value(serde_json::json!({
+            "role": "assistant",
+            "content": null
+        }))
+        .unwrap();
+        assert!(msg4.content.is_empty());
     }
 
     #[test]
