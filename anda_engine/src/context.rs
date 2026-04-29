@@ -1,6 +1,10 @@
-//! Context Management System for AI Agents
+//! Execution context system for Anda agents and tools.
 //!
-//! This module provides the core infrastructure for managing execution contexts in AI systems.
+//! Contexts carry the runtime capabilities exposed to [`anda_core`] agents and
+//! tools: caller identity, request metadata, cancellation, scoped cache, object
+//! storage, HTTP and canister calls, Web3 signing, remote engine access, and
+//! per-session state. Contexts are hierarchical so each agent or tool receives a
+//! scoped namespace while sharing the same underlying runtime resources.
 
 mod agent;
 mod base;
@@ -17,7 +21,7 @@ pub use subagent::*;
 pub use tool::*;
 pub use web3::*;
 
-/// Mock implementations for testing purposes.
+/// Mock implementations for tests.
 ///
 /// This module provides mock implementations of core interfaces that allow
 /// for controlled testing environments without requiring actual canister calls.

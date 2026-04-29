@@ -1,18 +1,16 @@
-//! Model integration module for Anda Engine
+//! Model provider integration and label-based routing.
 //!
-//! This module provides implementations for various AI model providers, including:
-//! - OpenAI (completion models)
-//! - DeepSeek (completion models)
-//! - Anthropic (completion models)
-//! - Google Gemini (completion models)
+//! This module adapts provider-specific completion APIs to the common
+//! [`CompletionRequest`] and [`AgentOutput`] contract used by Anda agents.
+//! Built-in providers currently include OpenAI-compatible APIs, Anthropic, and
+//! Google Gemini.
 //!
-//! Each provider implementation includes:
-//! - Client configuration and management
-//! - API request/response handling
-//! - Conversion to Anda's internal data structures
+//! The [`Models`] registry maps model labels such as `primary`, `fallback`,
+//! `pro`, `flash`, or `lite` to concrete [`Model`] instances. Labels let agents
+//! request capability tiers without hard-coding provider model names.
 //!
-//! The module is designed to be extensible, allowing easy addition of new model providers
-//! while maintaining a consistent interface through the `CompletionFeaturesDyn` trait.
+//! Custom providers can implement [`CompletionFeaturesDyn`] and be wrapped with
+//! [`Model::with_completer`].
 
 use anda_core::{
     AgentOutput, BoxError, BoxPinFut, CONTENT_TYPE_JSON, CompletionRequest, Json, Message, ToolCall,
@@ -31,25 +29,40 @@ pub use reqwest::Proxy;
 
 use crate::APP_USER_AGENT;
 
+/// Serializable configuration for constructing a model adapter.
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct ModelConfig {
-    /// "gemini", "anthropic", "openai" etc.
+    /// Provider family, such as `gemini`, `anthropic`, or `openai`.
     pub family: String,
+
+    /// Provider-specific model name.
     pub model: String,
+
+    /// Base URL for the provider API.
     pub api_base: String,
+
+    /// API key used by the provider adapter.
     pub api_key: String,
+
     /// Optional labels for selecting this model in the engine.
-    /// It will use the model name as default if not provided, but custom labels can be used to abstract away provider-specific model names and allow for more flexible configuration.
-    /// Recommended labels: "primary", "fallback", "pro", "flash", "lite"
+    ///
+    /// If omitted, the provider model name is used as the only label. Common
+    /// labels include `primary`, `fallback`, `pro`, `flash`, and `lite`.
     #[serde(default)]
     pub labels: Vec<String>,
+
+    /// Skips this model when loading a list of configs.
     #[serde(default)]
     pub disabled: bool,
+
+    /// Sends Anthropic credentials with bearer authentication instead of the
+    /// provider-specific API-key header.
     #[serde(default)]
     pub bearer_auth: bool,
 }
 
 impl ModelConfig {
+    /// Builds a [`Model`] from this configuration.
     pub fn model(&self, http_client: reqwest::Client) -> Result<Model, BoxError> {
         if self.disabled {
             return Err("model is disabled".into());
@@ -266,11 +279,12 @@ impl Models {
     }
 }
 
-/// Trait for dynamic completion features that can be used across threads
+/// Object-safe completion provider interface.
 pub trait CompletionFeaturesDyn: Send + Sync + 'static {
-    /// Performs a completion request and returns a future with the agent's output
+    /// Performs a completion request and returns the agent-facing output.
     fn completion(&self, req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>>;
 
+    /// Returns the provider model name used for diagnostics and usage reports.
     fn model_name(&self) -> String;
 
     /// Prunes a raw-history message in-place to reduce token usage.
@@ -312,7 +326,7 @@ pub(crate) fn pruned_placeholder(count: usize) -> String {
     )
 }
 
-/// A placeholder implementation for unimplemented features
+/// Placeholder implementation that returns errors for completion requests.
 #[derive(Clone, Debug)]
 pub struct NotImplemented;
 
@@ -326,7 +340,7 @@ impl CompletionFeaturesDyn for NotImplemented {
     }
 }
 
-/// A mock implementation for testing purposes
+/// Mock implementation for tests and examples.
 #[derive(Clone, Debug)]
 pub struct MockImplemented;
 
@@ -359,16 +373,18 @@ impl CompletionFeaturesDyn for MockImplemented {
     }
 }
 
-/// Main model struct that combines embedding and completion capabilities
+/// Concrete model entry registered with the engine.
 #[derive(Clone)]
 pub struct Model {
-    /// Completion feature implementation
+    /// Completion provider implementation.
     pub completer: Arc<dyn CompletionFeaturesDyn>,
+
+    /// Labels that can route requests to this model.
     pub labels: Vec<String>,
 }
 
 impl Model {
-    /// Creates a new Model with specified embedder and completer
+    /// Creates a model from a completion provider.
     pub fn new(completer: Arc<dyn CompletionFeaturesDyn>) -> Self {
         Self {
             completer,
@@ -376,7 +392,7 @@ impl Model {
         }
     }
 
-    /// Creates a Model with only completion features
+    /// Creates a model from a completion provider.
     pub fn with_completer(completer: Arc<dyn CompletionFeaturesDyn>) -> Self {
         Self {
             completer,
@@ -384,12 +400,13 @@ impl Model {
         }
     }
 
+    /// Assigns labels used by [`Models`] for routing.
     pub fn with_labels(mut self, labels: Vec<String>) -> Self {
         self.labels = labels;
         self
     }
 
-    /// Creates a Model with unimplemented features (returns errors for all operations)
+    /// Creates a model whose completion calls return `not implemented` errors.
     pub fn not_implemented() -> Self {
         Self {
             completer: Arc::new(NotImplemented),
@@ -397,7 +414,7 @@ impl Model {
         }
     }
 
-    /// Creates a Model with mock implementations for testing
+    /// Creates a model with deterministic mock completion behavior for tests.
     pub fn mock_implemented() -> Self {
         Self {
             completer: Arc::new(MockImplemented),
@@ -405,10 +422,12 @@ impl Model {
         }
     }
 
+    /// Returns the provider model name for this model.
     pub fn model_name(&self) -> String {
         self.completer.model_name()
     }
 
+    /// Executes a completion request with the underlying provider.
     pub async fn completion(&self, req: CompletionRequest) -> Result<AgentOutput, BoxError> {
         self.completer.completion(req).await
     }
@@ -429,7 +448,7 @@ impl PartialEq<&str> for AnyHost {
     }
 }
 
-/// Creates a new reqwest client builder with default settings
+/// Creates a reqwest client builder with Anda Engine defaults.
 pub fn request_client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .use_rustls_tls()

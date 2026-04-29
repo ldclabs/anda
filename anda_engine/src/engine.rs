@@ -1,32 +1,53 @@
-//! The Engine module provides the core functionality for managing and executing agents and tools.
+//! Engine construction and top-level execution APIs.
 //!
-//! # Overview
-//! The Engine is the central component that orchestrates agent execution, tool management,
-//! and context handling. It provides:
-//! - Agent management and execution
-//! - Tool registration and invocation
-//! - Context management with cancellation support
-//! - Builder pattern for configuration
+//! [`Engine`] is the runtime boundary for a group of agents, tools, model
+//! providers, storage backends, hooks, and remote engines. It is responsible for:
+//! - validating callers and request metadata;
+//! - creating scoped [`AgentCtx`] and [`BaseCtx`] values;
+//! - dispatching local agent runs and direct tool calls;
+//! - exporting selected agents and tools to other engines;
+//! - signing challenge responses when Web3 or TEE clients are configured.
 //!
-//! # Key Components
-//! - [`Engine`]: The main struct that provides execution capabilities
-//! - [`EngineBuilder`]: Builder pattern for constructing Engine instances
-//! - Context management through [`AgentCtx`] and [`BaseCtx`]
+//! Engines are created with [`EngineBuilder`]. A built engine is private by
+//! default; configure [`Management`] to expose it to additional callers.
 //!
 //! # Usage
-//! 1. Create an Engine using the builder pattern
-//! 2. Register tools and agents
-//! 3. Execute agents or call tools
+//! 1. Start from [`Engine::builder`].
+//! 2. Register models, tools, agents, hooks, storage, and remote engines.
+//! 3. Select the default agent with [`EngineBuilder::build`].
+//! 4. Execute agents with [`Engine::agent_run`] or direct tools with
+//!    [`Engine::tool_call`].
 //!
 //! # Example
 //! ```rust,ignore
-//! let engine = Engine::builder()
-//!     .with_name("MyEngine".to_string())
-//!     .register_tool(my_tool)?
-//!     .register_agent(my_agent, None)?
-//!     .build("default_agent".to_string())?;
+//! use anda_core::AgentInput;
+//! use anda_engine::{
+//!     ANONYMOUS,
+//!     engine::{AgentInfo, EchoEngineInfo, Engine},
+//! };
+//! use std::sync::Arc;
 //!
-//! let output = engine.agent_run(None, "Hello".to_string(), None, None, None).await?;
+//! # async fn example() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+//! let echo_info = AgentInfo {
+//!     handle: "echo".to_string(),
+//!     name: "Echo Agent".to_string(),
+//!     description: "Returns engine metadata as JSON.".to_string(),
+//!     ..Default::default()
+//! };
+//!
+//! let engine = Engine::builder()
+//!     .register_agent(Arc::new(EchoEngineInfo::new(echo_info)), None)?
+//!     .build("echo".to_string())
+//!     .await?;
+//!
+//! let output = engine
+//!     .agent_run(
+//!         ANONYMOUS,
+//!         AgentInput::new("echo".to_string(), "hello".to_string()),
+//!     )
+//!     .await?;
+//! # Ok(())
+//! # }
 //! ```
 
 use anda_cloud_cdk::{ChallengeEnvelope, ChallengeRequest, TEEInfo, TEEKind};
@@ -57,8 +78,11 @@ use crate::{
 
 pub use crate::context::{AgentInfo, EngineCard, RemoteEngineArgs, RemoteEngines};
 
-/// Engine is the core component that manages agents, tools, and execution context.
-/// It provides methods to interact with agents, call tools, and manage execution.
+/// Top-level runtime for a configured set of Anda agents and tools.
+///
+/// An engine owns the shared runtime state used to create child contexts for
+/// agent and tool execution. It is cheap to wrap in an [`Arc`] and share across
+/// server handlers.
 pub struct Engine {
     id: Principal,
     ctx: AgentCtx,
@@ -71,7 +95,8 @@ pub struct Engine {
 }
 
 impl Engine {
-    /// Creates a new EngineBuilder instance for constructing an Engine.
+    /// Creates a new builder with default engine metadata, in-memory storage,
+    /// built-in tool discovery agents, and private visibility.
     pub fn builder() -> EngineBuilder {
         EngineBuilder::new()
     }
@@ -86,6 +111,7 @@ impl Engine {
         &self.info
     }
 
+    /// Returns mutable engine metadata.
     pub fn info_mut(&mut self) -> &mut AgentInfo {
         &mut self.info
     }
@@ -120,15 +146,19 @@ impl Engine {
         self.ctx.models.clone()
     }
 
-    /// Closes the engine, cancelling all tasks and waiting for cancellation to complete.
+    /// Cancels the engine and resolves once cancellation has been requested.
     pub async fn close(&self) -> Result<(), BoxError> {
         self.ctx.base.cancellation_token.cancel();
         self.cancelled().await;
         Ok(())
     }
 
-    /// Creates a new [`AgentCtx`] with the specified agent name and caller.
-    /// Returns an error if the agent is not found or if the user name is invalid.
+    /// Creates an agent context for an exported agent or a manager-only agent.
+    ///
+    /// Non-manager callers can only access names listed by
+    /// [`EngineBuilder::export_agents`] or the default agent selected by
+    /// [`EngineBuilder::build`]. Managers can access registered agents that are
+    /// not exported.
     pub fn ctx_with(
         &self,
         caller: Principal,
@@ -148,8 +178,11 @@ impl Engine {
         self.ctx.child_with(caller, &name, agent_label, meta)
     }
 
-    /// Creates a new [`BaseCtx`] for a tool with the specified tool name and caller.
-    /// Returns an error if the tool is not found or if the user name is invalid.
+    /// Creates a tool context for an exported tool or a manager-only tool.
+    ///
+    /// The returned [`BaseCtx`] is scoped to the requested tool name and carries
+    /// the caller, agent name, request metadata, cancellation token, cache,
+    /// storage, and shared runtime state.
     pub fn base_ctx_with(
         &self,
         caller: Principal,
@@ -174,9 +207,12 @@ impl Engine {
         )
     }
 
-    /// Executes an agent with the specified parameters.
-    /// If no agent name is provided, uses the default agent.
-    /// Returns the agent's output or an error if the agent is not found.
+    /// Executes an agent request.
+    ///
+    /// If `input.name` is empty, the engine's default agent is used. The method
+    /// validates request metadata, enforces visibility rules, runs engine hooks,
+    /// and clears provider-native raw history before returning the output to the
+    /// caller.
     pub async fn agent_run(
         &self,
         caller: Principal,
@@ -225,8 +261,11 @@ impl Engine {
         Ok(output)
     }
 
-    /// Calls a tool by name with the specified arguments.
-    /// Returns tuple containing the result string and a boolean indicating if further processing is needed.
+    /// Calls a registered tool directly.
+    ///
+    /// Direct tool calls follow the same engine-id, user-name, visibility, and
+    /// hook checks as agent execution. Non-manager callers can only call tools
+    /// exported through [`EngineBuilder::export_tools`].
     pub async fn tool_call(
         &self,
         caller: Principal,
@@ -274,14 +313,16 @@ impl Engine {
         Ok(res)
     }
 
-    /// Returns function definitions for the specified agents.
-    /// If no names are provided, returns definitions for all agents.
+    /// Returns metadata for registered agents.
+    ///
+    /// When `names` is `Some`, only matching names are returned.
     pub fn agents(&self, names: Option<&[String]>) -> Vec<Function> {
         self.ctx.agents.functions(names)
     }
 
-    /// Returns function definitions for the specified tools.
-    /// If no names are provided, returns definitions for all tools.
+    /// Returns metadata for registered tools.
+    ///
+    /// When `names` is `Some`, only matching names are returned.
     pub fn tools(&self, names: Option<&[String]>) -> Vec<Function> {
         self.ctx.tools.functions(names)
     }
@@ -291,6 +332,9 @@ impl Engine {
         self.ctx.subagents.clone()
     }
 
+    /// Signs a challenge request with the configured Web3 or TEE identity.
+    ///
+    /// TEE-backed engines include attestation data in the returned envelope.
     pub async fn challenge(
         &self,
         request: ChallengeRequest,
@@ -334,7 +378,9 @@ impl Engine {
         Ok(res)
     }
 
-    /// Returns information about the engine, including agent and tool definitions.
+    /// Returns the public engine card used by remote engines for discovery.
+    ///
+    /// Only exported agents and tools are included.
     pub fn information(&self) -> EngineCard {
         EngineCard {
             id: self.id,
@@ -357,8 +403,11 @@ impl Engine {
     }
 }
 
-/// Builder pattern implementation for constructing an Engine.
-/// Allows for step-by-step configuration of the engine's components.
+/// Builder for assembling an [`Engine`].
+///
+/// The builder starts with in-memory object storage, a non-implemented Web3
+/// client, no external model provider, the built-in `tools_search` and
+/// `tools_select` discovery agents, and private management visibility.
 #[non_exhaustive]
 pub struct EngineBuilder {
     info: AgentInfo,
@@ -423,7 +472,7 @@ impl EngineBuilder {
         }
     }
 
-    /// Sets the engine information.
+    /// Sets the public engine metadata returned by [`Engine::information`].
     pub fn with_info(mut self, info: AgentInfo) -> Self {
         self.info = info;
         self
@@ -435,19 +484,19 @@ impl EngineBuilder {
         self
     }
 
-    /// Sets the TEE (Trusted Execution Environment) client.
+    /// Sets the Web3 or TEE client used for identity, signing, and challenges.
     pub fn with_web3_client(mut self, web3: Arc<Web3SDK>) -> Self {
         self.web3 = web3;
         self
     }
 
-    /// Sets the model to be used by the engine.
+    /// Sets the primary default model used when a request does not specify a label.
     pub fn with_model(self, model: Model) -> Self {
         self.models.set_model(model);
         self
     }
 
-    /// Sets the models.
+    /// Replaces the model registry used by the engine.
     pub fn with_models(mut self, models: Arc<Models>) -> Self {
         self.models = models;
         self
@@ -468,7 +517,7 @@ impl EngineBuilder {
         self
     }
 
-    /// Sets the management builder for the engine.
+    /// Sets the management policy used for caller authorization and visibility.
     pub fn with_management(mut self, management: Arc<dyn Management>) -> Self {
         self.management = Some(management);
         self
@@ -539,7 +588,11 @@ impl EngineBuilder {
         Ok(self)
     }
 
-    /// Registers a remote engine with given endpoint, optional agents, tools, and alias name.
+    /// Registers a remote engine for cross-engine agent and tool calls.
+    ///
+    /// Remote metadata is fetched during [`EngineBuilder::build`]. Optional
+    /// agent and tool filters in [`RemoteEngineArgs`] limit which remote
+    /// functions are exposed through this engine.
     pub fn register_remote_engine(mut self, engine: RemoteEngineArgs) -> Result<Self, BoxError> {
         if self.remote.contains_key(&engine.endpoint) {
             return Err(format!("remote engine {} already exists", engine.endpoint).into());
@@ -553,7 +606,7 @@ impl EngineBuilder {
         Ok(self)
     }
 
-    /// Exports agents by name.
+    /// Exports agents by name for non-manager callers and remote discovery.
     pub fn export_agents(mut self, agents: Vec<String>) -> Self {
         for mut agent in agents {
             agent.make_ascii_lowercase();
@@ -562,7 +615,7 @@ impl EngineBuilder {
         self
     }
 
-    /// Exports tools by name.
+    /// Exports tools by name for non-manager callers and remote discovery.
     pub fn export_tools(mut self, tools: Vec<String>) -> Self {
         for tool in tools {
             self.export_tools.insert(tool);
@@ -576,7 +629,10 @@ impl EngineBuilder {
         self
     }
 
-    /// Creates an empty Engine instance.
+    /// Creates an engine without selecting a default agent.
+    ///
+    /// This is mainly useful for tests or management-only engines. Most
+    /// production engines should use [`EngineBuilder::build`].
     pub async fn empty(self) -> Result<Engine, BoxError> {
         let id = self.web3.as_ref().get_principal();
         let mut names: BTreeSet<Path> = self
@@ -643,9 +699,10 @@ impl EngineBuilder {
         })
     }
 
-    /// Finalizes the builder and creates an Engine instance.
-    /// Requires a default agent name to be specified.
-    /// Returns an error if the default agent is not found.
+    /// Finalizes the builder and creates an engine with a default agent.
+    ///
+    /// The default agent is automatically exported. Registered tools and agents
+    /// are initialized before the engine is returned.
     pub async fn build(mut self, default_agent: String) -> Result<Engine, BoxError> {
         let default_agent = default_agent.to_ascii_lowercase();
         if !self.agents.contains(&default_agent) {
@@ -726,7 +783,7 @@ impl EngineBuilder {
         })
     }
 
-    /// Creates a mock context for testing purposes.
+    /// Creates a mock agent context for tests and examples.
     // #[cfg(test)]
     pub fn mock_ctx(self) -> AgentCtx {
         let mut names: BTreeSet<Path> = self
@@ -763,7 +820,7 @@ impl EngineBuilder {
     }
 }
 
-/// A simple echo agent that returns its own information as JSON.
+/// Simple built-in agent that returns its configured [`AgentInfo`] as JSON.
 pub struct EchoEngineInfo {
     info: AgentInfo,
     content: String,
@@ -818,13 +875,15 @@ impl EngineRef {
         }
     }
 
-    /// Binds the EngineRef to an actual Engine instance using a weak reference.
+    /// Binds the reference to an engine using a weak pointer.
     pub fn bind(&self, engine: Weak<Engine>) {
         let _ = self.inner.set(engine);
     }
 
-    /// Attempts to upgrade the weak reference to a strong reference and returns it.
-    /// Returns `None` if the Engine has not been bound or has been dropped.
+    /// Attempts to upgrade the weak pointer to a live engine instance.
+    ///
+    /// Returns `None` if no engine has been bound or the engine has been
+    /// dropped.
     pub fn get(&self) -> Option<Arc<Engine>> {
         self.inner.get().and_then(Weak::upgrade)
     }

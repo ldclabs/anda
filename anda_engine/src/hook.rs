@@ -1,4 +1,10 @@
-//! Hook system for customizing engine behavior.
+//! Hook system for observing and customizing runtime behavior.
+//!
+//! Hooks let applications wrap agent and tool execution without changing the
+//! agent or tool implementations themselves. Engine-level hooks are registered
+//! through [`EngineBuilder::with_hooks`](crate::engine::EngineBuilder::with_hooks),
+//! while typed tool and agent hooks are stored on [`BaseCtx`] state and consumed
+//! by specific extensions.
 
 use anda_core::{
     AgentOutput, BoxError, CacheExpiry, CacheFeatures, CompletionRequest, Json, Resource,
@@ -10,8 +16,10 @@ use structured_logger::unix_ms;
 
 use crate::context::{AgentCtx, BaseCtx};
 
-/// Hook trait for customizing engine behavior.
-/// Hooks can be used to intercept and modify agent and tool execution.
+/// Engine-level hook for agent runs and direct tool calls.
+///
+/// Returning an error from a start hook aborts execution. End hooks may inspect
+/// or replace the output before it is returned to the caller.
 #[async_trait]
 pub trait Hook: Send + Sync {
     /// Called before an agent is executed.
@@ -45,8 +53,11 @@ pub trait Hook: Send + Sync {
     }
 }
 
-/// ToolHook trait for customizing tool call behavior.
-/// It provides more fine-grained control over tool calls, allowing you to intercept and modify
+/// Typed hook for a specific tool's input and output types.
+///
+/// Tool hooks provide fine-grained interception for extension tools. They can
+/// transform arguments before execution, transform results after execution, and
+/// observe background task lifecycle events.
 #[async_trait]
 pub trait ToolHook<I, O>: Send + Sync
 where
@@ -67,13 +78,14 @@ where
         Ok(output)
     }
 
-    /// This method can be called to handle the start of an asynchronous tool execution when the tool is executed in the background.
+    /// Called when a tool starts a background task.
     async fn on_background_start(&self, _ctx: &BaseCtx, _task_id: &str, _args: &I) {}
 
-    /// This method can be called to handle the final output when the tool is executed asynchronously in the background.
+    /// Called with the final output from a background tool task.
     async fn on_background_end(&self, _ctx: BaseCtx, _task_id: String, _output: ToolOutput<O>) {}
 }
 
+/// Cloneable type-erased wrapper for a typed [`ToolHook`].
 #[derive(Clone)]
 pub struct DynToolHook<I, O> {
     inner: Arc<dyn ToolHook<I, O>>,
@@ -84,6 +96,7 @@ where
     I: Send + Sync + 'static,
     O: Send + Sync + 'static,
 {
+    /// Wraps a concrete hook implementation.
     pub fn new(inner: Arc<dyn ToolHook<I, O>>) -> Self {
         Self { inner }
     }
@@ -116,7 +129,7 @@ where
     }
 }
 
-/// AgentHook trait for customizing agent execution behavior with more fine-grained control.
+/// Typed hook for nested agent calls and agent-runner extensions.
 #[async_trait]
 pub trait AgentHook: Send + Sync {
     /// Called before an agent is executed, allowing you to modify the prompt and resources.
@@ -130,7 +143,9 @@ pub trait AgentHook: Send + Sync {
     }
 
     /// Called after an agent is executed, allowing you to modify the output.
-    /// If the agent is executed asynchronously in the background, this will be called immediately before the agent run is triggered, and the final output will be passed to `on_background_end`.
+    ///
+    /// For background execution, implementations can use
+    /// [`AgentHook::on_background_end`] to observe the final result.
     async fn after_agent_run(
         &self,
         _ctx: &AgentCtx,
@@ -139,20 +154,22 @@ pub trait AgentHook: Send + Sync {
         Ok(output)
     }
 
-    /// This method can be called to handle the start of an agent execution when the agent is executed asynchronously in the background.
+    /// Called when an agent starts a background task.
     async fn on_background_start(&self, _ctx: &AgentCtx, _task_id: &str, _req: &CompletionRequest) {
     }
 
-    /// This method can be called to handle the final output when the agent is executed asynchronously in the background.
+    /// Called with the final output from a background agent task.
     async fn on_background_end(&self, _ctx: AgentCtx, _task_id: String, _output: AgentOutput) {}
 }
 
+/// Cloneable type-erased wrapper for an [`AgentHook`].
 #[derive(Clone)]
 pub struct DynAgentHook {
     inner: Arc<dyn AgentHook>,
 }
 
 impl DynAgentHook {
+    /// Wraps a concrete agent hook implementation.
     pub fn new(inner: Arc<dyn AgentHook>) -> Self {
         Self { inner }
     }
@@ -186,7 +203,10 @@ impl AgentHook for DynAgentHook {
     }
 }
 
-/// Hooks struct for managing multiple hooks.
+/// Ordered collection of engine-level hooks.
+///
+/// Hooks run in insertion order. End hooks receive the output from the previous
+/// hook, so each hook can transform the value before the next one observes it.
 pub struct Hooks {
     hooks: Vec<Box<dyn Hook>>,
 }
@@ -198,11 +218,12 @@ impl Default for Hooks {
 }
 
 impl Hooks {
+    /// Creates an empty hook collection.
     pub fn new() -> Self {
         Self { hooks: Vec::new() }
     }
 
-    /// Adds a new hook to the list of hooks.
+    /// Adds a hook to the end of the collection.
     pub fn add(&mut self, hook: Box<dyn Hook>) {
         self.hooks.push(hook);
     }
@@ -249,11 +270,17 @@ impl Hook for Hooks {
     }
 }
 
+/// Hook that limits each caller to one active agent prompt at a time.
+///
+/// The hook stores a per-caller lease in the context cache when an agent starts
+/// and removes it when the agent ends. The TTL prevents stale leases from
+/// blocking a caller forever after an interrupted process.
 pub struct SingleThreadHook {
     ttl: Duration,
 }
 
 impl SingleThreadHook {
+    /// Creates a single-thread hook with the lease time-to-live.
     pub fn new(ttl: Duration) -> Self {
         Self { ttl }
     }

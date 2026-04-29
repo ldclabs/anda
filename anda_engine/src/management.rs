@@ -1,35 +1,54 @@
+//! Engine visibility and caller management policies.
+//!
+//! Management policies decide which principals can administer an engine and who
+//! can access exported agents and tools. The default [`BaseManagement`] policy
+//! makes engines private to the controller and explicit managers.
+
 use anda_core::BoxError;
 use async_trait::async_trait;
 use candid::Principal;
 use ic_auth_verifier::ANONYMOUS_PRINCIPAL;
 use std::collections::BTreeSet;
 
+/// Root cache and storage namespace reserved for engine system data.
 pub static SYSTEM_PATH: &str = "_";
 
+/// Authorization policy used by [`Engine`](crate::engine::Engine).
 #[async_trait]
 pub trait Management: Send + Sync {
+    /// Returns whether `caller` is the engine controller.
     fn is_controller(&self, caller: &Principal) -> bool;
+
+    /// Returns whether `caller` can manage private engine state.
     fn is_manager(&self, caller: &Principal) -> bool;
+
+    /// Validates access and returns the current engine visibility.
     fn check_visibility(&self, caller: &Principal) -> Result<Visibility, BoxError>;
 }
 
-/// Represents system management tools for the Anda engine.
+/// Basic principal-list management policy for an engine.
 pub struct BaseManagement {
+    /// Principal that controls the engine.
     pub controller: Principal,
+
+    /// Additional principals with manager privileges.
     pub managers: BTreeSet<Principal>,
-    pub visibility: Visibility, // 0: private, 1: protected, 2: public
+
+    /// Public access level for non-manager callers.
+    pub visibility: Visibility,
 }
 
-/// The visibility of the engine.
+/// Engine visibility for exported agents and tools.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Visibility {
-    /// private, can only be accessed by the controller and managers;
+    /// Only the controller and managers can access the engine.
     Private = 0,
 
-    /// protected, can be accessed by the controller, managers, and users who have permission;
+    /// Managers can access the engine; non-manager access requires an external
+    /// policy to grant permission before execution.
     Protected = 1,
 
-    /// public, can be accessed by anyone.
+    /// Any caller, including anonymous callers, can access exported functions.
     Public = 2,
 }
 
@@ -45,6 +64,7 @@ impl Management for BaseManagement {
         caller == &self.controller || self.managers.contains(caller)
     }
 
+    /// Checks anonymous access and private visibility rules.
     fn check_visibility(&self, caller: &Principal) -> Result<Visibility, BoxError> {
         if self.visibility != Visibility::Public && caller == &ANONYMOUS_PRINCIPAL {
             return Err("anonymous caller not allowed".into());

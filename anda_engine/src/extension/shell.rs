@@ -1,13 +1,15 @@
-//! Shell extension primitives.
+//! Shell command execution extension.
 //!
-//! This module defines:
-//! - a runtime-agnostic command execution abstraction ([`Executor`]),
-//! - tool input/output types ([`ExecArgs`], [`ExecOutput`]),
-//! - and the public tool entrypoint ([`ShellTool`]).
+//! [`ShellTool`] exposes controlled command execution to agents. The tool is
+//! runtime-agnostic: [`NativeRuntime`] runs commands on the host, while the
+//! `sandbox` module (behind the `sandbox` feature) runs commands in an isolated
+//! Boxlite environment.
 //!
-//! Runtime-specific implementations live in submodules:
-//! - [`native`]: execute commands on the host OS.
-//! - [`sandbox`] (feature-gated): execute commands in an isolated environment.
+//! Command output is normalized into [`ExecOutput`]. Large stdout or stderr
+//! streams are truncated in the tool response and written to a temporary file
+//! referenced by [`ExecOutput::raw_output_path`]. Native commands receive only a
+//! small allowlist of host environment variables plus explicit configured keys;
+//! arbitrary process environment variables are not forwarded.
 
 use anda_core::{BoxError, FunctionDefinition, Resource, Tool, ToolOutput};
 use async_trait::async_trait;
@@ -35,9 +37,9 @@ use crate::{
     hook::{DynToolHook, ToolHook},
 };
 
-/// Maximum shell command execution time before kill.
+/// Maximum foreground shell command execution time before timeout handling.
 pub const SHELL_TIMEOUT_SECS: u64 = 180;
-/// Maximum output size in bytes (256KB).
+/// Maximum inline output size in bytes before writing a raw-output file.
 pub const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 
 /// Environment variables safe to pass to shell commands.
@@ -106,66 +108,26 @@ pub trait Executor: Send + Sync {
     ) -> Result<ExecOutput, BoxError>;
 }
 
-// /// Hook for receiving callbacks when a background command finishes.
-// #[async_trait]
-// pub trait ExecutorHook: Send + Sync {
-//     /// Called before any command execution (foreground or background).
-//     /// The execution will be cancelled if this returns an error.
-//     async fn on_execution_start(&self, _ctx: &BaseCtx, _input: &ExecArgs) -> Result<(), BoxError> {
-//         Ok(())
-//     }
-
-//     /// Called after any command execution (foreground or background).
-//     async fn on_execution_end(&self, _ctx: &BaseCtx, _input: &ExecArgs, _output: &ExecOutput) {
-//         // Default implementation does nothing.
-//     }
-
-//     /// Called after a background execution ends.
-//     ///
-//     /// The default implementation is a no-op.
-//     async fn on_background_end(&self, _ctx: BaseCtx, _input: ExecArgs, _output: ExecOutput) {
-//         // Default implementation does nothing.
-//     }
-// }
-
-// #[derive(Clone)]
-// pub struct DynExecutorHook {
-//     inner: Arc<dyn ExecutorHook>,
-// }
-
-// impl DynExecutorHook {
-//     pub fn new(inner: Arc<dyn ExecutorHook>) -> Self {
-//         Self { inner }
-//     }
-// }
-
-// #[async_trait]
-// impl ExecutorHook for DynExecutorHook {
-//     async fn on_execution_start(&self, ctx: &BaseCtx, input: &ExecArgs) -> Result<(), BoxError> {
-//         self.inner.on_execution_start(ctx, input).await
-//     }
-
-//     async fn on_execution_end(&self, ctx: &BaseCtx, input: &ExecArgs, output: &ExecOutput) {
-//         self.inner.on_execution_end(ctx, input, output).await
-//     }
-
-//     async fn on_background_end(&self, ctx: BaseCtx, input: ExecArgs, output: ExecOutput) {
-//         self.inner.on_background_end(ctx, input, output).await
-//     }
-// }
-
-/// Arguments for process execution
+/// Arguments for shell process execution.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ExecArgs {
-    /// The shell command to execute
+    /// Shell command to execute.
     pub command: String,
-    /// The working directory to execute the command in (relative to runtime storage path)
+
+    /// Working directory relative to the runtime workspace.
+    ///
+    /// Absolute paths are normalized under the runtime workspace rather than
+    /// granting access to arbitrary host paths.
     #[serde(default)]
     pub workspace: String,
-    /// Additional environment variable keys to set for the command
+
+    /// Additional configured environment variable keys to expose to the command.
+    ///
+    /// Values are taken from the environment map passed to [`ShellTool::new`].
     #[serde(default)]
     pub env_keys: Vec<String>,
-    /// Whether to run the command in the background (non-blocking)
+
+    /// Whether to return immediately and deliver final output through hooks.
     #[serde(default)]
     pub background: bool,
 }
@@ -183,7 +145,7 @@ pub struct ExecOutput {
     pub stdout: Option<String>,
     /// The data that the process wrote to stderr.
     pub stderr: Option<String>,
-    /// For large outputs, the full stdout/stderr content can be saved to a temporary file and the path returned here.
+    /// Path to the raw-output file when stdout or stderr exceeded the inline limit.
     pub raw_output_path: Option<String>,
 }
 
@@ -268,7 +230,11 @@ impl ShellTool {
     /// Tool name used for registration and function definition.
     pub const NAME: &'static str = "shell";
 
-    /// Create a shell tool with a runtime and a fixed environment map.
+    /// Creates a shell tool with a runtime and a configured environment map.
+    ///
+    /// The environment map is not forwarded wholesale. Agents must request
+    /// specific keys through [`ExecArgs::env_keys`], and invalid environment
+    /// variable names are ignored.
     pub fn new(runtime: Arc<dyn Executor>, envs: HashMap<String, String>) -> Self {
         let description = format!(
             "Execute a shell command in the workspace directory (Runtime: {}, OS: {}, Shell: {})",
@@ -284,6 +250,7 @@ impl ShellTool {
         }
     }
 
+    /// Overrides the default tool description exposed to model providers.
     pub fn with_description(mut self, description: String) -> Self {
         self.description = description;
         self

@@ -1,14 +1,20 @@
-//! Extension module providing core AI agent capabilities
+//! Built-in tool and agent extensions.
 //!
-//! This module contains essential extensions that enhance AI agent functionality.
+//! Extensions are optional building blocks that can be registered with an
+//! [`EngineBuilder`](crate::engine::EngineBuilder) or used directly in tests.
+//! They cover common runtime needs such as structured extraction, web fetching,
+//! workspace filesystem access, shell execution, notes, skills, todos, and
+//! search.
 //!
 //! # Key Components
-//!
-//! - **Extraction Tools**: Enables structured data extraction from unstructured text
-//! - **Fetch Tools**: Fetch Resources Extension for Anda Engine.
-//! - **Google Web Search Tool**: Enables web searches and retrieve results.
-//! - **Skills Manager**: Load, create, and update file-backed skills.
-//!
+//! - [`extractor`]: structured extraction from unstructured text.
+//! - [`fetch`]: signed HTTP fetching and resource loading.
+//! - [`fs`]: workspace-scoped file read, write, search, and edit tools.
+//! - [`google`]: Google search integration.
+//! - [`note`]: lightweight per-agent note storage.
+//! - [`shell`]: native or sandboxed command execution.
+//! - [`skill`]: file-backed skill loading and lifecycle management.
+//! - [`mod@todo`]: session-scoped task tracking for long-running agents.
 
 pub mod extractor;
 pub mod fetch;

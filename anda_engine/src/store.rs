@@ -1,28 +1,14 @@
-//! # Store Module
+//! Object storage support for engine contexts.
 //!
-//! This module provides the core storage functionality for Anda Engine, combining both object storage
-//! and vector search capabilities. It serves as the primary interface for data persistence and retrieval.
+//! [`Store`] wraps an [`ObjectStore`] backend and applies namespace isolation for
+//! agent and tool contexts. Each context receives a namespace derived from its
+//! path, so shared storage backends can safely hold data for many agents and
+//! tools.
 //!
-//! ## Key Components
-//!
-//! - **Store**: Main storage interface that handles object storage operations
-//! - **VectorStore**: Wrapper for vector search functionality
-//! - **VectorSearchFeaturesDyn**: Trait defining vector search capabilities
-//!
-//! ## Features
-//!
-//! - Object storage operations (get, put, list, delete, rename)
-//! - Vector search operations (top_n, top_n_ids)
-//! - Namespace isolation for multi-tenant support
-//! - Mock and placeholder implementations for testing
-//!
-//! ## Implementation Details
-//!
-//! The module uses the [`ObjectStore`] trait from the `object_store` crate as its backend storage,
-//! allowing for various storage implementations to be used interchangeably.
+//! The module also defines [`VectorSearchFeaturesDyn`] and [`VectorStore`] for
+//! integrations that expose vector retrieval alongside object storage.
 //!
 //! ## Examples
-//!
 //! Basic usage:
 //! ```rust,ignore
 //! let store = Store::new(Arc::new(InMemory::new()));
@@ -37,12 +23,12 @@ use std::sync::Arc;
 
 pub use object_store::{ObjectStore, ObjectStoreExt, local::LocalFileSystem, memory::InMemory};
 
+/// Maximum object size accepted by store-backed context APIs.
 pub const MAX_STORE_OBJECT_SIZE: usize = 1024 * 1024 * 2; // 2 MB
 
-/// Trait defining vector search capabilities
+/// Object-safe vector search interface.
 pub trait VectorSearchFeaturesDyn: Send + Sync + 'static {
-    /// Find top N similar items based on query string
-    /// Returns vector of item identifiers
+    /// Finds the top `n` similar item identifiers for a query string.
     fn top_n(
         &self,
         namespace: Path,
@@ -50,8 +36,7 @@ pub trait VectorSearchFeaturesDyn: Send + Sync + 'static {
         n: usize,
     ) -> BoxPinFut<Result<Vec<String>, BoxError>>;
 
-    /// Find top N similar items based on query string
-    /// Returns vector of internal IDs
+    /// Finds the top `n` similar internal IDs for a query string.
     fn top_n_ids(
         &self,
         namespace: Path,
@@ -60,17 +45,19 @@ pub trait VectorSearchFeaturesDyn: Send + Sync + 'static {
     ) -> BoxPinFut<Result<Vec<String>, BoxError>>;
 }
 
-/// Wrapper for vector search functionality
+/// Cloneable wrapper around a vector search implementation.
 #[derive(Clone)]
 pub struct VectorStore {
     inner: Arc<dyn VectorSearchFeaturesDyn>,
 }
 
 impl VectorStore {
+    /// Creates a vector store from an implementation.
     pub fn new(inner: Arc<dyn VectorSearchFeaturesDyn>) -> Self {
         Self { inner }
     }
 
+    /// Creates a placeholder vector store that returns `not implemented` errors.
     pub fn not_implemented() -> Self {
         Self {
             inner: Arc::new(NotImplemented),
@@ -122,7 +109,7 @@ impl VectorSearchFeaturesDyn for NotImplemented {
     }
 }
 
-/// Mock implementation of vector search that returns empty results
+/// Mock vector search implementation that returns empty result sets.
 #[derive(Clone, Debug)]
 pub struct MockImplemented;
 
@@ -146,16 +133,16 @@ impl VectorSearchFeaturesDyn for MockImplemented {
     }
 }
 
-/// Main storage interface combining object storage and vector search capabilities
+/// Namespace-aware object storage facade used by engine contexts.
 ///
-/// In Anda Engine, the `path` parameter is derived from agents' or tools' `name`,
-/// ensuring isolated object storage for each agent or tool.
+/// In Anda Engine, the namespace is derived from an agent or tool context path,
+/// which isolates data for each registered component.
 ///
-/// Both VectorStore and Store use [`ObjectStore`] as their backend storage.
-/// They can share the same storage instance while maintaining data isolation through `path`.
+/// Any [`ObjectStore`] implementation can be used, including in-memory,
+/// filesystem, cloud, and IC-COSE-backed stores.
 ///
 /// You can find various implementations of [`ObjectStore`] at:
-/// https://github.com/apache/arrow-rs/tree/main/object_store
+/// <https://github.com/apache/arrow-rs/tree/main/object_store>
 ///
 /// Alternatively, you can use [IC-COSE](https://github.com/ldclabs/ic-cose)'s
 /// [`ObjectStore`] implementation, which stores data on the ICP blockchain.
@@ -165,11 +152,12 @@ pub struct Store {
 }
 
 impl Store {
+    /// Creates a storage facade from an object-store backend.
     pub fn new(store: Arc<dyn ObjectStore>) -> Self {
         Self { store }
     }
 
-    /// Retrieves data from storage at the specified path
+    /// Retrieves object bytes and metadata from a namespace-relative path.
     pub async fn store_get(
         &self,
         namespace: &Path,
@@ -190,7 +178,7 @@ impl Store {
         Ok((data, res.meta))
     }
 
-    /// Lists objects in storage with optional prefix and offset filters
+    /// Lists objects with optional namespace-relative prefix and offset filters.
     ///
     /// # Arguments
     /// * `prefix` - Optional path prefix to filter results
@@ -217,7 +205,7 @@ impl Store {
         Ok(metas)
     }
 
-    /// Stores data at the specified path with a given write mode
+    /// Stores bytes at a namespace-relative path with the given write mode.
     ///
     /// # Arguments
     /// * `path` - Target storage path
@@ -245,7 +233,7 @@ impl Store {
         Ok(res)
     }
 
-    /// Renames a storage object if the target path doesn't exist
+    /// Renames an object if the target path does not exist.
     ///
     /// # Arguments
     /// * `from` - Source path
@@ -262,7 +250,7 @@ impl Store {
         Ok(())
     }
 
-    /// Deletes data at the specified path
+    /// Deletes an object at a namespace-relative path.
     ///
     /// # Arguments
     /// * `path` - Path of the object to delete

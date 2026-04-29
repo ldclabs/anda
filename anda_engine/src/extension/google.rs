@@ -61,11 +61,11 @@ pub struct SearchResultItem {
 /// Provides functionality to perform web searches using Google's Custom Search API.
 ///
 /// # Prerequisites
-/// - Enable Custom Search API at https://console.cloud.google.com/
+/// - Enable Custom Search API at <https://console.cloud.google.com/>
 /// - Obtain API Key and Custom Search Engine ID
 ///
 /// # API Reference
-/// - Official documentation: https://developers.google.com/custom-search/v1/using_rest
+/// - Official documentation: <https://developers.google.com/custom-search/v1/using_rest>
 #[derive(Debug, Clone)]
 pub struct GoogleSearchTool {
     /// Google API key for authentication
