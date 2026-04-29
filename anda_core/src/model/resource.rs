@@ -9,6 +9,7 @@ use anda_db_schema::{Json, Map};
 
 pub use anda_db_schema::Resource;
 
+/// Borrowed view of a [`Resource`] suitable for serialization.
 #[derive(Debug, Serialize)]
 pub struct ResourceRef<'a> {
     /// The unique identifier for this resource in the Anda DB collection.
@@ -30,7 +31,7 @@ pub struct ResourceRef<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uri: Option<&'a String>,
 
-    /// MIME type, https://developer.mozilla.org/zh-CN/docs/Web/HTTP/MIME_types/Common_types
+    /// MIME type. See <https://developer.mozilla.org/en-US/docs/Web/HTTP/MIME_types/Common_types>.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mime_type: Option<&'a String>,
 
@@ -69,6 +70,10 @@ impl<'a> From<&'a Resource> for ResourceRef<'a> {
     }
 }
 
+/// Updates resource metadata before persistence.
+///
+/// Binary resources receive a SHA3-256 hash. New resources (`_id == 0`) also
+/// receive `user` and `created_at` metadata.
 pub fn update_resources(user: &Principal, resources: Vec<Resource>) -> Vec<Resource> {
     let user = user.to_string();
     let utc = Utc::now().to_rfc3339();
@@ -89,7 +94,10 @@ pub fn update_resources(user: &Principal, resources: Vec<Resource>) -> Vec<Resou
         .collect()
 }
 
-/// Extracts resources with the given tags from the list of resources.
+/// Removes and returns resources matching any of the supported tags.
+///
+/// The order of selected resources and remaining resources is preserved. If the
+/// first tag is `*`, all resources are selected.
 pub fn select_resources(resources: &mut Vec<Resource>, tags: &[String]) -> Vec<Resource> {
     if tags.is_empty() {
         return Vec::new();
@@ -98,14 +106,6 @@ pub fn select_resources(resources: &mut Vec<Resource>, tags: &[String]) -> Vec<R
     if tags.first().map(|s| s.as_str()) == Some("*") {
         return std::mem::take(resources);
     }
-
-    // nightly feature:
-    // {
-    //     let res: Vec<Resource> = resources
-    //         .extract_if(.., |r| tags.contains(&r.tag.as_str()))
-    //         .collect();
-    //     if res.is_empty() { None } else { Some(res) }
-    // }
 
     let tag_set: BTreeSet<&str> = tags.iter().map(String::as_str).collect();
     let mut selected = Vec::new();

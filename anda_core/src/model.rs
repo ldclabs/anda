@@ -1,12 +1,12 @@
-//! Core data models and traits for the AI agent system.
+//! Core data models shared by agents, tools, and model adapters.
 //!
-//! This module defines the fundamental data structures and interfaces used throughout the AI agent system.
-//! It includes:
-//! - Core message and conversation structures ([`AgentOutput`], [`Message`], [`ToolCall`]).
-//! - Function definition and tooling support ([`FunctionDefinition`]).
-//! - Knowledge and document handling ([`Document`], [`Documents`]).
-//! - Completion request and response structures ([`CompletionRequest`], [`Embedding`]).
-//! - Core AI capabilities traits ([`CompletionFeatures`], [`EmbeddingFeatures`]).
+//! The types in this module form the data contract between Anda runtimes,
+//! model providers, agents, tools, and clients. They cover:
+//! - agent and tool inputs/outputs ([`AgentInput`], [`AgentOutput`], [`ToolInput`], [`ToolOutput`]);
+//! - chat messages and multimodal content ([`Message`], [`ContentPart`]);
+//! - function-call metadata ([`FunctionDefinition`], [`ToolCall`]);
+//! - request metadata and usage accounting ([`RequestMeta`], [`Usage`]);
+//! - prompt documents and completion requests ([`Document`], [`Documents`], [`CompletionRequest`]).
 
 use candid::Principal;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -22,13 +22,13 @@ mod resource;
 pub use completion::*;
 pub use resource::*;
 
-/// Represents a request to an agent for processing.
+/// Request sent to an agent for processing.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct AgentInput {
-    /// agent name, use default agent if empty.
+    /// Agent name. When empty, the runtime selects its default agent.
     pub name: String,
 
-    /// agent prompt or message.
+    /// User prompt or task message for the agent.
     pub prompt: String,
 
     /// The resources to process by the agent.
@@ -39,7 +39,7 @@ pub struct AgentInput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub topics: Option<Vec<String>>,
 
-    /// The metadata for the agent request
+    /// Metadata for the agent request.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub meta: Option<RequestMeta>,
 }
@@ -57,21 +57,20 @@ impl AgentInput {
     }
 }
 
-/// Represents the output of an agent execution.
+/// Output produced by an agent execution.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct AgentOutput {
-    /// The output content from the agent, may be empty.
+    /// Final visible content from the agent. It may be empty.
     pub content: String,
 
-    /// The intermediate thinking process of the agent, may be empty if the agent does not provide it or the execution is already finished.
+    /// Optional intermediate reasoning text returned by providers that expose it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<String>,
 
     /// The usage statistics for the agent execution.
     pub usage: Usage,
 
-    /// Indicates failure reason if present, None means successful execution.
-    /// Should be None when finish_reason is "stop" or "tool_calls".
+    /// Failure reason if execution failed. `None` indicates success.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failed_reason: Option<String>,
 
@@ -83,9 +82,10 @@ pub struct AgentOutput {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub chat_history: Vec<Message>,
 
-    /// raw_history is the model specialized history of the conversation,
-    /// will be included in `ctx.completion` response,
-    /// but not be included in the engine response.
+    /// Provider-specific conversation history used internally by model adapters.
+    ///
+    /// This is included in completion responses for follow-up calls, but should
+    /// not be exposed as a stable engine API response.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub raw_history: Vec<Json>,
 
@@ -117,13 +117,13 @@ where
     }
 }
 
-/// Represents a message send to LLM for completion.
+/// Chat message sent to or returned by an LLM provider.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Message {
     /// Message role: "system", "user", "assistant", "tool".
     pub role: String,
 
-    /// The content of the message
+    /// Message content parts.
     #[serde(default, deserialize_with = "deserialize_content")]
     pub content: Vec<ContentPart>,
 
@@ -144,6 +144,7 @@ pub struct Message {
 }
 
 impl Message {
+    /// Returns all text content parts joined with blank lines.
     pub fn text(&self) -> Option<String> {
         let mut texts: Vec<&str> = Vec::new();
         for part in &self.content {
@@ -157,6 +158,7 @@ impl Message {
         Some(texts.join("\n\n"))
     }
 
+    /// Returns all reasoning content parts joined with blank lines.
     pub fn thoughts(&self) -> Option<String> {
         let mut thoughts: Vec<&str> = Vec::new();
         for part in &self.content {
@@ -170,6 +172,7 @@ impl Message {
         Some(thoughts.join("\n\n"))
     }
 
+    /// Extracts tool calls from this message.
     pub fn tool_calls(&self) -> Vec<ToolCall> {
         let mut tool_calls: Vec<ToolCall> = Vec::new();
         for part in &self.content {
@@ -191,6 +194,7 @@ impl Message {
         tool_calls
     }
 
+    /// Removes non-visible content parts and appends a short pruning notice.
     pub fn prune_content(&mut self) -> usize {
         let original_len = self.content.len();
         self.content.retain(|part| {
@@ -214,6 +218,10 @@ impl Message {
     }
 }
 
+/// A single content item inside a chat message.
+///
+/// The enum supports Anda's normalized content types while preserving unknown
+/// provider-specific JSON payloads in [`ContentPart::Any`].
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all_fields = "camelCase")]
 pub enum ContentPart {
@@ -266,7 +274,7 @@ pub enum ContentPart {
 
 /// Converts a content part with inline data to a data URL string.
 ///
-/// https://developer.mozilla.org/en-US/docs/Web/URI/Reference/Schemes/data
+/// See <https://developer.mozilla.org/en-US/docs/Web/URI/Reference/Schemes/data>.
 pub fn part_to_data_url(data: &ByteBufB64, mime_type: Option<&String>) -> String {
     format!(
         "data:{};base64,{}",
@@ -438,13 +446,13 @@ impl From<Resource> for ContentPart {
     }
 }
 
-/// Represents a request to a tool for processing.
+/// Request sent to a tool for processing.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ToolInput<T> {
-    /// tool name.
+    /// Tool name.
     pub name: String,
 
-    /// arguments in JSON format.
+    /// Tool arguments.
     pub args: T,
 
     /// The resources to process by the tool.
@@ -468,7 +476,7 @@ impl<T> ToolInput<T> {
     }
 }
 
-/// Represents the output of a tool execution.
+/// Output produced by a tool execution.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ToolOutput<T> {
     /// The output from the tool.
@@ -493,14 +501,14 @@ impl<T> ToolOutput<T> {
     }
 }
 
-/// Represents the metadata for an agent or tool request.
+/// Metadata attached to an agent or tool request.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct RequestMeta {
     /// The target engine principal for the request.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub engine: Option<Principal>,
 
-    /// Gets the username from request context.
+    /// User identifier supplied by the request context.
     /// Note: This is not verified and should not be used as a trusted identifier.
     /// For example, if triggered by a bot of X platform, this might be the username
     /// of the user interacting with the bot.
@@ -525,20 +533,20 @@ impl RequestMeta {
     }
 }
 
-/// Represents the usage statistics for the agent or tool execution.
+/// Usage statistics for an agent, model, or tool execution.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Usage {
-    /// input tokens sent to the LLM
+    /// Input tokens sent to the LLM.
     pub input_tokens: u64,
 
-    /// output tokens received from the LLM
+    /// Output tokens received from the LLM.
     pub output_tokens: u64,
 
     /// cached tokens used in the execution.
     #[serde(default)]
     pub cached_tokens: u64,
 
-    /// number of requests made to agents and tools
+    /// Number of requests made to models, agents, or tools.
     pub requests: u64,
 }
 
@@ -552,24 +560,24 @@ impl Usage {
     }
 }
 
-/// Represents a tool call response with it's ID, function name, and arguments.
+/// Tool call requested by an LLM or returned by a tool execution pipeline.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ToolCall {
-    /// tool function name.
+    /// Tool function name.
     pub name: String,
 
-    /// tool function  arguments.
+    /// Tool function arguments.
     pub args: Json,
 
-    /// The result of the tool call, auto processed by agents engine, if available.
+    /// Tool result populated by the agent runtime when available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<ToolOutput<Json>>,
 
-    /// tool call id.
+    /// Provider-specific tool call ID.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub call_id: Option<String>,
 
-    /// The remote engine id where tool running
+    /// Remote engine principal that executed the tool, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_id: Option<Principal>,
 }
@@ -580,7 +588,7 @@ pub struct Function {
     /// Definition of the function.
     pub definition: FunctionDefinition,
 
-    /// The tags of resource that this function supports.
+    /// Resource tags supported by this function.
     pub supported_resource_tags: Vec<String>,
 }
 
@@ -596,7 +604,9 @@ pub struct FunctionDefinition {
     /// JSON schema defining the function's parameters.
     pub parameters: Json,
 
-    /// Whether to enable strict schema adherence when generating the function call. If set to true, the model will follow the exact schema defined in the parameters field. Only a subset of JSON Schema is supported when strict is true.
+    /// Whether the model should strictly follow the parameter schema when calling the function.
+    ///
+    /// Provider support and the accepted JSON Schema subset vary by model.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub strict: Option<bool>,
 }
@@ -614,7 +624,7 @@ pub fn evaluate_tokens(content: &str) -> usize {
     content.len() / 3
 }
 
-/// Estimate the number of tokens in the given content in the simplest way.
+/// Estimates token count using a small, provider-independent heuristic.
 pub fn estimate_tokens(content: &str) -> usize {
     content.len() / 3
 }
@@ -660,7 +670,7 @@ impl From<&Resource> for Document {
     }
 }
 
-/// Collection of knowledge documents.
+/// Collection of documents that can be injected into a completion prompt.
 #[derive(Clone, Debug)]
 pub struct Documents {
     /// The tag of the document collection. Defaults to "documents".
@@ -694,7 +704,7 @@ impl Documents {
         &self.tag
     }
 
-    /// Converts the document collection to a message.
+    /// Converts the document collection into a system-style user message.
     pub fn to_message(&self, rfc3339_datetime: &str) -> Option<Message> {
         if self.docs.is_empty() {
             return None;

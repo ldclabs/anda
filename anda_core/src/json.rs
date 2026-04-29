@@ -1,6 +1,10 @@
 use schemars::{JsonSchema, Schema, generate::SchemaSettings, transform::RestrictFormats};
 
-/// Generate JSON schema for a given type T.
+/// Generates a JSON Schema document for `T`.
+///
+/// The schema is generated with draft 2020-12 settings, inline subschemas, no
+/// `$schema` field, and restricted format inference. This keeps function-call
+/// schemas compact and provider-friendly.
 pub fn root_schema_for<T: JsonSchema>() -> Schema {
     let settings = SchemaSettings::draft2020_12().with(|s| {
         s.inline_subschemas = true;
@@ -14,7 +18,10 @@ pub fn root_schema_for<T: JsonSchema>() -> Schema {
     generator.into_root_schema_for::<T>()
 }
 
-/// Generate JSON schema for a given type T. Returns as serde_json::Value.
+/// Generates a compact JSON Schema value for `T`.
+///
+/// Top-level `title` and `description` fields are removed. A missing
+/// `required` array is normalized to an empty array.
 pub fn gen_schema_for<T: JsonSchema>() -> serde_json::Value {
     let mut schema = root_schema_for::<T>();
     schema.remove("title");

@@ -1,36 +1,25 @@
-//! # Context Module
+//! Execution context traits for agents and tools.
 //!
-//! This module defines the core context interfaces and traits that provide the execution environment
-//! for Agents and Tools in the ANDA system. It includes:
+//! This module defines the capability traits that an Anda runtime exposes to
+//! agents and tools. Context implementations provide identity, cancellation,
+//! cryptographic keys, isolated storage, caching, HTTP calls, and canister
+//! access without requiring each agent or tool to know how those services are
+//! implemented.
 //!
-//! - **AgentContext**: The primary interface combining all core functionality and AI-specific features.
-//! - **BaseContext**: Fundamental operations available to all Agents and Tools.
-//! - **Feature Traits**: Modular capabilities including state management, cryptographic operations,
-//!   storage, caching, and HTTP communication.
+//! The traits are split by capability so custom runtimes can implement only one
+//! coherent execution surface while still keeping the public API explicit:
 //!
-//! The context system is designed to be:
-//! - **Modular**: Features are separated into distinct traits for better organization and flexibility.
-//! - **Asynchronous**: All operations are async to support efficient I/O operations.
-//! - **Extensible**: New features can be added as separate traits while maintaining compatibility.
-//! - **Secure**: Includes cryptographic operations and verified caller information.
+//! - [`BaseContext`] combines the capabilities available to agents and tools.
+//! - [`AgentContext`] extends [`BaseContext`] with completion and orchestration
+//!   features used by agents.
+//! - [`StateFeatures`], [`KeysFeatures`], [`StoreFeatures`], [`CacheFeatures`],
+//!   and [`HttpFeatures`] describe individual groups of runtime services.
+//! - [`CacheStoreFeatures`] provides convenience methods for values that should
+//!   be cached in memory and persisted to object storage.
 //!
-//! ## Key Components
-//!
-//! ### Core Traits
-//! - [`AgentContext`]: Main interface combining all capabilities;
-//! - [`BaseContext`]: Fundamental operations required by all contexts;
-//!
-//! ### Feature Sets
-//! - [`StateFeatures`]: Contextual information about the execution environment;
-//! - [`KeysFeatures`]: Cryptographic operations and key management;
-//! - [`StoreFeatures`]: Persistent storage capabilities;
-//! - [`CacheFeatures`]: In-memory caching with expiration policies;
-//! - [`HttpFeatures`]: HTTP communication capabilities;
-//! - [`VectorSearchFeatures`]: Semantic search functionality.
-//!
-//! ## Usage
-//! Implement these traits to create custom execution contexts for Agents and Tools. The `anda_engine` [`context`](https://github.com/ldclabs/anda/blob/main/anda_engine/src/context/mod.rs) module provides.
-//! a complete implementation, but custom implementations can be created for specialized environments.
+//! The `anda_engine` `context` module provides the default runtime
+//! implementation. Other runtimes can implement these traits for specialized
+//! environments such as tests, embedded workers, or alternative TEE backends.
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -49,12 +38,12 @@ pub use tokio_util::sync::CancellationToken;
 use crate::BoxError;
 use crate::model::*;
 
-/// AgentContext provides the execution environment for Agents.
-/// It combines core functionality with AI-specific features:
-/// - [`BaseContext`]`: Fundamental operations;
-/// - [`CompletionFeatures`]: LLM completions and function calling;
+/// Execution environment available to agents.
+///
+/// `AgentContext` combines the base runtime capabilities with model completion
+/// and orchestration methods for calling local or remote agents and tools.
 pub trait AgentContext: BaseContext + CompletionFeatures {
-    /// Retrieves definitions for available tools.
+    /// Returns definitions for available local tools.
     ///
     /// # Arguments
     /// * `names` - Optional filter for specific tool names.
@@ -63,7 +52,7 @@ pub trait AgentContext: BaseContext + CompletionFeatures {
     /// Vector of function definitions for the requested tools.
     fn tool_definitions(&self, names: Option<&[String]>) -> Vec<FunctionDefinition>;
 
-    /// Retrieves definitions for available tools in the remote engines.
+    /// Returns definitions for tools exposed by remote engines.
     ///
     /// # Arguments
     /// * `endpoint` - Optional filter for specific remote engine endpoint;
@@ -77,14 +66,14 @@ pub trait AgentContext: BaseContext + CompletionFeatures {
         names: Option<&[String]>,
     ) -> impl Future<Output = Result<Vec<FunctionDefinition>, BoxError>> + Send;
 
-    /// Extracts resources from the provided list based on the tool's supported tags.
+    /// Removes and returns resources supported by the named tool.
     fn select_tool_resources(
         &self,
         name: &str,
         resources: &mut Vec<Resource>,
     ) -> impl Future<Output = Vec<Resource>> + Send;
 
-    /// Retrieves definitions for available agents.
+    /// Returns definitions for available local agents.
     ///
     /// # Arguments
     /// * `names` - Optional filter for specific agent names;
@@ -93,7 +82,7 @@ pub trait AgentContext: BaseContext + CompletionFeatures {
     /// Vector of function definitions for the requested agents.
     fn agent_definitions(&self, names: Option<&[String]>) -> Vec<FunctionDefinition>;
 
-    /// Retrieves definitions for available agents in the remote engines.
+    /// Returns definitions for agents exposed by remote engines.
     ///
     /// # Arguments
     /// * `endpoint` - Optional filter for specific remote engine endpoint;
@@ -107,14 +96,14 @@ pub trait AgentContext: BaseContext + CompletionFeatures {
         names: Option<&[String]>,
     ) -> impl Future<Output = Result<Vec<FunctionDefinition>, BoxError>> + Send;
 
-    /// Extracts resources from the provided list based on the agent's supported tags.
+    /// Removes and returns resources supported by the named agent.
     fn select_agent_resources(
         &self,
         name: &str,
         resources: &mut Vec<Resource>,
     ) -> impl Future<Output = Vec<Resource>> + Send;
 
-    /// Retrieves definitions for all available tools and agents, including those in remote engines.
+    /// Returns definitions for all available tools and agents, including remote ones.
     ///
     /// # Arguments
     /// * `names` - Optional filter for specific tool or agent names;
@@ -141,7 +130,7 @@ pub trait AgentContext: BaseContext + CompletionFeatures {
     /// Runs a local agent.
     ///
     /// # Arguments
-    /// * `args` - Tool input arguments, [`AgentInput`].
+    /// * `args` - Agent input arguments, [`AgentInput`].
     ///
     /// # Returns
     /// [`AgentOutput`] containing the result of the agent execution.
@@ -154,7 +143,7 @@ pub trait AgentContext: BaseContext + CompletionFeatures {
     ///
     /// # Arguments
     /// * `endpoint` - Remote endpoint URL;
-    /// * `args` - Tool input arguments, [`AgentInput`]. The `meta` field will be set to the current agent's metadata.
+    /// * `args` - Agent input arguments, [`AgentInput`]. The `meta` field will be set by the runtime.
     ///
     /// # Returns
     /// [`AgentOutput`] containing the result of the agent execution.
@@ -165,14 +154,10 @@ pub trait AgentContext: BaseContext + CompletionFeatures {
     ) -> impl Future<Output = Result<AgentOutput, BoxError>> + Send;
 }
 
-/// BaseContext is the core context interface available when calling Agent or Tool.
-/// It provides access to various feature sets including:
-/// - [`StateFeatures`]: User, caller, time, and cancellation token.
-/// - [`KeysFeatures`]: Cryptographic key operations.
-/// - [`StoreFeatures`]: Persistent storage.
-/// - [`CacheFeatures`]: In-memory caching.
-/// - [`HttpFeatures`]: HTTP request capabilities.
-/// - [`CanisterCaller`]: ICP blockchain smart contract interactions.
+/// Core execution environment available to both agents and tools.
+///
+/// `BaseContext` groups state, cryptographic, storage, caching, HTTP, and ICP
+/// canister capabilities behind a single trait bound.
 pub trait BaseContext:
     Sized + StateFeatures + KeysFeatures + StoreFeatures + CacheFeatures + HttpFeatures + CanisterCaller
 {
@@ -191,41 +176,41 @@ pub trait BaseContext:
     ) -> impl Future<Output = Result<ToolOutput<Json>, BoxError>> + Send;
 }
 
-/// StateFeatures is one of the context feature sets available when calling Agent or Tool.
+/// Context metadata available during an agent or tool call.
 pub trait StateFeatures: Sized {
-    /// Gets the engine ID
+    /// Returns the engine principal.
     fn engine_id(&self) -> &Principal;
 
-    /// Gets the engine name。
+    /// Returns the engine name.
     fn engine_name(&self) -> &str;
 
-    /// Gets the verified caller principal if available.
-    /// A non anonymous principal indicates the request has been verified
+    /// Returns the verified caller principal if available.
+    /// A non-anonymous principal indicates that the request was verified
     /// using ICP blockchain's signature verification algorithm.
-    /// Details: https://github.com/ldclabs/ic-auth
+    /// Details: <https://github.com/ldclabs/ic-auth>
     fn caller(&self) -> &Principal;
 
-    /// Gets the matadata of the request。
+    /// Returns metadata attached to the current request.
     fn meta(&self) -> &RequestMeta;
 
-    /// Gets the cancellation token for the current execution context.
+    /// Returns the cancellation token for the current execution context.
     /// Each call level has its own token scope.
     /// For example, when an agent calls a tool, the tool receives
     /// a child token of the agent's token.
-    /// Cancelling the agent's token will cancel all its child calls,
-    /// but cancelling a tool's token won't affect its parent agent.
+    /// Cancelling the agent token cancels all child calls, while cancelling a
+    /// child token does not affect the parent context.
     fn cancellation_token(&self) -> CancellationToken;
 
-    /// Gets the time elapsed since the original context was created.
+    /// Returns the time elapsed since the context was created.
     fn time_elapsed(&self) -> Duration;
 }
 
-/// KeysFeatures is one of the context feature sets available when calling Agent or Tool.
+/// Cryptographic key operations available to agents and tools.
 ///
-/// The Agent engine running in TEE has a permanent fixed 48-bit root key,
-/// from which AES, Ed25519, Secp256k1 keys are derived.
-/// The Agent/Tool name is included in key derivation, ensuring isolation
-/// even with the same derivation path.
+/// Runtime implementations derive isolated AES, Ed25519, and Secp256k1 keys
+/// from their root key material. The active agent or tool namespace is included
+/// in derivation paths so identical user-supplied paths remain isolated across
+/// components.
 pub trait KeysFeatures: Sized {
     /// Derives a 256-bit AES-GCM key from the given derivation path.
     fn a256gcm_key(
@@ -248,7 +233,7 @@ pub trait KeysFeatures: Sized {
         signature: &[u8],
     ) -> impl Future<Output = Result<(), BoxError>> + Send;
 
-    /// Gets the public key for Ed25519 from the given derivation path.
+    /// Returns the Ed25519 public key for the given derivation path.
     fn ed25519_public_key(
         &self,
         derivation_path: Vec<Vec<u8>>,
@@ -269,7 +254,7 @@ pub trait KeysFeatures: Sized {
         signature: &[u8],
     ) -> impl Future<Output = Result<(), BoxError>> + Send;
 
-    /// Signs a message using Secp256k1 ECDSA signature from the given derivation path.
+    /// Signs a SHA-256 digest using Secp256k1 ECDSA from the given derivation path.
     /// The message will be hashed with SHA-256 before signing.
     fn secp256k1_sign_message_ecdsa(
         &self,
@@ -292,14 +277,14 @@ pub trait KeysFeatures: Sized {
         signature: &[u8],
     ) -> impl Future<Output = Result<(), BoxError>> + Send;
 
-    /// Gets the compressed SEC1-encoded public key for Secp256k1 from the given derivation path.
+    /// Returns the compressed SEC1-encoded Secp256k1 public key for the given derivation path.
     fn secp256k1_public_key(
         &self,
         derivation_path: Vec<Vec<u8>>,
     ) -> impl Future<Output = Result<[u8; 33], BoxError>> + Send;
 }
 
-/// StoreFeatures is one of the context feature sets available when calling Agent or Tool.
+/// Persistent object storage available to agents and tools.
 ///
 /// Provides persistent storage capabilities for Agents and Tools to store and manage data.
 /// All operations are asynchronous and return Result types with custom error handling.
@@ -361,7 +346,7 @@ pub enum CacheExpiry {
     TTI(Duration),
 }
 
-/// CacheFeatures is one of the context feature sets available when calling Agent or Tool.
+/// In-memory cache storage available to agents and tools.
 ///
 /// Provides isolated in-memory cache storage with TTL/TTI expiration.
 /// Cache data is ephemeral and will be lost on engine restart.
@@ -413,13 +398,13 @@ pub trait CacheFeatures: Sized {
     ) -> impl Iterator<Item = (Arc<String>, Arc<(Bytes, Option<CacheExpiry>)>)>;
 }
 
-/// HttpFeatures provides HTTP request capabilities for Agents and Tools.
+/// HTTP request capabilities available to agents and tools.
 ///
-/// All HTTP requests are managed and scheduled by the Agent engine.
-/// Since Agents may run in WASM containers, implementations should not
+/// All HTTP requests are managed and scheduled by the runtime. Since agents may
+/// run in WASM containers, implementations should not
 /// implement HTTP requests directly.
 pub trait HttpFeatures: Sized {
-    /// Makes an HTTPs request.
+    /// Makes an HTTPS request.
     ///
     /// # Arguments
     /// * `url` - Target URL, should start with `https://`;
@@ -434,7 +419,7 @@ pub trait HttpFeatures: Sized {
         body: Option<Vec<u8>>, // default is empty
     ) -> impl Future<Output = Result<reqwest::Response, BoxError>> + Send;
 
-    /// Makes a signed HTTPs request with message authentication.
+    /// Makes a signed HTTPS request with message authentication.
     ///
     /// # Arguments
     /// * `url` - Target URL;
@@ -470,10 +455,10 @@ pub trait HttpFeatures: Sized {
 #[derive(Clone, Deserialize, Serialize)]
 struct CacheStoreValue<T>(T, UpdateVersion);
 
-/// CacheStoreFeatures combines Store and Cache features for efficient data management.
+/// Convenience methods for values backed by both cache and object storage.
 #[async_trait]
 pub trait CacheStoreFeatures: StoreFeatures + CacheFeatures + Send + Sync + 'static {
-    /// Initializes a cache value from store if missing.
+    /// Initializes a cached value from storage, or creates it with `init` if missing.
     async fn cache_store_init<T, F>(&self, key: &str, init: F) -> Result<(), BoxError>
     where
         T: DeserializeOwned + Serialize + Send,
@@ -522,7 +507,7 @@ pub trait CacheStoreFeatures: StoreFeatures + CacheFeatures + Send + Sync + 'sta
         }
     }
 
-    /// Gets a value from cache, initializes from store if missing.
+    /// Returns a value and its storage version, loading it into cache if needed.
     async fn cache_store_get<T>(&self, key: &str) -> Result<(T, UpdateVersion), BoxError>
     where
         T: DeserializeOwned + Serialize + Send,
@@ -546,8 +531,11 @@ pub trait CacheStoreFeatures: StoreFeatures + CacheFeatures + Send + Sync + 'sta
         }
     }
 
-    /// Sets a value to cache and persists it in store.
-    /// Optionally provides an update version for atomic updates.
+    /// Persists a value to storage and updates the cache on success.
+    ///
+    /// When `version` is provided, the write uses an atomic update against that
+    /// storage version. Without a version, the value is written with overwrite
+    /// semantics.
     async fn cache_store_set<T>(
         &self,
         key: &str,
@@ -591,7 +579,7 @@ pub trait CacheStoreFeatures: StoreFeatures + CacheFeatures + Send + Sync + 'sta
         }
     }
 
-    /// Deletes a value from cache and store
+    /// Deletes a value from both cache and storage.
     async fn cache_store_delete(&self, key: &str) -> Result<(), BoxError> {
         let p = Path::from(key);
         self.cache_delete(key).await;
@@ -599,7 +587,7 @@ pub trait CacheStoreFeatures: StoreFeatures + CacheFeatures + Send + Sync + 'sta
     }
 }
 
-/// Derives a derivation path with the given path and derivation path.
+/// Prefixes a derivation path with the current context path.
 pub fn derivation_path_with(path: &Path, derivation_path: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
     let mut dp = Vec::with_capacity(derivation_path.len() + 1);
     dp.push(path.as_ref().as_bytes().to_vec());

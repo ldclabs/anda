@@ -1,4 +1,4 @@
-//! HTTP utilities for making RPC calls to canisters and other services.
+//! HTTP utilities for CBOR and Candid RPC calls.
 //!
 //! This module provides functionality for:
 //! - Making CBOR-encoded RPC calls;
@@ -8,7 +8,7 @@
 //!
 //! The main types are:
 //! - [`RPCRequest`]: Represents a generic RPC request with CBOR-encoded parameters;
-//! - [`CanisterRequest`]: Represents a canister-specific request with Candid-encoded parameters;
+//! - [`CanisterRequestRef`]: Represents a canister-specific request with Candid-encoded parameters;
 //! - [`RPCResponse`]: Represents a response from an RPC call;
 //! - [`HttpRPCError`]: Represents possible errors during RPC operations.
 //!
@@ -29,7 +29,7 @@ pub static CONTENT_TYPE_CBOR: &str = "application/cbor";
 pub static CONTENT_TYPE_JSON: &str = "application/json";
 pub static CONTENT_TYPE_TEXT: &str = "text/plain";
 
-/// Represents an RPC request with method name and CBOR-encoded parameters.
+/// Owned RPC request with a method name and CBOR-encoded parameters.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RPCRequest {
     /// The method name to call.
@@ -44,7 +44,7 @@ pub struct RPCRequest {
     pub params: ByteBufB64,
 }
 
-/// Represents an RPC request with method name and CBOR-encoded parameters.
+/// Borrowed RPC request with a method name and CBOR-encoded parameters.
 #[derive(Clone, Debug, Serialize)]
 pub struct RPCRequestRef<'a> {
     /// The method name to call.
@@ -58,7 +58,7 @@ pub struct RPCRequestRef<'a> {
     pub params: &'a ByteBufB64,
 }
 
-/// Represents a request to an ICP canister with canister ID, method name, and Candid-encoded parameters
+/// Borrowed request to an ICP canister with Candid-encoded parameters.
 #[derive(Clone, Debug, Serialize)]
 pub struct CanisterRequestRef<'a> {
     /// The target canister's principal ID
@@ -74,9 +74,10 @@ pub struct CanisterRequestRef<'a> {
     pub params: &'a ByteBufB64,
 }
 
-/// Represents an RPC response that can be either:
-/// - Ok(ByteBufB64): CBOR or Candid encoded successful response;
-/// - Err(String): Error message as a string.
+/// RPC response payload returned by remote engines.
+///
+/// `Ok` contains the CBOR or Candid encoded success payload. `Err` contains a
+/// remote error message.
 pub type RPCResponse = Result<ByteBufB64, String>;
 
 // #[derive(Debug, Deserialize, Serialize)]
@@ -86,7 +87,7 @@ pub type RPCResponse = Result<ByteBufB64, String>;
 //     pub page_size: Option<u16>,
 // }
 
-/// Represents a list of objects with optional pagination information.
+/// Paginated list response.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ListObject<T> {
     pub data: Vec<T>,
@@ -98,7 +99,7 @@ pub struct ListObject<T> {
     pub next_page_token: Option<String>,
 }
 
-/// Possible errors when working with http_rpc.
+/// Errors returned by [`http_rpc`], [`canister_rpc`], and [`cbor_rpc`].
 #[derive(Debug, thiserror::Error)]
 pub enum HttpRPCError {
     #[error("http_rpc({endpoint:?}, {path:?}): send error: {error}")]
@@ -124,7 +125,7 @@ pub enum HttpRPCError {
     },
 }
 
-/// Makes an HTTP RPC call with CBOR-encoded parameters and returns the decoded response.
+/// Calls a remote CBOR RPC method and decodes its CBOR response payload.
 ///
 /// # Arguments
 /// * `client` - HTTP client to use for the request.
@@ -166,7 +167,7 @@ where
     })
 }
 
-/// Makes a canister-specific RPC call with Candid-encoded arguments.
+/// Calls a canister method through a remote endpoint using Candid-encoded arguments.
 ///
 /// # Arguments
 /// * `client` - HTTP client to use for the request.
@@ -212,7 +213,7 @@ where
     Ok(res.0)
 }
 
-/// Internal function to make a CBOR-encoded RPC call.
+/// Sends a raw CBOR RPC request and returns the remote payload.
 ///
 /// # Arguments
 /// * `client` - HTTP client to use for the request.

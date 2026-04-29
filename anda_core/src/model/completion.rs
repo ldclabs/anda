@@ -5,9 +5,9 @@ use crate::{
     Resource,
 };
 
-/// Provides LLM completion capabilities for agents.
+/// LLM completion capability exposed by an agent context.
 pub trait CompletionFeatures: Sized {
-    /// Generates a completion based on the given request and optional resources.
+    /// Generates a completion for the request and optional resources.
     fn completion(
         &self,
         req: CompletionRequest,
@@ -18,26 +18,25 @@ pub trait CompletionFeatures: Sized {
     fn model_name(&self) -> String;
 }
 
-/// Represents a general completion request that can be sent to a completion model provider.
+/// Provider-neutral completion request.
 #[derive(Debug, Clone, Default)]
 pub struct CompletionRequest {
-    /// The system instructions to be sent to the completion model provider, as the "system" role.
+    /// System instructions sent to the completion provider.
     pub instructions: String,
 
-    /// The name of role, defaulting to "user".
+    /// Role used for `prompt` and `content`; defaults to `user` when omitted.
     pub role: Option<String>,
 
     /// The chat history to be sent to the completion model provider.
     pub chat_history: Vec<Message>,
 
-    /// raw_history is the model specialized history used by anda_engine.
-    /// It should be empty in most cases.
+    /// Provider-specific history used by model adapters. It is empty for most callers.
     pub raw_history: Vec<Json>,
 
     /// The documents to embed into the prompt.
     pub documents: Documents,
 
-    /// The prompt to be sent to the completion model provider as role
+    /// Prompt sent to the completion provider using `role`.
     /// It can be empty.
     pub prompt: String,
 
@@ -51,10 +50,10 @@ pub struct CompletionRequest {
     /// Whether the tool choice is required.
     pub tool_choice_required: bool,
 
-    /// The temperature to be sent to the completion model provider. [0.0, 2.0]
+    /// Sampling temperature requested from the provider, usually in the `[0.0, 2.0]` range.
     pub temperature: Option<f64>,
 
-    /// An upper bound for the number of tokens that can be generated for a response,
+    /// Upper bound for the number of tokens that can be generated for a response.
     pub max_output_tokens: Option<usize>,
 
     /// An object specifying the JSON format that the model must output.

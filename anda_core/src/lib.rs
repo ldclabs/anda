@@ -1,3 +1,18 @@
+//! Core traits, data models, and utility helpers for the Anda agent framework.
+//!
+//! `anda_core` defines the stable interfaces shared by Anda runtimes,
+//! agents, tools, model adapters, and clients. It intentionally keeps runtime
+//! orchestration and provider integrations out of this crate; those pieces are
+//! implemented by higher-level crates such as `anda_engine`.
+//!
+//! The main building blocks are:
+//! - [`Agent`] and [`AgentSet`] for registering and running AI agents.
+//! - [`Tool`] and [`ToolSet`] for type-safe tool implementations.
+//! - [`BaseContext`] and [`AgentContext`] for execution capabilities.
+//! - [`Message`], [`ContentPart`], [`CompletionRequest`], and related model
+//!   types for LLM provider adapters.
+//! - HTTP and CBOR/Candid RPC helpers for remote engine and canister calls.
+
 use object_store::path::DELIMITER;
 use std::{future::Future, pin::Pin};
 
@@ -22,14 +37,17 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// A type alias for a boxed future that is thread-safe and sendable across threads.
 pub type BoxPinFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
-/// Converts a path to lowercase path.
+/// Returns a lowercase copy of an object-store path.
 pub fn path_lowercase(path: &Path) -> Path {
     let mut path = path.to_string();
     path.make_ascii_lowercase();
     path.into()
 }
 
-/// Joins two paths together without percent-encoding, and ensures the result is in lowercase.
+/// Joins two object-store paths without percent-encoding and lowercases the result.
+///
+/// Root paths are treated as empty namespaces: joining root with `b` returns
+/// `b`, and joining `a` with root returns `a`.
 pub fn path_join(a: &Path, b: &Path) -> Path {
     let mut path = if a.is_root() {
         b.to_string()
@@ -42,8 +60,10 @@ pub fn path_join(a: &Path, b: &Path) -> Path {
     path.into()
 }
 
-/// Validates a path part to ensure it doesn't contain the path delimiter
-/// agent name and user name should be validated.
+/// Validates a single path component used in agent, tool, or user namespaces.
+///
+/// The value must be non-empty, must not contain the object-store path
+/// delimiter, and must round-trip through [`Path`] without normalization.
 pub fn validate_path_part(part: &str) -> Result<(), BoxError> {
     if part.is_empty() || part.contains(DELIMITER) || Path::from(part).as_ref() != part {
         return Err(format!("invalid path part: {}", part).into());
@@ -52,7 +72,7 @@ pub fn validate_path_part(part: &str) -> Result<(), BoxError> {
     Ok(())
 }
 
-/// Validates a function name to ensure it doesn't contain invalid characters
+/// Validates an agent or tool function name.
 ///
 /// # Rules
 /// - Must not be empty

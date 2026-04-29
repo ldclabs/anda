@@ -1,31 +1,14 @@
-//! Module providing core tooling functionality for AI Agents.
+//! Tool traits and registries.
 //!
-//! This module defines the core traits and structures for creating and managing tools
-//! that can be used by AI Agents. It provides:
-//! - The [`Tool`] trait for defining custom tools with typed arguments and outputs.
-//! - Dynamic dispatch capabilities through [`DynTool`] trait.
-//! - A [`ToolSet`] collection for managing multiple tools.
+//! Tools are reusable capabilities that agents can call through the runtime.
+//! This module provides:
+//! - [`Tool`] for strongly typed tool implementations.
+//! - [`DynTool`] for runtime dispatch through trait objects.
+//! - [`ToolSet`] for name-based registration and lookup.
 //!
-//! # Key Features
-//! - Type-safe tool definitions with schema validation.
-//! - Asynchronous execution model.
-//! - Dynamic dispatch support for runtime tool selection.
-//! - Tool registration and management system.
-//!
-//! # Usage
-//!
-//! ## Reference Implementations
-//! See the [`anda_engine`](https://github.com/ldclabs/anda/tree/main/anda_engine/src/extension) module
-//! for concrete tool implementations such as:
-//! - [`GoogleSearchTool`](https://github.com/ldclabs/anda/blob/main/anda_engine/src/extension/google.rs) -
-//!   A tool for performing web searches and retrieving results.
-//! - [`Extractor`](https://github.com/ldclabs/anda/blob/main/anda_engine/src/extension/extractor.rs) -
-//!   A tool for extracting structured data using LLMs.
-//! - [`Shell`](https://github.com/ldclabs/anda/blob/main/anda_engine/src/extension/shell.rs) -
-//!   A tool for executing shell commands.
-//!
-//! These reference implementations share a common feature: they automatically generate the JSON Schema
-//! required for LLM Function Calling.
+//! Tools define their own JSON function schema through [`FunctionDefinition`]
+//! and receive typed arguments after the runtime validates and deserializes a
+//! raw JSON call.
 
 use serde::{Serialize, de::DeserializeOwned};
 use std::{collections::BTreeMap, future::Future, marker::PhantomData, sync::Arc};
@@ -35,10 +18,10 @@ use crate::{
     model::FunctionDefinition, select_resources, validate_function_name,
 };
 
-/// Core trait for implementing tools that can be used by the AI Agent system.
+/// Strongly typed interface for an agent tool.
 ///
 /// # Type Parameters
-/// - `C`: The context type that implements [`BaseContext`], must be thread-safe and have a static lifetime.
+/// - `C`: Runtime context implementing [`BaseContext`].
 pub trait Tool<C>: Send + Sync
 where
     C: BaseContext + Send + Sync,
@@ -49,7 +32,7 @@ where
     /// The output type of the tool.
     type Output: Serialize;
 
-    /// Returns the tool's name.
+    /// Returns the unique tool name.
     ///
     /// # Rules
     /// - Must not be empty;
@@ -59,47 +42,49 @@ where
     /// - Unique within the engine.
     fn name(&self) -> String;
 
-    /// Returns the tool's capabilities description in a short string.
+    /// Returns a concise description of the tool's capability.
     fn description(&self) -> String;
 
-    /// Provides the tool's definition including its parameters schema.
+    /// Returns the function definition, including the JSON parameter schema.
     ///
     /// # Returns
     /// - `FunctionDefinition`: The schema definition of the tool's parameters and metadata.
     fn definition(&self) -> FunctionDefinition;
 
-    /// It is used to select resources based on the provided tags.
-    /// If the tool requires specific resources, it can filter them based on the tags.
-    /// By default, it returns an empty list.
+    /// Returns resource tags this tool can consume.
+    ///
+    /// The default implementation returns an empty list, meaning no resources
+    /// are selected for this tool. Return `vec!["*".into()]` to accept all
+    /// attached resources.
     ///
     /// # Returns
-    /// - A list of resource tags from the tags provided that supported by the tool
+    /// Resource tags supported by this tool.
     fn supported_resource_tags(&self) -> Vec<String> {
         Vec::new()
     }
 
-    /// Selects resources based on the tool's supported tags.
-    /// This method filters the provided resources based on the tags that the tool supports.
+    /// Removes and returns resources matching this tool's supported tags.
     fn select_resources(&self, resources: &mut Vec<Resource>) -> Vec<Resource> {
         let supported_tags = self.supported_resource_tags();
         select_resources(resources, &supported_tags)
     }
 
     /// Initializes the tool with the given context.
-    /// It will be called once when building the Anda engine.
+    ///
+    /// Runtimes call this once while building the engine.
     fn init(&self, _ctx: C) -> impl Future<Output = Result<(), BoxError>> + Send {
         futures::future::ready(Ok(()))
     }
 
-    /// Executes the tool with given context and arguments.
+    /// Executes the tool with typed arguments and selected resources.
     ///
     /// # Arguments
     /// - `ctx`: The execution context implementing [`BaseContext`].
     /// - `args`: struct arguments for the tool.
-    /// - `resources`: Optional additional resources, If resources don’t meet the tool’s expectations, return an error.
+    /// - `resources`: Additional resources selected for this tool.
     ///
     /// # Returns
-    /// - A future resolving to Result<[`ToolOutput<Output>`], BoxError>
+    /// A future resolving to [`ToolOutput<Self::Output>`].
     fn call(
         &self,
         ctx: C,
@@ -107,8 +92,7 @@ where
         resources: Vec<Resource>,
     ) -> impl Future<Output = Result<ToolOutput<Self::Output>, BoxError>> + Send;
 
-    /// Executes the tool with given context and arguments using raw JSON string
-    /// Returns the output as a JSON object.
+    /// Executes the tool from raw JSON arguments and returns JSON output.
     fn call_raw(
         &self,
         ctx: C,
@@ -136,10 +120,10 @@ where
     }
 }
 
-/// Dynamic dispatch version of the Tool trait.
+/// Object-safe wrapper around [`Tool`] for runtime dispatch.
 ///
-/// This trait allows for runtime polymorphism of tools, enabling different tool implementations.
-/// to be stored and called through a common interface.
+/// Runtime registries store tools through this trait so callers can select and
+/// execute tools by name without knowing their concrete Rust types.
 pub trait DynTool<C>: Send + Sync
 where
     C: BaseContext + Send + Sync,
@@ -160,7 +144,7 @@ where
     ) -> BoxPinFut<Result<ToolOutput<Json>, BoxError>>;
 }
 
-/// Wrapper to convert static Tool implementation to dynamic dispatch.
+/// Adapter that exposes a concrete [`Tool`] through [`DynTool`].
 struct ToolWrapper<T, C>(Arc<T>, PhantomData<C>)
 where
     T: Tool<C> + 'static,
@@ -199,7 +183,7 @@ where
     }
 }
 
-/// Collection of tools that can be used by the AI Agent
+/// Name-based registry for tools.
 ///
 /// # Type Parameters
 /// - `C`: The context type that implements [`BaseContext`].
@@ -212,42 +196,42 @@ impl<C> ToolSet<C>
 where
     C: BaseContext + Send + Sync + 'static,
 {
-    /// Creates a new empty ToolSet
+    /// Creates an empty tool set.
     pub fn new() -> Self {
         Self {
             set: BTreeMap::new(),
         }
     }
 
-    /// Checks if a tool with the given name exists in the set
+    /// Returns whether a tool with the given name exists.
     pub fn contains(&self, name: &str) -> bool {
         self.set.contains_key(&name.to_ascii_lowercase())
     }
 
-    /// Checks if a tool with given name (should be lowercase) exists.
+    /// Returns whether a tool with the given lowercase name exists.
     pub fn contains_lowercase(&self, lowercase_name: &str) -> bool {
         self.set.contains_key(lowercase_name)
     }
 
-    /// Returns the names of all tools in the set
+    /// Returns the names of all registered tools.
     pub fn names(&self) -> Vec<String> {
         self.set.keys().cloned().collect()
     }
 
-    /// Retrieves definition for a specific tool.
+    /// Returns the function definition for a specific tool.
     pub fn definition(&self, name: &str) -> Option<FunctionDefinition> {
         self.set
             .get(&name.to_ascii_lowercase())
             .map(|tool| tool.definition())
     }
 
-    /// Returns definitions for all or specified tools.
+    /// Returns function definitions for all tools or the selected names.
     ///
     /// # Arguments
     /// - `names`: Optional slice of tool names to filter by.
     ///
     /// # Returns
-    /// - Vec<[`FunctionDefinition`]>: Vector of tool definitions.
+    /// A vector of tool definitions.
     pub fn definitions(&self, names: Option<&[String]>) -> Vec<FunctionDefinition> {
         match names {
             None => self.set.values().map(|tool| tool.definition()).collect(),
@@ -262,13 +246,13 @@ where
         }
     }
 
-    /// Returns a list of functions for all or specified tools.
+    /// Returns function metadata for all tools or the selected names.
     ///
     /// # Arguments
     /// - `names`: Optional slice of tool names to filter by.
     ///
     /// # Returns
-    /// - Vec<[`Function`]>: Vector of tool functions.
+    /// A vector of tool function metadata.
     pub fn functions(&self, names: Option<&[String]>) -> Vec<Function> {
         match names {
             None => self
@@ -293,7 +277,7 @@ where
         }
     }
 
-    /// Extracts resources from the provided list based on the tool's supported tags.
+    /// Removes and returns resources supported by the named tool.
     pub fn select_resources(&self, name: &str, resources: &mut Vec<Resource>) -> Vec<Resource> {
         self.set
             .get(&name.to_ascii_lowercase())
@@ -304,10 +288,10 @@ where
             .unwrap_or_default()
     }
 
-    /// Adds a new tool to the set
+    /// Registers a new tool.
     ///
     /// # Arguments
-    /// - `tool`: The tool to add, must implement the [`Tool`] trait.
+    /// - `tool`: The tool to register.
     pub fn add<T>(&mut self, tool: Arc<T>) -> Result<(), BoxError>
     where
         T: Tool<C> + Send + Sync + 'static,
@@ -323,12 +307,12 @@ where
         Ok(())
     }
 
-    /// Retrieves a tool by name
+    /// Returns a tool by name.
     pub fn get(&self, name: &str) -> Option<Arc<dyn DynTool<C>>> {
         self.set.get(&name.to_ascii_lowercase()).cloned()
     }
 
-    /// Retrieves a tool by lowercase name.
+    /// Returns a tool by lowercase name.
     pub fn get_lowercase(&self, lowercase_name: &str) -> Option<Arc<dyn DynTool<C>>> {
         self.set.get(lowercase_name).cloned()
     }

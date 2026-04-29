@@ -1,33 +1,16 @@
-//! Module providing core agent functionality for AI systems.
+//! Agent traits and registries.
 //!
-//! This module defines the core traits and structures for creating and managing AI agents. It provides:
-//! - The [`Agent`] trait for defining custom agents with specific capabilities.
-//! - Dynamic dispatch capabilities through [`DynAgent`] trait.
-//! - An [`AgentSet`] collection for managing multiple agents.
+//! This module defines how custom AI agents are described, registered, and
+//! invoked by an Anda runtime. It provides:
+//! - [`Agent`] for strongly typed agent implementations.
+//! - [`DynAgent`] for runtime dispatch through trait objects.
+//! - [`AgentSet`] for name-based registration and lookup.
 //!
-//! # Key Features
-//! - Type-safe agent definitions with clear interfaces.
-//! - Asynchronous execution model.
-//! - Dynamic dispatch support for runtime agent selection.
-//! - Agent registration and management system.
-//! - Tool dependency management.
+//! Agents may declare tool dependencies and supported resource tags. The
+//! runtime uses those declarations to validate engine configuration and route
+//! resource attachments to the components that can consume them.
 //!
-//! # Architecture Overview
-//! The module follows a dual-trait pattern:
-//! 1. [`Agent`] - Static trait for defining concrete agent implementations.
-//! 2. [`DynAgent`] - Dynamic trait for runtime polymorphism.
-//!
-//! The [`AgentSet`] acts as a registry and execution manager for agents, providing:
-//! - Agent registration and lookup.
-//! - Bulk definition retrieval.
-//! - Execution routing.
-//!
-//! # Usage
-//!
-//! ## Reference Implementations
-//! See the [`anda_engine`](https://github.com/ldclabs/anda/tree/main/anda_engine/src/extension) module
-//! for concrete agent implementations such as the [`Extractor`](https://github.com/ldclabs/anda/blob/main/anda_engine/src/extension/extractor.rs)
-//! for structured data extraction using LLMs.
+//! See the `anda_engine` extension modules for concrete agent implementations.
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -40,23 +23,24 @@ use crate::{
     select_resources, validate_function_name,
 };
 
-/// Arguments for an AI agent.
+/// Default JSON arguments for an agent exposed as a callable function.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AgentArgs {
     /// Self-contained task prompt for the agent.
     pub prompt: String,
 }
 
-/// Core trait defining an AI agent's behavior.
+/// Strongly typed interface for an AI agent.
 ///
 /// # Type Parameters
-/// - `C`: The context type that implements [`AgentContext`], must be thread-safe and have a static lifetime.
+/// - `C`: Runtime context implementing [`AgentContext`].
 pub trait Agent<C>: Send + Sync
 where
     C: AgentContext + Send + Sync,
 {
-    /// Returns the agent's name as a String
-    /// The unique name of the agent, case-insensitive, must follow these rules in lowercase:
+    /// Returns the unique agent name.
+    ///
+    /// Names are registered case-insensitively and stored in lowercase.
     ///
     /// # Rules
     /// - Must not be empty;
@@ -66,10 +50,10 @@ where
     /// - Unique within the engine in lowercase.
     fn name(&self) -> String;
 
-    /// Returns the agent's capabilities description in a short string.
+    /// Returns a concise description of the agent's capability.
     fn description(&self) -> String;
 
-    /// Returns the agent's function definition for API integration.
+    /// Returns the function definition used for LLM/tool-call integration.
     ///
     /// # Returns
     /// - `FunctionDefinition`: The structured definition of the agent's capabilities.
@@ -94,43 +78,47 @@ where
         }
     }
 
-    /// It is used to select resources based on the provided tags.
-    /// If the agent requires specific resources, it can filter them based on the tags.
-    /// By default, it returns an empty list.
+    /// Returns resource tags this agent can consume.
+    ///
+    /// The default implementation returns an empty list, meaning no resources
+    /// are selected for this agent. Return `vec!["*".into()]` to accept all
+    /// attached resources.
     ///
     /// # Returns
-    /// - A list of resource tags from the tags provided that supported by the agent.
+    /// Resource tags supported by this agent.
     fn supported_resource_tags(&self) -> Vec<String> {
         Vec::new()
     }
 
-    /// Selects resources based on the agent's supported tags.
+    /// Removes and returns resources matching this agent's supported tags.
     fn select_resources(&self, resources: &mut Vec<Resource>) -> Vec<Resource> {
         let supported_tags = self.supported_resource_tags();
         select_resources(resources, &supported_tags)
     }
 
-    /// Initializes the tool with the given context.
-    /// It will be called once when building the Anda engine.
+    /// Initializes the agent with the given context.
+    ///
+    /// Runtimes call this once while building the engine.
     fn init(&self, _ctx: C) -> impl Future<Output = Result<(), BoxError>> + Send {
         futures::future::ready(Ok(()))
     }
 
-    /// Returns a list of tool dependencies required by the agent.
-    /// The tool dependencies are checked when building the engine.
+    /// Returns tool names required by this agent.
+    ///
+    /// Runtimes use this list to validate that required tools are registered.
     fn tool_dependencies(&self) -> Vec<String> {
         Vec::new()
     }
 
-    /// Executes the agent's main logic with given context and inputs.
+    /// Executes the agent with the given context and inputs.
     ///
     /// # Arguments
     /// - `ctx`: The execution context implementing [`AgentContext`].
     /// - `prompt`: The input prompt or message for the agent.
-    /// - `resources`: Optional additional resources, If resources don’t meet the agent’s expectations, ignore them.
+    /// - `resources`: Additional resources selected for this agent. Ignore resources that are not useful.
     ///
     /// # Returns
-    /// - A future resolving to Result<[`AgentOutput`], BoxError>.
+    /// A future resolving to [`AgentOutput`].
     fn run(
         &self,
         ctx: C,
@@ -139,10 +127,10 @@ where
     ) -> impl Future<Output = Result<AgentOutput, BoxError>> + Send;
 }
 
-/// Dynamic dispatch version of Agent trait for runtime flexibility.
+/// Object-safe wrapper around [`Agent`] for runtime dispatch.
 ///
-/// This trait allows for runtime polymorphism of agents, enabling dynamic agent selection
-/// and execution without knowing the concrete type at compile time.
+/// Runtime registries store agents through this trait so callers can select and
+/// execute agents by name without knowing their concrete Rust types.
 pub trait DynAgent<C>: Send + Sync
 where
     C: AgentContext + Send + Sync,
@@ -167,7 +155,7 @@ where
     ) -> BoxPinFut<Result<AgentOutput, BoxError>>;
 }
 
-/// Adapter for converting static Agent to dynamic dispatch.
+/// Adapter that exposes a concrete [`Agent`] through [`DynAgent`].
 struct AgentWrapper<T, C>
 where
     T: Agent<C> + 'static,
@@ -219,7 +207,7 @@ where
     }
 }
 
-/// Collection of agents with lookup capabilities.
+/// Name-based registry for agents.
 ///
 /// # Type Parameters
 /// - `C`: The context type that implements [`AgentContext`].
@@ -239,12 +227,12 @@ where
         }
     }
 
-    /// Checks if an agent with given name exists.
+    /// Returns whether an agent with the given name exists.
     pub fn contains(&self, name: &str) -> bool {
         self.set.contains_key(&name.to_ascii_lowercase())
     }
 
-    /// Checks if an agent with given name (should be lowercase) exists.
+    /// Returns whether an agent with the given lowercase name exists.
     pub fn contains_lowercase(&self, lowercase_name: &str) -> bool {
         self.set.contains_key(lowercase_name)
     }
@@ -254,20 +242,20 @@ where
         self.set.keys().cloned().collect()
     }
 
-    /// Retrieves definition for a specific agent.
+    /// Returns the function definition for a specific agent.
     pub fn definition(&self, name: &str) -> Option<FunctionDefinition> {
         self.set
             .get(&name.to_ascii_lowercase())
             .map(|agent| agent.definition())
     }
 
-    /// Returns definitions for all or specified agents.
+    /// Returns function definitions for all agents or the selected names.
     ///
     /// # Arguments
     /// - `names`: Optional slice of agent names to filter by.
     ///
     /// # Returns
-    /// - Vec<[`FunctionDefinition`]>: Vector of agent definitions.
+    /// A vector of agent definitions.
     pub fn definitions(&self, names: Option<&[String]>) -> Vec<FunctionDefinition> {
         match names {
             None => self.set.values().map(|agent| agent.definition()).collect(),
@@ -282,13 +270,13 @@ where
         }
     }
 
-    /// Returns a list of functions for all or specified agents.
+    /// Returns function metadata for all agents or the selected names.
     ///
     /// # Arguments
     /// - `names`: Optional slice of agent names to filter by.
     ///
     /// # Returns
-    /// - Vec<[`Function`]>: Vector of agent functions.
+    /// A vector of agent function metadata.
     pub fn functions(&self, names: Option<&[String]>) -> Vec<Function> {
         match names {
             None => self
@@ -313,7 +301,7 @@ where
         }
     }
 
-    /// Extracts resources from the provided list based on the agent's supported tags.
+    /// Removes and returns resources supported by the named agent.
     pub fn select_resources(&self, name: &str, resources: &mut Vec<Resource>) -> Vec<Resource> {
         if resources.is_empty() {
             return Vec::new();
@@ -328,10 +316,10 @@ where
             .unwrap_or_default()
     }
 
-    /// Registers a new agent in the set.
+    /// Registers a new agent.
     ///
     /// # Arguments
-    /// - `agent`: The agent to register, must implement [`Agent`] trait.
+    /// - `agent`: The agent to register.
     pub fn add<T>(&mut self, agent: Arc<T>, label: Option<String>) -> Result<(), BoxError>
     where
         T: Agent<C> + Send + Sync + 'static,
@@ -351,12 +339,12 @@ where
         Ok(())
     }
 
-    /// Retrieves an agent by name.
+    /// Returns an agent by name.
     pub fn get(&self, name: &str) -> Option<Arc<dyn DynAgent<C>>> {
         self.set.get(&name.to_ascii_lowercase()).cloned()
     }
 
-    /// Retrieves an agent by lowercase name.
+    /// Returns an agent by lowercase name.
     pub fn get_lowercase(&self, lowercase_name: &str) -> Option<Arc<dyn DynAgent<C>>> {
         self.set.get(lowercase_name).cloned()
     }
