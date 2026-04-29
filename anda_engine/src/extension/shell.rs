@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{MAIN_SEPARATOR, Path, PathBuf},
     process::Output,
     sync::Arc,
@@ -39,6 +39,34 @@ use crate::{
 pub const SHELL_TIMEOUT_SECS: u64 = 180;
 /// Maximum output size in bytes (256KB).
 pub const MAX_OUTPUT_BYTES: usize = 256 * 1024;
+
+/// Environment variables safe to pass to shell commands.
+/// Only functional variables are included — never API keys or secrets.
+#[cfg(not(target_os = "windows"))]
+const SAFE_ENV_VARS: &[&str] = &[
+    "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
+];
+
+/// Environment variables safe to pass to shell commands on Windows.
+/// Includes Windows-specific variables needed for cmd.exe and program resolution.
+#[cfg(target_os = "windows")]
+const SAFE_ENV_VARS: &[&str] = &[
+    "PATH",
+    "PATHEXT",
+    "HOME",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "SYSTEMROOT",
+    "SYSTEMDRIVE",
+    "WINDIR",
+    "COMSPEC",
+    "TEMP",
+    "TMP",
+    "TERM",
+    "LANG",
+    "USERNAME",
+];
 
 /// Runtime abstraction used by [`ShellTool`] to execute shell commands.
 #[async_trait]
@@ -260,6 +288,38 @@ impl ShellTool {
         self.description = description;
         self
     }
+
+    fn collect_shell_env_vars(&self, env_keys: &[String]) -> HashMap<String, String> {
+        let mut out = HashMap::new();
+        let mut seen = HashSet::new();
+        if self.runtime.name() == "native" {
+            // For native runtime, we allow safe environment variables from the host process
+            for key in SAFE_ENV_VARS.iter().copied() {
+                let candidate = key.trim();
+                if candidate.is_empty() || !is_valid_env_var_name(candidate) {
+                    continue;
+                }
+                if seen.insert(candidate.to_string()) {
+                    if let Ok(val) = std::env::var(&candidate) {
+                        out.insert(candidate.to_string(), val);
+                    }
+                }
+            }
+        }
+
+        for key in env_keys.iter() {
+            let candidate = key.trim();
+            if candidate.is_empty() || !is_valid_env_var_name(candidate) {
+                continue;
+            }
+            if seen.insert(candidate.to_string()) {
+                if let Some(val) = self.envs.get(candidate) {
+                    out.insert(candidate.to_string(), val.clone());
+                }
+            }
+        }
+        out
+    }
 }
 
 impl Tool<BaseCtx> for ShellTool {
@@ -336,11 +396,7 @@ impl Tool<BaseCtx> for ShellTool {
             args
         };
         let command = args.command.clone();
-        let envs: HashMap<String, String> = args
-            .env_keys
-            .iter()
-            .filter_map(|key| self.envs.get(key).map(|value| (key.clone(), value.clone())))
-            .collect();
+        let envs = self.collect_shell_env_vars(&args.env_keys);
 
         let result = tokio::time::timeout(
             Duration::from_secs(SHELL_TIMEOUT_SECS),
@@ -370,6 +426,15 @@ impl Tool<BaseCtx> for ShellTool {
             Ok(rt)
         }
     }
+}
+
+fn is_valid_env_var_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_alphabetic() || first == '_' => {}
+        _ => return false,
+    }
+    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
 pub(crate) fn join_current_dir(base: &Path, relative: &str) -> PathBuf {
@@ -462,7 +527,7 @@ fn build_raw_output_bytes(stdout: Option<&[u8]>, stderr: Option<&[u8]>) -> Vec<u
     }
 }
 
-fn truncate_utf8_to_max_bytes(text: &mut String, max_bytes: usize) -> Option<usize> {
+pub fn truncate_utf8_to_max_bytes(text: &mut String, max_bytes: usize) -> Option<usize> {
     if text.len() <= max_bytes {
         return None;
     }
