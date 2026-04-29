@@ -108,38 +108,48 @@ impl RemoteEngines {
 
     /// Retrieves a remote tool endpoint and name from a prefixed name.
     pub fn get_tool_endpoint(&self, prefixed_name: &str) -> Option<(Principal, String, String)> {
-        if let Some(name) = prefixed_name.strip_prefix("RT_") {
-            for (handle, engine) in self.engines.iter() {
-                if let Some(tool_name) = name.strip_prefix(handle)
-                    && let Some(tool_name) = tool_name.strip_prefix("_")
-                {
-                    return Some((
-                        engine.id,
-                        engine.info.endpoint.clone(),
-                        tool_name.to_string(),
-                    ));
-                }
-            }
-        }
-        None
+        self.engines
+            .iter()
+            .filter_map(|(handle, engine)| {
+                let prefix = format!("RT_{handle}_");
+                let tool_name = prefixed_name.strip_prefix(&prefix)?;
+                engine
+                    .tools
+                    .iter()
+                    .any(|tool| tool.definition.name == tool_name)
+                    .then_some((handle.len(), engine, tool_name))
+            })
+            .max_by_key(|(handle_len, _, _)| *handle_len)
+            .map(|(_, engine, tool_name)| {
+                (
+                    engine.id,
+                    engine.info.endpoint.clone(),
+                    tool_name.to_string(),
+                )
+            })
     }
 
     /// Retrieves a remote agent endpoint and name from a prefixed name.
     pub fn get_agent_endpoint(&self, prefixed_name: &str) -> Option<(Principal, String, String)> {
-        if let Some(name) = prefixed_name.strip_prefix("RA_") {
-            for (handle, engine) in self.engines.iter() {
-                if let Some(agent_name) = name.strip_prefix(handle)
-                    && let Some(agent_name) = agent_name.strip_prefix("_")
-                {
-                    return Some((
-                        engine.id,
-                        engine.info.endpoint.clone(),
-                        agent_name.to_string(),
-                    ));
-                }
-            }
-        }
-        None
+        self.engines
+            .iter()
+            .filter_map(|(handle, engine)| {
+                let prefix = format!("RA_{handle}_");
+                let agent_name = prefixed_name.strip_prefix(&prefix)?;
+                engine
+                    .agents
+                    .iter()
+                    .any(|agent| agent.definition.name == agent_name)
+                    .then_some((handle.len(), engine, agent_name))
+            })
+            .max_by_key(|(handle_len, _, _)| *handle_len)
+            .map(|(_, engine, agent_name)| {
+                (
+                    engine.id,
+                    engine.info.endpoint.clone(),
+                    agent_name.to_string(),
+                )
+            })
     }
 
     /// Retrieves a remote engine ID by endpoint.
@@ -457,5 +467,76 @@ impl Agent<AgentCtx> for RemoteAgent {
             },
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn function(name: &str) -> Function {
+        Function {
+            definition: FunctionDefinition {
+                name: name.to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn engine(endpoint: &str, tools: &[&str], agents: &[&str]) -> EngineCard {
+        EngineCard {
+            id: Principal::anonymous(),
+            info: AgentInfo {
+                endpoint: endpoint.to_string(),
+                ..Default::default()
+            },
+            tools: tools.iter().map(|name| function(name)).collect(),
+            agents: agents.iter().map(|name| function(name)).collect(),
+        }
+    }
+
+    #[test]
+    fn remote_tool_endpoint_prefers_registered_function_on_longest_handle() {
+        let mut remote = RemoteEngines::new();
+        remote.engines.insert(
+            "alpha".to_string(),
+            engine("https://alpha.example", &["beta_tool", "status"], &[]),
+        );
+        remote.engines.insert(
+            "alpha_beta".to_string(),
+            engine("https://alpha-beta.example", &["tool"], &[]),
+        );
+
+        let (_, endpoint, tool_name) = remote.get_tool_endpoint("RT_alpha_beta_tool").unwrap();
+        assert_eq!(endpoint, "https://alpha-beta.example");
+        assert_eq!(tool_name, "tool");
+
+        let (_, endpoint, tool_name) = remote.get_tool_endpoint("RT_alpha_status").unwrap();
+        assert_eq!(endpoint, "https://alpha.example");
+        assert_eq!(tool_name, "status");
+        assert!(remote.get_tool_endpoint("RT_alpha_missing").is_none());
+    }
+
+    #[test]
+    fn remote_agent_endpoint_prefers_registered_function_on_longest_handle() {
+        let mut remote = RemoteEngines::new();
+        remote.engines.insert(
+            "alpha".to_string(),
+            engine("https://alpha.example", &[], &["beta_agent", "chat"]),
+        );
+        remote.engines.insert(
+            "alpha_beta".to_string(),
+            engine("https://alpha-beta.example", &[], &["agent"]),
+        );
+
+        let (_, endpoint, agent_name) = remote.get_agent_endpoint("RA_alpha_beta_agent").unwrap();
+        assert_eq!(endpoint, "https://alpha-beta.example");
+        assert_eq!(agent_name, "agent");
+
+        let (_, endpoint, agent_name) = remote.get_agent_endpoint("RA_alpha_chat").unwrap();
+        assert_eq!(endpoint, "https://alpha.example");
+        assert_eq!(agent_name, "chat");
+        assert!(remote.get_agent_endpoint("RA_alpha_missing").is_none());
     }
 }

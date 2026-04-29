@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     path::{MAIN_SEPARATOR, Path, PathBuf},
     process::Output,
     sync::Arc,
@@ -291,18 +291,15 @@ impl ShellTool {
 
     fn collect_shell_env_vars(&self, env_keys: &[String]) -> HashMap<String, String> {
         let mut out = HashMap::new();
-        let mut seen = HashSet::new();
         if self.runtime.name() == "native" {
             // For native runtime, we allow safe environment variables from the host process
-            for key in SAFE_ENV_VARS.iter().copied() {
+            for key in SAFE_ENV_VARS {
                 let candidate = key.trim();
                 if candidate.is_empty() || !is_valid_env_var_name(candidate) {
                     continue;
                 }
-                if seen.insert(candidate.to_string()) {
-                    if let Ok(val) = std::env::var(&candidate) {
-                        out.insert(candidate.to_string(), val);
-                    }
+                if let Ok(val) = std::env::var(candidate) {
+                    out.insert(candidate.to_string(), val);
                 }
             }
         }
@@ -312,10 +309,10 @@ impl ShellTool {
             if candidate.is_empty() || !is_valid_env_var_name(candidate) {
                 continue;
             }
-            if seen.insert(candidate.to_string()) {
-                if let Some(val) = self.envs.get(candidate) {
-                    out.insert(candidate.to_string(), val.clone());
-                }
+            if !out.contains_key(candidate)
+                && let Some(val) = self.envs.get(candidate)
+            {
+                out.insert(candidate.to_string(), val.clone());
             }
         }
         out
@@ -542,7 +539,52 @@ pub fn truncate_utf8_to_max_bytes(text: &mut String, max_bytes: usize) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use std::process::ExitStatus;
+
+    struct TestRuntime {
+        name: &'static str,
+        workspace: PathBuf,
+        temp_dir: PathBuf,
+    }
+
+    impl TestRuntime {
+        fn new(name: &'static str) -> Self {
+            Self {
+                name,
+                workspace: PathBuf::from("/tmp/anda-shell-test-workspace"),
+                temp_dir: std::env::temp_dir(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Executor for TestRuntime {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn workspace(&self) -> &PathBuf {
+            &self.workspace
+        }
+
+        fn temp_dir(&self) -> &PathBuf {
+            &self.temp_dir
+        }
+
+        fn shell(&self) -> &str {
+            "sh"
+        }
+
+        async fn execute(
+            &self,
+            _ctx: BaseCtx,
+            _input: ExecArgs,
+            _envs: HashMap<String, String>,
+        ) -> Result<ExecOutput, BoxError> {
+            unreachable!("test runtime does not execute commands")
+        }
+    }
 
     struct TestTempDir(PathBuf);
 
@@ -660,5 +702,26 @@ mod tests {
         assert_eq!(result.raw_output_path, None);
         assert_eq!(result.stdout.as_deref(), Some("ok\n"));
         assert_eq!(result.stderr.as_deref(), Some("warn\n"));
+    }
+
+    #[test]
+    fn collect_shell_env_vars_uses_configured_keys_once() {
+        let mut envs = HashMap::new();
+        envs.insert("ANDA_TEST_ENV".to_string(), "configured".to_string());
+        envs.insert("INVALID-NAME".to_string(), "ignored".to_string());
+        let tool = ShellTool::new(Arc::new(TestRuntime::new("sandbox")), envs);
+
+        let collected = tool.collect_shell_env_vars(&[
+            " ANDA_TEST_ENV ".to_string(),
+            "ANDA_TEST_ENV".to_string(),
+            "INVALID-NAME".to_string(),
+            "MISSING".to_string(),
+        ]);
+
+        assert_eq!(collected.len(), 1);
+        assert_eq!(
+            collected.get("ANDA_TEST_ENV").map(String::as_str),
+            Some("configured")
+        );
     }
 }

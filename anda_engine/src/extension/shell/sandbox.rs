@@ -8,7 +8,7 @@ use futures_util::stream::{Stream, StreamExt};
 use ic_auth_types::Xid;
 use std::{
     collections::HashMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     pin::Pin,
     process::{ExitStatus, Output},
     sync::Arc,
@@ -66,7 +66,7 @@ impl SandboxRuntime {
 
     fn build_command(
         &self,
-        workspace: &PathBuf,
+        workspace: &Path,
         input: &ExecArgs,
         envs: HashMap<String, String>,
     ) -> SandboxCommandSpec {
@@ -122,7 +122,7 @@ impl Executor for SandboxRuntime {
             match wait_with_output(child).await {
                 Ok(output) => {
                     let mut exec_output =
-                        ExecOutput::from_output(None, Some(output), &temp_dir).await;
+                        ExecOutput::from_output(None, Some(output), temp_dir).await;
                     exec_output.workspace = Some(workspace_str);
 
                     return Ok(exec_output);
@@ -478,8 +478,10 @@ mod tests {
         }
     }
 
+    type BackgroundEndSender = oneshot::Sender<(String, ToolOutput<ExecOutput>)>;
+
     struct TestHook {
-        sender: Mutex<Option<oneshot::Sender<(String, ToolOutput<ExecOutput>)>>>,
+        sender: Mutex<Option<BackgroundEndSender>>,
     }
 
     impl TestHook {
