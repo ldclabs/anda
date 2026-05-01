@@ -65,8 +65,10 @@ pub struct AgentCtx {
     /// Label of the agent.
     pub label: String,
 
+    /// Default AI model instance for completions.
+    pub model: Model,
+
     pub(crate) root: BaseCtx,
-    pub(crate) model: Model,
     // label -> model
     pub(crate) models: Arc<Models>,
 

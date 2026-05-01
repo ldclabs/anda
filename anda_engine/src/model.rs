@@ -112,7 +112,7 @@ impl ModelConfig {
         };
 
         let labels = if self.labels.is_empty() {
-            vec![self.model.clone()]
+            vec![self.model.to_ascii_lowercase()]
         } else {
             self.labels.clone()
         };
@@ -233,7 +233,8 @@ impl Models {
 
         let model_name = model.model_name();
         let mut models = self.models.load().as_ref().clone();
-        for label in labels {
+        for mut label in labels {
+            label.make_ascii_lowercase();
             if label == "primary" {
                 self.model.store(Arc::new(Some(model.clone())));
             } else if label == "fallback" {
@@ -254,7 +255,7 @@ impl Models {
         self.models.store(Arc::new(models));
     }
 
-    /// Returns a model by label if it exists.
+    /// Returns a model by lowercase label if it exists.
     ///
     /// This is a direct lookup only and never falls back to the primary or
     /// fallback slots.
@@ -286,7 +287,7 @@ impl Models {
         self.fallback_model.load().as_ref().clone()
     }
 
-    /// Resolves a model for label-aware routing.
+    /// Resolves a model for lowercase-label-aware routing.
     ///
     /// Resolution order is:
     /// - the exact label match when `label` is non-empty
