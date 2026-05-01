@@ -65,7 +65,7 @@ pub static FUNCTION_DEFINITION: LazyLock<FunctionDefinition> = LazyLock::new(|| 
 
 /// Conversation record stored in the memory database.
 ///
-/// Schema version: 3.
+/// Schema version: 4
 #[derive(Debug, Clone, Deserialize, Serialize, AndaDBSchema)]
 pub struct Conversation {
     /// Unique collection identifier assigned by AndaDB.
@@ -115,6 +115,10 @@ pub struct Conversation {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub follow_up_messages: Option<Vec<String>>,
 
+    /// The child conversation ID, if this conversation has been continued. Should not be updated after set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub child: Option<u64>,
+
     /// The ancestor conversation IDs, ordered from root to parent.
     /// Should not be updated after creation.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -156,6 +160,7 @@ impl Default for Conversation {
             usage: Usage::default(),
             steering_messages: None,
             follow_up_messages: None,
+            child: None,
             ancestors: None,
             label: None,
             extra: None,
@@ -223,6 +228,10 @@ impl Conversation {
                 },
             ),
         ]);
+
+        if let Some(child) = self.child {
+            changes.insert("child".to_string(), Fv::U64(child));
+        }
         if let Some(reason) = &self.failed_reason {
             changes.insert("failed_reason".to_string(), Fv::Text(reason.clone()));
         }
@@ -318,6 +327,8 @@ pub struct ConversationRef<'a> {
     pub created_at: u64,
     pub updated_at: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub child: &'a Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ancestors: &'a Option<Vec<u64>>,
 }
 
@@ -339,6 +350,7 @@ impl<'a> From<&'a Conversation> for ConversationRef<'a> {
             period: conversation.period,
             created_at: conversation.created_at,
             updated_at: conversation.updated_at,
+            child: &conversation.child,
             ancestors: &conversation.ancestors,
         }
     }
@@ -401,7 +413,7 @@ pub struct Conversations {
 impl Conversations {
     pub async fn connect(db: Arc<AndaDB>, name: String) -> Result<Self, BoxError> {
         let mut schema = Conversation::schema()?;
-        schema.with_version(3);
+        schema.with_version(4);
 
         let conversations = db
             .open_or_create_collection(
@@ -579,7 +591,7 @@ pub struct MemoryManagement {
 impl MemoryManagement {
     pub async fn connect(db: Arc<AndaDB>, nexus: Arc<CognitiveNexus>) -> Result<Self, BoxError> {
         let mut schema = Conversation::schema()?;
-        schema.with_version(3);
+        schema.with_version(4);
 
         let conversations = db
             .open_or_create_collection(

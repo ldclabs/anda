@@ -18,7 +18,10 @@ use anda_core::{
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{BTreeSet, HashMap, hash_map::Entry},
+    sync::Arc,
+};
 
 pub mod anthropic;
 pub mod gemini;
@@ -51,6 +54,12 @@ pub struct ModelConfig {
     #[serde(default)]
     pub labels: Vec<String>,
 
+    #[serde(default)]
+    pub context_window: usize,
+
+    #[serde(default)]
+    pub max_output: usize,
+
     /// Skips this model when loading a list of configs.
     #[serde(default)]
     pub disabled: bool,
@@ -80,7 +89,7 @@ impl ModelConfig {
             return Err(format!("{}: api_key is required", self.model).into());
         }
 
-        let model = match self.family.as_str() {
+        let mut model = match self.family.as_str() {
             "gemini" => Model::with_completer(Arc::new(
                 gemini::Client::new(&self.api_key, Some(self.api_base.clone()))
                     .with_client(http_client)
@@ -107,6 +116,8 @@ impl ModelConfig {
         } else {
             self.labels.clone()
         };
+        model.context_window = self.context_window;
+        model.max_output = self.max_output;
         Ok(model.with_labels(labels))
     }
 
@@ -115,31 +126,10 @@ impl ModelConfig {
         note = "use the `model` method which returns a Result and allows error handling instead of silently returning a not_implemented model"
     )]
     pub fn build_model(&self, http_client: reqwest::Client) -> Model {
-        if self.disabled {
-            return Model::not_implemented();
-        }
-
-        match self.family.as_str() {
-            "gemini" => Model::with_completer(Arc::new(
-                gemini::Client::new(&self.api_key, Some(self.api_base.clone()))
-                    .with_client(http_client)
-                    .completion_model(&self.model),
-            )),
-            "anthropic" => {
-                let mut cli = anthropic::Client::new(&self.api_key, Some(self.api_base.clone()))
-                    .with_client(http_client);
-                if self.bearer_auth {
-                    cli = cli.with_bearer_auth(true);
-                }
-                Model::with_completer(Arc::new(cli.completion_model(&self.model)))
-            }
-            "openai" => Model::with_completer(Arc::new(
-                openai::Client::new(&self.api_key, Some(self.api_base.clone()))
-                    .with_client(http_client)
-                    .completion_model_v2(&self.model),
-            )),
-            _ => Model::not_implemented(),
-        }
+        self.model(http_client).unwrap_or_else(|err| {
+            eprintln!("warning: failed to build model from config: {err}");
+            Model::not_implemented()
+        })
     }
 }
 
@@ -156,7 +146,7 @@ impl ModelConfig {
 /// lookup (`get`) separate from default-routing (`get_model`).
 pub struct Models {
     model: ArcSwap<Option<Model>>,
-    models: ArcSwap<HashMap<String, Model>>,
+    models: ArcSwap<HashMap<String, Vec<Model>>>,
     fallback_model: ArcSwap<Option<Model>>,
 }
 
@@ -173,7 +163,7 @@ impl Default for Models {
 impl Models {
     /// Creates a new Models instance by cloning the internal state of another Models instance.
     pub fn from_clone(other: &Models) -> Self {
-        let models: HashMap<String, Model> = HashMap::from_iter(
+        let models: HashMap<String, Vec<Model>> = HashMap::from_iter(
             other
                 .models
                 .load()
@@ -205,14 +195,25 @@ impl Models {
         self.models.load().contains_key(label)
     }
 
+    pub fn model_names(&self) -> BTreeSet<String> {
+        self.models
+            .load()
+            .values()
+            .flatten()
+            .map(|m| m.model_name())
+            .collect()
+    }
+
     /// Sets the primary default model without mutating the label map.
     pub fn set_model(&self, model: Model) {
+        self.inner_set(model.labels.clone(), model.clone());
         self.model.store(Arc::new(Some(model)));
     }
 
     /// Sets the fallback model used when primary lookup fails without mutating
     /// the label map.
     pub fn set_fallback_model(&self, model: Model) {
+        self.inner_set(model.labels.clone(), model.clone());
         self.fallback_model.store(Arc::new(Some(model)));
     }
 
@@ -222,19 +223,34 @@ impl Models {
     /// routing slots. If no primary exists yet, any inserted model is promoted
     /// to become the primary default.
     pub fn set(&self, label: String, model: Model) {
-        let mut models = self.models.load().as_ref().clone();
-        models.insert(label.clone(), model.clone());
+        self.inner_set(vec![label], model);
+    }
 
-        let model = Arc::new(Some(model));
-        if label == "primary" {
-            self.model.store(model.clone());
-        } else if label == "fallback" {
-            self.fallback_model.store(model.clone());
-        }
-
+    fn inner_set(&self, labels: Vec<String>, model: Model) {
         if self.model.load().is_none() {
-            self.model.store(model);
+            self.model.store(Arc::new(Some(model.clone())));
         }
+
+        let model_name = model.model_name();
+        let mut models = self.models.load().as_ref().clone();
+        for label in labels {
+            if label == "primary" {
+                self.model.store(Arc::new(Some(model.clone())));
+            } else if label == "fallback" {
+                self.fallback_model.store(Arc::new(Some(model.clone())));
+            }
+
+            match models.entry(label) {
+                Entry::Vacant(e) => {
+                    e.insert(vec![model.clone()]);
+                }
+                Entry::Occupied(mut e) => {
+                    e.get_mut().retain(|m| m.model_name() != model_name);
+                    e.get_mut().push(model.clone());
+                }
+            }
+        }
+
         self.models.store(Arc::new(models));
     }
 
@@ -243,7 +259,10 @@ impl Models {
     /// This is a direct lookup only and never falls back to the primary or
     /// fallback slots.
     pub fn get(&self, label: &str) -> Option<Model> {
-        self.models.load().get(label).cloned()
+        self.models
+            .load()
+            .get(label)
+            .and_then(|v| v.last().cloned())
     }
 
     /// Returns the primary model if available; otherwise returns the fallback
@@ -255,7 +274,11 @@ impl Models {
         if let Some(m) = self.fallback_model.load().as_ref() {
             return Some(m.clone());
         }
-        self.models.load().values().next().cloned()
+        self.models
+            .load()
+            .values()
+            .next()
+            .and_then(|v| v.last().cloned())
     }
 
     /// Returns the configured fallback model if one exists.
@@ -275,7 +298,13 @@ impl Models {
         }
         self.get(label)
             .or_else(|| self.fallback_model())
-            .or_else(|| self.models.load().values().next().cloned())
+            .or_else(|| {
+                self.models
+                    .load()
+                    .values()
+                    .next()
+                    .and_then(|v| v.last().cloned())
+            })
     }
 }
 
@@ -381,6 +410,10 @@ pub struct Model {
 
     /// Labels that can route requests to this model.
     pub labels: Vec<String>,
+
+    pub context_window: usize,
+
+    pub max_output: usize,
 }
 
 impl Model {
@@ -389,6 +422,8 @@ impl Model {
         Self {
             completer,
             labels: Vec::new(),
+            context_window: 0,
+            max_output: 0,
         }
     }
 
@@ -397,6 +432,8 @@ impl Model {
         Self {
             completer,
             labels: Vec::new(),
+            context_window: 0,
+            max_output: 0,
         }
     }
 
@@ -411,6 +448,8 @@ impl Model {
         Self {
             completer: Arc::new(NotImplemented),
             labels: Vec::new(),
+            context_window: 0,
+            max_output: 0,
         }
     }
 
@@ -419,6 +458,8 @@ impl Model {
         Self {
             completer: Arc::new(MockImplemented),
             labels: Vec::new(),
+            context_window: 0,
+            max_output: 0,
         }
     }
 

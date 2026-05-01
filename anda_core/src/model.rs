@@ -11,7 +11,7 @@
 use candid::Principal;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::Json;
 pub use ic_auth_types::{ByteArrayB64, ByteBufB64, Xid};
@@ -69,6 +69,10 @@ pub struct AgentOutput {
 
     /// The usage statistics for the agent execution.
     pub usage: Usage,
+
+    /// The usage statistics for each tool called by the agent.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub tools_usage: HashMap<String, Usage>,
 
     /// Failure reason if execution failed. `None` indicates success.
     #[serde(skip_serializing_if = "Option::is_none")]

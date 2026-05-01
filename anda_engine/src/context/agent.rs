@@ -189,18 +189,21 @@ impl AgentCtx {
         req: CompletionRequest,
         resources: Vec<Resource>,
     ) -> CompletionRunner {
+        let model = self.model.clone();
         CompletionRunner {
             ctx: self,
             req,
+            model,
             resources,
             chat_history: Vec::new(),
             tool_calls: Vec::new(),
-            usage: Usage::default(),
+            total_usage: Usage::default(),
+            current_usage: Usage::default(),
             artifacts: Vec::new(),
             steering_message: Vec::new(),
             follow_up_message: VecDeque::new(),
             pending_tool_calls: Vec::new(),
-            tool_call_stats: HashMap::new(),
+            tools_usage: HashMap::new(),
             done: false,
             unbound: false,
             turns: 0,
@@ -962,15 +965,17 @@ impl HttpFeatures for AgentCtx {
 pub struct CompletionRunner {
     ctx: AgentCtx,
     req: CompletionRequest,
+    model: Model,
     resources: Vec<Resource>,
     chat_history: Vec<Message>,
     tool_calls: Vec<ToolCall>,
-    usage: Usage,
+    total_usage: Usage,
+    current_usage: Usage,
     artifacts: Vec<Resource>,
     steering_message: Vec<String>,
     follow_up_message: VecDeque<String>,
     pending_tool_calls: Vec<ToolCall>,
-    tool_call_stats: HashMap<String, usize>,
+    tools_usage: HashMap<String, Usage>,
     done: bool,
     unbound: bool,
     turns: usize,
@@ -988,9 +993,28 @@ impl CompletionRunner {
         self.turns
     }
 
-    /// Returns the accumulated calls of the tools so far.
-    pub fn tool_calls(&self) -> HashMap<String, usize> {
-        self.tool_call_stats.clone()
+    /// Get the total usage accumulated so far, including all intermediate steps.
+    pub fn total_usage(&self) -> &Usage {
+        &self.total_usage
+    }
+
+    /// Get the usage from the most recent turn.
+    pub fn current_usage(&self) -> &Usage {
+        &self.current_usage
+    }
+
+    /// Returns the accumulated usage of the tools so far.
+    pub fn tools_usage(&self) -> &HashMap<String, Usage> {
+        &self.tools_usage
+    }
+
+    /// Returns the chat history of the completion so far.
+    pub fn chat_history(&self) -> &Vec<Message> {
+        &self.chat_history
+    }
+
+    pub fn model(&self) -> &Model {
+        &self.model
     }
 
     /// Enables or disables unbound mode.
@@ -1023,7 +1047,7 @@ impl CompletionRunner {
 
     /// Accumulate usage from an intermediate step into the runner's total usage.
     pub fn accumulate(&mut self, other: &Usage) {
-        self.usage.accumulate(other);
+        self.total_usage.accumulate(other);
     }
 
     // Drains all queued steering messages into a single user turn. When steering exists, queued
@@ -1051,7 +1075,8 @@ impl CompletionRunner {
     }
 
     fn intermediate_output(&self, mut output: AgentOutput) -> AgentOutput {
-        output.usage = self.usage.clone();
+        output.usage = self.total_usage.clone();
+        output.tools_usage = self.tools_usage.clone();
         output.chat_history = self.chat_history.clone();
         output
     }
@@ -1077,14 +1102,8 @@ impl CompletionRunner {
             return 0;
         }
         let pruned_len = prune_len.min(raw_history_len);
-        let label = self.req.model.as_ref().unwrap_or(&self.ctx.label);
-        let model = self
-            .ctx
-            .models
-            .get(label)
-            .unwrap_or_else(|| self.ctx.model.clone());
         for i in self.pruned..(self.pruned + pruned_len) {
-            model.prune_raw_message(&mut self.req.raw_history[i]);
+            self.model.prune_raw_message(&mut self.req.raw_history[i]);
         }
         self.pruned += pruned_len;
         pruned_len
@@ -1125,10 +1144,6 @@ impl CompletionRunner {
                     Vec::new();
                 for mut tool in tool_calls.into_iter() {
                     let tool_name = tool.name.to_ascii_lowercase();
-                    self.tool_call_stats
-                        .entry(tool_name.clone())
-                        .and_modify(|c| *c += 1)
-                        .or_insert(1);
                     if self.ctx.tools.contains_lowercase(&tool_name) || tool_name.starts_with("rt_")
                     {
                         let ctx = self.ctx.clone();
@@ -1240,6 +1255,13 @@ impl CompletionRunner {
                         if let Some(mut tool) = tool
                             && let Some(res) = &mut tool.result
                         {
+                            let mut usage = res.usage.clone();
+                            // usage.requests 原值为内部调用次数，这里把它重置为 1 来表示被模型调用了一次，方便后续统计被调用的工具次数
+                            usage.requests = 1;
+                            self.tools_usage
+                                .entry(tool.name.to_ascii_lowercase())
+                                .and_modify(|u| u.accumulate(&usage))
+                                .or_insert(usage);
                             self.accumulate(&res.usage);
                             if is_tools_select_name(&tool.name) {
                                 // 从模型输出或工具调用结果中获取实际被选中的工具定义，传递给下一轮模型调用
@@ -1301,15 +1323,14 @@ impl CompletionRunner {
         let req = self.req.clone();
 
         let label = req.model.as_ref().unwrap_or(&self.ctx.label);
-        let model = self
-            .ctx
-            .models
-            .get(label)
-            .unwrap_or_else(|| self.ctx.model.clone());
+        if let Some(model) = self.ctx.models.get(label) {
+            self.model = model;
+        }
 
-        let mut output = model.completion(req).await?;
-        output.model = Some(model.model_name());
+        let mut output = self.model.completion(req).await?;
+        output.model = Some(self.model.model_name());
 
+        self.current_usage = output.usage.clone();
         self.accumulate(&output.usage);
 
         // If the primary model returns a failed result (failed_reason exists),
@@ -1323,8 +1344,10 @@ impl CompletionRunner {
                 .clone()
                 .unwrap_or_else(|| "unknown error".to_string());
 
-            let mut output2 = fallback.completion(self.req.clone()).await?;
-            output2.model = Some(fallback.model_name());
+            self.model = fallback;
+            let mut output2 = self.model.completion(self.req.clone()).await?;
+            output2.model = Some(self.model.model_name());
+            self.current_usage = output2.usage.clone();
             self.accumulate(&output2.usage);
 
             if let Some(fallback_reason) = output2.failed_reason {
@@ -1391,7 +1414,8 @@ impl CompletionRunner {
         output.chat_history = std::mem::take(&mut self.chat_history);
         output.tool_calls = std::mem::take(&mut self.tool_calls);
         output.artifacts = std::mem::take(&mut self.artifacts);
-        output.usage = std::mem::take(&mut self.usage);
+        output.usage = std::mem::take(&mut self.total_usage);
+        output.tools_usage = std::mem::take(&mut self.tools_usage);
 
         output
     }
