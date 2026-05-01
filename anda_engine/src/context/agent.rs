@@ -38,7 +38,7 @@ use futures_util::Stream;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::json;
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     future::Future,
     pin::Pin,
     sync::Arc,
@@ -200,6 +200,7 @@ impl AgentCtx {
             steering_message: Vec::new(),
             follow_up_message: VecDeque::new(),
             pending_tool_calls: Vec::new(),
+            tool_call_stats: HashMap::new(),
             done: false,
             unbound: false,
             turns: 0,
@@ -969,6 +970,7 @@ pub struct CompletionRunner {
     steering_message: Vec<String>,
     follow_up_message: VecDeque<String>,
     pending_tool_calls: Vec<ToolCall>,
+    tool_call_stats: HashMap<String, usize>,
     done: bool,
     unbound: bool,
     turns: usize,
@@ -984,6 +986,11 @@ impl CompletionRunner {
     /// Returns the number of turns executed.
     pub fn turns(&self) -> usize {
         self.turns
+    }
+
+    /// Returns the accumulated calls of the tools so far.
+    pub fn tool_calls(&self) -> HashMap<String, usize> {
+        self.tool_call_stats.clone()
     }
 
     /// Enables or disables unbound mode.
@@ -1118,6 +1125,10 @@ impl CompletionRunner {
                     Vec::new();
                 for mut tool in tool_calls.into_iter() {
                     let tool_name = tool.name.to_ascii_lowercase();
+                    self.tool_call_stats
+                        .entry(tool_name.clone())
+                        .and_modify(|c| *c += 1)
+                        .or_insert(1);
                     if self.ctx.tools.contains_lowercase(&tool_name) || tool_name.starts_with("rt_")
                     {
                         let ctx = self.ctx.clone();
