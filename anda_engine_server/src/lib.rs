@@ -249,7 +249,22 @@ pub async fn create_reuse_port_listener(
         SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
     };
 
+    #[cfg(all(
+        unix,
+        not(target_os = "solaris"),
+        not(target_os = "illumos"),
+        not(target_os = "cygwin"),
+    ))]
     socket.set_reuseport(true)?;
+
+    #[cfg(not(all(
+        unix,
+        not(target_os = "solaris"),
+        not(target_os = "illumos"),
+        not(target_os = "cygwin"),
+    )))]
+    socket.set_reuseaddr(true)?;
+
     socket.bind(addr)?;
     let listener = socket.listen(1024)?;
     Ok(listener)
