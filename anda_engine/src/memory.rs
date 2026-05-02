@@ -237,6 +237,42 @@ impl Conversation {
         }
         Ok(changes)
     }
+
+    pub fn to_delta(&self, messages_offset: usize, artifacts_offset: usize) -> ConversationDelta {
+        ConversationDelta {
+            _id: self._id,
+            messages: self
+                .messages
+                .iter()
+                .skip(messages_offset)
+                .cloned()
+                .collect(),
+            artifacts: self
+                .artifacts
+                .iter()
+                .skip(artifacts_offset)
+                .cloned()
+                .collect(),
+            status: self.status.clone(),
+            usage: self.usage.clone(),
+            failed_reason: self.failed_reason.clone(),
+            updated_at: self.updated_at,
+            child: self.child,
+        }
+    }
+
+    pub fn into_delta(self, messages_offset: usize, artifacts_offset: usize) -> ConversationDelta {
+        ConversationDelta {
+            _id: self._id,
+            messages: self.messages.into_iter().skip(messages_offset).collect(),
+            artifacts: self.artifacts.into_iter().skip(artifacts_offset).collect(),
+            status: self.status,
+            usage: self.usage,
+            failed_reason: self.failed_reason,
+            updated_at: self.updated_at,
+            child: self.child,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -378,6 +414,20 @@ impl From<&Conversation> for ConversationState {
             status: conversation.status.clone(),
         }
     }
+}
+
+/// A delta of a conversation since a given offset, used for incremental fetching of conversation messages.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ConversationDelta {
+    pub _id: u64,
+    /// The new messages since the given offset. The offset is determined by the client and is not stored in the database. It is used to support incremental fetching of conversation messages.
+    pub messages: Vec<Json>,
+    pub artifacts: Vec<Resource>,
+    pub status: ConversationStatus,
+    pub usage: Usage,
+    pub failed_reason: Option<String>,
+    pub updated_at: u64,
+    pub child: Option<u64>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -1250,6 +1300,14 @@ pub enum MemoryToolArgs {
         /// The ID of the conversation to get
         _id: u64,
     },
+    GetConversationDelta {
+        /// The ID of the conversation to get
+        _id: u64,
+        /// The messages offset for the conversation delta
+        messages_offset: usize,
+        /// The artifacts offset for the conversation delta
+        artifacts_offset: usize,
+    },
     StopConversation {
         /// The ID of the conversation to stop
         _id: u64,
@@ -1357,6 +1415,21 @@ impl Tool<BaseCtx> for MemoryTool {
 
                 Ok(ToolOutput::new(Response::Ok {
                     result: json!(conversation),
+                    next_cursor: None,
+                }))
+            }
+            MemoryToolArgs::GetConversationDelta {
+                _id,
+                messages_offset,
+                artifacts_offset,
+            } => {
+                let conversation = self.memory.get_conversation(_id).await?;
+                if &conversation.user != ctx.caller() {
+                    return Err("permission denied".into());
+                }
+
+                Ok(ToolOutput::new(Response::Ok {
+                    result: json!(conversation.into_delta(messages_offset, artifacts_offset)),
                     next_cursor: None,
                 }))
             }
