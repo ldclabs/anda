@@ -985,6 +985,13 @@ pub struct CompletionRunner {
 }
 
 impl CompletionRunner {
+    pub fn unbound(self) -> Self {
+        Self {
+            unbound: true,
+            ..self
+        }
+    }
+
     /// Returns whether the completion has finished.
     pub fn is_done(&self) -> bool {
         self.done
