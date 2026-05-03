@@ -55,6 +55,9 @@ use super::{
 use crate::model::{Model, Models};
 
 pub static DYNAMIC_REMOTE_ENGINES: &str = "_engines";
+pub static REMOTE_AGENT_PREFIX: &str = "RA_";
+pub static REMOTE_TOOL_PREFIX: &str = "RT_";
+pub static SUB_AGENT_PREFIX: &str = "SA_";
 
 /// Context for agent operations, providing access to models, tools, and other agents.
 #[derive(Clone)]
@@ -271,9 +274,15 @@ impl AgentContext for AgentCtx {
                 }
             }
 
-            Ok(defs)
+            Ok(defs
+                .into_iter()
+                .map(|d| d.name_with_prefix(REMOTE_TOOL_PREFIX))
+                .collect())
         } else {
-            Ok(defs)
+            Ok(defs
+                .into_iter()
+                .map(|d| d.name_with_prefix(REMOTE_TOOL_PREFIX))
+                .collect())
         }
     }
 
@@ -283,11 +292,8 @@ impl AgentContext for AgentCtx {
         prefixed_name: &str,
         resources: &mut Vec<Resource>,
     ) -> Vec<Resource> {
-        if prefixed_name.starts_with("RT_") {
-            let res = self
-                .base
-                .remote
-                .select_tool_resources(prefixed_name, resources);
+        if let Some(name) = prefixed_name.strip_prefix(REMOTE_TOOL_PREFIX) {
+            let res = self.base.remote.select_tool_resources(name, resources);
             if !res.is_empty() {
                 return res;
             }
@@ -297,7 +303,7 @@ impl AgentContext for AgentCtx {
                 .cache_store_get::<RemoteEngines>(DYNAMIC_REMOTE_ENGINES)
                 .await
             {
-                return engines.select_tool_resources(prefixed_name, resources);
+                return engines.select_tool_resources(name, resources);
             }
         }
 
@@ -323,7 +329,7 @@ impl AgentContext for AgentCtx {
             self.subagents
                 .definitions(names)
                 .into_iter()
-                .map(|d| d.name_with_prefix("SA_")),
+                .map(|d| d.name_with_prefix(SUB_AGENT_PREFIX)),
         );
         defs
     }
@@ -360,9 +366,15 @@ impl AgentContext for AgentCtx {
                 }
             }
 
-            Ok(defs)
+            Ok(defs
+                .into_iter()
+                .map(|d| d.name_with_prefix(REMOTE_AGENT_PREFIX))
+                .collect())
         } else {
-            Ok(defs)
+            Ok(defs
+                .into_iter()
+                .map(|d| d.name_with_prefix(REMOTE_AGENT_PREFIX))
+                .collect())
         }
     }
 
@@ -372,11 +384,8 @@ impl AgentContext for AgentCtx {
         prefixed_name: &str,
         resources: &mut Vec<Resource>,
     ) -> Vec<Resource> {
-        if prefixed_name.starts_with("RA_") {
-            let res = self
-                .base
-                .remote
-                .select_agent_resources(prefixed_name, resources);
+        if let Some(name) = prefixed_name.strip_prefix(REMOTE_AGENT_PREFIX) {
+            let res = self.base.remote.select_agent_resources(name, resources);
             if !res.is_empty() {
                 return res;
             }
@@ -390,8 +399,8 @@ impl AgentContext for AgentCtx {
             }
         }
 
-        if prefixed_name.starts_with("SA_") {
-            return self.subagents.select_resources(prefixed_name, resources);
+        if let Some(prefix) = prefixed_name.strip_prefix(SUB_AGENT_PREFIX) {
+            return self.subagents.select_resources(prefix, resources);
         }
 
         self.agents.select_resources(prefixed_name, resources)
@@ -429,10 +438,9 @@ impl AgentContext for AgentCtx {
         &self,
         mut input: ToolInput<Json>,
     ) -> Result<(ToolOutput<Json>, Option<Principal>), BoxError> {
-        if input.name.starts_with("RT_") {
+        if let Some(name) = input.name.strip_prefix(REMOTE_TOOL_PREFIX) {
             // find registered remote tool and call it
-            if let Some((id, endpoint, tool_name)) = self.base.remote.get_tool_endpoint(&input.name)
-            {
+            if let Some((id, endpoint, tool_name)) = self.base.remote.get_tool_endpoint(name) {
                 input.name = tool_name;
                 input.meta = Some(self.base.self_meta(id));
                 return self
@@ -447,7 +455,7 @@ impl AgentContext for AgentCtx {
                 .root
                 .cache_store_get::<RemoteEngines>(DYNAMIC_REMOTE_ENGINES)
                 .await
-                && let Some((id, endpoint, tool_name)) = engines.get_tool_endpoint(&input.name)
+                && let Some((id, endpoint, tool_name)) = engines.get_tool_endpoint(name)
             {
                 input.name = tool_name;
                 input.meta = Some(self.base.self_meta(id));
@@ -482,10 +490,8 @@ impl AgentContext for AgentCtx {
     ) -> impl Future<Output = Result<(AgentOutput, Option<Principal>), BoxError>> + Send {
         let ctx = self;
         Box::pin(async move {
-            if input.name.starts_with("RA_") {
-                if let Some((id, endpoint, agent_name)) =
-                    ctx.base.remote.get_agent_endpoint(&input.name)
-                {
+            if let Some(name) = input.name.strip_prefix(REMOTE_AGENT_PREFIX) {
+                if let Some((id, endpoint, agent_name)) = ctx.base.remote.get_agent_endpoint(name) {
                     input.name = agent_name;
                     input.meta = Some(ctx.base.self_meta(id));
                     return ctx
@@ -498,8 +504,7 @@ impl AgentContext for AgentCtx {
                     .root
                     .cache_store_get::<RemoteEngines>(DYNAMIC_REMOTE_ENGINES)
                     .await
-                    && let Some((id, endpoint, agent_name)) =
-                        engines.get_agent_endpoint(&input.name)
+                    && let Some((id, endpoint, agent_name)) = engines.get_agent_endpoint(name)
                 {
                     input.name = agent_name;
                     input.meta = Some(ctx.base.self_meta(id));
@@ -509,11 +514,11 @@ impl AgentContext for AgentCtx {
                         .map(|output| (output, Some(id)));
                 }
 
-                return Err(format!("agent {} not found", input.name).into());
+                return Err(format!("agent {} not found", name).into());
             }
 
-            if input.name.starts_with("SA_") {
-                let name = input.name[3..].to_ascii_lowercase();
+            if let Some(name) = input.name.strip_prefix(SUB_AGENT_PREFIX) {
+                let name = name.to_ascii_lowercase();
                 if let Some(agent) = ctx.subagents.get_lowercase(&name) {
                     let child = ctx.child(&name, &name)?;
                     return agent
@@ -521,7 +526,7 @@ impl AgentContext for AgentCtx {
                         .await
                         .map(|output| (output, None));
                 } else {
-                    return Err(format!("agent {} not found", input.name).into());
+                    return Err(format!("agent {} not found", name).into());
                 }
             }
 
@@ -533,7 +538,7 @@ impl AgentContext for AgentCtx {
                     .await
                     .map(|output| (output, None))
             } else {
-                Err(format!("agent {} not found", input.name).into())
+                Err(format!("agent {} not found", name).into())
             }
         })
     }

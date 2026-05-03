@@ -134,8 +134,8 @@ The `memory` module stores conversations, resources, artifacts, usage, steering 
 
 Engines can register other engines by endpoint. Remote metadata is fetched through signed RPC, and exported remote functions are exposed with prefixed names:
 
-- Tools: `RT_{handle}_{tool}`
-- Agents: `RA_{handle}_{agent}`
+- Tools: `{handle}_{tool}`
+- Agents: `{handle}_{agent}`
 
 This lets agents discover and call capabilities hosted by other engines without linking them into the same process.
 

@@ -883,28 +883,20 @@ impl SubAgentSet for SkillManager {
         }
     }
 
-    fn select_resources(
-        &self,
-        prefixed_name: &str,
-        resources: &mut Vec<Resource>,
-    ) -> Vec<Resource> {
+    fn select_resources(&self, name: &str, resources: &mut Vec<Resource>) -> Vec<Resource> {
         if resources.is_empty() {
             return Vec::new();
         }
 
-        if let Some(name) = prefixed_name.strip_prefix("SA_") {
-            self.skills
-                .read()
-                .get(&name.to_ascii_lowercase())
-                .map(SubAgent::from)
-                .map(|agent| {
-                    let supported_tags = agent.supported_resource_tags();
-                    select_resources(resources, &supported_tags)
-                })
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        }
+        self.skills
+            .read()
+            .get(&name.to_ascii_lowercase())
+            .map(SubAgent::from)
+            .map(|agent| {
+                let supported_tags = agent.supported_resource_tags();
+                select_resources(resources, &supported_tags)
+            })
+            .unwrap_or_default()
     }
 }
 

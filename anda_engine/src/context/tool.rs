@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::context::AgentCtx;
+use crate::context::{AgentCtx, REMOTE_AGENT_PREFIX, REMOTE_TOOL_PREFIX, SUB_AGENT_PREFIX};
 
 pub const TOOLS_SEARCH_NAME: &str = "tools_search";
 pub const TOOLS_SELECT_NAME: &str = "tools_select";
@@ -58,6 +58,37 @@ impl ToolsSearch {
     pub fn new() -> Self {
         let tokenizer = jieba_tokenizer();
         Self { tokenizer }
+    }
+
+    pub fn search(
+        &self,
+        candidates: &[FunctionDefinition],
+        args: &ToolsSearchArgs,
+    ) -> ToolsSearchOutput {
+        let normalized_query = args.query.trim().to_lowercase();
+        let tools: Vec<ToolsSearchItem> = candidates
+            .iter()
+            .map(|def| ToolsSearchItem {
+                name: def.name.clone(),
+                description: def.description.clone(),
+            })
+            .collect();
+
+        let total_tools = tools.len();
+        if normalized_query == "*" {
+            return ToolsSearchOutput { tools, total_tools };
+        }
+
+        let normalized_tokens: Vec<(String, usize)> =
+            collect_tokens(&mut self.tokenizer.clone(), &normalized_query, None)
+                .into_iter()
+                .collect();
+
+        let mut tools = rank_search_items(tools, &normalized_query, &normalized_tokens, false);
+        if args.limit > 0 {
+            tools.truncate(args.limit);
+        }
+        ToolsSearchOutput { tools, total_tools }
     }
 }
 
@@ -114,53 +145,18 @@ impl Agent<AgentCtx> for ToolsSearch {
         };
 
         let definitions = ctx.definitions(None).await;
-        let items: Vec<ToolsSearchItem> = definitions
-            .into_iter()
-            .map(|def| ToolsSearchItem {
-                name: def.name,
-                description: def.description,
-            })
-            .collect();
-        let total_tools = items.len();
-
-        let normalized_query = args.query.trim().to_lowercase();
-        if normalized_query.is_empty() || items.is_empty() {
+        if args.query.trim().is_empty() || definitions.is_empty() {
             return Ok(AgentOutput {
                 content: serde_json::to_string(&ToolsSearchOutput {
                     tools: Vec::new(),
-                    total_tools,
+                    total_tools: definitions.len(),
                 })?,
                 ..Default::default()
             });
         }
-
-        if normalized_query == "*" {
-            return Ok(AgentOutput {
-                content: serde_json::to_string(&ToolsSearchOutput {
-                    tools: if args.limit > 0 {
-                        items.into_iter().take(args.limit).collect()
-                    } else {
-                        items
-                    },
-                    total_tools,
-                })?,
-                ..Default::default()
-            });
-        }
-
-        // (lowercase token, weight)
-        let normalized_tokens: Vec<(String, usize)> =
-            collect_tokens(&mut self.tokenizer.clone(), &normalized_query, None)
-                .into_iter()
-                .collect();
-
-        let mut tools = rank_search_items(items, &normalized_query, &normalized_tokens, false);
-        if args.limit > 0 {
-            tools.truncate(args.limit);
-        }
-
+        let rt = self.search(&definitions, &args);
         Ok(AgentOutput {
-            content: serde_json::to_string(&ToolsSearchOutput { tools, total_tools })?,
+            content: serde_json::to_string(&rt)?,
             ..Default::default()
         })
     }
@@ -483,11 +479,11 @@ fn rank_search_items(
     for item in items {
         let normalized_name = item
             .name
-            .strip_prefix("SA_")
+            .strip_prefix(SUB_AGENT_PREFIX)
             .unwrap_or(&item.name)
-            .strip_prefix("RA_")
+            .strip_prefix(REMOTE_AGENT_PREFIX)
             .unwrap_or(&item.name)
-            .strip_prefix("RT_")
+            .strip_prefix(REMOTE_TOOL_PREFIX)
             .unwrap_or(&item.name)
             .to_lowercase();
         let normalized_description = item.description.to_lowercase();

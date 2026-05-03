@@ -160,7 +160,7 @@ pub trait SubAgentSet: Send + Sync {
     /// - `names`: Optional slice of agent names to filter by.
     ///
     /// # Returns
-    /// - Vec<[`FunctionDefinition`]>: Vector of agent definitions. The name in each definition is prefixed with "SA_" to avoid conflicts and indicate it's a subagent.
+    /// - Vec<[`FunctionDefinition`]>: Vector of agent definitions.
     fn definitions(&self, names: Option<&[String]>) -> Vec<FunctionDefinition>;
 
     /// Selects and returns resources relevant to the specified subagent name from the provided list.
@@ -235,7 +235,7 @@ impl SubAgentSet for SubAgentManager {
                 .agents
                 .read()
                 .values()
-                .map(|agent| agent.definition().name_with_prefix("SA_"))
+                .map(|agent| agent.definition())
                 .collect(),
             Some(names) => {
                 let agents = self.agents.read();
@@ -244,34 +244,26 @@ impl SubAgentSet for SubAgentManager {
                     .filter_map(|name| {
                         agents
                             .get(&name.to_ascii_lowercase())
-                            .map(|agent| agent.definition().name_with_prefix("SA_"))
+                            .map(|agent| agent.definition())
                     })
                     .collect()
             }
         }
     }
 
-    fn select_resources(
-        &self,
-        prefixed_name: &str,
-        resources: &mut Vec<Resource>,
-    ) -> Vec<Resource> {
+    fn select_resources(&self, name: &str, resources: &mut Vec<Resource>) -> Vec<Resource> {
         if resources.is_empty() {
             return Vec::new();
         }
 
-        if let Some(name) = prefixed_name.strip_prefix("SA_") {
-            self.agents
-                .read()
-                .get(&name.to_ascii_lowercase())
-                .map(|agent| {
-                    let supported_tags = agent.supported_resource_tags();
-                    select_resources(resources, &supported_tags)
-                })
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        }
+        self.agents
+            .read()
+            .get(&name.to_ascii_lowercase())
+            .map(|agent| {
+                let supported_tags = agent.supported_resource_tags();
+                select_resources(resources, &supported_tags)
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -338,23 +330,18 @@ impl SubAgentSet for SubAgentSetManager {
             .collect()
     }
 
-    fn select_resources(
-        &self,
-        prefixed_name: &str,
-        resources: &mut Vec<Resource>,
-    ) -> Vec<Resource> {
+    fn select_resources(&self, name: &str, resources: &mut Vec<Resource>) -> Vec<Resource> {
         if resources.is_empty() {
             return Vec::new();
         }
 
-        if prefixed_name.starts_with("SA_") {
-            for set in self.sets.read().values() {
-                let selected = set.select_resources(prefixed_name, resources);
-                if !selected.is_empty() {
-                    return selected;
-                }
+        for set in self.sets.read().values() {
+            let selected = set.select_resources(name, resources);
+            if !selected.is_empty() {
+                return selected;
             }
         }
+
         Vec::new()
     }
 }

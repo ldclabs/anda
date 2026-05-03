@@ -107,12 +107,11 @@ impl RemoteEngines {
     }
 
     /// Retrieves a remote tool endpoint and name from a prefixed name.
-    pub fn get_tool_endpoint(&self, prefixed_name: &str) -> Option<(Principal, String, String)> {
+    pub fn get_tool_endpoint(&self, name: &str) -> Option<(Principal, String, String)> {
         self.engines
             .iter()
             .filter_map(|(handle, engine)| {
-                let prefix = format!("RT_{handle}_");
-                let tool_name = prefixed_name.strip_prefix(&prefix)?;
+                let tool_name = name.strip_prefix(&format!("{handle}_"))?;
                 engine
                     .tools
                     .iter()
@@ -130,12 +129,11 @@ impl RemoteEngines {
     }
 
     /// Retrieves a remote agent endpoint and name from a prefixed name.
-    pub fn get_agent_endpoint(&self, prefixed_name: &str) -> Option<(Principal, String, String)> {
+    pub fn get_agent_endpoint(&self, name: &str) -> Option<(Principal, String, String)> {
         self.engines
             .iter()
             .filter_map(|(handle, engine)| {
-                let prefix = format!("RA_{handle}_");
-                let agent_name = prefixed_name.strip_prefix(&prefix)?;
+                let agent_name = name.strip_prefix(&format!("{handle}_"))?;
                 engine
                     .agents
                     .iter()
@@ -188,7 +186,7 @@ impl RemoteEngines {
         if let Some(endpoint) = endpoint {
             for (handle, engine) in self.engines.iter() {
                 if endpoint == engine.info.endpoint {
-                    let prefix = format!("RT_{handle}_");
+                    let prefix = format!("{handle}_");
                     return engine
                         .tools
                         .iter()
@@ -212,7 +210,7 @@ impl RemoteEngines {
             Vec::with_capacity(self.engines.values().map(|e| e.tools.len()).sum());
 
         for (handle, engine) in self.engines.iter() {
-            let prefix = format!("RT_{handle}_");
+            let prefix = format!("{handle}_");
             definitions.extend(engine.tools.iter().filter_map(|d| {
                 if let Some(names) = names {
                     if names.contains(&d.definition.name) {
@@ -235,17 +233,16 @@ impl RemoteEngines {
         prefixed_name: &str,
         resources: &mut Vec<Resource>,
     ) -> Vec<Resource> {
-        if prefixed_name.starts_with("RT_") {
-            for (handle, engine) in self.engines.iter() {
-                if let Some(name) = prefixed_name.strip_prefix(&format!("RT_{handle}_")) {
-                    for tool in engine.tools.iter() {
-                        if tool.definition.name.eq_ignore_ascii_case(name) {
-                            return select_resources(resources, &tool.supported_resource_tags);
-                        }
+        for (handle, engine) in self.engines.iter() {
+            if let Some(name) = prefixed_name.strip_prefix(&format!("{handle}_")) {
+                for tool in engine.tools.iter() {
+                    if tool.definition.name.eq_ignore_ascii_case(name) {
+                        return select_resources(resources, &tool.supported_resource_tags);
                     }
                 }
             }
         }
+
         Vec::new()
     }
 
@@ -265,7 +262,7 @@ impl RemoteEngines {
         if let Some(endpoint) = endpoint {
             for (handle, engine) in self.engines.iter() {
                 if endpoint == engine.info.endpoint {
-                    let prefix = format!("RA_{handle}_");
+                    let prefix = format!("{handle}_");
                     return engine
                         .agents
                         .iter()
@@ -288,7 +285,7 @@ impl RemoteEngines {
         let mut definitions =
             Vec::with_capacity(self.engines.values().map(|e| e.agents.len()).sum());
         for (handle, engine) in self.engines.iter() {
-            let prefix = format!("RA_{handle}_");
+            let prefix = format!("{handle}_");
             definitions.extend(engine.agents.iter().filter_map(|d| {
                 if let Some(names) = names {
                     if names.contains(&d.definition.name) {
@@ -308,20 +305,19 @@ impl RemoteEngines {
     /// Extracts resources from the provided list based on the agent's supported tags.
     pub fn select_agent_resources(
         &self,
-        prefixed_name: &str,
+        name: &str,
         resources: &mut Vec<Resource>,
     ) -> Vec<Resource> {
-        if prefixed_name.starts_with("RA_") {
-            for (handle, engine) in self.engines.iter() {
-                if let Some(name) = prefixed_name.strip_prefix(&format!("RA_{handle}_")) {
-                    for agent in engine.agents.iter() {
-                        if agent.definition.name.eq_ignore_ascii_case(name) {
-                            return select_resources(resources, &agent.supported_resource_tags);
-                        }
+        for (handle, engine) in self.engines.iter() {
+            if let Some(name) = name.strip_prefix(&format!("{handle}_")) {
+                for agent in engine.agents.iter() {
+                    if agent.definition.name.eq_ignore_ascii_case(name) {
+                        return select_resources(resources, &agent.supported_resource_tags);
                     }
                 }
             }
         }
+
         Vec::new()
     }
 }
@@ -508,14 +504,14 @@ mod tests {
             engine("https://alpha-beta.example", &["tool"], &[]),
         );
 
-        let (_, endpoint, tool_name) = remote.get_tool_endpoint("RT_alpha_beta_tool").unwrap();
+        let (_, endpoint, tool_name) = remote.get_tool_endpoint("alpha_beta_tool").unwrap();
         assert_eq!(endpoint, "https://alpha-beta.example");
         assert_eq!(tool_name, "tool");
 
-        let (_, endpoint, tool_name) = remote.get_tool_endpoint("RT_alpha_status").unwrap();
+        let (_, endpoint, tool_name) = remote.get_tool_endpoint("alpha_status").unwrap();
         assert_eq!(endpoint, "https://alpha.example");
         assert_eq!(tool_name, "status");
-        assert!(remote.get_tool_endpoint("RT_alpha_missing").is_none());
+        assert!(remote.get_tool_endpoint("alpha_missing").is_none());
     }
 
     #[test]
@@ -530,13 +526,13 @@ mod tests {
             engine("https://alpha-beta.example", &[], &["agent"]),
         );
 
-        let (_, endpoint, agent_name) = remote.get_agent_endpoint("RA_alpha_beta_agent").unwrap();
+        let (_, endpoint, agent_name) = remote.get_agent_endpoint("alpha_beta_agent").unwrap();
         assert_eq!(endpoint, "https://alpha-beta.example");
         assert_eq!(agent_name, "agent");
 
-        let (_, endpoint, agent_name) = remote.get_agent_endpoint("RA_alpha_chat").unwrap();
+        let (_, endpoint, agent_name) = remote.get_agent_endpoint("alpha_chat").unwrap();
         assert_eq!(endpoint, "https://alpha.example");
         assert_eq!(agent_name, "chat");
-        assert!(remote.get_agent_endpoint("RA_alpha_missing").is_none());
+        assert!(remote.get_agent_endpoint("alpha_missing").is_none());
     }
 }
