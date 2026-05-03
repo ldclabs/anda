@@ -209,6 +209,7 @@ impl AgentCtx {
             follow_up_message: VecDeque::new(),
             pending_tool_calls: Vec::new(),
             tools_usage: HashMap::new(),
+            last_output: None,
             done: false,
             unbound: false,
             turns: 0,
@@ -983,6 +984,7 @@ pub struct CompletionRunner {
     follow_up_message: VecDeque<String>,
     pending_tool_calls: Vec<ToolCall>,
     tools_usage: HashMap<String, Usage>,
+    last_output: Option<AgentOutput>,
     done: bool,
     unbound: bool,
     turns: usize,
@@ -990,6 +992,7 @@ pub struct CompletionRunner {
 }
 
 impl CompletionRunner {
+    /// Enables unbound mode for the completion runner.
     pub fn unbound(self) -> Self {
         Self {
             unbound: true,
@@ -1078,9 +1081,14 @@ impl CompletionRunner {
         }
     }
 
-    fn take_queued_user_message(&mut self) -> Option<String> {
-        self.drain_steering_message()
-            .or_else(|| self.follow_up_message.pop_front())
+    fn drain_queued_message(&mut self) -> Option<String> {
+        let mut msgs: Vec<String> = self.follow_up_message.drain(..).collect();
+        msgs.append(&mut self.steering_message);
+        if msgs.is_empty() {
+            None
+        } else {
+            Some(msgs.join("\n\n"))
+        }
     }
 
     fn set_next_user_prompt(&mut self, prompt: String) {
@@ -1088,10 +1096,11 @@ impl CompletionRunner {
         self.req.role = Some("user".to_string());
     }
 
-    fn intermediate_output(&self, mut output: AgentOutput) -> AgentOutput {
+    fn intermediate_output(&mut self, mut output: AgentOutput) -> AgentOutput {
         output.usage = self.total_usage.clone();
         output.tools_usage = self.tools_usage.clone();
         output.chat_history = self.chat_history.clone();
+        self.last_output = Some(output.clone());
         output
     }
 
@@ -1149,8 +1158,61 @@ impl CompletionRunner {
         }
     }
 
+    /// Finalize the completion with an optional prompt.
+    ///
+    /// Queued messages, plus the optional prompt, are processed through the normal runner flow.
+    /// If the runner is already idle, finalization returns the latest intermediate output with
+    /// accumulated usage, tool calls, artifacts, and chat history attached.
+    pub async fn finalize(&mut self, prompt: Option<String>) -> Result<AgentOutput, BoxError> {
+        if self.done {
+            return Err("completion already finalized".into());
+        }
+
+        self.unbound = false;
+
+        if let Some(prompt) = prompt {
+            self.follow_up_message.push_back(prompt);
+        }
+
+        if self.req.prompt.is_empty()
+            && self.req.content.is_empty()
+            && self.pending_tool_calls.is_empty()
+        {
+            if let Some(prompt) = self.drain_queued_message() {
+                self.set_next_user_prompt(prompt);
+            } else {
+                return Ok(self.final_idle_output());
+            }
+        }
+
+        let mut last: Option<AgentOutput> = None;
+        while let Some(step) = self.next().await? {
+            if step.failed_reason.is_some() {
+                return Ok(step);
+            }
+            last = Some(step);
+        }
+
+        last.ok_or_else(|| "completion runner returned no output".into())
+    }
+
     async fn inner_next(&mut self) -> Result<Option<AgentOutput>, BoxError> {
-        if self.req.prompt.is_empty() && self.req.content.is_empty() {
+        if !self.pending_tool_calls.is_empty()
+            && let Some(prompt) = self.drain_steering_message()
+        {
+            // Drop the raw tool-call assistant turn so the redirected round does not inherit
+            // an unfinished tool-call requirement.
+            self.req.raw_history.pop();
+            // Clear pending tool calls since the operator's steering should take priority and interrupt the current flow, even if there are still pending tool calls.
+            self.pending_tool_calls.clear();
+            self.req.content.clear();
+            self.req.prompt = if self.req.prompt.is_empty() {
+                prompt
+            } else {
+                format!("{}\n\n{}", self.req.prompt, prompt)
+            };
+            self.req.role = Some("user".to_string());
+        } else if self.req.prompt.is_empty() && self.req.content.is_empty() {
             // 自动执行工具/代理调用
             let tool_calls = std::mem::take(&mut self.pending_tool_calls);
             if !tool_calls.is_empty() {
@@ -1326,7 +1388,7 @@ impl CompletionRunner {
                 if !tool_call_errors.is_empty() {
                     self.req.content.push(tool_call_errors.join("; ").into());
                 }
-            } else if let Some(prompt) = self.take_queued_user_message() {
+            } else if let Some(prompt) = self.drain_queued_message() {
                 self.set_next_user_prompt(prompt);
             } else {
                 return Ok(None);
@@ -1410,7 +1472,7 @@ impl CompletionRunner {
             return Ok(Some(self.intermediate_output(output)));
         }
 
-        if let Some(prompt) = self.take_queued_user_message() {
+        if let Some(prompt) = self.drain_queued_message() {
             self.set_next_user_prompt(prompt);
             return Ok(Some(self.intermediate_output(output)));
         }
@@ -1422,8 +1484,21 @@ impl CompletionRunner {
         Ok(Some(self.final_output(output)))
     }
 
+    fn final_idle_output(&mut self) -> AgentOutput {
+        self.done = true;
+        let mut output = self.last_output.take().unwrap_or_default();
+        output.chat_history = std::mem::take(&mut self.chat_history);
+        output.tool_calls = std::mem::take(&mut self.tool_calls);
+        output.artifacts = std::mem::take(&mut self.artifacts);
+        output.usage = std::mem::take(&mut self.total_usage);
+        output.tools_usage = std::mem::take(&mut self.tools_usage);
+
+        output
+    }
+
     fn final_output(&mut self, mut output: AgentOutput) -> AgentOutput {
         self.done = true;
+        self.last_output = None;
         self.chat_history.append(&mut output.chat_history);
         output.chat_history = std::mem::take(&mut self.chat_history);
         output.tool_calls = std::mem::take(&mut self.tool_calls);
@@ -2766,7 +2841,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn runner_multiple_follow_up_messages_drained_sequentially() {
+    async fn runner_multiple_follow_up_messages_combined() {
         let model = Model::with_completer(Arc::new(EchoCompleter));
         let ctx = EngineBuilder::new().with_model(model).mock_ctx();
 
@@ -2784,15 +2859,10 @@ mod tests {
         assert!(!runner.is_done());
         assert_eq!(step1.content, "initial");
 
-        // Step 2: processes first follow_up.
+        // Step 2: processes all queued follow-up messages as one user turn.
         let step2 = runner.next().await.unwrap().unwrap();
-        assert!(!runner.is_done());
-        assert_eq!(step2.content, "first follow");
-
-        // Step 3: processes second follow_up.
-        let step3 = runner.next().await.unwrap().unwrap();
         assert!(runner.is_done());
-        assert_eq!(step3.content, "second follow");
+        assert_eq!(step2.content, "first follow\n\nsecond follow");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2826,7 +2896,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn runner_steering_empty_drains_follow_up_only() {
         // When steering_message is empty but follow_up has messages,
-        // drain_steering_message returns None and follow_up is popped via pop_front.
+        // drain_steering_message returns None and queued follow-up messages are drained.
         let model = Model::with_completer(Arc::new(EchoCompleter));
         let ctx = EngineBuilder::new().with_model(model).mock_ctx();
 
@@ -2839,7 +2909,7 @@ mod tests {
         runner.follow_up("follow only".to_string());
 
         // Step 1: drain_steering_message returns None (steering empty),
-        // so follow_up_message.pop_front() is used.
+        // so queued follow-up messages are drained after the initial response.
         let step1 = runner.next().await.unwrap().unwrap();
         assert!(!runner.is_done());
         assert_eq!(step1.content, "initial");
@@ -2848,6 +2918,60 @@ mod tests {
         let step2 = runner.next().await.unwrap().unwrap();
         assert!(runner.is_done());
         assert_eq!(step2.content, "follow only");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_finalize_idle_unbound_returns_latest_output() {
+        let model = Model::with_completer(Arc::new(EchoCompleter));
+        let ctx = EngineBuilder::new().with_model(model).mock_ctx();
+
+        let req = CompletionRequest {
+            prompt: "initial".to_string(),
+            ..Default::default()
+        };
+
+        let mut runner = ctx.completion_iter(req, Vec::new()).unbound();
+
+        let step1 = runner.next().await.unwrap().unwrap();
+        assert_eq!(step1.content, "initial");
+        assert!(!runner.is_done());
+
+        assert!(runner.next().await.unwrap().is_none());
+
+        let output = runner.finalize(None).await.unwrap();
+        assert!(runner.is_done());
+        assert_eq!(output.content, "initial");
+        assert_eq!(output.usage.input_tokens, 5);
+        assert_eq!(output.usage.output_tokens, 10);
+        assert!(runner.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_finalize_processes_queued_and_new_prompt() {
+        let model = Model::with_completer(Arc::new(EchoCompleter));
+        let ctx = EngineBuilder::new().with_model(model).mock_ctx();
+
+        let req = CompletionRequest {
+            prompt: "initial".to_string(),
+            ..Default::default()
+        };
+
+        let mut runner = ctx.completion_iter(req, Vec::new()).unbound();
+
+        let step1 = runner.next().await.unwrap().unwrap();
+        assert_eq!(step1.content, "initial");
+        assert!(runner.next().await.unwrap().is_none());
+
+        runner.follow_up("queued follow-up".to_string());
+
+        let output = runner
+            .finalize(Some("final prompt".to_string()))
+            .await
+            .unwrap();
+        assert!(runner.is_done());
+        assert_eq!(output.content, "queued follow-up\n\nfinal prompt");
+        assert_eq!(output.usage.input_tokens, 10);
+        assert_eq!(output.usage.output_tokens, 20);
     }
 
     // ── Cancellation tests ──
