@@ -223,6 +223,7 @@ pub type ShellToolHook = DynToolHook<ExecArgs, ExecOutput>;
 pub struct ShellTool {
     runtime: Arc<dyn Executor>,
     envs: HashMap<String, String>,
+    name: String,
     description: String,
 }
 
@@ -235,7 +236,12 @@ impl ShellTool {
     /// The environment map is not forwarded wholesale. Agents must request
     /// specific keys through [`ExecArgs::env_keys`], and invalid environment
     /// variable names are ignored.
-    pub fn new(runtime: Arc<dyn Executor>, envs: HashMap<String, String>) -> Self {
+    pub fn new(
+        runtime: Arc<dyn Executor>,
+        envs: HashMap<String, String>,
+        name: Option<String>,
+    ) -> Self {
+        let name = name.unwrap_or_else(|| Self::NAME.to_string());
         let description = format!(
             "Execute a shell command in the workspace directory (Runtime: {}, OS: {}, Shell: {})",
             runtime.name(),
@@ -246,6 +252,7 @@ impl ShellTool {
         Self {
             runtime,
             envs,
+            name,
             description,
         }
     }
@@ -291,7 +298,7 @@ impl Tool<BaseCtx> for ShellTool {
     type Output = ExecOutput;
 
     fn name(&self) -> String {
-        Self::NAME.to_string()
+        self.name.clone()
     }
 
     fn description(&self) -> String {
@@ -676,7 +683,7 @@ mod tests {
         let mut envs = HashMap::new();
         envs.insert("ANDA_TEST_ENV".to_string(), "configured".to_string());
         envs.insert("INVALID-NAME".to_string(), "ignored".to_string());
-        let tool = ShellTool::new(Arc::new(TestRuntime::new("sandbox")), envs);
+        let tool = ShellTool::new(Arc::new(TestRuntime::new("sandbox")), envs, None);
 
         let collected = tool.collect_shell_env_vars(&[
             " ANDA_TEST_ENV ".to_string(),

@@ -405,7 +405,7 @@ async fn select_requested_names_with_model(
 }
 
 fn parse_selector_tool_names(content: &str) -> Vec<String> {
-    for candidate in selector_json_candidates(content) {
+    for candidate in json_candidates(content) {
         if let Ok(output) = serde_json::from_str::<ToolsSelectNamesOutput>(&candidate) {
             return output.tools;
         }
@@ -417,7 +417,8 @@ fn parse_selector_tool_names(content: &str) -> Vec<String> {
     Vec::new()
 }
 
-fn selector_json_candidates(content: &str) -> Vec<String> {
+/// Extracts JSON candidates from the input string by applying various heuristics, such as stripping markdown code blocks and extracting JSON-like substrings. This increases the chances of successfully parsing the model output even when it is not perfectly formatted.
+pub fn json_candidates(content: &str) -> Vec<String> {
     let mut candidates = Vec::new();
     let mut seen = BTreeSet::new();
 

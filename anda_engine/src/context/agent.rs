@@ -120,7 +120,10 @@ impl AgentCtx {
                 .child(format!("A:{}", agent_name.to_ascii_lowercase()))?,
             label: agent_label.to_string(),
             root: self.root.clone(),
-            model: self.model.clone(),
+            model: self
+                .models
+                .get(agent_label)
+                .unwrap_or_else(|| self.model.clone()),
             models: self.models.clone(),
             tools: self.tools.clone(),
             agents: self.agents.clone(),
@@ -159,7 +162,10 @@ impl AgentCtx {
             )?,
             label: agent_label.to_string(),
             root: self.root.clone(),
-            model: self.model.clone(),
+            model: self
+                .models
+                .get(agent_label)
+                .unwrap_or_else(|| self.model.clone()),
             models: self.models.clone(),
             tools: self.tools.clone(),
             agents: self.agents.clone(),
@@ -996,6 +1002,14 @@ impl CompletionRunner {
     pub fn unbound(self) -> Self {
         Self {
             unbound: true,
+            ..self
+        }
+    }
+
+    /// Reserves the chat history for the completion runner.
+    pub fn reserve_chat_history(self, chat_history: Vec<Message>) -> Self {
+        Self {
+            chat_history,
             ..self
         }
     }
