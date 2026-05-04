@@ -51,15 +51,9 @@ log = { workspace = true }
 url = { workspace = true }
 serde-saphyr = { workspace = true }
 glob = { workspace = true }
-boxlite = { version = "0.9", default-features = false, optional = true }
 
 [dev-dependencies]
 dotenv = { workspace = true }
-
-[features]
-default = []
-full = ["sandbox"]
-sandbox = ["dep:boxlite"]
 
 [lib]
 doctest = false

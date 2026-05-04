@@ -28,10 +28,6 @@ pub mod native;
 
 pub use native::NativeRuntime;
 
-#[cfg(feature = "sandbox")]
-/// Sandboxed runtime implementation.
-pub mod sandbox;
-
 use crate::{
     context::BaseCtx,
     hook::{DynToolHook, ToolHook},

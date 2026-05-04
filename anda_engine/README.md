@@ -40,13 +40,6 @@ The crate has no default optional features.
 anda_engine = "0.11"
 ```
 
-Enable sandboxed shell execution when you need isolated command execution through Boxlite:
-
-```toml
-[dependencies]
-anda_engine = { version = "0.11", features = ["sandbox"] }
-```
-
 ## Quick Start
 
 The example below builds an engine with the built-in `EchoEngineInfo` agent. Real applications usually register their own `anda_core::Agent` and `anda_core::Tool` implementations.
@@ -145,13 +138,6 @@ Engine-level hooks can observe or transform agent and tool execution. Typed hook
 
 `SingleThreadHook` is included for applications that want to limit each caller to one active prompt at a time.
 
-## Feature Flags
-
-| Feature   | Description                                                             |
-| --------- | ----------------------------------------------------------------------- |
-| `sandbox` | Enables the Boxlite-backed sandbox runtime for `extension::shell`.      |
-| `full`    | Enables all optional runtime features currently provided by this crate. |
-
 ## Security Notes
 
 - Engines are private by default. Configure `Management` when exposing an engine to external callers.
@@ -174,14 +160,6 @@ Useful checks while working on this crate:
 cargo check -p anda_engine
 cargo test -p anda_engine --lib
 cargo clippy -p anda_engine --all-targets -- -D warnings
-```
-
-Optional sandbox checks:
-
-```sh
-cargo check -p anda_engine --features sandbox
-cargo test -p anda_engine --lib --features sandbox
-cargo clippy -p anda_engine --all-targets --features sandbox -- -D warnings
 ```
 
 ## License
