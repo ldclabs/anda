@@ -12,9 +12,7 @@
 //! Custom providers can implement [`CompletionFeaturesDyn`] and be wrapped with
 //! [`Model::with_completer`].
 
-use anda_core::{
-    AgentOutput, BoxError, BoxPinFut, CONTENT_TYPE_JSON, CompletionRequest, Json, Message, ToolCall,
-};
+use anda_core::{AgentOutput, BoxError, BoxPinFut, CONTENT_TYPE_JSON, CompletionRequest, ToolCall};
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -316,48 +314,6 @@ pub trait CompletionFeaturesDyn: Send + Sync + 'static {
 
     /// Returns the provider model name used for diagnostics and usage reports.
     fn model_name(&self) -> String;
-
-    /// Prunes a raw-history message in-place to reduce token usage.
-    ///
-    /// `raw_history` stores provider-native JSON (Anthropic blocks, Gemini parts,
-    /// OpenAI items, DeepSeek chat messages, …). Each provider must know how to
-    /// shrink non-text payloads (tool calls, tool outputs, images, files) without
-    /// breaking the request contract (e.g. preserving tool_call ↔ tool_output
-    /// pairing and required fields).
-    ///
-    /// The default implementation falls back to the unified [`Message`] shape
-    /// for backward compatibility with non-provider producers (mocks, tests,
-    /// custom integrations).
-    ///
-    /// Returns the number of items pruned (0 if the message was already minimal
-    /// or the shape was not recognized.
-    #[deprecated(
-        since = "0.11.0",
-        note = "This method is deprecated and will be removed in a future release."
-    )]
-    fn prune_raw_message(&self, value: &mut Json) -> usize {
-        let Ok(mut msg) = serde_json::from_value::<Message>(value.clone()) else {
-            return 0;
-        };
-        let pruned = msg.prune_content();
-        if pruned > 0
-            && let Ok(raw) = serde_json::to_value(&msg)
-        {
-            *value = raw;
-        }
-        pruned
-    }
-}
-
-/// Standard placeholder text for content pruned from raw history.
-///
-/// Kept identical in wording to [`anda_core::Message::prune_content`] so the
-/// model observes a consistent marker regardless of provider.
-pub(crate) fn pruned_placeholder(count: usize) -> String {
-    format!(
-        "[{} items (tool calls or files) pruned due to limits]",
-        count
-    )
 }
 
 /// Placeholder implementation that returns errors for completion requests.
@@ -476,16 +432,6 @@ impl Model {
     /// Executes a completion request with the underlying provider.
     pub async fn completion(&self, req: CompletionRequest) -> Result<AgentOutput, BoxError> {
         self.completer.completion(req).await
-    }
-
-    /// Prunes a raw-history message in-place using the underlying provider's
-    /// knowledge of its own JSON shape.
-    #[deprecated(
-        since = "0.11.0",
-        note = "This method is deprecated and will be removed in a future release."
-    )]
-    pub fn prune_raw_message(&self, value: &mut Json) -> usize {
-        self.completer.prune_raw_message(value)
     }
 }
 

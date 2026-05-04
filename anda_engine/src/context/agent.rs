@@ -219,7 +219,6 @@ impl AgentCtx {
             done: false,
             unbound: false,
             turns: 0,
-            pruned: 0,
         }
     }
 
@@ -994,7 +993,6 @@ pub struct CompletionRunner {
     done: bool,
     unbound: bool,
     turns: usize,
-    pruned: usize,
 }
 
 impl CompletionRunner {
@@ -1116,38 +1114,6 @@ impl CompletionRunner {
         output.chat_history = self.chat_history.clone();
         self.last_output = Some(output.clone());
         output
-    }
-
-    /// Prune the raw history of the completion request to reduce tokens usage.
-    /// Only prunes messages that have tool calls (intermediate steps), and keeps the final response intact.
-    ///
-    /// Because `raw_history` stores provider-native JSON (Anthropic blocks,
-    /// Gemini parts, OpenAI items, …) and each provider has its own shape,
-    /// pruning is delegated to the active model via
-    /// [`Model::prune_raw_message`]. Each implementation preserves structural
-    /// invariants (e.g. tool_call ↔ tool_output pairing) and only shrinks
-    /// heavy payloads to a compact placeholder.
-    ///
-    /// # Arguments
-    /// * `un_pruned_len` - The minimum length of raw history to keep un-pruned. Only when the current un-pruned length reaches or exceeds this threshold, pruning will be performed.
-    /// * `prune_len` - The maximum number of messages to prune in this call. This is a soft limit, actual pruned messages may be less if it is greater than un-pruned messages.
-    ///
-    /// Returns the number of pruned messages.
-    #[deprecated(
-        since = "0.11.0",
-        note = "This method is deprecated and will be removed in a future release."
-    )]
-    pub fn prune_raw_history_if(&mut self, un_pruned_len: usize, prune_len: usize) -> usize {
-        let raw_history_len = self.req.raw_history.len().saturating_sub(self.pruned);
-        if raw_history_len < un_pruned_len {
-            return 0;
-        }
-        let pruned_len = prune_len.min(raw_history_len);
-        for i in self.pruned..(self.pruned + pruned_len) {
-            self.model.prune_raw_message(&mut self.req.raw_history[i]);
-        }
-        self.pruned += pruned_len;
-        pruned_len
     }
 
     /// Execute the next step.
@@ -3345,150 +3311,5 @@ mod tests {
         for tc in &final_out.tool_calls {
             assert!(tc.result.is_some());
         }
-    }
-
-    fn raw_message(content: Vec<anda_core::ContentPart>) -> serde_json::Value {
-        serde_json::to_value(anda_core::Message {
-            role: "assistant".to_string(),
-            content,
-            name: None,
-            user: None,
-            timestamp: None,
-        })
-        .unwrap()
-    }
-
-    fn decode_message(raw: &serde_json::Value) -> anda_core::Message {
-        serde_json::from_value(raw.clone()).unwrap()
-    }
-
-    fn pruned_placeholder(count: usize) -> anda_core::ContentPart {
-        anda_core::ContentPart::Text {
-            text: format!(
-                "[{} items (tool calls or files) pruned due to limits]",
-                count
-            ),
-        }
-    }
-
-    #[test]
-    fn runner_prune_raw_history_if_noop_below_threshold() {
-        let model = Model::with_completer(Arc::new(EchoCompleter));
-        let ctx = EngineBuilder::new().with_model(model).mock_ctx();
-
-        let raw = raw_message(vec![
-            anda_core::ContentPart::Text {
-                text: "keep".to_string(),
-            },
-            anda_core::ContentPart::ToolCall {
-                name: "echo_tool".to_string(),
-                args: json!({ "input": "hello" }),
-                call_id: Some("call_1".to_string()),
-            },
-        ]);
-
-        let req = CompletionRequest {
-            raw_history: vec![raw.clone()],
-            ..Default::default()
-        };
-        let mut runner = ctx.completion_iter(req, Vec::new());
-
-        assert_eq!(runner.prune_raw_history_if(2, 10), 0);
-        assert_eq!(runner.pruned, 0);
-        assert_eq!(runner.req.raw_history, vec![raw]);
-    }
-
-    #[test]
-    fn runner_prune_raw_history_if_prunes_prefix_and_continues_from_cursor() {
-        let model = Model::with_completer(Arc::new(EchoCompleter));
-        let ctx = EngineBuilder::new().with_model(model).mock_ctx();
-
-        let first = raw_message(vec![
-            anda_core::ContentPart::Text {
-                text: "keep".to_string(),
-            },
-            anda_core::ContentPart::ToolCall {
-                name: "echo_tool".to_string(),
-                args: json!({ "input": "hello" }),
-                call_id: Some("call_1".to_string()),
-            },
-            anda_core::ContentPart::FileData {
-                file_uri: "file:///tmp/a.txt".to_string(),
-                mime_type: None,
-            },
-        ]);
-        let second = raw_message(vec![anda_core::ContentPart::Text {
-            text: "text only".to_string(),
-        }]);
-        let third = raw_message(vec![anda_core::ContentPart::ToolOutput {
-            name: "echo_tool".to_string(),
-            output: json!("done"),
-            call_id: Some("call_2".to_string()),
-            remote_id: None,
-        }]);
-
-        let req = CompletionRequest {
-            raw_history: vec![first, second.clone(), third.clone()],
-            ..Default::default()
-        };
-        let mut runner = ctx.completion_iter(req, Vec::new());
-
-        assert_eq!(runner.prune_raw_history_if(2, 2), 2);
-        assert_eq!(runner.pruned, 2);
-
-        let first_after = decode_message(&runner.req.raw_history[0]);
-        assert_eq!(
-            first_after.content,
-            vec![
-                anda_core::ContentPart::Text {
-                    text: "keep".to_string(),
-                },
-                pruned_placeholder(2),
-            ]
-        );
-        assert_eq!(
-            decode_message(&runner.req.raw_history[1]),
-            decode_message(&second)
-        );
-        assert_eq!(runner.req.raw_history[2], third);
-
-        assert_eq!(runner.prune_raw_history_if(0, 2), 1);
-        assert_eq!(runner.pruned, 3);
-        assert_eq!(decode_message(&runner.req.raw_history[0]), first_after);
-        assert_eq!(
-            decode_message(&runner.req.raw_history[2]).content,
-            vec![pruned_placeholder(1)]
-        );
-    }
-
-    #[test]
-    fn runner_prune_raw_history_if_skips_invalid_raw_entries_and_advances_cursor() {
-        let model = Model::with_completer(Arc::new(EchoCompleter));
-        let ctx = EngineBuilder::new().with_model(model).mock_ctx();
-
-        let invalid = json!({ "provider": "opaque raw message" });
-        let valid = raw_message(vec![anda_core::ContentPart::ToolCall {
-            name: "echo_tool".to_string(),
-            args: json!({ "input": "hello" }),
-            call_id: Some("call_1".to_string()),
-        }]);
-
-        let req = CompletionRequest {
-            raw_history: vec![invalid.clone(), valid.clone()],
-            ..Default::default()
-        };
-        let mut runner = ctx.completion_iter(req, Vec::new());
-
-        assert_eq!(runner.prune_raw_history_if(1, 1), 1);
-        assert_eq!(runner.pruned, 1);
-        assert_eq!(runner.req.raw_history[0], invalid);
-        assert_eq!(runner.req.raw_history[1], valid);
-
-        assert_eq!(runner.prune_raw_history_if(0, 1), 1);
-        assert_eq!(runner.pruned, 2);
-        assert_eq!(
-            decode_message(&runner.req.raw_history[1]).content,
-            vec![pruned_placeholder(1)]
-        );
     }
 }

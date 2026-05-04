@@ -13,7 +13,7 @@
 //! snake_case (`my_skill`) when loaded as [`SubAgent`] instances.
 
 use anda_core::{
-    Agent, BoxError, FunctionDefinition, Resource, Tool, ToolOutput, select_resources,
+    Agent, BoxError, FunctionDefinition, Json, Resource, Tool, ToolOutput, select_resources,
     validate_function_name,
 };
 use parking_lot::RwLock;
@@ -101,7 +101,7 @@ pub struct SkillArgs {
     pub compatibility: Option<String>,
     /// Arbitrary key-value metadata.
     #[serde(default)]
-    pub metadata: BTreeMap<String, String>,
+    pub metadata: BTreeMap<String, Json>,
     /// Space-delimited list of pre-approved tools. Defaults to `"shell"`.
     #[serde(default)]
     pub allowed_tools: Option<String>,
@@ -336,6 +336,7 @@ impl SkillManager {
             compatibility: args.compatibility.clone(),
             metadata: args.metadata.clone(),
             allowed_tools: args.allowed_tools.clone(),
+            ..Default::default()
         };
 
         let tools = match &args.allowed_tools {

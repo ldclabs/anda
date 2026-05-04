@@ -10,9 +10,8 @@ use anda_core::{
     Resource,
 };
 use log::{Level::Debug, log_enabled};
-use serde_json::json;
 
-use super::{CompletionFeaturesDyn, pruned_placeholder, request_client_builder};
+use super::{CompletionFeaturesDyn, request_client_builder};
 use crate::{rfc3339_datetime, unix_ms};
 
 pub mod types;
@@ -135,73 +134,6 @@ impl CompletionFeatures for CompletionModel {
 impl CompletionFeaturesDyn for CompletionModel {
     fn model_name(&self) -> String {
         self.model.clone()
-    }
-
-    /// Prune a Gemini-native content JSON in-place.
-    ///
-    /// Gemini messages have shape `{role?, parts: [Part, ...]}` where each
-    /// part is one of `text`, `functionCall`, `functionResponse`, `fileData`,
-    /// `inlineData`, … distinguished by which field is present.
-    ///
-    /// `functionCall` and `functionResponse` parts must stay paired across
-    /// turns (each `functionResponse.name` refers to a prior `functionCall`),
-    /// so pruning must not drop either side — otherwise the API rejects the
-    /// request. We therefore preserve those parts' envelope (name / id) and
-    /// only shrink their heavy payload (`args` / `response`). Other
-    /// non-text parts (files, inline data, …) are dropped and summarized by
-    /// a single placeholder text part.
-    fn prune_raw_message(&self, value: &mut Json) -> usize {
-        let Some(obj) = value.as_object_mut() else {
-            return 0;
-        };
-        let Some(parts) = obj.get_mut("parts").and_then(|v| v.as_array_mut()) else {
-            return 0;
-        };
-        let mut pruned = 0usize;
-        let mut dropped = 0usize;
-        parts.retain_mut(|part| {
-            let Some(map) = part.as_object_mut() else {
-                dropped += 1;
-                return false;
-            };
-            if map.get("text").map(|t| t.is_string()).unwrap_or(false) {
-                return true;
-            }
-            if let Some(fc) = map.get_mut("functionCall")
-                && let Some(fc_obj) = fc.as_object_mut()
-            {
-                if let Some(args) = fc_obj.get_mut("args") {
-                    let already = matches!(args, Json::Object(m) if m.is_empty());
-                    if !already {
-                        *args = json!({});
-                        pruned += 1;
-                    }
-                }
-                return true;
-            }
-            if let Some(fr) = map.get_mut("functionResponse")
-                && let Some(fr_obj) = fr.as_object_mut()
-            {
-                if let Some(resp) = fr_obj.get_mut("response") {
-                    let placeholder = pruned_placeholder(1);
-                    let already = matches!(resp, Json::Object(m)
-                        if m.get("output").and_then(|v| v.as_str()) == Some(placeholder.as_str())
-                            && m.len() == 1);
-                    if !already {
-                        *resp = json!({ "output": placeholder });
-                        pruned += 1;
-                    }
-                }
-                return true;
-            }
-            dropped += 1;
-            false
-        });
-        if dropped > 0 {
-            parts.push(json!({ "text": pruned_placeholder(dropped) }));
-            pruned += dropped;
-        }
-        pruned
     }
 
     fn completion(&self, mut req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {

@@ -1,4 +1,4 @@
-use anda_core::{BoxError, validate_function_name};
+use anda_core::{BoxError, Json, validate_function_name};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -33,7 +33,7 @@ pub struct SkillFrontmatter {
 
     /// Arbitrary key-value metadata.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub metadata: BTreeMap<String, String>,
+    pub metadata: BTreeMap<String, Json>,
 
     /// Space-delimited list of pre-approved tools the skill may use.
     #[serde(
@@ -42,6 +42,10 @@ pub struct SkillFrontmatter {
         skip_serializing_if = "Option::is_none"
     )]
     pub allowed_tools: Option<String>,
+
+    #[serde(flatten)]
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Json>,
 }
 
 /// A fully-parsed skill: frontmatter + body + derived fields.
@@ -353,7 +357,11 @@ Process PDFs here.
             Some("Requires Python 3.14+ and uv")
         );
         assert_eq!(
-            skill.frontmatter.metadata.get("author").map(|s| s.as_str()),
+            skill
+                .frontmatter
+                .metadata
+                .get("author")
+                .and_then(|v| v.as_str()),
             Some("example-org")
         );
         assert_eq!(
@@ -361,7 +369,7 @@ Process PDFs here.
                 .frontmatter
                 .metadata
                 .get("version")
-                .map(|s| s.as_str()),
+                .and_then(|v| v.as_str()),
             Some("1.0")
         );
         assert_eq!(
@@ -369,6 +377,46 @@ Process PDFs here.
             vec!["shell".to_string(), "google_web_search".to_string()]
         );
         assert!(skill.instructions.contains("# PDF Processing"));
+
+        let md = "\
+---
+name: gif-search
+description: \"Search/download GIFs from Tenor via curl + jq.\"
+version: 1.1.0
+author: Hermes Agent
+license: MIT
+prerequisites:
+  env_vars: [TENOR_API_KEY]
+  commands: [curl, jq]
+metadata:
+  tags: [GIF, Media, Search, Tenor, API]
+---
+
+# GIF Search (Tenor API)
+
+Search and download GIFs directly via the Tenor API using curl. No extra tools needed.
+";
+        let skill = parse_skill_md(PathBuf::from("/test_dir"), md).unwrap();
+        assert_eq!(skill.frontmatter.name, "gif-search");
+        assert_eq!(
+            skill
+                .frontmatter
+                .metadata
+                .get("tags")
+                .and_then(|v| v.as_array())
+                .map(|tags| tags.len()),
+            Some(5)
+        );
+        assert_eq!(
+            skill
+                .frontmatter
+                .extra
+                .get("author")
+                .and_then(|v| v.as_str()),
+            Some("Hermes Agent")
+        );
+        assert!(skill.frontmatter.extra.contains_key("version"));
+        assert!(skill.frontmatter.extra.contains_key("prerequisites"));
     }
 
     #[test]
@@ -422,9 +470,9 @@ Body.
                 name: "my-skill".to_string(),
                 description: "A test skill.".to_string(),
                 license: Some("MIT".to_string()),
-                compatibility: None,
-                metadata: BTreeMap::from([("author".to_string(), "test".to_string())]),
+                metadata: BTreeMap::from([("author".to_string(), "test".into())]),
                 allowed_tools: Some("shell fetch".to_string()),
+                ..Default::default()
             },
             instructions: "# Instructions\n\nDo something useful.".to_string(),
             agent_name: "skill_my_skill".to_string(),

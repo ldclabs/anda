@@ -229,7 +229,7 @@ impl Engine {
         }
         if let Some(user) = &meta.user {
             let u = user.trim();
-            if u.is_empty() || u != user || u.len() > 32 {
+            if u.is_empty() || u != user || u.len() > 96 {
                 return Err(format!("invalid user name {:?}", user).into());
             }
         }
@@ -282,7 +282,7 @@ impl Engine {
         }
         if let Some(user) = &meta.user {
             let u = user.trim();
-            if u.is_empty() || u != user || u.len() > 32 {
+            if u.is_empty() || u != user || u.len() > 96 {
                 return Err(format!("invalid user name {:?}", user).into());
             }
         }

@@ -10,9 +10,8 @@ use anda_core::{
     Resource,
 };
 use log::{Level::Debug, log_enabled};
-use serde_json::json;
 
-use super::{CompletionFeaturesDyn, pruned_placeholder, request_client_builder};
+use super::{CompletionFeaturesDyn, request_client_builder};
 use crate::{rfc3339_datetime, unix_ms};
 
 pub mod types;
@@ -162,83 +161,6 @@ impl CompletionFeatures for CompletionModel {
 impl CompletionFeaturesDyn for CompletionModel {
     fn model_name(&self) -> String {
         self.model.clone()
-    }
-
-    /// Prune an Anthropic-native message JSON in-place.
-    ///
-    /// Anthropic messages have shape `{role, content: "..." | [block, ...]}`
-    /// where each block is tagged by `type`. `tool_use` and `tool_result`
-    /// blocks must stay paired across messages (each `tool_result.tool_use_id`
-    /// needs a matching `tool_use.id` in the previous assistant message), so
-    /// pruning must not drop either side — otherwise the API rejects the
-    /// request (e.g. `tool_result` blocks must have a corresponding
-    /// `tool_use`). We therefore preserve the envelope of tool blocks and
-    /// only shrink their heavy payload (`input` / `content`). Other unknown
-    /// non-text blocks are dropped and summarized by a placeholder text
-    /// block. If `content` is already a plain string nothing is pruned.
-    fn prune_raw_message(&self, value: &mut Json) -> usize {
-        let Some(obj) = value.as_object_mut() else {
-            return 0;
-        };
-        let Some(content) = obj.get_mut("content") else {
-            return 0;
-        };
-        let Some(arr) = content.as_array_mut() else {
-            return 0;
-        };
-        let mut pruned = 0usize;
-        let mut dropped = 0usize;
-        arr.retain_mut(|block| {
-            let ty = block
-                .get("type")
-                .and_then(|t| t.as_str())
-                .unwrap_or("")
-                .to_string();
-            match ty.as_str() {
-                "text" | "thinking" | "redacted_thinking" => true,
-                "tool_use" => {
-                    // Keep the envelope (id/name) so pairing with tool_result is preserved;
-                    // only shrink the heavy `input` payload.
-                    if let Some(obj) = block.as_object_mut()
-                        && let Some(input) = obj.get_mut("input")
-                    {
-                        let already = matches!(input, Json::Object(m) if m.is_empty());
-                        if !already {
-                            *input = json!({});
-                            pruned += 1;
-                        }
-                    }
-                    true
-                }
-                "tool_result" => {
-                    // Keep the envelope (tool_use_id) so pairing is preserved;
-                    // only shrink the heavy `content` payload.
-                    if let Some(obj) = block.as_object_mut()
-                        && let Some(c) = obj.get_mut("content")
-                    {
-                        let placeholder = pruned_placeholder(1);
-                        let already = c.as_str() == Some(placeholder.as_str());
-                        if !already {
-                            *c = Json::String(placeholder);
-                            pruned += 1;
-                        }
-                    }
-                    true
-                }
-                _ => {
-                    dropped += 1;
-                    false
-                }
-            }
-        });
-        if dropped > 0 {
-            arr.push(json!({
-                "type": "text",
-                "text": pruned_placeholder(dropped),
-            }));
-            pruned += dropped;
-        }
-        pruned
     }
 
     fn completion(&self, mut req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
