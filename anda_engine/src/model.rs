@@ -330,7 +330,11 @@ pub trait CompletionFeaturesDyn: Send + Sync + 'static {
     /// custom integrations).
     ///
     /// Returns the number of items pruned (0 if the message was already minimal
-    /// or the shape was not recognized).
+    /// or the shape was not recognized.
+    #[deprecated(
+        since = "0.11.0",
+        note = "This method is deprecated and will be removed in a future release."
+    )]
     fn prune_raw_message(&self, value: &mut Json) -> usize {
         let Ok(mut msg) = serde_json::from_value::<Message>(value.clone()) else {
             return 0;
@@ -476,6 +480,10 @@ impl Model {
 
     /// Prunes a raw-history message in-place using the underlying provider's
     /// knowledge of its own JSON shape.
+    #[deprecated(
+        since = "0.11.0",
+        note = "This method is deprecated and will be removed in a future release."
+    )]
     pub fn prune_raw_message(&self, value: &mut Json) -> usize {
         self.completer.prune_raw_message(value)
     }

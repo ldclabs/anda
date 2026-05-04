@@ -1133,6 +1133,10 @@ impl CompletionRunner {
     /// * `prune_len` - The maximum number of messages to prune in this call. This is a soft limit, actual pruned messages may be less if it is greater than un-pruned messages.
     ///
     /// Returns the number of pruned messages.
+    #[deprecated(
+        since = "0.11.0",
+        note = "This method is deprecated and will be removed in a future release."
+    )]
     pub fn prune_raw_history_if(&mut self, un_pruned_len: usize, prune_len: usize) -> usize {
         let raw_history_len = self.req.raw_history.len().saturating_sub(self.pruned);
         if raw_history_len < un_pruned_len {
@@ -1257,10 +1261,10 @@ impl CompletionRunner {
                                     // 工具调用失败了，但我们不一定要因此终止整个对话流程，可以让 LLM 尝试纠正错误并继续对话
                                     {
                                         tool.result = Some(ToolOutput {
-                                            output: Json::String(format!(
-                                                "tool call error: {}",
+                                            output: json!({ "error": format!(
+                                                "tool call failed: {}",
                                                 err
-                                            )),
+                                            )}),
                                             ..Default::default()
                                         });
                                         (Some(tool), None)
@@ -1300,8 +1304,8 @@ impl CompletionRunner {
                                 Ok((res, remote_id)) => {
                                     tool.remote_id = remote_id;
                                     tool.result = Some(ToolOutput {
-                                        output: if (res.content.starts_with("{")
-                                            || res.content.starts_with("["))
+                                        output: if (res.content.trim().starts_with("{")
+                                            || res.content.trim().starts_with("["))
                                             && let Ok(val) = serde_json::from_str(&res.content)
                                         {
                                             val
@@ -1323,10 +1327,10 @@ impl CompletionRunner {
                     } else {
                         tool_call_futs.push(Box::pin(async move {
                             tool.result = Some(ToolOutput {
-                                output: Json::String(format!(
-                                    "tool call error: {} not found",
+                                output: json!({ "error": format!(
+                                    "tool call failed: {} not found",
                                     tool.name
-                                )),
+                                )}),
                                 ..Default::default()
                             });
                             (Some(tool), None)

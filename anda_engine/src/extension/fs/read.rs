@@ -148,7 +148,7 @@ impl Tool<BaseCtx> for ReadFileTool {
             size: meta.len(),
             ..Default::default()
         };
-        if let Some(kind) = infer::get(&data) {
+        if let Some(kind) = infer2::get(&data) {
             output.mime_type = Some(kind.mime_type().to_string());
         }
         match String::from_utf8(data) {

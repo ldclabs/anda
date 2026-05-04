@@ -2,7 +2,8 @@ use anda_core::{BoxError, ToolOutput};
 use async_trait::async_trait;
 use boxlite::{
     BoxCommand, BoxOptions, BoxliteOptions, BoxliteRuntime, ExecResult, Execution, LiteBox,
-    RootfsSpec, runtime::options::VolumeSpec,
+    RootfsSpec,
+    runtime::options::{ImageRegistry, VolumeSpec},
 };
 use futures_util::stream::{Stream, StreamExt};
 use ic_auth_types::Xid;
@@ -32,7 +33,10 @@ impl SandboxRuntime {
     pub async fn new(home_dir: PathBuf) -> Result<Self, BoxError> {
         let runtime = BoxliteRuntime::new(BoxliteOptions {
             home_dir: home_dir.clone(),
-            image_registries: vec!["ghcr.io/ldclabs".to_string(), "docker.io".to_string()],
+            image_registries: vec![
+                ImageRegistry::https("ghcr.io/ldclabs").with_search(true),
+                ImageRegistry::https("docker.io").with_search(true),
+            ],
         })?;
 
         tokio::fs::create_dir_all(&home_dir).await?;

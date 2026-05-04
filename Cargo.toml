@@ -62,7 +62,7 @@ ic_auth_verifier = "0.8"
 ic_tee_cdk = "0.6"
 ic_tee_agent = "0.6"
 ic_tee_gateway_sdk = "0.6"
-infer = "0.19"
+infer2 = "0.21"
 anda_cloud_cdk = "0.4"
 object_store = { version = "0.13" }
 parking_lot = "0.12"
@@ -92,7 +92,6 @@ glob = "0.3"
 serde-saphyr = "0.0"
 
 [patch.crates-io]
-boxlite = { git = "https://github.com/boxlite-ai/boxlite.git", tag = "v0.8.2" }
 
 [workspace.metadata.cargo-shear]
 ignored = ["idna", "serde_bytes"]
