@@ -100,7 +100,7 @@ impl Agent<AgentCtx> for SubAgent {
             let task_id = format!("{}:{}", self.name(), Xid::new());
             let rt = AgentOutput {
                 content: format!(
-                    "subagent is running in the background with task ID: {}",
+                    "subagent is running in the background with task ID: {}. The final output will be pushed to you when the task is completed.",
                     task_id
                 ),
                 ..Default::default()

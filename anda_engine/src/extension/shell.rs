@@ -117,9 +117,11 @@ pub struct ExecArgs {
     #[serde(default)]
     pub workspace: String,
 
-    /// Additional configured environment variable keys to expose to the command.
+    /// Additional custom environment variable keys to expose to the command.
     ///
-    /// Values are taken from the environment map passed to [`ShellTool::new`].
+    /// Values are taken from [`CustomEnv`] entries configured on [`ShellTool`].
+    /// Variables marked [`CustomEnv::default`] are injected automatically and
+    /// do not need to be listed here.
     #[serde(default)]
     pub env_keys: Vec<String>,
 
@@ -214,11 +216,30 @@ impl ExecOutput {
 
 pub type ShellToolHook = DynToolHook<ExecArgs, ExecOutput>;
 
+/// Configured environment variable available to shell commands.
+///
+/// The `key` and `description` are exposed to model providers so callers can
+/// discover optional variables. The `value` is only injected into subprocesses
+/// and is never included in tool descriptions or JSON schemas.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct CustomEnv {
+    /// Environment variable name.
+    pub key: String,
+    /// Environment variable value injected into the subprocess environment.
+    pub value: String,
+    /// Human-readable explanation of what this variable enables.
+    #[serde(default)]
+    pub description: String,
+    /// Whether this variable is injected even when it is not requested.
+    #[serde(default)]
+    pub default: bool,
+}
+
 /// Tool implementation that exposes shell command execution to the engine.
 #[derive(Clone)]
 pub struct ShellTool {
     runtime: Arc<dyn Executor>,
-    envs: HashMap<String, String>,
+    envs: Vec<CustomEnv>,
     name: String,
     description: String,
 }
@@ -227,23 +248,42 @@ impl ShellTool {
     /// Tool name used for registration and function definition.
     pub const NAME: &'static str = "shell";
 
-    /// Creates a shell tool with a runtime and a configured environment map.
+    /// Creates a shell tool with a runtime and a simple configured environment map.
     ///
-    /// The environment map is not forwarded wholesale. Agents must request
-    /// specific keys through [`ExecArgs::env_keys`], and invalid environment
-    /// variable names are ignored.
+    /// Each map entry becomes an optional [`CustomEnv`] without a description.
+    /// Prefer [`Self::new_with_custom_envs`] when callers need to discover the
+    /// available keys or when some variables should be injected by default.
     pub fn new(
         runtime: Arc<dyn Executor>,
         envs: HashMap<String, String>,
         name: Option<String>,
     ) -> Self {
+        let envs = envs
+            .into_iter()
+            .map(|(key, value)| CustomEnv {
+                key,
+                value,
+                description: String::new(),
+                default: false,
+            })
+            .collect();
+        Self::new_with_custom_envs(runtime, envs, name)
+    }
+
+    /// Creates a shell tool with documented custom environment variables.
+    ///
+    /// The custom environment list is not forwarded wholesale. Agents must request
+    /// optional keys through [`ExecArgs::env_keys`], while variables with
+    /// [`CustomEnv::default`] are injected automatically. Invalid environment
+    /// variable names are ignored, and values are never exposed in tool metadata.
+    pub fn new_with_custom_envs(
+        runtime: Arc<dyn Executor>,
+        envs: Vec<CustomEnv>,
+        name: Option<String>,
+    ) -> Self {
+        let envs = normalize_custom_envs(envs);
         let name = name.unwrap_or_else(|| Self::NAME.to_string());
-        let description = format!(
-            "Execute a shell command in the workspace directory (Runtime: {}, OS: {}, Shell: {})",
-            runtime.name(),
-            runtime.os(),
-            runtime.shell()
-        );
+        let description = default_tool_description(runtime.as_ref(), &envs);
 
         Self {
             runtime,
@@ -254,9 +294,23 @@ impl ShellTool {
     }
 
     /// Overrides the default tool description exposed to model providers.
+    ///
+    /// Custom environment metadata is appended so available keys remain
+    /// discoverable, but values stay hidden.
     pub fn with_description(mut self, description: String) -> Self {
-        self.description = description;
+        self.description = append_custom_env_description(description, &self.envs);
         self
+    }
+
+    fn env_keys_parameter_description(&self) -> String {
+        let Some(custom_envs) = format_custom_env_description(&self.envs) else {
+            return "Additional configured environment variable keys to set for the command"
+                .to_string();
+        };
+
+        format!(
+            "Optional custom environment variable keys to set for the command. Auto-injected keys are already included. Unknown or invalid keys are ignored. Available custom environment variables:\n{custom_envs}"
+        )
     }
 
     fn collect_shell_env_vars(&self, env_keys: &[String]) -> HashMap<String, String> {
@@ -274,15 +328,21 @@ impl ShellTool {
             }
         }
 
+        for env in self.envs.iter().filter(|env| env.default) {
+            if !out.contains_key(&env.key) {
+                out.insert(env.key.clone(), env.value.clone());
+            }
+        }
+
         for key in env_keys.iter() {
             let candidate = key.trim();
             if candidate.is_empty() || !is_valid_env_var_name(candidate) {
                 continue;
             }
             if !out.contains_key(candidate)
-                && let Some(val) = self.envs.get(candidate)
+                && let Some(env) = self.envs.iter().find(|env| env.key == candidate)
             {
-                out.insert(candidate.to_string(), val.clone());
+                out.insert(candidate.to_string(), env.value.clone());
             }
         }
         out
@@ -302,6 +362,8 @@ impl Tool<BaseCtx> for ShellTool {
     }
 
     fn definition(&self) -> FunctionDefinition {
+        let env_keys_description = self.env_keys_parameter_description();
+
         FunctionDefinition {
             name: self.name(),
             description: self.description(),
@@ -322,12 +384,12 @@ impl Tool<BaseCtx> for ShellTool {
                         "items": {
                             "type": "string"
                         },
-                        "description": "Additional environment variable keys to set for the command",
+                        "description": env_keys_description,
                         "default": []
                     },
                     "background": {
                         "type": "boolean",
-                        "description": "Whether to run the command in the background (non-blocking)",
+                        "description": "Whether to run the command in the background (non-blocking). The final output will be pushed to you when the task is completed through hooks.",
                         "default": false
                     }
                 },
@@ -393,6 +455,68 @@ impl Tool<BaseCtx> for ShellTool {
             Ok(rt)
         }
     }
+}
+
+fn normalize_custom_envs(envs: Vec<CustomEnv>) -> Vec<CustomEnv> {
+    let mut by_key = HashMap::new();
+    for mut env in envs {
+        env.key = env.key.trim().to_string();
+        env.description = env.description.trim().to_string();
+        if env.key.is_empty() || !is_valid_env_var_name(&env.key) {
+            continue;
+        }
+        by_key.entry(env.key.clone()).or_insert(env);
+    }
+
+    let mut envs = by_key.into_values().collect::<Vec<_>>();
+    envs.sort_by(|left, right| left.key.cmp(&right.key));
+    envs
+}
+
+fn default_tool_description(runtime: &dyn Executor, envs: &[CustomEnv]) -> String {
+    let description = format!(
+        "Execute a shell command in the workspace directory (Runtime: {}, OS: {}, Shell: {})",
+        runtime.name(),
+        runtime.os(),
+        runtime.shell()
+    );
+
+    append_custom_env_description(description, envs)
+}
+
+fn append_custom_env_description(mut description: String, envs: &[CustomEnv]) -> String {
+    if let Some(custom_envs) = format_custom_env_description(envs) {
+        description.push_str(
+            "\n\nCustom environment variables are listed by key only; values are never exposed. Auto-injected variables are included in every command, and optional variables can be requested with env_keys.\n",
+        );
+        description.push_str(&custom_envs);
+    }
+
+    description
+}
+
+fn format_custom_env_description(envs: &[CustomEnv]) -> Option<String> {
+    if envs.is_empty() {
+        return None;
+    }
+
+    Some(
+        envs.iter()
+            .map(|env| {
+                let mode = if env.default {
+                    "auto-injected"
+                } else {
+                    "available via env_keys"
+                };
+                if env.description.is_empty() {
+                    format!("- {} ({mode})", env.key)
+                } else {
+                    format!("- {} ({mode}): {}", env.key, env.description)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
 }
 
 fn is_valid_env_var_name(name: &str) -> bool {
@@ -591,6 +715,15 @@ mod tests {
         ExitStatus::from_raw(0)
     }
 
+    fn custom_env(key: &str, value: &str, description: &str, default: bool) -> CustomEnv {
+        CustomEnv {
+            key: key.to_string(),
+            value: value.to_string(),
+            description: description.to_string(),
+            default,
+        }
+    }
+
     #[tokio::test]
     async fn persists_large_stdout_to_temp_file() {
         let temp_dir = TestTempDir::new().await;
@@ -693,5 +826,134 @@ mod tests {
             collected.get("ANDA_TEST_ENV").map(String::as_str),
             Some("configured")
         );
+    }
+
+    #[test]
+    fn collect_shell_env_vars_auto_injects_default_custom_envs() {
+        let tool = ShellTool::new_with_custom_envs(
+            Arc::new(TestRuntime::new("sandbox")),
+            vec![
+                custom_env(
+                    "ANDA_AUTO_ENV",
+                    "auto",
+                    "Always needed by the runtime",
+                    true,
+                ),
+                custom_env(
+                    "ANDA_OPTIONAL_ENV",
+                    "optional",
+                    "Only needed for optional operations",
+                    false,
+                ),
+            ],
+            None,
+        );
+
+        let collected = tool.collect_shell_env_vars(&[]);
+
+        assert_eq!(collected.len(), 1);
+        assert_eq!(
+            collected.get("ANDA_AUTO_ENV").map(String::as_str),
+            Some("auto")
+        );
+        assert!(!collected.contains_key("ANDA_OPTIONAL_ENV"));
+    }
+
+    #[test]
+    fn collect_shell_env_vars_uses_requested_custom_envs() {
+        let tool = ShellTool::new_with_custom_envs(
+            Arc::new(TestRuntime::new("sandbox")),
+            vec![
+                custom_env(
+                    "ANDA_AUTO_ENV",
+                    "auto",
+                    "Always needed by the runtime",
+                    true,
+                ),
+                custom_env(
+                    " ANDA_OPTIONAL_ENV ",
+                    "optional",
+                    "Only needed for optional operations",
+                    false,
+                ),
+                custom_env("INVALID-NAME", "ignored", "Invalid key", true),
+            ],
+            None,
+        );
+
+        let collected = tool.collect_shell_env_vars(&[
+            " ANDA_OPTIONAL_ENV ".to_string(),
+            "ANDA_OPTIONAL_ENV".to_string(),
+            "INVALID-NAME".to_string(),
+            "MISSING".to_string(),
+        ]);
+
+        assert_eq!(collected.len(), 2);
+        assert_eq!(
+            collected.get("ANDA_AUTO_ENV").map(String::as_str),
+            Some("auto")
+        );
+        assert_eq!(
+            collected.get("ANDA_OPTIONAL_ENV").map(String::as_str),
+            Some("optional")
+        );
+    }
+
+    #[test]
+    fn definition_describes_custom_envs_without_exposing_values() {
+        let tool = ShellTool::new_with_custom_envs(
+            Arc::new(TestRuntime::new("sandbox")),
+            vec![
+                custom_env("ANDA_AUTO_ENV", "auto-secret", "Always available", true),
+                custom_env(
+                    "ANDA_OPTIONAL_ENV",
+                    "optional-secret",
+                    "Request this for optional operations",
+                    false,
+                ),
+                custom_env("INVALID-NAME", "ignored-secret", "Invalid key", true),
+            ],
+            None,
+        );
+
+        let description = <ShellTool as Tool<BaseCtx>>::description(&tool);
+        assert!(description.contains("ANDA_AUTO_ENV"));
+        assert!(description.contains("Always available"));
+        assert!(description.contains("auto-injected"));
+        assert!(description.contains("ANDA_OPTIONAL_ENV"));
+        assert!(description.contains("Request this for optional operations"));
+        assert!(description.contains("available via env_keys"));
+        assert!(!description.contains("auto-secret"));
+        assert!(!description.contains("optional-secret"));
+        assert!(!description.contains("INVALID-NAME"));
+
+        let definition = <ShellTool as Tool<BaseCtx>>::definition(&tool);
+        let env_keys_description = definition.parameters["properties"]["env_keys"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(env_keys_description.contains("ANDA_OPTIONAL_ENV"));
+        assert!(env_keys_description.contains("Request this for optional operations"));
+        assert!(!env_keys_description.contains("optional-secret"));
+    }
+
+    #[test]
+    fn custom_description_keeps_custom_env_metadata() {
+        let tool = ShellTool::new_with_custom_envs(
+            Arc::new(TestRuntime::new("sandbox")),
+            vec![custom_env(
+                "ANDA_OPTIONAL_ENV",
+                "optional-secret",
+                "Request this for optional operations",
+                false,
+            )],
+            None,
+        )
+        .with_description("Run shell commands for tests".to_string());
+
+        let description = <ShellTool as Tool<BaseCtx>>::description(&tool);
+        assert!(description.starts_with("Run shell commands for tests"));
+        assert!(description.contains("ANDA_OPTIONAL_ENV"));
+        assert!(description.contains("Request this for optional operations"));
+        assert!(!description.contains("optional-secret"));
     }
 }
