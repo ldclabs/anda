@@ -165,17 +165,9 @@ impl Store {
     ) -> Result<(bytes::Bytes, ObjectMeta), BoxError> {
         let path = path_join(namespace, path);
         let res = self.store.get_opts(&path, Default::default()).await?;
-        let data = match res.payload {
-            object_store::GetResultPayload::Stream(mut stream) => {
-                let mut buf = bytes::BytesMut::new();
-                while let Some(data) = stream.try_next().await? {
-                    buf.extend_from_slice(&data);
-                }
-                buf.freeze() // Convert to immutable Bytes
-            }
-            _ => return Err("StoreFeatures: unexpected payload from get_opts".into()),
-        };
-        Ok((data, res.meta))
+        let meta = res.meta.clone();
+        let data = res.bytes().await?;
+        Ok((data, meta))
     }
 
     /// Lists objects with optional namespace-relative prefix and offset filters.
