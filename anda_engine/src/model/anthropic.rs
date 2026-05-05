@@ -127,7 +127,7 @@ impl CompletionModel {
     /// * `model` - Model identifier string
     pub fn new(client: Client, model: &str) -> Self {
         let default_request = types::CreateMessageParams {
-            max_tokens: 65535,
+            max_tokens: 64000,
             ..Default::default()
         };
         Self {
