@@ -6,7 +6,7 @@ use std::{
     borrow::Cow,
     collections::HashMap,
     path::{Path, PathBuf},
-    process::Stdio,
+    process::{ExitStatus, Output, Stdio},
 };
 
 use super::{ExecArgs, ExecOutput, Executor, ShellToolHook, join_current_dir};
@@ -57,7 +57,7 @@ impl NativeRuntime {
 #[async_trait]
 impl Executor for NativeRuntime {
     fn name(&self) -> &str {
-        "native"
+        "native_shell"
     }
 
     fn workspace(&self) -> &PathBuf {
@@ -130,7 +130,16 @@ impl Executor for NativeRuntime {
 
         let task_id = format!("{}:{}", self.name(), Xid::new());
         let temp_dir = self.temp_dir();
-        let exec_output = ExecOutput::from_output(pid, None, temp_dir).await;
+        let exec_output = ExecOutput::from_output(
+            pid,
+            Some(Output {
+                status: ExitStatus::default(),
+                stdout: format!("Background process started with task ID {task_id}").into_bytes(),
+                stderr: Vec::new(),
+            }),
+            temp_dir,
+        )
+        .await;
         let json_hook = ctx.get_state::<DynToolJsonHook>();
         if let Some(hook) = &json_hook {
             hook.on_background_start(&ctx, &task_id, json!(&input))
@@ -275,7 +284,7 @@ mod tests {
     fn new_initializes_paths_and_shell() {
         let runtime = NativeRuntime::new(PathBuf::from("/home/anda-native-runtime-tests"));
 
-        assert_eq!(runtime.name(), "native");
+        assert_eq!(runtime.name(), "native_shell");
         assert_eq!(
             runtime.workspace(),
             &PathBuf::from("/home/anda-native-runtime-tests")
@@ -363,9 +372,9 @@ mod tests {
             .unwrap();
 
         assert!(output.process_id.is_some());
-        assert_eq!(output.exit_status, None);
-        assert_eq!(output.stdout, None);
-        assert_eq!(output.stderr, None);
+        assert!(output.exit_status.is_some());
+        assert!(output.stdout.is_some());
+        assert!(output.stderr.is_none());
 
         let (
             task_id,
@@ -378,7 +387,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert!(task_id.contains("native"));
+        assert!(task_id.contains("native_shell"));
         assert_eq!(hook_output.process_id, output.process_id);
         assert_eq!(hook_output.stdout.as_deref().map(str::trim), Some("bg-out"));
         assert_eq!(hook_output.stderr.as_deref().map(str::trim), Some("bg-err"));

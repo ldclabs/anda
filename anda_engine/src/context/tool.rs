@@ -21,25 +21,18 @@ pub(crate) fn is_tools_select_name(name: &str) -> bool {
 pub struct ToolsSearchArgs {
     /// Search terms, or `*` to enumerate every available callable name.
     pub query: String,
-    /// Maximum number of results to return. `0` means all.
+    /// Maximum number of results to return. Defaults to `10`.
     #[serde(default)]
     pub limit: usize,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct ToolsSearchOutput {
+pub struct ToolsOutput {
     /// Matching callable names and descriptions.
-    pub tools: Vec<ToolsSearchItem>,
+    pub tools: Vec<FunctionDefinition>, // tool 只要出现在上下文即可能被调用，不一定要求在请求的 tools 列表中，所以这里返回完整定义，防止大模型瞎编请求参数。
     /// Total number of callables to the current model turn.
+    #[serde(default)]
     pub total_tools: usize,
-}
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct ToolsSearchItem {
-    /// Callable name to pass back into `tools_select` or a direct tool call.
-    pub name: String,
-    /// Short description exposed to the model.
-    pub description: String,
 }
 
 /// Searches the callable surface currently available to the model.
@@ -60,23 +53,13 @@ impl ToolsSearch {
         Self { tokenizer }
     }
 
-    pub fn search(
-        &self,
-        candidates: &[FunctionDefinition],
-        args: &ToolsSearchArgs,
-    ) -> ToolsSearchOutput {
+    pub fn search(&self, candidates: &[FunctionDefinition], args: &ToolsSearchArgs) -> ToolsOutput {
         let normalized_query = args.query.trim().to_lowercase();
-        let tools: Vec<ToolsSearchItem> = candidates
-            .iter()
-            .map(|def| ToolsSearchItem {
-                name: def.name.clone(),
-                description: def.description.clone(),
-            })
-            .collect();
+        let tools: Vec<FunctionDefinition> = candidates.iter().cloned().collect();
 
         let total_tools = tools.len();
         if normalized_query == "*" {
-            return ToolsSearchOutput { tools, total_tools };
+            return ToolsOutput { tools, total_tools };
         }
 
         let normalized_tokens: Vec<(String, usize)> =
@@ -84,11 +67,11 @@ impl ToolsSearch {
                 .into_iter()
                 .collect();
 
-        let mut tools = rank_search_items(tools, &normalized_query, &normalized_tokens, false);
-        if args.limit > 0 {
-            tools.truncate(args.limit);
-        }
-        ToolsSearchOutput { tools, total_tools }
+        let mut tools_name =
+            rank_search_items(&tools, &normalized_query, &normalized_tokens, false);
+        tools_name.truncate(if args.limit == 0 { 10 } else { args.limit });
+        let tools = select_requested_definitions(tools, &tools_name);
+        ToolsOutput { tools, total_tools }
     }
 }
 
@@ -116,8 +99,8 @@ impl Agent<AgentCtx> for ToolsSearch {
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Maximum number of matches to return (default: 0, all matching tools).",
-                        "default": 0,
+                        "description": "Maximum number of matches to return. Defaults to `10`.",
+                        "default": 10,
                         "minimum": 0
                     }
                 },
@@ -147,7 +130,7 @@ impl Agent<AgentCtx> for ToolsSearch {
         let definitions = ctx.definitions(None).await;
         if args.query.trim().is_empty() || definitions.is_empty() {
             return Ok(AgentOutput {
-                content: serde_json::to_string(&ToolsSearchOutput {
+                content: serde_json::to_string(&ToolsOutput {
                     tools: Vec::new(),
                     total_tools: definitions.len(),
                 })?,
@@ -170,15 +153,9 @@ pub struct ToolsSelectArgs {
     /// Natural-language intent used to select tools when exact names are unknown.
     #[serde(default)]
     pub query: String,
-    /// Maximum number of resolved definitions to load. `0` lets the selector choose a bounded set.
+    /// Maximum number of resolved definitions to load. Defaults to `5`, and is capped at `16` to prevent overloading the next model turn.
     #[serde(default)]
     pub limit: usize,
-}
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct ToolsSelectOutput {
-    /// Resolved function definitions that should be available to the next model turn.
-    pub tools: Vec<FunctionDefinition>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -219,41 +196,29 @@ impl ToolsSelect {
         let limit = if args.limit > 0 {
             args.limit.min(MAX_SELECTOR_LIMIT)
         } else {
-            MAX_SELECTOR_LIMIT / 2
+            5
         };
 
-        let items: Vec<ToolsSearchItem> = definitions
-            .iter()
-            .map(|def| ToolsSearchItem {
-                name: def.name.clone(),
-                description: def.description.clone(),
-            })
-            .collect();
-
-        let candidates =
-            self.collect_query_candidates(items, &normalized_query, MAX_SELECTOR_CANDIDATE_LIMIT);
+        let mut candidates = self.collect_query_candidates(
+            &definitions,
+            &normalized_query,
+            MAX_SELECTOR_CANDIDATE_LIMIT,
+        );
 
         if candidates.is_empty() {
             return Vec::new();
         }
 
         if normalized_query.len() <= 3 {
-            let names: Vec<String> = candidates
-                .into_iter()
-                .take(limit)
-                .map(|item| item.name)
-                .collect();
-            return select_requested_definitions(definitions, &names);
+            candidates.truncate(limit);
+            return select_requested_definitions(definitions, &candidates);
         }
 
         let mut requested =
-            select_requested_names_with_model(ctx, &candidates, &normalized_query, limit).await;
+            select_requested_names_with_model(ctx, &definitions, &normalized_query, limit).await;
         if requested.is_empty() {
-            requested = candidates
-                .iter()
-                .take(limit)
-                .map(|item| item.name.clone())
-                .collect();
+            candidates.truncate(limit);
+            requested = candidates;
         }
 
         select_requested_definitions(definitions, &requested)
@@ -261,22 +226,28 @@ impl ToolsSelect {
 
     fn collect_query_candidates(
         &self,
-        mut items: Vec<ToolsSearchItem>,
+        items: &[FunctionDefinition],
         query: &str,
         candidate_limit: usize,
-    ) -> Vec<ToolsSearchItem> {
-        if !query.is_empty() && query != "*" {
+    ) -> Vec<String> {
+        let mut rt = if !query.is_empty() && query != "*" {
             // (lowercase token, weight)
             let normalized_tokens: Vec<(String, usize)> =
                 collect_tokens(&mut self.tokenizer.clone(), query, None)
                     .into_iter()
                     .collect();
 
-            items = rank_search_items(items, query, &normalized_tokens, true);
-        }
+            rank_search_items(items, query, &normalized_tokens, true)
+        } else {
+            items
+                .iter()
+                .take(candidate_limit)
+                .map(|item| item.name.clone())
+                .collect::<Vec<_>>()
+        };
 
-        items.truncate(candidate_limit);
-        items
+        rt.truncate(candidate_limit);
+        rt
     }
 }
 
@@ -313,8 +284,8 @@ impl Agent<AgentCtx> for ToolsSelect {
                     "limit": {
                         "type": "integer",
                         "minimum": 0,
-                        "default": 0,
-                        "description": "Maximum number of resolved callables to inject into the next turn. `0` lets the selector choose a bounded set."
+                        "default": 5,
+                        "description": "Maximum number of resolved callables to inject into the next turn. Defaults to `5`, and is capped at `16`."
                     }
                 },
                 "required": [],
@@ -348,6 +319,7 @@ impl Agent<AgentCtx> for ToolsSelect {
         }
 
         let definitions = ctx.definitions(None).await;
+        let total_tools = definitions.len();
         let tool_definitions = if !args.tools.is_empty() {
             select_requested_definitions(definitions, &args.tools)
         } else {
@@ -356,8 +328,9 @@ impl Agent<AgentCtx> for ToolsSelect {
         };
 
         Ok(AgentOutput {
-            content: serde_json::to_string(&ToolsSelectOutput {
+            content: serde_json::to_string(&ToolsOutput {
                 tools: tool_definitions,
+                total_tools,
             })?,
             ..Default::default()
         })
@@ -366,7 +339,7 @@ impl Agent<AgentCtx> for ToolsSelect {
 
 async fn select_requested_names_with_model(
     ctx: &AgentCtx,
-    candidates: &[ToolsSearchItem],
+    candidates: &[FunctionDefinition],
     query: &str,
     limit: usize,
 ) -> Vec<String> {
@@ -471,12 +444,12 @@ const TOKEN_NAME_MATCH_WEIGHT: usize = 100;
 const TOKEN_DESCRIPTION_MATCH_WEIGHT: usize = 10;
 
 fn rank_search_items(
-    items: Vec<ToolsSearchItem>,
+    items: &[FunctionDefinition],
     normalized_query: &str,
     normalized_tokens: &[(String, usize)],
     fallback: bool,
-) -> Vec<ToolsSearchItem> {
-    let mut candidates: Vec<(bool, usize, String, ToolsSearchItem)> = Vec::new();
+) -> Vec<String> {
+    let mut candidates: Vec<(bool, usize, String)> = Vec::new();
     for item in items {
         let normalized_name = item
             .name
@@ -508,9 +481,9 @@ fn rank_search_items(
         }
 
         if score > 0 {
-            candidates.push((exact_name_match, score, normalized_name, item));
+            candidates.push((exact_name_match, score, normalized_name));
         } else if fallback {
-            candidates.push((false, 0, normalized_name, item));
+            candidates.push((false, 0, normalized_name));
         }
     }
 
@@ -520,7 +493,7 @@ fn rank_search_items(
             .then_with(|| a.2.cmp(&b.2))
     });
 
-    candidates.into_iter().map(|(_, _, _, item)| item).collect()
+    candidates.into_iter().map(|(_, _, name)| name).collect()
 }
 
 fn select_requested_definitions(
@@ -535,7 +508,6 @@ fn select_requested_definitions(
     }
 
     let mut seen_requests = BTreeSet::new();
-    let mut seen_definitions = BTreeSet::new();
     let mut selected = Vec::new();
 
     for name in requested {
@@ -544,10 +516,8 @@ fn select_requested_definitions(
             continue;
         }
 
-        if let Some(def) = index.get(&lookup)
-            && seen_definitions.insert(def.name.clone())
-        {
-            selected.push(def.clone());
+        if let Some(def) = index.remove(&lookup) {
+            selected.push(def);
         }
     }
 
@@ -712,7 +682,7 @@ mod tests {
         }
     }
 
-    async fn run_search(ctx: AgentCtx, args: ToolsSearchArgs) -> ToolsSearchOutput {
+    async fn run_search(ctx: AgentCtx, args: ToolsSearchArgs) -> ToolsOutput {
         let output = ToolsSearch::new()
             .run(ctx, serde_json::to_string(&args).unwrap(), Vec::new())
             .await
@@ -720,7 +690,7 @@ mod tests {
         serde_json::from_str(&output.content).unwrap()
     }
 
-    async fn run_select(ctx: AgentCtx, args: ToolsSelectArgs) -> ToolsSelectOutput {
+    async fn run_select(ctx: AgentCtx, args: ToolsSelectArgs) -> ToolsOutput {
         let output = ToolsSelect::new()
             .run(ctx, serde_json::to_string(&args).unwrap(), Vec::new())
             .await

@@ -49,7 +49,7 @@ use std::{
 use super::{
     base::BaseCtx,
     engine::RemoteEngines,
-    tool::{ToolsSelectOutput, is_tools_select_name},
+    tool::{ToolsOutput, is_tools_select_name},
 };
 use crate::{
     model::{Model, Models},
@@ -1247,7 +1247,7 @@ impl CompletionRunner {
                                     (Some(tool), None)
                                 }
                                 Err(err) => {
-                                    // 工具调用失败了，但我们不一定要因此终止整个对话流程，可以让 LLM 尝试纠正错误并继续对话
+                                    // 工具调用失败了，但我们不能终止整个对话流程，可以让 LLM 尝试纠正错误并继续对话
                                     {
                                         tool.result = Some(ToolOutput {
                                             output: json!({ "error": format!(
@@ -1295,7 +1295,19 @@ impl CompletionRunner {
                                     tool.result = Some(res.into_tool_output());
                                     (Some(tool), None)
                                 }
-                                Err(err) => (None, Some(err.to_string())),
+                                Err(err) => {
+                                    // agent 调用失败了，但我们不能终止整个对话流程，可以让 LLM 尝试纠正错误并继续对话
+                                    {
+                                        tool.result = Some(ToolOutput {
+                                            output: json!({ "error": format!(
+                                                "agent run failed: {}",
+                                                err
+                                            )}),
+                                            ..Default::default()
+                                        });
+                                        (Some(tool), None)
+                                    }
+                                }
                             }
                         }));
                     } else {
@@ -1334,7 +1346,7 @@ impl CompletionRunner {
                             self.accumulate(&res.usage);
                             if is_tools_select_name(&tool.name) {
                                 // 从模型输出或工具调用结果中获取实际被选中的工具定义，传递给下一轮模型调用
-                                if let Ok(selected) = serde_json::from_value::<ToolsSelectOutput>(
+                                if let Ok(selected) = serde_json::from_value::<ToolsOutput>(
                                     res.output
                                         .get("content")
                                         .cloned()
