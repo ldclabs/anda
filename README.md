@@ -77,6 +77,67 @@ The Anda framework provides a command-line interface in `anda_cli` for interacti
 - [IC-TEE](https://github.com/ldclabs/ic-tee): 🔐 Make Trusted Execution Environments (TEEs) work with the Internet Computer.
 - [IC-COSE](https://github.com/ldclabs/ic-cose): ⚙️ A decentralized COnfiguration service with Signing and Encryption on the Internet Computer.
 
+## FAQ
+
+### What is Anda?
+
+Anda is a Rust-based AI agent framework featuring ICP blockchain integration and TEE (Trusted Execution Environment) support. It's designed to create a highly composable, autonomous, and perpetually memorizing network of AI agents.
+
+### Why Rust for an AI agent framework?
+
+Rust provides:
+- Memory safety without garbage collection
+- High performance for concurrent agent operations
+- Strong type system for reliable agent interfaces
+- Efficient resource management for long-running agents
+
+### How does Anda differ from LangChain or CrewAI?
+
+Anda focuses on:
+- **Web3 integration**: Permanent identity and memory via ICP blockchain
+- **Security**: Decentralized TEE for trusted execution
+- **Autonomy**: Agents can operate indefinitely with perpetual memory
+- **Composability**: Domain-specific agents that collaborate flexibly
+
+### What is ICP (Internet Computer Protocol)?
+
+ICP provides:
+- Permanent agent identity and cryptographic capabilities
+- Persistent memory storage on blockchain
+- Decentralized infrastructure for agent operations
+
+### What is dTEE (Decentralized TEE)?
+
+dTEE ensures:
+- Security: Code execution in isolated environments
+- Privacy: Data remains confidential during processing
+- Integrity: Results can be verified and trusted
+
+### How to build custom agents?
+
+Use the `anda_core` traits to:
+- Define agent behavior and capabilities
+- Implement custom tools for specific tasks
+- Configure memory and state management
+
+### How to contribute?
+
+- Enhance `anda_core` and `anda_engine`
+- Build custom agents and tools
+- Improve `anda_engine_server` HTTP implementation
+
+### Deployment options?
+
+- `anda_engine_server`: HTTP server for multiple engines
+- `anda_cli`: Command-line interface for interaction
+- Self-hosted or ICP network deployment
+
+### Help resources?
+
+- [Anda Architecture](docs/architecture.md)
+- [ICPanda DAO](https://panda.fans/)
+- GitHub Issues
+
 ## 📝 License
 
 Copyright © 2026 [LDC Labs](https://github.com/ldclabs).
