@@ -196,6 +196,14 @@ impl AgentCtx {
         )
     }
 
+    /// Clones the context with a new caller principal.
+    pub fn with_caller(&self, caller: Principal) -> Self {
+        Self {
+            base: self.base.with_caller(caller),
+            ..self.clone()
+        }
+    }
+
     /// Creates a completion runner for iterative processing of completion requests.
     pub fn completion_iter(
         self,

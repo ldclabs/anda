@@ -2,6 +2,16 @@
 
 All notable changes to the Anda project will be documented in this file.
 
+## [0.12.5] — 2026-05-11
+
+### Features
+
+- **`with_caller()` for context cloning** — `BaseCtx::with_caller(caller)` and `AgentCtx::with_caller(caller)` clone the context with a new caller principal while preserving all extensions and internal state. Useful for sub-operations that execute under a different identity.
+
+### Changed
+
+- **Background progress interval 3s → 5s** — reduces noise for long-running commands (e.g., model inference, large builds). New `NativeRuntime::background_progress_interval()` builder method allows per-runtime customization for environments that need faster or slower tick rates.
+
 ## [0.12.4] — 2026-05-11
 
 ### Features

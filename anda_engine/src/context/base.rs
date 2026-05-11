@@ -213,6 +213,17 @@ impl BaseCtx {
         }
     }
 
+    /// Clones the context with a new caller principal.
+    pub fn with_caller(&self, caller: Principal) -> Self {
+        let mut state = Extensions::default();
+        state.extend(self.state.read().clone());
+        Self {
+            caller,
+            state: Arc::new(RwLock::new(state)),
+            ..self.clone()
+        }
+    }
+
     pub fn get_state<T>(&self) -> Option<T>
     where
         T: Clone + Send + Sync + 'static,

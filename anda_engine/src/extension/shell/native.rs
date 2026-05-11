@@ -21,7 +21,7 @@ use crate::{
 };
 
 #[cfg(not(test))]
-const BACKGROUND_PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+const BACKGROUND_PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 #[cfg(test)]
 const BACKGROUND_PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 const OUTPUT_READ_CHUNK_BYTES: usize = 8192;
@@ -33,6 +33,7 @@ pub struct NativeRuntime {
     workspace: PathBuf,
     temp_dir: PathBuf,
     insecure: bool,
+    background_progress_interval: std::time::Duration,
 }
 
 impl NativeRuntime {
@@ -57,6 +58,7 @@ impl NativeRuntime {
             workspace,
             temp_dir: std::env::temp_dir(),
             insecure: false,
+            background_progress_interval: BACKGROUND_PROGRESS_INTERVAL,
         }
     }
 
@@ -67,6 +69,13 @@ impl NativeRuntime {
     pub fn insecure(self) -> Self {
         Self {
             insecure: true,
+            ..self
+        }
+    }
+
+    pub fn background_progress_interval(self, interval: std::time::Duration) -> Self {
+        Self {
+            background_progress_interval: interval,
             ..self
         }
     }
@@ -152,6 +161,7 @@ impl NativeRuntime {
 
         {
             let temp_dir = self.temp_dir.clone();
+            let background_progress_interval = self.background_progress_interval;
             tokio::spawn(async move {
                 let mut child = child;
                 let stdout = std::sync::Arc::new(TokioMutex::new(Vec::new()));
@@ -160,7 +170,7 @@ impl NativeRuntime {
                 let stderr_reader = spawn_output_reader(child.stderr.take(), stderr.clone());
                 let mut stdout_progress = ProgressStreamState::default();
                 let mut stderr_progress = ProgressStreamState::default();
-                let mut interval = tokio::time::interval(BACKGROUND_PROGRESS_INTERVAL);
+                let mut interval = tokio::time::interval(background_progress_interval);
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 interval.tick().await;
 
@@ -464,8 +474,10 @@ impl TerminalProgressState {
         let target_column = column.saturating_sub(1);
         let char_count = self.lines[self.cursor_row].chars().count();
         if target_column > char_count {
-            self.lines[self.cursor_row]
-                .extend(std::iter::repeat_n(' ', target_column.saturating_sub(char_count)));
+            self.lines[self.cursor_row].extend(std::iter::repeat_n(
+                ' ',
+                target_column.saturating_sub(char_count),
+            ));
             self.mark_dirty();
         }
         self.cursor = byte_index_for_char_column(&self.lines[self.cursor_row], target_column);
