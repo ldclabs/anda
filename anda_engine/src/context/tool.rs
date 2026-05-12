@@ -12,11 +12,6 @@ use crate::context::{AgentCtx, REMOTE_AGENT_PREFIX, REMOTE_TOOL_PREFIX, SUB_AGEN
 pub const TOOLS_SEARCH_NAME: &str = "tools_search";
 pub const TOOLS_SELECT_NAME: &str = "tools_select";
 
-/// Returns whether a callable name refers to the built-in `tools_select` agent.
-pub(crate) fn is_tools_select_name(name: &str) -> bool {
-    name.eq_ignore_ascii_case(TOOLS_SELECT_NAME)
-}
-
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ToolsSearchArgs {
     /// Search terms, or `*` to enumerate every available callable name.
@@ -97,13 +92,11 @@ impl Agent<AgentCtx> for ToolsSearch {
                     "query": {
                         "type": "string",
                         "description": "Search terms for callable tools/agents, or `*` to list every available callable name.",
-                        "minLength": 1
                     },
                     "limit": {
                         "type": "integer",
                         "description": "Maximum number of matches to return. Defaults to `10`.",
                         "default": 10,
-                        "minimum": 0
                     }
                 },
                 "required": ["query"],
@@ -273,21 +266,18 @@ impl Agent<AgentCtx> for ToolsSelect {
                 "properties": {
                     "tools": {
                         "type": "array",
-                        "minItems": 1,
                         "uniqueItems": true,
                         "items": {
                             "type": "string"
                         },
-                        "description": "Callable names to load. Use names exactly as returned by `tools_search`."
+                        "description": "Callable names to load."
                     },
                     "query": {
                         "type": "string",
-                        "minLength": 1,
-                        "description": "Natural-language intent for loading relevant callables when exact names are unknown. Prefer this over `tools_search` + `tools_select` when you want direct intent-based selection."
+                        "description": "Natural-language intent for loading relevant callables when exact names are unknown."
                     },
                     "limit": {
                         "type": "integer",
-                        "minimum": 0,
                         "default": 5,
                         "description": "Maximum number of resolved callables to inject into the next turn. Defaults to `5`, and is capped at `16`."
                     }
@@ -341,19 +331,35 @@ impl Agent<AgentCtx> for ToolsSelect {
     }
 }
 
+#[derive(Debug, Serialize)]
+struct ToolItemRef<'a> {
+    pub name: &'a str,
+    pub description: &'a str,
+}
+
+impl<'a> From<&'a FunctionDefinition> for ToolItemRef<'a> {
+    fn from(def: &'a FunctionDefinition) -> Self {
+        Self {
+            name: &def.name,
+            description: &def.description,
+        }
+    }
+}
+
 async fn select_requested_names_with_model(
     ctx: &AgentCtx,
     candidates: &[FunctionDefinition],
     query: &str,
     limit: usize,
 ) -> Vec<String> {
+    let tools = candidates.iter().map(ToolItemRef::from).collect::<Vec<_>>();
     let req = CompletionRequest {
         instructions: "You are selecting callable tools or agents for the next model turn. Choose only from the provided candidates. Prefer the smallest set that can plausibly help with the user intent. Return exact candidate names only. Never invent names. If no candidate is relevant, return an empty list.".to_string(),
         prompt: format!(
             "# User intent:\n{:?}\n\n---\n\n# Task:\n\nSelect up to {} callable names from the candidate list below. Return JSON only.\n\nCandidate callables:\n{}",
             query,
             limit,
-            serde_json::to_string(candidates).unwrap_or_default()
+            serde_json::to_string(&tools).unwrap_or_default()
         ),
         output_schema: Some(json!({
             "type": "object",
@@ -710,39 +716,20 @@ mod tests {
     fn tools_search_and_tools_select_definitions_constrain_inputs() {
         let search_definition = ToolsSearch::new().definition();
         assert_eq!(
-            search_definition.parameters["properties"]["query"]["minLength"],
-            json!(1)
-        );
-        assert_eq!(
             search_definition.parameters["additionalProperties"],
             json!(false)
         );
 
         let select_definition = ToolsSelect::new().definition();
         assert_eq!(
-            select_definition.parameters["properties"]["tools"]["minItems"],
-            json!(1)
-        );
-        assert_eq!(
             select_definition.parameters["properties"]["tools"]["uniqueItems"],
             json!(true)
-        );
-        assert_eq!(
-            select_definition.parameters["properties"]["query"]["minLength"],
-            json!(1)
         );
         assert_eq!(select_definition.parameters["required"], json!([]));
         assert_eq!(
             select_definition.parameters["additionalProperties"],
             json!(false)
         );
-    }
-
-    #[test]
-    fn tools_select_name_matches_prefixed_agent_calls() {
-        assert!(is_tools_select_name("tools_select"));
-        assert!(is_tools_select_name("Tools_Select"));
-        assert!(!is_tools_select_name("tools_search"));
     }
 
     #[tokio::test(flavor = "current_thread")]

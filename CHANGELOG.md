@@ -2,6 +2,24 @@
 
 All notable changes to the Anda project will be documented in this file.
 
+## [0.12.6] — 2026-05-12
+
+### Removed
+
+- **`CompletionRunner` tools_select auto-loading** — the completion loop no longer parses `tools_select` results to automatically inject selected tool definitions into the next turn. Tool selection/loading is now handled externally by the calling context, simplifying the runner's responsibility and removing ~25 lines of specialized handling code.
+- **`is_tools_select_name()`** helper removed — no longer needed after the above simplification.
+- **ToolsSelect/ToolsSearch integration tests** — `ToolsSelectFlowCompleter`, `ToolsSelectQueryFlowCompleter`, and `ToolSelectorCompleter` (~280 lines of test infrastructure) removed alongside the auto-loading behavior they tested.
+
+### Changed
+
+- **Relaxed ToolsSelect/ToolsSearch parameter constraints** — `minLength`, `minItems`, and `minimum` constraints removed from JSON schemas. These validations now happen at the implementation level, giving models more flexibility in parameter usage.
+- **Optimized `select_requested_names_with_model` serialization** — new `ToolItemRef` struct serializes only `name` + `description` when passing candidates to the selector model, instead of full `FunctionDefinition` (which includes large parameter schemas). Reduces token usage.
+
+### Added
+
+- **`local_date_hour(now_ms: u64) -> Option<String>`** — converts a Unix millisecond timestamp to a local datetime string in `"YYYY-MM-DD HH(AM/PM) ±TZ"` format.
+- **Test coverage for `lib.rs` utilities** — `rand_number`, `rfc3339_datetime`, `json_set_unix_ms_timestamp`, `json_convert_rfc3339_timestamp`, and `local_date_hour` now have comprehensive tests.
+
 ## [0.12.5] — 2026-05-11
 
 ### Features
