@@ -169,9 +169,7 @@ impl Models {
         let models = Self::default();
         for config in configs {
             if let Ok(model) = config.model(http_client.clone()) {
-                for label in &model.labels {
-                    models.set(label.clone(), model.clone());
-                }
+                models.inner_set(model.labels.clone(), model);
             }
         }
         models
@@ -179,7 +177,7 @@ impl Models {
 
     /// Returns whether a label exists in the direct lookup table.
     pub fn contains(&self, label: &str) -> bool {
-        self.models.load().contains_key(label)
+        self.models.load().contains_key(&label.to_ascii_lowercase())
     }
 
     pub fn model_names(&self) -> BTreeSet<String> {
@@ -213,12 +211,13 @@ impl Models {
         self.inner_set(vec![label], model);
     }
 
-    fn inner_set(&self, labels: Vec<String>, model: Model) {
+    fn inner_set(&self, mut labels: Vec<String>, model: Model) {
         if self.model.load().is_none() {
             self.model.store(Arc::new(Some(model.clone())));
         }
 
         let model_name = model.model_name();
+        labels.push(model_name.to_ascii_lowercase());
         let mut models = self.models.load().as_ref().clone();
         for mut label in labels {
             label.make_ascii_lowercase();
@@ -249,7 +248,7 @@ impl Models {
     pub fn get(&self, label: &str) -> Option<Model> {
         self.models
             .load()
-            .get(label)
+            .get(&label.to_ascii_lowercase())
             .and_then(|v| v.last().cloned())
     }
 
@@ -284,7 +283,7 @@ impl Models {
         if label.is_empty() {
             return self.get_model();
         }
-        self.get(label)
+        self.get(&label.to_ascii_lowercase())
             .or_else(|| self.fallback_model())
             .or_else(|| {
                 self.models
@@ -533,7 +532,7 @@ mod tests {
                 .model_name(),
             "primary"
         );
-        assert!(models.get("primary").is_none());
+        assert!(models.get("primary").is_some());
         assert!(models.fallback_model().is_none());
     }
 

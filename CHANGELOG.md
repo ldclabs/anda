@@ -2,6 +2,13 @@
 
 All notable changes to the Anda project will be documented in this file.
 
+## [0.12.7] — 2026-05-15
+
+### Changed
+
+- **Case-insensitive model label lookup** — `Models::get()`, `Models::contains()`, and `Models::resolve()` now normalize labels with `to_ascii_lowercase()` before lookup. Labels are stored lowercase in `inner_set`. This means `get("GPT-4")` and `get("gpt-4")` resolve to the same model.
+- **Model names auto-registered as labels** — `inner_set()` now appends `model_name.to_ascii_lowercase()` to the label set. A model with `model_name = "primary"` is now findable via `get("primary")`, removing the need for manual label aliasing.
+
 ## [0.12.6] — 2026-05-12
 
 ### Removed
