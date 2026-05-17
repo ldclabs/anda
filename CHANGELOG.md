@@ -2,6 +2,14 @@
 
 All notable changes to the Anda project will be documented in this file.
 
+## [0.12.12] — 2026-05-17
+
+### Fixed — anda_engine v0.12.12
+
+- **OpenAI: Multi-tool-output splitting** — `to_message_input` refactored to `to_message_inputs`, now returning `Vec<MessageInput>`. When a single `Message` contains multiple `ToolOutput` content parts, each output is emitted as a separate tool-role message with its own `tool_call_id`. This fixes the case where multiple tool outputs were flattened into one message, which violated the OpenAI API contract (one tool message per call).
+- **OpenAI: Non-text content part preservation** — `MessageOutput → Message` conversion rewritten. The old `text()` filter that discarded non-text parts is replaced with `chat_completion_content_into_parts` / `chat_completion_content_part_into` / `file_data_content_part` pipeline. Image URLs, input audio, files, video URLs, and refusals now survive the round-trip conversion as proper `ContentPart` variants instead of being silently dropped.
+- **`MessageInput` now carries `name`** — `name: msg.name.clone()` is propagated to `MessageInput` during conversion.
+
 ## [0.12.11] — 2026-05-17
 
 ### Fixed — anda_engine v0.12.11

@@ -8,7 +8,7 @@
 
 use anda_core::{
     AgentOutput, BoxError, BoxPinFut, CompletionRequest, ContentPart, FunctionDefinition, Json,
-    Message, Usage as ModelUsage, part_to_data_url,
+    Message, Usage as ModelUsage, inline_data_from_data_url, part_to_data_url,
 };
 use log::{Level::Debug, log_enabled};
 use serde::{Deserialize, Serialize};
@@ -511,20 +511,6 @@ impl ChatCompletionMessageContent {
         }
     }
 
-    fn text(&self) -> String {
-        match self {
-            Self::Text(text) => text.clone(),
-            Self::Parts(parts) => parts
-                .iter()
-                .filter_map(|part| match part {
-                    ChatCompletionContentPart::Text { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n\n"),
-        }
-    }
-
     fn refusal(&self) -> Option<&str> {
         match self {
             Self::Text(_) => None,
@@ -658,17 +644,43 @@ pub struct MessageInput {
     pub function_call: Option<Function>,
 }
 
-fn to_message_input(msg: &Message) -> MessageInput {
-    let mut arr: Vec<Json> = Vec::new();
-    let mut tool_calls: Vec<ToolCallOutput> = Vec::new();
-    let mut res = MessageInput {
+fn push_message_input(
+    messages: &mut Vec<MessageInput>,
+    msg: &Message,
+    content: &mut Vec<Json>,
+    tool_calls: &mut Vec<ToolCallOutput>,
+) {
+    if content.is_empty() && tool_calls.is_empty() {
+        return;
+    }
+
+    let mut input = MessageInput {
         role: msg.role.clone(),
         content: Json::Null,
+        name: msg.name.clone(),
         ..Default::default()
     };
-    for content in msg.content.iter() {
-        match content {
-            ContentPart::Text { text } => arr.push(json!({
+    if !content.is_empty() {
+        input.content = Json::Array(std::mem::take(content));
+    }
+    if !tool_calls.is_empty() {
+        input.tool_calls = Some(std::mem::take(tool_calls));
+    }
+    messages.push(input);
+}
+
+fn tool_output_to_string(output: &Json) -> String {
+    serde_json::to_string(output).unwrap_or_default()
+}
+
+fn to_message_inputs(msg: &Message) -> Vec<MessageInput> {
+    let mut messages: Vec<MessageInput> = Vec::new();
+    let mut content: Vec<Json> = Vec::new();
+    let mut tool_calls: Vec<ToolCallOutput> = Vec::new();
+
+    for part in msg.content.iter() {
+        match part {
+            ContentPart::Text { text } => content.push(json!({
                 "type": "text",
                 "text": text,
             })),
@@ -688,29 +700,26 @@ fn to_message_input(msg: &Message) -> MessageInput {
             ContentPart::ToolOutput {
                 output, call_id, ..
             } => {
-                if msg.content.len() == 1 {
-                    res.content = serde_json::to_string(output).unwrap_or_default().into();
-                    res.tool_call_id = call_id.clone();
-                    return res;
-                }
-                arr.push(json!({
-                    "type": "text",
-                    "text": serde_json::to_string(output).unwrap_or_default(),
-                }));
-                res.tool_call_id = call_id.clone();
+                push_message_input(&mut messages, msg, &mut content, &mut tool_calls);
+                messages.push(MessageInput {
+                    role: "tool".into(),
+                    content: tool_output_to_string(output).into(),
+                    tool_call_id: call_id.clone(),
+                    ..Default::default()
+                });
             }
             ContentPart::FileData {
                 file_uri,
                 mime_type,
             } => match mime_type.clone().unwrap_or_default().as_str() {
-                mt if mt.starts_with("image") => arr.push(json!({
+                mt if mt.starts_with("image") => content.push(json!({
                     "type": "image_url",
                     "image_url":  {
                         "url": file_uri,
                     },
                 })),
                 mt if mt.starts_with("video") => {
-                    arr.push(json!({
+                    content.push(json!({
                         "type": "video_url",
                         "video_url": {
                             "url": file_uri,
@@ -718,7 +727,7 @@ fn to_message_input(msg: &Message) -> MessageInput {
                     }));
                 }
                 mt if mt.starts_with("audio") => {
-                    arr.push(json!({
+                    content.push(json!({
                         "type": "input_audio",
                         "input_audio": {
                             "data": file_uri,
@@ -726,7 +735,7 @@ fn to_message_input(msg: &Message) -> MessageInput {
                         },
                     }));
                 }
-                _ => arr.push(json!({
+                _ => content.push(json!({
                     "type": "file",
                     "file":  {
                         "file_data": file_uri,
@@ -736,7 +745,7 @@ fn to_message_input(msg: &Message) -> MessageInput {
             ContentPart::InlineData { data, mime_type } => {
                 match mime_type.as_str() {
                     mt if mt.starts_with("image") => {
-                        arr.push(json!({
+                        content.push(json!({
                             "type": "image_url",
                             "image_url": {
                                 "url": part_to_data_url(data, Some(mime_type)),
@@ -744,7 +753,7 @@ fn to_message_input(msg: &Message) -> MessageInput {
                         }));
                     }
                     mt if mt.starts_with("video") => {
-                        arr.push(json!({
+                        content.push(json!({
                             "type": "video_url",
                             "video_url": {
                                 "url": part_to_data_url(data, Some(mime_type)),
@@ -752,7 +761,7 @@ fn to_message_input(msg: &Message) -> MessageInput {
                         }));
                     }
                     mt if mt.starts_with("audio") => {
-                        arr.push(json!({
+                        content.push(json!({
                             "type": "input_audio",
                             "input_audio": {
                                 "data": part_to_data_url(data, Some(mime_type)),
@@ -760,7 +769,7 @@ fn to_message_input(msg: &Message) -> MessageInput {
                             },
                         }));
                     }
-                    _ => arr.push(json!({
+                    _ => content.push(json!({
                         "type": "file",
                         "file":  {
                             "file_data": data,
@@ -768,16 +777,11 @@ fn to_message_input(msg: &Message) -> MessageInput {
                     })),
                 };
             }
-            v => arr.push(json!(v)),
+            v => content.push(json!(v)),
         }
     }
-    if !arr.is_empty() {
-        res.content = Json::Array(arr);
-    }
-    if !tool_calls.is_empty() {
-        res.tool_calls = Some(tool_calls);
-    }
-    res
+    push_message_input(&mut messages, msg, &mut content, &mut tool_calls);
+    messages
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -869,13 +873,81 @@ impl MessageOutput {
     }
 }
 
+fn file_data_content_part(file_uri: String, mime_type: Option<String>) -> ContentPart {
+    if let Some((data, mime_type)) = inline_data_from_data_url(&file_uri) {
+        ContentPart::InlineData { mime_type, data }
+    } else {
+        ContentPart::FileData {
+            file_uri,
+            mime_type,
+        }
+    }
+}
+
+fn chat_completion_content_part_into(part: ChatCompletionContentPart) -> Option<ContentPart> {
+    match part {
+        ChatCompletionContentPart::Text { text } => Some(ContentPart::Text { text }),
+        ChatCompletionContentPart::ImageUrl { image_url } => {
+            Some(file_data_content_part(image_url.url, None))
+        }
+        ChatCompletionContentPart::InputAudio { input_audio } => {
+            let mime_type = Some(format!("audio/{}", input_audio.format));
+            Some(file_data_content_part(input_audio.data, mime_type))
+        }
+        ChatCompletionContentPart::File { file } => {
+            let FileContent {
+                file_data,
+                file_id,
+                filename,
+            } = file;
+            if let Some(file_data) = file_data {
+                Some(file_data_content_part(file_data, None))
+            } else {
+                let mut fields = Map::new();
+                if let Some(file_id) = file_id {
+                    fields.insert("file_id".into(), file_id.into());
+                }
+                if let Some(filename) = filename {
+                    fields.insert("filename".into(), filename.into());
+                }
+                if fields.is_empty() {
+                    None
+                } else {
+                    Some(ContentPart::Any(json!({
+                        "type": "file",
+                        "file": fields,
+                    })))
+                }
+            }
+        }
+        ChatCompletionContentPart::Refusal { refusal } => Some(ContentPart::Any(json!({
+            "type": "refusal",
+            "refusal": refusal,
+        }))),
+        ChatCompletionContentPart::Any(value) => Some(ContentPart::Any(value)),
+    }
+}
+
+fn chat_completion_content_into_parts(content: ChatCompletionMessageContent) -> Vec<ContentPart> {
+    match content {
+        ChatCompletionMessageContent::Text(text) => {
+            if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![ContentPart::Text { text }]
+            }
+        }
+        ChatCompletionMessageContent::Parts(parts) => parts
+            .into_iter()
+            .filter_map(chat_completion_content_part_into)
+            .collect(),
+    }
+}
+
 impl From<MessageOutput> for Message {
     fn from(msg: MessageOutput) -> Self {
         let mut content = Vec::new();
-        let text = msg.content.text();
-        if !text.is_empty() {
-            content.push(ContentPart::Text { text });
-        }
+        content.extend(chat_completion_content_into_parts(msg.content));
         if let Some(reasoning_content) = msg.reasoning_content {
             content.push(ContentPart::Reasoning {
                 text: reasoning_content,
@@ -1055,8 +1127,9 @@ impl CompletionFeaturesDyn for CompletionModel {
             let skip_raw = r.messages.len();
 
             for msg in req.chat_history {
-                let val = serde_json::to_value(to_message_input(&msg))?;
-                r.messages.push(val);
+                for input in to_message_inputs(&msg) {
+                    r.messages.push(serde_json::to_value(input)?);
+                }
             }
 
             if let Some(mut msg) = req
@@ -1064,8 +1137,9 @@ impl CompletionFeaturesDyn for CompletionModel {
                 .to_message(&rfc3339_datetime(timestamp).unwrap())
             {
                 msg.timestamp = Some(timestamp);
-                r.messages
-                    .push(serde_json::to_value(to_message_input(&msg))?);
+                for input in to_message_inputs(&msg) {
+                    r.messages.push(serde_json::to_value(input)?);
+                }
                 chat_history.push(msg);
             }
 
@@ -1081,8 +1155,9 @@ impl CompletionFeaturesDyn for CompletionModel {
                     ..Default::default()
                 };
 
-                r.messages
-                    .push(serde_json::to_value(to_message_input(&msg))?);
+                for input in to_message_inputs(&msg) {
+                    r.messages.push(serde_json::to_value(input)?);
+                }
                 chat_history.push(msg);
             }
 
@@ -1459,7 +1534,13 @@ mod tests {
             ..Default::default()
         };
 
-        let value = serde_json::to_value(to_message_input(&msg)).unwrap();
+        let values = to_message_inputs(&msg)
+            .into_iter()
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(values.len(), 1);
+        let value = &values[0];
         assert_eq!(value["role"], "assistant");
         assert_eq!(
             value["content"],
@@ -1471,6 +1552,100 @@ mod tests {
         assert_eq!(
             value["tool_calls"][0]["function"]["arguments"],
             r#"{"id":1}"#
+        );
+    }
+
+    #[test]
+    fn to_message_inputs_splits_multiple_tool_outputs() {
+        let msg = Message {
+            role: "tool".into(),
+            content: vec![
+                ContentPart::ToolOutput {
+                    name: "lookup".into(),
+                    output: json!({"temperature": 20}),
+                    call_id: Some("call_1".into()),
+                    remote_id: None,
+                },
+                ContentPart::ToolOutput {
+                    name: "lookup".into(),
+                    output: json!({"temperature": 24}),
+                    call_id: Some("call_2".into()),
+                    remote_id: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let values = to_message_inputs(&msg)
+            .into_iter()
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0]["role"], "tool");
+        assert_eq!(values[0]["tool_call_id"], "call_1");
+        assert_eq!(values[0]["content"], r#"{"temperature":20}"#);
+        assert_eq!(values[1]["role"], "tool");
+        assert_eq!(values[1]["tool_call_id"], "call_2");
+        assert_eq!(values[1]["content"], r#"{"temperature":24}"#);
+        assert!(values[0].get("tool_calls").is_none());
+        assert!(values[1].get("tool_calls").is_none());
+    }
+
+    #[test]
+    fn message_output_preserves_non_text_content_parts() {
+        let msg: Message = serde_json::from_value::<MessageOutput>(json!({
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "See attached"},
+                {"type": "image_url", "image_url": {"url": "https://example.com/image.png"}},
+                {"type": "input_audio", "input_audio": {"data": "https://example.com/audio.mp3", "format": "mp3"}},
+                {"type": "file", "file": {"file_id": "file_123", "filename": "notes.txt"}},
+                {"type": "video_url", "video_url": {"url": "https://example.com/video.mp4"}}
+            ]
+        }))
+        .unwrap()
+        .into();
+
+        assert_eq!(msg.role, "assistant");
+        assert_eq!(msg.content.len(), 5);
+        assert_eq!(
+            msg.content[0],
+            ContentPart::Text {
+                text: "See attached".into()
+            }
+        );
+        assert_eq!(
+            msg.content[1],
+            ContentPart::FileData {
+                file_uri: "https://example.com/image.png".into(),
+                mime_type: None,
+            }
+        );
+        assert_eq!(
+            msg.content[2],
+            ContentPart::FileData {
+                file_uri: "https://example.com/audio.mp3".into(),
+                mime_type: Some("audio/mp3".into()),
+            }
+        );
+        assert_eq!(
+            msg.content[3],
+            ContentPart::Any(json!({
+                "type": "file",
+                "file": {
+                    "file_id": "file_123",
+                    "filename": "notes.txt",
+                },
+            }))
+        );
+        assert_eq!(
+            msg.content[4],
+            ContentPart::Any(json!({
+                "type": "video_url",
+                "video_url": {"url": "https://example.com/video.mp4"},
+            }))
         );
     }
 
