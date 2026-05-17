@@ -176,7 +176,7 @@ impl CompletionFeaturesDyn for CompletionModel {
 
             let mut content = req.content;
             if !req.prompt.is_empty() {
-                content.push(req.prompt.into());
+                content.insert(0, req.prompt.into());
             }
             if !content.is_empty() {
                 let msg = Message {

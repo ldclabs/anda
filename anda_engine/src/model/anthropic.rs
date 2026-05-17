@@ -6,8 +6,7 @@
 //! - Response parsing and conversion to Anda's internal formats
 
 use anda_core::{
-    AgentOutput, BoxError, BoxPinFut, CompletionFeatures, CompletionRequest, Message,
-    Resource,
+    AgentOutput, BoxError, BoxPinFut, CompletionFeatures, CompletionRequest, Message, Resource,
 };
 use log::{Level::Debug, log_enabled};
 use serde_json::json;
@@ -199,7 +198,7 @@ impl CompletionFeaturesDyn for CompletionModel {
 
             let mut content = req.content;
             if !req.prompt.is_empty() {
-                content.push(req.prompt.into());
+                content.insert(0, req.prompt.into());
             }
             if !content.is_empty() {
                 let msg = Message {

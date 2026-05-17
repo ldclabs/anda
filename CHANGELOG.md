@@ -2,6 +2,14 @@
 
 All notable changes to the Anda project will be documented in this file.
 
+## [0.12.10] — 2026-05-17
+
+### Changed — anda_engine v0.12.10
+
+- **`implicit_context` on `CompletionRunner`** — new `implicit_context(&mut self, message: Message)` method stores a context message that is automatically injected into the next request's `chat_history` and consumed on use. This enables steering/follow-up messages to pass contextual information without manual request manipulation.
+- **Prompt ordering fix across all providers** — system prompt now uses `content.insert(0, req.prompt.into())` instead of `content.push()`, ensuring the prompt appears before the conversation content in all three model backends (Anthropic, Gemini, OpenAI, and OpenAI v2). This fixes cases where the prompt was appended after content instead of leading.
+- **OpenAI: `model` field fix** — `CompletionModel` now explicitly sets `r.model = self.model.clone()` on each request, fixing a bug where the model field in the cloned `default_request` was not being updated to the current model selection.
+
 ## [0.12.8] — 2026-05-16
 
 ### Changed — anda_core v0.12.1

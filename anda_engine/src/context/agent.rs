@@ -219,6 +219,7 @@ impl AgentCtx {
             artifacts: Vec::new(),
             steering_message: Vec::new(),
             follow_up_message: VecDeque::new(),
+            implicit_context: None,
             pending_tool_calls: Vec::new(),
             tools_usage: HashMap::new(),
             last_output: None,
@@ -993,6 +994,7 @@ pub struct CompletionRunner {
     artifacts: Vec<Resource>,
     steering_message: Vec<ContentPart>,
     follow_up_message: VecDeque<ContentPart>,
+    implicit_context: Option<Message>,
     pending_tool_calls: Vec<ToolCall>,
     tools_usage: HashMap<String, Usage>,
     last_output: Option<AgentOutput>,
@@ -1107,6 +1109,11 @@ impl CompletionRunner {
     /// Queue a follow-up message with multiple content parts to be processed after the agent finishes.
     pub fn follow_up_content(&mut self, content: Vec<ContentPart>) {
         self.follow_up_message.extend(content);
+    }
+
+    /// Set an implicit context message that is automatically included in the next request.
+    pub fn implicit_context(&mut self, message: Message) {
+        self.implicit_context = Some(message);
     }
 
     /// Accumulate usage from an intermediate step into the runner's total usage.
@@ -1385,6 +1392,9 @@ impl CompletionRunner {
 
         self.turns += 1;
         let mut req = self.req.clone();
+        if let Some(implicit_context) = self.implicit_context.take() {
+            req.chat_history.push(implicit_context);
+        }
 
         let label = req.model.as_ref().unwrap_or(&self.ctx.label);
         if let Some(model) = self.ctx.models.get(label) {

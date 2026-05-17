@@ -1037,6 +1037,7 @@ impl CompletionFeaturesDyn for CompletionModel {
         let model = self.model.clone();
         let client = self.client.clone();
         let mut r = self.default_request.clone();
+        r.model = self.model.clone();
 
         Box::pin(async move {
             let timestamp = unix_ms();
@@ -1070,7 +1071,7 @@ impl CompletionFeaturesDyn for CompletionModel {
 
             let mut content = req.content;
             if !req.prompt.is_empty() {
-                content.push(req.prompt.into());
+                content.insert(0, req.prompt.into());
             }
             if !content.is_empty() {
                 let msg = Message {
@@ -1241,7 +1242,7 @@ impl CompletionFeaturesDyn for CompletionModelV2 {
 
             let mut content = req.content;
             if !req.prompt.is_empty() {
-                content.push(req.prompt.into());
+                content.insert(0, req.prompt.into());
             }
             if !content.is_empty() {
                 let msg = Message {
