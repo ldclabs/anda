@@ -1106,7 +1106,6 @@ impl CompletionFeaturesDyn for CompletionModel {
     }
 
     fn completion(&self, mut req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
-        let model = self.model.clone();
         let client = self.client.clone();
         let mut r = self.default_request.clone();
         r.model = self.model.clone();
@@ -1198,21 +1197,36 @@ impl CompletionFeaturesDyn for CompletionModel {
                 log::debug!(request = val; "OpenAI completions request");
             }
 
-            let response = client.post("/chat/completions").json(&r).send().await?;
+            let response = client
+                .post("/chat/completions")
+                .json(&r)
+                .send()
+                .await
+                .map_err(|err| {
+                    format!(
+                        "Failed to send completion request, model: {}, error: {}",
+                        r.model, err
+                    )
+                })?;
             if response.status().is_success() {
-                let text = response.text().await?;
+                let text = response.text().await.map_err(|err| {
+                    format!(
+                        "Failed to read completion response, model: {}, error: {}",
+                        r.model, err
+                    )
+                })?;
                 match serde_json::from_str::<CompletionResponse>(&text) {
                     Ok(mut res) => {
                         res.parse_output();
                         if log_enabled!(Debug) {
                             log::debug!(
-                                model = model,
+                                model = r.model,
                                 request:serde = r,
                                 response:serde = res;
                                 "Completion response");
                         } else if res.maybe_failed() {
                             log::warn!(
-                                model = model,
+                                model = r.model,
                                 request:serde = r,
                                 response:serde = res;
                                 "Completion maybe failed");
@@ -1224,7 +1238,7 @@ impl CompletionFeaturesDyn for CompletionModel {
                     }
                     Err(err) => Err(format!(
                         "Invalid completion response, model: {}, error: {}, body: {}",
-                        model, err, text
+                        r.model, err, text
                     )
                     .into()),
                 }
@@ -1232,11 +1246,11 @@ impl CompletionFeaturesDyn for CompletionModel {
                 let status = response.status();
                 let msg = response.text().await?;
                 log::error!(
-                    model = model,
+                    model = r.model,
                     request:serde = r;
                     "Completion request failed: {status}, body: {msg}",
                 );
-                Err(format!("Completion failed, model: {}, error: {}", model, msg).into())
+                Err(format!("Completion failed, model: {}, error: {}", r.model, msg).into())
             }
         })
     }
@@ -1377,9 +1391,24 @@ impl CompletionFeaturesDyn for CompletionModelV2 {
                 log::debug!(request = val; "Completion request");
             }
 
-            let response = client.post("/responses").json(&r).send().await?;
+            let response = client
+                .post("/responses")
+                .json(&r)
+                .send()
+                .await
+                .map_err(|err| {
+                    format!(
+                        "Failed to send completion request, model: {}, error: {}",
+                        r.model, err
+                    )
+                })?;
             if response.status().is_success() {
-                let text = response.text().await?;
+                let text = response.text().await.map_err(|err| {
+                    format!(
+                        "Failed to read completion response, model: {}, error: {}",
+                        r.model, err
+                    )
+                })?;
                 match serde_json::from_str::<types::CompletionResponse>(&text) {
                     Ok(mut res) => {
                         res.parse_output();

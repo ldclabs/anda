@@ -241,11 +241,26 @@ impl CompletionFeaturesDyn for CompletionModel {
                 log::debug!(request = val; "Completion request");
             }
 
-            let response = client.post("/messages").json(&r).send().await?;
+            let response = client
+                .post("/messages")
+                .json(&r)
+                .send()
+                .await
+                .map_err(|err| {
+                    format!(
+                        "Failed to send completion request, model: {}, error: {}",
+                        model, err
+                    )
+                })?;
 
             r.system = None; // avoid logging tedious instructions
             if response.status().is_success() {
-                let text = response.text().await?;
+                let text = response.text().await.map_err(|err| {
+                    format!(
+                        "Failed to read completion response, model: {}, error: {}",
+                        model, err
+                    )
+                })?;
 
                 match serde_json::from_str::<types::CreateMessageResponse>(&text) {
                     Ok(res) => {

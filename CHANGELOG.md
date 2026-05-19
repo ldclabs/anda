@@ -2,6 +2,13 @@
 
 All notable changes to the Anda project will be documented in this file.
 
+## [0.12.13] — 2026-05-17
+
+### Changed — anda_engine v0.12.13
+
+- **Error messages include model name across all backends** — HTTP request send failures and response body read failures in Anthropic, Gemini, OpenAI, and OpenAI V2 backends now include the model name in the error message. Previously these relied on bare `?` propagation, yielding opaque errors like "connection refused" with no model context, making multi-model debugging difficult.
+- **OpenAI: simplified model reference** — Removed redundant local `let model = self.model.clone()`. Logging and errors now use `r.model` consistently.
+
 ## [0.12.12] — 2026-05-17
 
 ### Fixed — anda_engine v0.12.12

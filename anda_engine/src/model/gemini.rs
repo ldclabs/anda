@@ -224,11 +224,22 @@ impl CompletionFeaturesDyn for CompletionModel {
                 .post(&format!("/{}:generateContent", model))
                 .json(&r)
                 .send()
-                .await?;
+                .await
+                .map_err(|err| {
+                    format!(
+                        "Failed to send completion request, model: {}, error: {}",
+                        model, err
+                    )
+                })?;
 
             r.system_instruction = None; // avoid logging tedious instructions
             if response.status().is_success() {
-                let text = response.text().await?;
+                let text = response.text().await.map_err(|err| {
+                    format!(
+                        "Failed to read completion response, model: {}, error: {}",
+                        model, err
+                    )
+                })?;
 
                 match serde_json::from_str::<types::GenerateContentResponse>(&text) {
                     Ok(res) => {
