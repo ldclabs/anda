@@ -1412,9 +1412,6 @@ impl CompletionRunner {
         if let Some(model) = self.ctx.models.get(label) {
             self.model = model;
         }
-        if req.max_output_tokens.is_none() && self.model.max_output > 0 {
-            req.max_output_tokens = Some(self.model.max_output);
-        }
 
         let mut output = self.model.completion(req).await?;
         output.model = Some(self.model.model_name());

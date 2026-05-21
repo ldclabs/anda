@@ -3,6 +3,13 @@
 All notable changes to the Anda project will be documented in this file.
 
 
+## [0.12.17] — 2026-05-21
+
+### Changed — anda_engine v0.12.17
+
+- **Removed automatic `max_output_tokens` injection** — `CompletionRunner` no longer applies `self.model.max_output` as a default `max_output_tokens` when the request omits it. This responsibility now belongs to each provider's completion method or the caller, giving more precise control over token limits per request. Previously the runner automatically set `req.max_output_tokens = Some(self.model.max_output)` for any request without an explicit limit.
+
+
 ## [0.12.16] — 2026-05-21
 
 ### Added — anda_core v0.12.2, anda_engine v0.12.16
