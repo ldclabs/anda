@@ -485,8 +485,7 @@ impl Agent<AgentCtx> for SubAgent {
                 "properties": {
                     "prompt": {
                         "type": "string",
-                        "description": "The task for this subagent. Include the objective, relevant context, constraints, preferred workflow or deliverable, and any success criteria needed to complete the work.",
-                        "minLength": 1
+                        "description": "The task for this subagent. Include the objective, relevant context, constraints, preferred workflow or deliverable, and any success criteria needed to complete the work."
                     },
                     "session": {
                         "type": "string",
@@ -793,32 +792,27 @@ impl SubAgentManager {
                 "properties": {
                     "name": {
                         "type": "string",
-                        "description": "Unique callable subagent name. Must be lowercase snake_case, start with a letter, contain only letters, digits, or underscores, and be no longer than 64 characters. The subagent becomes callable as SA_<name>.",
-                        "pattern": "^[a-z][a-z0-9_]{0,63}$"
+                        "description": "Unique callable subagent name. Must be lowercase snake_case, start with a letter, contain only letters, digits, or underscores, and be no longer than 64 characters. The subagent becomes callable as SA_<name>."
                     },
                     "description": {
                         "type": "string",
-                        "description": "Short routing description shown when models decide whether to call this subagent. State when it should be used and what outcome it produces.",
-                        "minLength": 1
+                        "description": "Short routing description shown when models decide whether to call this subagent. State when it should be used and what outcome it produces."
                     },
                     "instructions": {
                         "type": "string",
-                        "description": "Durable system-style instructions for the subagent. Define its role, scope, workflow, constraints, decision rules, and expected output style. Write reusable guidance, not a one-off task prompt.",
-                        "minLength": 1
+                        "description": "Durable system-style instructions for the subagent. Define its role, scope, workflow, constraints, decision rules, and expected output style. Write reusable guidance, not a one-off task prompt."
                     },
                     "tools": {
                         "type": "array",
                         "items": { "type": "string" },
                         "description": "Optional whitelist of tool names the subagent may use. Include only the minimum tools it needs. Leave empty to create a no-tool subagent.",
-                        "default": [],
-                        "uniqueItems": true
+                        "default": []
                     },
                     "tags": {
                         "type": "array",
                         "items": { "type": "string" },
                         "description": "Optional list of resource tags relevant to this subagent, such as 'image', 'text', or 'audio'. Resources with matching tags are processed when the subagent is called.",
-                        "default": [],
-                        "uniqueItems": true
+                        "default": []
                     },
                     "output_schema": {
                         "type": ["object", "null"],
@@ -1125,10 +1119,6 @@ mod tests {
             json!(
                 "Run this subagent on a focused task. Leave session empty for normal blocking mode, or provide a session ID for non-blocking session mode with hook-delivered progress and final output."
             )
-        );
-        assert_eq!(
-            definition.parameters["properties"]["prompt"]["minLength"],
-            json!(1)
         );
         assert_eq!(
             definition.parameters["properties"]["session"]["default"],

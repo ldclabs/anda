@@ -369,9 +369,7 @@ impl Tool<BaseCtx> for SkillManager {
                 "properties": {
                     "name": {
                         "type": "string",
-                        "description": "Skill name in kebab-case (e.g. 'pdf-processing'). Returns the matching SKILL.md content so the agent can follow it directly.",
-                        "pattern": "^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$",
-                        "maxLength": 64
+                        "description": "Skill name in kebab-case (e.g. 'pdf-processing'). Returns the matching SKILL.md content so the agent can follow it directly."
                     }
                 },
                 "required": ["name"],
@@ -429,7 +427,6 @@ mod tests {
         assert_eq!(def.parameters["additionalProperties"], json!(false));
         assert_eq!(def.parameters["required"], json!(["name"]));
         assert!(def.parameters["properties"].get("action").is_none());
-        assert_eq!(def.parameters["properties"]["name"]["maxLength"], json!(64));
     }
 
     // -- integration: load and read --

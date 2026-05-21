@@ -3,6 +3,17 @@
 All notable changes to the Anda project will be documented in this file.
 
 
+## [0.12.18] — 2026-05-21
+
+### Changed — anda_engine v0.12.18
+
+- **Stripped non-essential JSON Schema keywords from tool definitions** — Removed `default`, `uniqueItems`, `minLength`, `minLength` (input/description), `pattern`, `maxLength`, `minimum`, and `maximum` from all tool schemas. These keywords add unnecessary strictness in a world where `required` already lists every field; some providers may also fail to handle them correctly in strict function calling mode. Affected tools:
+  - `tools_search` / `tools_select`: removed `default` and `uniqueItems`
+  - `skills_manager`: removed `pattern`, `maxLength`
+  - `list_conversations` / `search_conversations`: removed `default`, `minimum`, `maximum`
+  - `subagents_manager` / `subagent`: removed `minLength`, `uniqueItems`, `pattern`
+
+
 ## [0.12.17] — 2026-05-21
 
 ### Changed — anda_engine v0.12.17

@@ -1148,10 +1148,7 @@ impl Tool<BaseCtx> for ListConversationsTool {
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "The maximum number of conversations to return, between 1 and 100. Default is 10.",
-                        "default": 10,
-                        "minimum": 1,
-                        "maximum": 100
+                        "description": "The maximum number of conversations to return, between 1 and 100. Default is 10."
                     }
                 },
                 "required": ["cursor", "limit"],
@@ -1246,10 +1243,7 @@ impl Tool<BaseCtx> for SearchConversationsTool {
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "The maximum number of conversations to return, between 1 and 100. Default is 10.",
-                        "default": 10,
-                        "minimum": 1,
-                        "maximum": 100
+                        "description": "The maximum number of conversations to return, between 1 and 100. Default is 10."
                     }
                 },
                 "required": ["query", "limit"],

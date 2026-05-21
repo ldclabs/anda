@@ -95,8 +95,7 @@ impl Agent<AgentCtx> for ToolsSearch {
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Maximum number of matches to return. Defaults to `10`.",
-                        "default": 10,
+                        "description": "Maximum number of matches to return. Defaults to `10`."
                     }
                 },
                 "required": ["query", "limit"],
@@ -266,7 +265,6 @@ impl Agent<AgentCtx> for ToolsSelect {
                 "properties": {
                     "tools": {
                         "type": "array",
-                        "uniqueItems": true,
                         "items": {
                             "type": "string"
                         },
@@ -278,7 +276,6 @@ impl Agent<AgentCtx> for ToolsSelect {
                     },
                     "limit": {
                         "type": "integer",
-                        "default": 5,
                         "description": "Maximum number of resolved callables to inject into the next turn. Defaults to `5`, and is capped at `16`."
                     }
                 },
@@ -368,8 +365,7 @@ async fn select_requested_names_with_model(
                     "type": "array",
                     "items": {
                         "type": "string"
-                    },
-                    "uniqueItems": true
+                    }
                 }
             },
             "required": ["tools"],
@@ -727,10 +723,6 @@ mod tests {
         );
 
         let select_definition = ToolsSelect::new().definition();
-        assert_eq!(
-            select_definition.parameters["properties"]["tools"]["uniqueItems"],
-            json!(true)
-        );
         assert_eq!(
             select_definition.parameters["required"],
             json!(["tools", "query", "limit"])
