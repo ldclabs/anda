@@ -14,6 +14,8 @@
 
 use anda_core::{AgentOutput, BoxError, BoxPinFut, CONTENT_TYPE_JSON, CompletionRequest, ToolCall};
 use arc_swap::ArcSwap;
+use futures_util::StreamExt;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use std::{
@@ -495,6 +497,102 @@ pub fn request_client_builder() -> reqwest::ClientBuilder {
             headers.insert(http::header::ACCEPT, ct);
             headers
         })
+}
+
+pub(crate) async fn read_sse_json_events<T>(
+    response: reqwest::Response,
+    model: &str,
+) -> Result<Vec<T>, BoxError>
+where
+    T: DeserializeOwned,
+{
+    let mut stream = response.bytes_stream();
+    let mut pending = Vec::new();
+    let mut data = String::new();
+    let mut events = Vec::new();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|err| {
+            format!(
+                "Failed to read streaming completion response, model: {}, error: {}",
+                model, err
+            )
+        })?;
+        pending.extend_from_slice(&chunk);
+
+        while let Some(pos) = pending.iter().position(|byte| *byte == b'\n') {
+            let mut line = pending.drain(..=pos).collect::<Vec<_>>();
+            if line.last() == Some(&b'\n') {
+                line.pop();
+            }
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            handle_sse_line(&line, &mut data, &mut events, model)?;
+        }
+    }
+
+    if !pending.is_empty() {
+        let line = std::mem::take(&mut pending);
+        handle_sse_line(&line, &mut data, &mut events, model)?;
+    }
+    flush_sse_data(&mut data, &mut events, model)?;
+
+    Ok(events)
+}
+
+fn handle_sse_line<T>(
+    line: &[u8],
+    data: &mut String,
+    events: &mut Vec<T>,
+    model: &str,
+) -> Result<(), BoxError>
+where
+    T: DeserializeOwned,
+{
+    if line.is_empty() {
+        return flush_sse_data(data, events, model);
+    }
+    if line.starts_with(b":") {
+        return Ok(());
+    }
+
+    let Some(value) = line.strip_prefix(b"data:") else {
+        return Ok(());
+    };
+    let value = value.strip_prefix(b" ").unwrap_or(value);
+    let value = std::str::from_utf8(value).map_err(|err| {
+        format!(
+            "Invalid UTF-8 in streaming completion response, model: {}, error: {}",
+            model, err
+        )
+    })?;
+    if !data.is_empty() {
+        data.push('\n');
+    }
+    data.push_str(value);
+    Ok(())
+}
+
+fn flush_sse_data<T>(data: &mut String, events: &mut Vec<T>, model: &str) -> Result<(), BoxError>
+where
+    T: DeserializeOwned,
+{
+    let value = data.trim_end();
+    if value.is_empty() || value == "[DONE]" {
+        data.clear();
+        return Ok(());
+    }
+
+    let event = serde_json::from_str::<T>(value).map_err(|err| {
+        format!(
+            "Invalid streaming completion event, model: {}, error: {}, body: {}",
+            model, err, value
+        )
+    })?;
+    events.push(event);
+    data.clear();
+    Ok(())
 }
 
 #[cfg(test)]

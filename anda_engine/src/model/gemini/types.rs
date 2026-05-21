@@ -42,6 +42,10 @@ pub struct GenerateContentRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub store: Option<bool>,
 
+    /// Local SDK switch: use the streaming REST endpoint and aggregate chunks.
+    #[serde(default, skip)]
+    pub stream: bool,
+
     pub generation_config: GenerationConfig,
 }
 

@@ -9,9 +9,11 @@ use anda_core::{
     AgentOutput, BoxError, BoxPinFut, CompletionFeatures, CompletionRequest, Message, Resource,
 };
 use log::{Level::Debug, log_enabled};
-use serde_json::json;
+use reqwest::header::ACCEPT;
+use serde_json::{Value, json};
+use std::collections::BTreeMap;
 
-use super::{CompletionFeaturesDyn, request_client_builder};
+use super::{CompletionFeaturesDyn, read_sse_json_events, request_client_builder};
 use crate::{rfc3339_datetime, unix_ms};
 
 pub mod types;
@@ -144,6 +146,231 @@ impl CompletionModel {
     }
 }
 
+fn empty_usage() -> types::Usage {
+    types::Usage {
+        input_tokens: 0,
+        cache_creation: None,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+        inference_geo: None,
+        output_tokens: 0,
+        server_tool_use: None,
+        service_tier: None,
+    }
+}
+
+fn merge_usage(usage: &mut types::Usage, delta: types::Usage) {
+    let types::Usage {
+        input_tokens,
+        cache_creation,
+        cache_creation_input_tokens,
+        cache_read_input_tokens,
+        inference_geo,
+        output_tokens,
+        server_tool_use,
+        service_tier,
+    } = delta;
+
+    if input_tokens != 0 {
+        usage.input_tokens = input_tokens;
+    }
+    if cache_creation.is_some() {
+        usage.cache_creation = cache_creation;
+    }
+    if cache_creation_input_tokens != 0 {
+        usage.cache_creation_input_tokens = cache_creation_input_tokens;
+    }
+    if cache_read_input_tokens != 0 {
+        usage.cache_read_input_tokens = cache_read_input_tokens;
+    }
+    if inference_geo.is_some() {
+        usage.inference_geo = inference_geo;
+    }
+    if output_tokens != 0 {
+        usage.output_tokens = output_tokens;
+    }
+    if server_tool_use.is_some() {
+        usage.server_tool_use = server_tool_use;
+    }
+    if service_tier.is_some() {
+        usage.service_tier = service_tier;
+    }
+}
+
+fn ensure_content_block(
+    blocks: &mut Vec<Option<types::ContentBlock>>,
+    index: usize,
+) -> &mut Option<types::ContentBlock> {
+    if blocks.len() <= index {
+        blocks.resize_with(index + 1, || None);
+    }
+    &mut blocks[index]
+}
+
+fn apply_content_delta(
+    blocks: &mut Vec<Option<types::ContentBlock>>,
+    json_buffers: &mut BTreeMap<usize, String>,
+    index: usize,
+    delta: types::ContentBlockDelta,
+) {
+    match delta {
+        types::ContentBlockDelta::TextDelta { text: delta_text } => {
+            match ensure_content_block(blocks, index) {
+                Some(types::ContentBlock::Text { text, .. }) => text.push_str(&delta_text),
+                block @ None => {
+                    *block = Some(types::ContentBlock::Text {
+                        text: delta_text,
+                        cache_control: None,
+                        citations: None,
+                    });
+                }
+                _ => {}
+            }
+        }
+        types::ContentBlockDelta::InputJsonDelta { partial_json } => {
+            json_buffers
+                .entry(index)
+                .or_default()
+                .push_str(&partial_json);
+        }
+        types::ContentBlockDelta::ThinkingDelta { thinking } => {
+            match ensure_content_block(blocks, index) {
+                Some(types::ContentBlock::Thinking { thinking: text, .. }) => {
+                    text.push_str(&thinking)
+                }
+                block @ None => {
+                    *block = Some(types::ContentBlock::Thinking {
+                        thinking,
+                        signature: String::new(),
+                    });
+                }
+                _ => {}
+            }
+        }
+        types::ContentBlockDelta::SignatureDelta { signature } => {
+            match ensure_content_block(blocks, index) {
+                Some(types::ContentBlock::Thinking {
+                    signature: text, ..
+                }) => text.push_str(&signature),
+                block @ None => {
+                    *block = Some(types::ContentBlock::Thinking {
+                        thinking: String::new(),
+                        signature,
+                    });
+                }
+                _ => {}
+            }
+        }
+        types::ContentBlockDelta::CitationsDelta { citation } => {
+            if let Some(types::ContentBlock::Text { citations, .. }) =
+                ensure_content_block(blocks, index)
+            {
+                citations.get_or_insert_with(Vec::new).push(citation);
+            }
+        }
+    }
+}
+
+fn finalize_content_block(
+    blocks: &mut [Option<types::ContentBlock>],
+    json_buffers: &mut BTreeMap<usize, String>,
+    index: usize,
+) {
+    let Some(partial_json) = json_buffers.remove(&index) else {
+        return;
+    };
+    let input = serde_json::from_str::<Value>(&partial_json).unwrap_or(Value::String(partial_json));
+    if let Some(Some(
+        types::ContentBlock::ToolUse { input: target, .. }
+        | types::ContentBlock::ServerToolUse { input: target, .. },
+    )) = blocks.get_mut(index)
+    {
+        *target = input;
+    }
+}
+
+fn response_from_stream_events(
+    events: Vec<types::StreamEvent>,
+) -> Result<types::CreateMessageResponse, BoxError> {
+    let mut id = String::new();
+    let mut r#type = "message".to_string();
+    let mut role = types::Role::Assistant;
+    let mut model = String::new();
+    let mut stop_reason = None;
+    let mut stop_sequence = None;
+    let mut usage = empty_usage();
+    let mut content = Vec::<Option<types::ContentBlock>>::new();
+    let mut json_buffers = BTreeMap::<usize, String>::new();
+    let mut saw_message = false;
+
+    for event in events {
+        match event {
+            types::StreamEvent::MessageStart { message } => {
+                saw_message = true;
+                id = message.id;
+                r#type = message.r#type;
+                role = message.role;
+                model = message.model;
+                stop_reason = message.stop_reason;
+                stop_sequence = message.stop_sequence;
+                usage = message.usage;
+                content = message.content.into_iter().map(Some).collect();
+            }
+            types::StreamEvent::ContentBlockStart {
+                index,
+                content_block,
+            } => {
+                *ensure_content_block(&mut content, index) = Some(content_block);
+            }
+            types::StreamEvent::ContentBlockDelta { index, delta } => {
+                apply_content_delta(&mut content, &mut json_buffers, index, delta);
+            }
+            types::StreamEvent::ContentBlockStop { index } => {
+                finalize_content_block(&mut content, &mut json_buffers, index);
+            }
+            types::StreamEvent::MessageDelta {
+                delta,
+                usage: delta_usage,
+            } => {
+                if delta.stop_reason.is_some() {
+                    stop_reason = delta.stop_reason;
+                }
+                if delta.stop_sequence.is_some() {
+                    stop_sequence = delta.stop_sequence;
+                }
+                if let Some(delta_usage) = delta_usage {
+                    merge_usage(&mut usage, delta_usage);
+                }
+            }
+            types::StreamEvent::Error { error } => {
+                return Err(format!(
+                    "Completion stream failed, type: {}, message: {}",
+                    error.r#type, error.message
+                )
+                .into());
+            }
+            types::StreamEvent::MessageStop | types::StreamEvent::Ping => {}
+        }
+    }
+
+    if !saw_message {
+        return Err("No streamed Anthropic message".into());
+    }
+
+    Ok(types::CreateMessageResponse {
+        content: content.into_iter().flatten().collect(),
+        id,
+        container: None,
+        model,
+        role,
+        stop_reason,
+        stop_sequence,
+        stop_details: None,
+        r#type,
+        usage,
+    })
+}
+
 impl CompletionFeatures for CompletionModel {
     fn model_name(&self) -> String {
         self.model.clone()
@@ -241,57 +468,63 @@ impl CompletionFeaturesDyn for CompletionModel {
                 log::debug!(request = val; "Completion request");
             }
 
-            let response = client
-                .post("/messages")
-                .json(&r)
-                .send()
-                .await
-                .map_err(|err| {
-                    format!(
-                        "Failed to send completion request, model: {}, error: {}",
-                        model, err
-                    )
-                })?;
+            let mut request = client.post("/messages").json(&r);
+            if r.stream == Some(true) {
+                request = request.header(ACCEPT, "text/event-stream");
+            }
+            let response = request.send().await.map_err(|err| {
+                format!(
+                    "Failed to send completion request, model: {}, error: {}",
+                    model, err
+                )
+            })?;
 
             r.system = None; // avoid logging tedious instructions
             if response.status().is_success() {
-                let text = response.text().await.map_err(|err| {
-                    format!(
-                        "Failed to read completion response, model: {}, error: {}",
-                        model, err
-                    )
-                })?;
-
-                match serde_json::from_str::<types::CreateMessageResponse>(&text) {
-                    Ok(res) => {
-                        if log_enabled!(Debug) {
-                            log::debug!(
-                                model = model,
-                                request:serde = r,
-                                response:serde = res;
-                                "Completion response");
-                        } else if res.maybe_failed() {
-                            log::warn!(
-                                model = model,
-                                request:serde = r,
-                                response:serde = res;
-                                "Completion maybe failed");
-                        }
-                        if skip_raw > 0 {
-                            r.messages.drain(0..skip_raw);
-                        }
-
-                        res.try_into(
-                            r.messages.into_iter().map(|v| json!(v)).collect(),
-                            chat_history,
+                let res = if r.stream == Some(true) {
+                    let events = read_sse_json_events(response, &model).await?;
+                    response_from_stream_events(events)?
+                } else {
+                    let text = response.text().await.map_err(|err| {
+                        format!(
+                            "Failed to read completion response, model: {}, error: {}",
+                            model, err
                         )
+                    })?;
+
+                    match serde_json::from_str::<types::CreateMessageResponse>(&text) {
+                        Ok(res) => res,
+                        Err(err) => {
+                            return Err(format!(
+                                "Completion error, model: {}, error: {}, body: {}",
+                                model, err, text
+                            )
+                            .into());
+                        }
                     }
-                    Err(err) => Err(format!(
-                        "Completion error, model: {}, error: {}, body: {}",
-                        model, err, text
-                    )
-                    .into()),
+                };
+
+                if log_enabled!(Debug) {
+                    log::debug!(
+                        model = model,
+                        request:serde = r,
+                        response:serde = res;
+                        "Completion response");
+                } else if res.maybe_failed() {
+                    log::warn!(
+                        model = model,
+                        request:serde = r,
+                        response:serde = res;
+                        "Completion maybe failed");
                 }
+                if skip_raw > 0 {
+                    r.messages.drain(0..skip_raw);
+                }
+
+                res.try_into(
+                    r.messages.into_iter().map(|v| json!(v)).collect(),
+                    chat_history,
+                )
             } else {
                 let status = response.status();
                 let msg = response.text().await?;
@@ -303,5 +536,102 @@ impl CompletionFeaturesDyn for CompletionModel {
                 Err(format!("Completion failed, model: {}, error: {}", model, msg).into())
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anda_core::ContentPart;
+
+    #[test]
+    fn aggregates_anthropic_stream_events() {
+        let events = vec![
+            serde_json::from_value::<types::StreamEvent>(json!({
+                "type": "message_start",
+                "message": {
+                    "id": "msg_stream_1",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": "claude-sonnet-4-6",
+                    "stop_reason": null,
+                    "stop_sequence": null,
+                    "usage": {"input_tokens": 3, "output_tokens": 0}
+                }
+            }))
+            .unwrap(),
+            serde_json::from_value::<types::StreamEvent>(json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""}
+            }))
+            .unwrap(),
+            serde_json::from_value::<types::StreamEvent>(json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "Hi "}
+            }))
+            .unwrap(),
+            serde_json::from_value::<types::StreamEvent>(json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "there"}
+            }))
+            .unwrap(),
+            serde_json::from_value::<types::StreamEvent>(json!({
+                "type": "content_block_stop",
+                "index": 0
+            }))
+            .unwrap(),
+            serde_json::from_value::<types::StreamEvent>(json!({
+                "type": "content_block_start",
+                "index": 1,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "lookup",
+                    "input": {}
+                }
+            }))
+            .unwrap(),
+            serde_json::from_value::<types::StreamEvent>(json!({
+                "type": "content_block_delta",
+                "index": 1,
+                "delta": {"type": "input_json_delta", "partial_json": "{\"q\""}
+            }))
+            .unwrap(),
+            serde_json::from_value::<types::StreamEvent>(json!({
+                "type": "content_block_delta",
+                "index": 1,
+                "delta": {"type": "input_json_delta", "partial_json": ":\"anda\"}"}
+            }))
+            .unwrap(),
+            serde_json::from_value::<types::StreamEvent>(json!({
+                "type": "content_block_stop",
+                "index": 1
+            }))
+            .unwrap(),
+            serde_json::from_value::<types::StreamEvent>(json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": "tool_use", "stop_sequence": null},
+                "usage": {"output_tokens": 5}
+            }))
+            .unwrap(),
+            serde_json::from_value::<types::StreamEvent>(json!({"type": "message_stop"})).unwrap(),
+        ];
+
+        let response = response_from_stream_events(events).unwrap();
+        assert!(!response.maybe_failed());
+
+        let output = response.try_into(vec![], vec![]).unwrap();
+        assert_eq!(output.content, "Hi there");
+        assert_eq!(output.usage.input_tokens, 3);
+        assert_eq!(output.usage.output_tokens, 5);
+        assert!(matches!(
+            &output.chat_history[0].content[1],
+            ContentPart::ToolCall { name, args, call_id: Some(call_id) }
+                if name == "lookup" && args == &json!({"q": "anda"}) && call_id == "toolu_1"
+        ));
     }
 }

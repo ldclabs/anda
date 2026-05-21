@@ -3,6 +3,20 @@
 All notable changes to the Anda project will be documented in this file.
 
 
+## [0.12.15] — 2026-05-21
+
+### Added — anda_engine v0.12.15
+
+- **SSE streaming support across all backends** — Anthropic, Gemini, OpenAI Chat Completions, and OpenAI Responses backends now support true SSE (Server-Sent Events) streaming. Previously responses were always read as complete JSON payloads; now streaming responses are parsed and aggregated from `text/event-stream` chunks. Added generic `read_sse_json_events<T>()` in `model.rs` with proper line-buffering, UTF-8 validation, and multi-line `data:` event concatenation.
+  - **Anthropic**: `response_from_stream_events()` reconstructs `CreateMessageResponse` from stream events — handles MessageStart, ContentBlock{Start,Delta,Stop}, MessageDelta, and MessageStop. Content blocks (text, thinking, tool_use, server_tool_use) are incrementally assembled; cursor deltas accumulate non-zero fields. Streaming enabled when request `stream=true`.
+  - **Gemini**: `response_from_stream_chunks()` aggregates `:streamGenerateContent?alt=sse` SSE responses. Candidates with the same index are merged — text parts are concatenated, finish_reason/safety_ratings/citation_metadata from later chunks overwrite earlier, and non-empty fields from later chunks supersede earlier defaults.
+  - **OpenAI Chat Completions**: `chat_completion_response_from_stream_chunks()` reconstructs `CompletionResponse` from `chat.completion.chunk` SSE events. Stream delta accumulation handles: text content concatenation, content parts extension, tool call incremental assembly (id/type/function/custom), reasoning_content, refusal, function_call, and finish_reason. Tool calls are built via `ToolCallStreamBuilder` with per-index `BTreeMap` tracking.
+  - **OpenAI Responses**: `responses_response_from_stream_events()` extracts the most recent response from events — picks up `response.created`/in_progress/completed/failed/incomplete. Parses output after reconstruction.
+- All streaming backends set `Accept: text/event-stream` header and conditionally dispatch to streaming vs non-streaming code paths based on request configuration.
+- **Gemini: `stream` request flag** — Added `stream: bool` field to `GenerateContentRequest` (serde-skipped, local-only) for choosing the streaming endpoint.
+- **Unit tests**: `aggregates_anthropic_stream_events` (text + tool_use with partial JSON), `aggregates_gemini_stream_chunks` (text concatenation across chunks), `aggregates_chat_completion_stream_chunks` (text + streaming tool calls), `aggregates_responses_stream_completed_event` (response.completed extraction).
+
+
 ## [0.12.14] — 2026-05-21
 
 ### Added — anda_engine v0.12.14
