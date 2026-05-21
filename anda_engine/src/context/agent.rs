@@ -1030,6 +1030,16 @@ impl CompletionRunner {
         self.done
     }
 
+    /// Returns whether the completion is idle, meaning it has no pending tasks.
+    pub fn is_idle(&self) -> bool {
+        self.req.prompt.is_empty()
+            && self.req.content.is_empty()
+            && self.req.documents.is_empty()
+            && self.steering_message.is_empty()
+            && self.follow_up_message.is_empty()
+            && self.pending_tool_calls.is_empty()
+    }
+
     /// Returns the number of turns executed.
     pub fn turns(&self) -> usize {
         self.turns

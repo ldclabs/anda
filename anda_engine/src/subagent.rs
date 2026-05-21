@@ -816,7 +816,7 @@ impl SubAgentManager {
                     "tags": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Optional list of resource tags relevant to this subagent. Resources with matching tags are prioritized when the subagent is called.",
+                        "description": "Optional list of resource tags relevant to this subagent, such as 'image', 'text', or 'audio'. Resources with matching tags are processed when the subagent is called.",
                         "default": [],
                         "uniqueItems": true
                     },

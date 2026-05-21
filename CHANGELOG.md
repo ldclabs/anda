@@ -2,6 +2,17 @@
 
 All notable changes to the Anda project will be documented in this file.
 
+
+## [0.12.14] — 2026-05-21
+
+### Added — anda_engine v0.12.14
+
+- **`CompletionRunner::is_idle()`** — New method that reports whether the completion runner has no pending work: prompt, content, documents, steering message, follow-up message, and pending tool calls are all empty. Useful for polling-based control loops that need to detect when the agent is ready for new input.
+
+### Changed — anda_engine v0.12.14
+
+- **Subagent `tags` description refined** — Added concrete examples (`image`, `text`, `audio`) to the `tags` field description in the `subagents_manager` tool schema.
+
 ## [0.12.13] — 2026-05-19
 
 ### Changed — anda_engine v0.12.13
