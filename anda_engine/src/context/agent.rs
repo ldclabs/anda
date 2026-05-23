@@ -66,9 +66,6 @@ pub struct AgentCtx {
     /// Label of the agent.
     pub label: String,
 
-    /// Default AI model instance for completions.
-    pub model: Model,
-
     pub(crate) root: BaseCtx,
     // label -> model
     pub(crate) models: Arc<Models>,
@@ -99,7 +96,6 @@ impl AgentCtx {
             base: base.clone(),
             label: String::new(),
             root: base,
-            model: models.get_model().unwrap_or_else(Model::not_implemented),
             models,
             tools,
             agents,
@@ -118,10 +114,6 @@ impl AgentCtx {
                 .child(format!("A:{}", agent_name.to_ascii_lowercase()))?,
             label: agent_label.to_string(),
             root: self.root.clone(),
-            model: self
-                .models
-                .get(agent_label)
-                .unwrap_or_else(|| self.model.clone()),
             models: self.models.clone(),
             tools: self.tools.clone(),
             agents: self.agents.clone(),
@@ -160,10 +152,6 @@ impl AgentCtx {
             )?,
             label: agent_label.to_string(),
             root: self.root.clone(),
-            model: self
-                .models
-                .get(agent_label)
-                .unwrap_or_else(|| self.model.clone()),
             models: self.models.clone(),
             tools: self.tools.clone(),
             agents: self.agents.clone(),
@@ -206,7 +194,10 @@ impl AgentCtx {
         req: CompletionRequest,
         resources: Vec<Resource>,
     ) -> CompletionRunner {
-        let model = self.model.clone();
+        let model = self
+            .models
+            .get_model()
+            .unwrap_or_else(Model::not_implemented);
         CompletionRunner {
             ctx: self,
             req,
@@ -586,7 +577,10 @@ impl AgentContext for AgentCtx {
 
 impl CompletionFeatures for AgentCtx {
     fn model_name(&self) -> String {
-        self.model.model_name()
+        self.models
+            .get_model()
+            .unwrap_or_else(Model::not_implemented)
+            .model_name()
     }
 
     /// Executes a completion request with automatic tool call handling.

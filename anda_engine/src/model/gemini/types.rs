@@ -92,6 +92,7 @@ impl GenerateContentResponse {
         let mut output = AgentOutput {
             raw_history,
             chat_history,
+            model: self.model_version.clone(),
             usage: ModelUsage {
                 input_tokens: self.usage_metadata.prompt_token_count as u64,
                 output_tokens: (self.usage_metadata.candidates_token_count

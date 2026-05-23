@@ -398,6 +398,7 @@ impl CompletionFeaturesDyn for CompletionModel {
                 if skip_raw > 0 {
                     r.contents.drain(0..skip_raw);
                 }
+
                 res.try_into(
                     r.contents.into_iter().map(|v| json!(v)).collect(),
                     chat_history,

@@ -193,6 +193,7 @@ impl CompletionResponse {
         let mut output = AgentOutput {
             raw_history,
             chat_history,
+            model: Some(self.model.clone()),
             usage: ModelUsage {
                 input_tokens: self.usage.prompt_tokens as u64,
                 output_tokens: self.usage.completion_tokens as u64,

@@ -3,6 +3,14 @@
 All notable changes to the Anda project will be documented in this file.
 
 
+## [0.12.20] — 2026-05-21
+
+### Changed — anda_engine v0.12.20
+
+- **Removed `model` field from `AgentCtx`** — The cached default model instance is no longer stored on the context. Instead `models.get_model()` is called inline at the point of use (`completion_runner`, `model_name()`). Child and spawn agent contexts no longer need to clone the parent's model. This reduces cloning and simplifies the context lifecycle.
+- **Compaction threshold raised to 80% of context window** — `needs_compaction` now triggers at 80% (`saturating_mul(8) / 10`) instead of 50% (`saturating_div(2)`), with the minimum raised from 50,000 to 100,000 tokens. Fewer unnecessary compactions, preserving more context across turns.
+
+
 ## [0.12.19] — 2026-05-21
 
 ### Fixed — anda_core v0.12.3, anda_engine v0.12.19

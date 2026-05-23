@@ -1087,8 +1087,9 @@ pub fn needs_compaction(runner: &CompletionRunner) -> bool {
     let threshold = runner
         .model()
         .context_window
-        .saturating_div(2)
-        .clamp(50_000, 500_000) as u64;
+        .saturating_mul(8)
+        .saturating_div(10)
+        .max(100_000) as u64;
 
     current_usage.input_tokens >= threshold || runner.turns() >= MAX_TURNS_TO_COMPACT
 }
