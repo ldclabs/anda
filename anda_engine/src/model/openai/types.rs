@@ -1530,10 +1530,11 @@ pub fn message_into(msg: Message) -> Vec<MessageItem> {
             ContentPart::FileData {
                 file_uri,
                 mime_type,
-            } if mime_type
-                .as_ref()
-                .map(|v| v.starts_with("image/"))
-                .unwrap_or(false) =>
+            } if (file_uri.starts_with("data:") || file_uri.starts_with("https://"))
+                && mime_type
+                    .as_ref()
+                    .map(|v| v.starts_with("image/"))
+                    .unwrap_or(false) =>
             {
                 content.push(ContentItem::Image {
                     detail: "auto".to_string(),
@@ -1541,7 +1542,9 @@ pub fn message_into(msg: Message) -> Vec<MessageItem> {
                     file_id: None,
                 });
             }
-            ContentPart::FileData { file_uri, .. } => {
+            ContentPart::FileData { file_uri, .. }
+                if file_uri.starts_with("data:") || file_uri.starts_with("https://") =>
+            {
                 content.push(ContentItem::File {
                     file_data: None,
                     file_url: Some(file_uri),
@@ -1599,9 +1602,9 @@ pub fn message_into(msg: Message) -> Vec<MessageItem> {
                     created_by: None,
                 });
             }
-            v => content.push(ContentItem::Any(
-                serde_json::to_value(v).unwrap_or(Json::Null),
-            )),
+            v => content.push(ContentItem::Text {
+                text: serde_json::to_string(&v).unwrap_or_default(),
+            }),
         }
     }
 
@@ -2830,7 +2833,7 @@ mod tests {
                     remote_id: None,
                 },
                 ContentPart::FileData {
-                    file_uri: "http://a/b".into(),
+                    file_uri: "https://a/b".into(),
                     mime_type: None,
                 },
             ],
@@ -2915,7 +2918,7 @@ mod tests {
                     filename,
                 } => {
                     assert!(file_data.is_none());
-                    assert_eq!(file_url.as_deref(), Some("http://a/b"));
+                    assert_eq!(file_url.as_deref(), Some("https://a/b"));
                     assert!(file_id.is_none());
                     assert!(filename.is_none());
                 }
@@ -2923,6 +2926,35 @@ mod tests {
             }
         } else {
             panic!("items[4] should be Message");
+        }
+    }
+
+    #[test]
+    fn test_message_into_serializes_non_remote_file_data_as_text() {
+        let file_part = ContentPart::FileData {
+            file_uri: "file:///tmp/report.pdf".into(),
+            mime_type: Some("application/pdf".into()),
+        };
+        let items = message_into(Message {
+            role: "user".into(),
+            content: vec![file_part.clone()],
+            ..Default::default()
+        });
+
+        assert_eq!(items.len(), 1);
+        match &items[0] {
+            MessageItem::Message { role, content, .. } => {
+                assert_eq!(role, "user");
+                assert_eq!(content.len(), 1);
+                match &content[0] {
+                    ContentItem::Text { text } => {
+                        let parsed: Json = serde_json::from_str(text).unwrap();
+                        assert_eq!(parsed, serde_json::to_value(&file_part).unwrap());
+                    }
+                    _ => panic!("content[0] should be Text"),
+                }
+            }
+            _ => panic!("items[0] should be Message"),
         }
     }
 

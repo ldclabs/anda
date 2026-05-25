@@ -8,6 +8,7 @@ All notable changes to the Anda project will be documented in this file.
 ### Changed — anda_engine v0.12.21
 
 - **SubAgentManager now isolates subagent storage under `subagents/` prefix** — Previously `store_list` was called with no prefix filter (loading everything from root), and subagents were stored directly at the root level. Now both `load()` and `save()` use `store_prefix() = "subagents"` as the listing and storage path prefix, separating subagent data from other store entries. Added test verifying that a legacy agent stored at root level is not loaded by `SubAgentManager::load`.
+- **Fixed `ContentPart::FileData` conversion for non-remote URIs** — In Anthropic, Gemini, and OpenAI (both `to_message_inputs` and `message_into`), `ContentPart::FileData` now guards on `file_uri` starting with `data:` or `https://` before converting to provider-native blocks (Image, Document, File, Video, Audio). Non-remote URIs like `file://` now correctly fall back to JSON-serialized text content blocks instead of being sent as inaccessible document/file references to the API. Added tests across all four conversion paths.
 
 ## [0.12.20] — 2026-05-21
 

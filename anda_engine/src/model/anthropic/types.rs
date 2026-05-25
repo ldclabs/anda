@@ -1077,23 +1077,28 @@ impl From<ContentPart> for ContentBlock {
             ContentPart::FileData {
                 file_uri,
                 mime_type,
-            } if mime_type
-                .as_deref()
-                .map(|v| v.starts_with("image/"))
-                .unwrap_or(false) =>
+            } if (file_uri.starts_with("data:") || file_uri.starts_with("https://"))
+                && mime_type
+                    .as_deref()
+                    .map(|v| v.starts_with("image/"))
+                    .unwrap_or(false) =>
             {
                 ContentBlock::Image {
                     source: ImageSource::Url { url: file_uri },
                     cache_control: None,
                 }
             }
-            ContentPart::FileData { file_uri, .. } => ContentBlock::Document {
-                source: DocumentSource::Url { url: file_uri },
-                cache_control: None,
-                citations: None,
-                context: None,
-                title: None,
-            },
+            ContentPart::FileData { file_uri, .. }
+                if file_uri.starts_with("data:") || file_uri.starts_with("https://") =>
+            {
+                ContentBlock::Document {
+                    source: DocumentSource::Url { url: file_uri },
+                    cache_control: None,
+                    citations: None,
+                    context: None,
+                    title: None,
+                }
+            }
             ContentPart::InlineData { mime_type, data } if mime_type.starts_with("image/") => {
                 ContentBlock::Image {
                     source: ImageSource::Base64 {
@@ -1594,6 +1599,23 @@ mod tests {
                 && value["source"]["type"] == "base64"
                 && value["source"]["data"] == "not-base64"
         ));
+    }
+
+    #[test]
+    fn converts_non_remote_file_data_to_text_block() {
+        let file_part = ContentPart::FileData {
+            file_uri: "file:///tmp/report.pdf".to_string(),
+            mime_type: Some("application/pdf".to_string()),
+        };
+
+        let block: ContentBlock = file_part.clone().into();
+        match block {
+            ContentBlock::Text { text, .. } => {
+                let parsed: Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(parsed, serde_json::to_value(&file_part).unwrap());
+            }
+            _ => panic!("non-remote FileData should fall back to Text"),
+        }
     }
 
     #[test]

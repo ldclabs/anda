@@ -231,7 +231,7 @@ impl From<ContentPart> for Part {
             ContentPart::FileData {
                 mime_type,
                 file_uri,
-            } => Part {
+            } if file_uri.starts_with("data:") || file_uri.starts_with("https://") => Part {
                 data: PartKind::FileData {
                     file_uri,
                     mime_type,
@@ -282,7 +282,7 @@ impl From<ContentPart> for Part {
                     ..Default::default()
                 })
             }
-            ContentPart::Action { .. } => Part {
+            _ => Part {
                 data: PartKind::Text(serde_json::to_string(&value).unwrap_or_default()),
                 ..Default::default()
             },
@@ -1746,6 +1746,23 @@ mod tests {
 
         // let val = into_parts(json!(vec![string_value, complex_value])).unwrap();
         // assert_eq!(val, vec![content_part, content_part2]);
+    }
+
+    #[test]
+    fn test_non_remote_file_data_falls_back_to_text_part() {
+        let file_part = ContentPart::FileData {
+            file_uri: "file:///tmp/report.pdf".to_string(),
+            mime_type: Some("application/pdf".to_string()),
+        };
+
+        let part: Part = file_part.clone().into();
+        match part.data {
+            PartKind::Text(text) => {
+                let parsed: Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(parsed, serde_json::to_value(&file_part).unwrap());
+            }
+            _ => panic!("non-remote FileData should fall back to Text"),
+        }
     }
 
     #[test]

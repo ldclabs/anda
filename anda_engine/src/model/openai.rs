@@ -713,37 +713,39 @@ fn to_message_inputs(msg: &Message) -> Vec<MessageInput> {
             ContentPart::FileData {
                 file_uri,
                 mime_type,
-            } => match mime_type.clone().unwrap_or_default().as_str() {
-                mt if mt.starts_with("image") => content.push(json!({
-                    "type": "image_url",
-                    "image_url":  {
-                        "url": file_uri,
-                    },
-                })),
-                mt if mt.starts_with("video") => {
-                    content.push(json!({
-                        "type": "video_url",
-                        "video_url": {
+            } if file_uri.starts_with("data:") || file_uri.starts_with("https://") => {
+                match mime_type.clone().unwrap_or_default().as_str() {
+                    mt if mt.starts_with("image") => content.push(json!({
+                        "type": "image_url",
+                        "image_url":  {
                             "url": file_uri,
                         },
-                    }));
-                }
-                mt if mt.starts_with("audio") => {
-                    content.push(json!({
-                        "type": "input_audio",
-                        "input_audio": {
-                            "data": file_uri,
-                            "format": if mt.contains("wav") { "wav" } else { "mp3" },
+                    })),
+                    mt if mt.starts_with("video") => {
+                        content.push(json!({
+                            "type": "video_url",
+                            "video_url": {
+                                "url": file_uri,
+                            },
+                        }));
+                    }
+                    mt if mt.starts_with("audio") => {
+                        content.push(json!({
+                            "type": "input_audio",
+                            "input_audio": {
+                                "data": file_uri,
+                                "format": if mt.contains("wav") { "wav" } else { "mp3" },
+                            },
+                        }));
+                    }
+                    _ => content.push(json!({
+                        "type": "file",
+                        "file":  {
+                            "file_data": file_uri,
                         },
-                    }));
+                    })),
                 }
-                _ => content.push(json!({
-                    "type": "file",
-                    "file":  {
-                        "file_data": file_uri,
-                    },
-                })),
-            },
+            }
             ContentPart::InlineData { data, mime_type } => {
                 match mime_type.as_str() {
                     mt if mt.starts_with("image") => {
@@ -779,7 +781,10 @@ fn to_message_inputs(msg: &Message) -> Vec<MessageInput> {
                     })),
                 };
             }
-            v => content.push(json!(v)),
+            v => content.push(json!({
+                "type": "text",
+                "text": serde_json::to_string(v).unwrap_or_default(),
+            })),
         }
     }
     push_message_input(&mut messages, msg, &mut content, &mut tool_calls);
@@ -2035,6 +2040,35 @@ mod tests {
         assert_eq!(values[1]["content"], r#"{"temperature":24}"#);
         assert!(values[0].get("tool_calls").is_none());
         assert!(values[1].get("tool_calls").is_none());
+    }
+
+    #[test]
+    fn to_message_inputs_serializes_non_remote_file_data_as_text() {
+        let file_part = ContentPart::FileData {
+            file_uri: "file:///tmp/report.pdf".into(),
+            mime_type: Some("application/pdf".into()),
+        };
+        let msg = Message {
+            role: "user".into(),
+            content: vec![file_part.clone()],
+            ..Default::default()
+        };
+
+        let values = to_message_inputs(&msg)
+            .into_iter()
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0]["role"], "user");
+        assert_eq!(values[0]["content"][0]["type"], "text");
+
+        let text = values[0]["content"][0]["text"]
+            .as_str()
+            .expect("text content should be serialized");
+        let parsed: Json = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed, serde_json::to_value(&file_part).unwrap());
     }
 
     #[test]
