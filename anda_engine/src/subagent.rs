@@ -28,6 +28,7 @@ use crate::{
 const CONVERSATION_IDLE_MS: u64 = 10 * 60 * 1000; // 10 minutes
 const CONVERSATION_WAIT_BACKGROUND_TASK_MS: u64 = 60 * 60 * 1000; // 1 hour
 const MAX_TURNS_TO_COMPACT: usize = 81; // The number of turns after which the conversation history will be compacted. This is to prevent the conversation history from growing indefinitely and causing performance issues. The optimal value may depend on the typical length of conversations and the token limits of the language model.
+const SUBAGENT_STORE_PATH: &str = "subagents";
 static COMPACTION_PROMPT: &str = r#"
 Compress the current conversation into a concise continuation handoff. This is not a final answer to the user. Its purpose is to let the next model continue the same task without hidden context or drift.
 
@@ -764,9 +765,18 @@ impl SubAgentManager {
         }
     }
 
+    fn store_prefix() -> Path {
+        Path::from(SUBAGENT_STORE_PATH)
+    }
+
+    fn store_path(name: &str) -> Path {
+        Path::from(format!("{SUBAGENT_STORE_PATH}/{name}"))
+    }
+
     pub async fn load(&self, ctx: AgentCtx) -> Result<(), BoxError> {
         let offset = Path::from("");
-        if let Ok(agents) = ctx.root.store_list(None, &offset).await {
+        let prefix = Self::store_prefix();
+        if let Ok(agents) = ctx.root.store_list(Some(&prefix), &offset).await {
             for meta in agents {
                 let (data, _) = ctx.root.store_get(&meta.location).await?;
                 if let Ok(agent) = from_reader::<SubAgent, _>(&data[..]) {
@@ -789,7 +799,7 @@ impl SubAgentManager {
         self.agents.write().insert(name.clone(), agent);
 
         ctx.root
-            .store_put(&Path::from(name), PutMode::Overwrite, data.into())
+            .store_put(&Self::store_path(&name), PutMode::Overwrite, data.into())
             .await?;
         Ok(())
     }
@@ -1301,8 +1311,30 @@ mod tests {
             tool.upsert(ctx.clone(), agent).await.unwrap();
         }
 
-        let stored = ctx.store_list(None, &Path::from("")).await.unwrap();
+        let legacy_agent = SubAgent {
+            name: "legacy_agent".to_string(),
+            description: "Stored outside the subagents directory.".to_string(),
+            instructions: "This should not be loaded by SubAgentManager::load.".to_string(),
+            ..Default::default()
+        };
+        ctx.store_put(
+            &Path::from("legacy_agent"),
+            PutMode::Overwrite,
+            deterministic_cbor_into_vec(&legacy_agent).unwrap().into(),
+        )
+        .await
+        .unwrap();
+
+        let stored = ctx
+            .store_list(Some(&SubAgentManager::store_prefix()), &Path::from(""))
+            .await
+            .unwrap();
         assert_eq!(stored.len(), agents.len());
+        assert!(stored.iter().all(|meta| {
+            meta.location
+                .prefix_match(&SubAgentManager::store_prefix())
+                .is_some()
+        }));
 
         for meta in &stored {
             let (data, _) = ctx.store_get(&meta.location).await.unwrap();
@@ -1314,6 +1346,7 @@ mod tests {
         reloaded.load(ctx).await.unwrap();
 
         assert_eq!(reloaded.definitions(None).len(), agents.len());
+        assert!(reloaded.get_lowercase("legacy_agent").is_none());
 
         for expected in agents {
             let loaded = reloaded

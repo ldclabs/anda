@@ -3,6 +3,12 @@
 All notable changes to the Anda project will be documented in this file.
 
 
+## [0.12.21] — 2026-05-25
+
+### Changed — anda_engine v0.12.21
+
+- **SubAgentManager now isolates subagent storage under `subagents/` prefix** — Previously `store_list` was called with no prefix filter (loading everything from root), and subagents were stored directly at the root level. Now both `load()` and `save()` use `store_prefix() = "subagents"` as the listing and storage path prefix, separating subagent data from other store entries. Added test verifying that a legacy agent stored at root level is not loaded by `SubAgentManager::load`.
+
 ## [0.12.20] — 2026-05-21
 
 ### Changed — anda_engine v0.12.20
@@ -331,3 +337,4 @@ All notable changes to the Anda project will be documented in this file.
 - `DEFAULT_SKILL_TOOLS` expanded to include `todo`, `tools_search`, `tools_select`.
 - User name max length relaxed from 32 to 96 chars.
 - `SkillFrontmatter` gains `extra` field with `serde(flatten)` for forward compatibility.
+
