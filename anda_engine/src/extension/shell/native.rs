@@ -5,16 +5,16 @@ use serde_json::json;
 use std::{
     borrow::Cow,
     collections::{BTreeSet, HashMap},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{ExitStatus, Output, Stdio},
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
-    process::Command,
+    process::{Child, Command},
     sync::Mutex as TokioMutex,
 };
 
-use super::{ExecArgs, ExecOutput, Executor, ShellToolHook};
+use super::{ExecArgs, ExecOutput, Executor, SHELL_AUTO_BACKGROUND_SECS, ShellToolHook};
 use crate::{
     context::BaseCtx,
     hook::{DynToolJsonHook, ToolBackgroundHook, ToolHook},
@@ -24,9 +24,20 @@ use crate::{
 const BACKGROUND_PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 #[cfg(test)]
 const BACKGROUND_PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+const AUTO_BACKGROUND_AFTER: std::time::Duration =
+    std::time::Duration::from_secs(SHELL_AUTO_BACKGROUND_SECS);
 const OUTPUT_READ_CHUNK_BYTES: usize = 8192;
 
 type OutputBuffer = std::sync::Arc<TokioMutex<Vec<u8>>>;
+type OutputReaderHandle = tokio::task::JoinHandle<std::io::Result<()>>;
+
+struct RunningProcess {
+    child: Child,
+    stdout: OutputBuffer,
+    stderr: OutputBuffer,
+    stdout_reader: OutputReaderHandle,
+    stderr_reader: OutputReaderHandle,
+}
 
 /// Native runtime — full access, runs on Mac/Linux/Docker/Raspberry Pi
 pub struct NativeRuntime {
@@ -34,6 +45,7 @@ pub struct NativeRuntime {
     temp_dir: PathBuf,
     insecure: bool,
     background_progress_interval: std::time::Duration,
+    auto_background_after: std::time::Duration,
 }
 
 impl NativeRuntime {
@@ -59,6 +71,7 @@ impl NativeRuntime {
             temp_dir: std::env::temp_dir(),
             insecure: false,
             background_progress_interval: BACKGROUND_PROGRESS_INTERVAL,
+            auto_background_after: AUTO_BACKGROUND_AFTER,
         }
     }
 
@@ -76,6 +89,13 @@ impl NativeRuntime {
     pub fn background_progress_interval(self, interval: std::time::Duration) -> Self {
         Self {
             background_progress_interval: interval,
+            ..self
+        }
+    }
+
+    pub fn auto_background_after(self, interval: std::time::Duration) -> Self {
+        Self {
+            auto_background_after: interval,
             ..self
         }
     }
@@ -110,7 +130,7 @@ impl NativeRuntime {
         cmd.stderr(Stdio::piped());
         cmd.kill_on_drop(true);
 
-        let child = match cmd.spawn() {
+        let mut child = match cmd.spawn() {
             Ok(child) => child,
             Err(err) => {
                 return Ok(ExecOutput {
@@ -121,32 +141,58 @@ impl NativeRuntime {
             }
         };
         let pid = child.id();
+        let stdout = std::sync::Arc::new(TokioMutex::new(Vec::new()));
+        let stderr = std::sync::Arc::new(TokioMutex::new(Vec::new()));
+        let stdout_reader = spawn_output_reader(child.stdout.take(), stdout.clone());
+        let stderr_reader = spawn_output_reader(child.stderr.take(), stderr.clone());
+        let mut running = RunningProcess {
+            child,
+            stdout,
+            stderr,
+            stdout_reader,
+            stderr_reader,
+        };
+
         if !args.background {
-            match child.wait_with_output().await {
-                Ok(output) => {
-                    let mut exec_output =
-                        ExecOutput::from_output(pid, Some(output), &self.temp_dir).await;
-                    exec_output.workspace = Some(workspace_str);
-                    return Ok(exec_output);
+            let status = {
+                let wait = running.child.wait();
+                tokio::pin!(wait);
+                let auto_background = tokio::time::sleep(self.auto_background_after);
+                tokio::pin!(auto_background);
+
+                tokio::select! {
+                    status = &mut wait => Some(status),
+                    _ = &mut auto_background => None,
                 }
-                Err(err) => {
-                    let exec_output = ExecOutput {
-                        workspace: Some(workspace_str),
-                        process_id: pid,
-                        stderr: Some(format!("Failed to execute background process: {err}")),
-                        ..Default::default()
-                    };
-                    return Ok(exec_output);
-                }
+            };
+
+            if let Some(status) = status {
+                return Ok(finalize_process_output(
+                    pid,
+                    &workspace_str,
+                    status,
+                    running.stdout,
+                    running.stderr,
+                    running.stdout_reader,
+                    running.stderr_reader,
+                    &self.temp_dir,
+                )
+                .await);
             }
         }
 
+        let auto_started = !args.background;
         let task_id = format!("{}:{}", tool_name, Xid::new());
+        let start_message = if auto_started {
+            format!("Command is still running and was moved to background with task ID {task_id}")
+        } else {
+            format!("Background process started with task ID {task_id}")
+        };
         let exec_output = ExecOutput::from_output(
             pid,
             Some(Output {
                 status: ExitStatus::default(),
-                stdout: format!("Background process started with task ID {task_id}").into_bytes(),
+                stdout: start_message.into_bytes(),
                 stderr: Vec::new(),
             }),
             &self.temp_dir,
@@ -163,11 +209,13 @@ impl NativeRuntime {
             let temp_dir = self.temp_dir.clone();
             let background_progress_interval = self.background_progress_interval;
             tokio::spawn(async move {
-                let mut child = child;
-                let stdout = std::sync::Arc::new(TokioMutex::new(Vec::new()));
-                let stderr = std::sync::Arc::new(TokioMutex::new(Vec::new()));
-                let stdout_reader = spawn_output_reader(child.stdout.take(), stdout.clone());
-                let stderr_reader = spawn_output_reader(child.stderr.take(), stderr.clone());
+                let RunningProcess {
+                    mut child,
+                    stdout,
+                    stderr,
+                    stdout_reader,
+                    stderr_reader,
+                } = running;
                 let mut stdout_progress = ProgressStreamState::default();
                 let mut stderr_progress = ProgressStreamState::default();
                 let mut interval = tokio::time::interval(background_progress_interval);
@@ -204,42 +252,17 @@ impl NativeRuntime {
                     }
                 };
 
-                let stdout_read_error = output_reader_error(stdout_reader, "stdout").await;
-                let stderr_read_error = output_reader_error(stderr_reader, "stderr").await;
-                let stdout_bytes = std::mem::take(&mut *stdout.lock().await);
-                let mut stderr_bytes = std::mem::take(&mut *stderr.lock().await);
-                if let Some(err) = stdout_read_error {
-                    append_output_read_error(&mut stderr_bytes, err);
-                }
-                if let Some(err) = stderr_read_error {
-                    append_output_read_error(&mut stderr_bytes, err);
-                }
-
-                let exec_output = match status {
-                    Ok(status) => {
-                        let mut exec_output = ExecOutput::from_output(
-                            pid,
-                            Some(Output {
-                                status,
-                                stdout: stdout_bytes,
-                                stderr: stderr_bytes,
-                            }),
-                            &temp_dir,
-                        )
-                        .await;
-                        exec_output.workspace = Some(workspace_str);
-                        exec_output
-                    }
-                    Err(err) => {
-                        let mut error =
-                            format!("Failed to execute background process: {err}").into_bytes();
-                        if !stderr_bytes.is_empty() {
-                            error.push(b'\n');
-                            error.extend_from_slice(&stderr_bytes);
-                        }
-                        output_bytes_to_exec_output(pid, &workspace_str, stdout_bytes, error)
-                    }
-                };
+                let exec_output = finalize_process_output(
+                    pid,
+                    &workspace_str,
+                    status,
+                    stdout,
+                    stderr,
+                    stdout_reader,
+                    stderr_reader,
+                    &temp_dir,
+                )
+                .await;
 
                 emit_background_end(
                     &ctx,
@@ -621,6 +644,54 @@ where
             output.lock().await.extend_from_slice(&chunk[..len]);
         }
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finalize_process_output(
+    process_id: Option<u32>,
+    workspace: &str,
+    status: std::io::Result<ExitStatus>,
+    stdout: OutputBuffer,
+    stderr: OutputBuffer,
+    stdout_reader: OutputReaderHandle,
+    stderr_reader: OutputReaderHandle,
+    temp_dir: &Path,
+) -> ExecOutput {
+    let stdout_read_error = output_reader_error(stdout_reader, "stdout").await;
+    let stderr_read_error = output_reader_error(stderr_reader, "stderr").await;
+    let stdout_bytes = std::mem::take(&mut *stdout.lock().await);
+    let mut stderr_bytes = std::mem::take(&mut *stderr.lock().await);
+    if let Some(err) = stdout_read_error {
+        append_output_read_error(&mut stderr_bytes, err);
+    }
+    if let Some(err) = stderr_read_error {
+        append_output_read_error(&mut stderr_bytes, err);
+    }
+
+    match status {
+        Ok(status) => {
+            let mut exec_output = ExecOutput::from_output(
+                process_id,
+                Some(Output {
+                    status,
+                    stdout: stdout_bytes,
+                    stderr: stderr_bytes,
+                }),
+                temp_dir,
+            )
+            .await;
+            exec_output.workspace = Some(workspace.to_string());
+            exec_output
+        }
+        Err(err) => {
+            let mut error = format!("Failed to execute process: {err}").into_bytes();
+            if !stderr_bytes.is_empty() {
+                error.push(b'\n');
+                error.extend_from_slice(&stderr_bytes);
+            }
+            output_bytes_to_exec_output(process_id, workspace, stdout_bytes, error)
+        }
+    }
 }
 
 async fn collect_progress_output(
@@ -1213,6 +1284,63 @@ mod tests {
 
         assert!(progress_task_id.contains("shell"));
         assert_eq!(end_task_id, progress_task_id);
+        assert_eq!(hook_output.process_id, output.process_id);
+        assert!(
+            hook_output
+                .stdout
+                .as_deref()
+                .is_some_and(|stdout| stdout.contains("progress-out") && stdout.contains("done"))
+        );
+        assert!(
+            hook_output
+                .stderr
+                .as_deref()
+                .is_some_and(|stderr| stderr.contains("progress-err"))
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn execute_auto_moves_long_running_foreground_to_background() {
+        let ctx = EngineBuilder::new().mock_ctx();
+        let workspace = TestTempDir::new("anda-native-auto-background").await;
+        let (sender, receiver) = oneshot::channel();
+        let hook = ShellToolHook::new(Arc::new(TestHook::new(sender)));
+        ctx.base.set_state(hook);
+        let runtime = NativeRuntime::new(workspace.path().to_path_buf())
+            .auto_background_after(Duration::from_millis(500))
+            .background_progress_interval(Duration::from_millis(100));
+        let input = ExecArgs {
+            command: background_progress_command(&runtime),
+            ..Default::default()
+        };
+
+        let output = runtime
+            .execute(ctx.base, input.clone(), HashMap::new())
+            .await
+            .unwrap();
+
+        assert!(output.process_id.is_some());
+        assert!(output.exit_status.is_some());
+        assert!(
+            output
+                .stdout
+                .as_deref()
+                .is_some_and(|stdout| stdout.contains("moved to background"))
+        );
+        assert!(output.stderr.is_none());
+
+        let (
+            task_id,
+            ToolOutput {
+                output: hook_output,
+                ..
+            },
+        ) = tokio::time::timeout(Duration::from_secs(5), receiver)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(task_id.contains("shell"));
         assert_eq!(hook_output.process_id, output.process_id);
         assert!(
             hook_output

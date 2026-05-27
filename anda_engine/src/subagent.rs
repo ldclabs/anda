@@ -1110,6 +1110,8 @@ mod tests {
     use crate::engine::EngineBuilder;
     use crate::model::{CompletionFeaturesDyn, Model};
     use anda_core::BoxPinFut;
+    use async_trait::async_trait;
+    use parking_lot::Mutex;
     use serde_json::json;
 
     #[derive(Clone, Debug)]
@@ -1121,8 +1123,9 @@ mod tests {
         }
 
         fn completion(&self, req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
+            let content = request_text(&req);
             Box::pin(futures::future::ready(Ok(AgentOutput {
-                content: req.prompt,
+                content,
                 usage: Usage {
                     input_tokens: 1,
                     output_tokens: 2,
@@ -1132,6 +1135,287 @@ mod tests {
                 ..Default::default()
             })))
         }
+    }
+
+    #[derive(Clone, Debug)]
+    struct UsageCompleter {
+        input_tokens: u64,
+    }
+
+    impl CompletionFeaturesDyn for UsageCompleter {
+        fn model_name(&self) -> String {
+            "usage".to_string()
+        }
+
+        fn completion(&self, req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
+            let content = request_text(&req);
+            let input_tokens = self.input_tokens;
+            Box::pin(futures::future::ready(Ok(AgentOutput {
+                content,
+                usage: Usage {
+                    input_tokens,
+                    output_tokens: 1,
+                    cached_tokens: 0,
+                    requests: 1,
+                },
+                ..Default::default()
+            })))
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct RecordingCompactionCompleter {
+        requests: Arc<Mutex<Vec<CompletionRequest>>>,
+    }
+
+    impl CompletionFeaturesDyn for RecordingCompactionCompleter {
+        fn model_name(&self) -> String {
+            "recording-compaction".to_string()
+        }
+
+        fn completion(&self, req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
+            self.requests.lock().push(req.clone());
+
+            let prompt = request_text(&req);
+            let history = req
+                .chat_history
+                .iter()
+                .filter_map(Message::text)
+                .collect::<Vec<_>>()
+                .join(" | ");
+
+            let content = if prompt.trim() == COMPACTION_PROMPT.trim() {
+                "compacted handoff".to_string()
+            } else if history.is_empty() {
+                prompt.clone()
+            } else {
+                format!("history={history}; input={prompt}")
+            };
+
+            let input_tokens = if prompt.trim() == COMPACTION_PROMPT.trim() {
+                1
+            } else {
+                100_000
+            };
+
+            Box::pin(futures::future::ready(Ok(AgentOutput {
+                content,
+                usage: Usage {
+                    input_tokens,
+                    output_tokens: 1,
+                    cached_tokens: 0,
+                    requests: 1,
+                },
+                ..Default::default()
+            })))
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingAgentHook {
+        progress: Arc<Mutex<Vec<(String, AgentOutput)>>>,
+    }
+
+    impl RecordingAgentHook {
+        fn progress_events(&self) -> Vec<(String, AgentOutput)> {
+            self.progress.lock().clone()
+        }
+    }
+
+    #[async_trait]
+    impl AgentHook for RecordingAgentHook {
+        async fn on_background_progress(
+            &self,
+            _ctx: &AgentCtx,
+            session_id: String,
+            output: AgentOutput,
+        ) {
+            self.progress.lock().push((session_id, output));
+        }
+    }
+
+    fn request_text(req: &CompletionRequest) -> String {
+        if !req.prompt.is_empty() {
+            return req.prompt.clone();
+        }
+
+        Message {
+            content: req.content.clone(),
+            ..Default::default()
+        }
+        .text()
+        .unwrap_or_default()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn needs_compaction_respects_usage_threshold() {
+        let low_model = Model::with_completer(Arc::new(UsageCompleter {
+            input_tokens: 99_999,
+        }));
+        let low_ctx = EngineBuilder::new().with_model(low_model).mock_ctx();
+        let mut low_runner = low_ctx.completion_iter(
+            CompletionRequest {
+                prompt: "below threshold".to_string(),
+                ..Default::default()
+            },
+            Vec::new(),
+        );
+        low_runner.next().await.unwrap().unwrap();
+        assert_eq!(low_runner.current_usage().input_tokens, 99_999);
+        assert!(!needs_compaction(&low_runner));
+
+        let high_model = Model::with_completer(Arc::new(UsageCompleter {
+            input_tokens: 100_000,
+        }));
+        let high_ctx = EngineBuilder::new().with_model(high_model).mock_ctx();
+        let mut high_runner = high_ctx.completion_iter(
+            CompletionRequest {
+                prompt: "at threshold".to_string(),
+                ..Default::default()
+            },
+            Vec::new(),
+        );
+        high_runner.next().await.unwrap().unwrap();
+        assert_eq!(high_runner.current_usage().input_tokens, 100_000);
+        assert!(needs_compaction(&high_runner));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn needs_compaction_triggers_at_turn_limit() {
+        let model = Model::with_completer(Arc::new(EchoCompleter));
+        let ctx = EngineBuilder::new().with_model(model).mock_ctx();
+        let mut runner = ctx
+            .completion_iter(
+                CompletionRequest {
+                    prompt: "turn-0".to_string(),
+                    ..Default::default()
+                },
+                Vec::new(),
+            )
+            .unbound();
+
+        for turn in 0..MAX_TURNS_TO_COMPACT {
+            if turn > 0 {
+                runner.follow_up(format!("turn-{turn}"));
+            }
+
+            let output = runner.next().await.unwrap().unwrap();
+            assert_eq!(output.content, format!("turn-{turn}"));
+
+            if turn + 1 < MAX_TURNS_TO_COMPACT {
+                assert!(runner.next().await.unwrap().is_none());
+                assert!(!needs_compaction(&runner));
+            }
+        }
+
+        assert_eq!(runner.turns(), MAX_TURNS_TO_COMPACT);
+        assert!(needs_compaction(&runner));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn subsession_runner_compacts_context_and_continues_from_handoff() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let model = Model::with_completer(Arc::new(RecordingCompactionCompleter {
+            requests: requests.clone(),
+        }));
+        let ctx = EngineBuilder::new().with_model(model).mock_ctx();
+        let hook = Arc::new(RecordingAgentHook::default());
+
+        let req = CompletionRequest {
+            instructions: "Keep working".to_string(),
+            prompt: "seed task".to_string(),
+            role: Some("user".to_string()),
+            output_schema: Some(json!({
+                "type": "object",
+                "additionalProperties": false
+            })),
+            ..Default::default()
+        };
+
+        let (sender, _rx) = tokio::sync::mpsc::channel(4);
+        let session = Arc::new(SubSession {
+            id: "session-1".to_string(),
+            agent: "compactor".to_string(),
+            sender,
+            background_tasks: Arc::new(RwLock::new(HashMap::new())),
+            active_at: AtomicU64::new(unix_ms()),
+        });
+
+        let mut runner = SubSessionRunner {
+            session,
+            agent_hook: Some(DynAgentHook::new(hook.clone())),
+            runner: ctx.clone().completion_iter(req, Vec::new()).unbound(),
+            last_output: None,
+        };
+
+        assert!(runner.run(Vec::new()).await.unwrap());
+        assert_eq!(
+            runner.last_output.as_ref().map(|v| v.content.as_str()),
+            Some("seed task")
+        );
+
+        let role_before_compaction = runner.runner.req().role.clone();
+        let output_schema_before_compaction = runner.runner.req().output_schema.clone();
+
+        assert!(runner.run(Vec::new()).await.unwrap());
+
+        let progress = hook.progress_events();
+        assert_eq!(progress.len(), 1);
+        assert_eq!(progress[0].0, "session-1");
+        assert_eq!(progress[0].1.content, "seed task");
+
+        let recorded = requests.lock().clone();
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(request_text(&recorded[0]), "seed task");
+        assert_eq!(request_text(&recorded[1]).trim(), COMPACTION_PROMPT.trim());
+
+        assert_eq!(runner.runner.chat_history().len(), 1);
+        assert_eq!(runner.runner.chat_history()[0].role, "assistant");
+        assert_eq!(
+            runner.runner.chat_history()[0].text().as_deref(),
+            Some("compacted handoff")
+        );
+        assert_eq!(runner.runner.req().instructions, "Keep working");
+        assert_eq!(runner.runner.req().role, role_before_compaction);
+        assert_eq!(
+            runner.runner.req().output_schema,
+            output_schema_before_compaction
+        );
+        assert!(runner.runner.req().prompt.is_empty());
+        assert!(runner.runner.req().content.is_empty());
+        assert!(runner.last_output.is_none());
+
+        assert!(
+            runner
+                .run(vec![SubAgentInput {
+                    command: PromptCommand::Plain {
+                        prompt: "continue after compaction".to_string(),
+                    },
+                    resources: Vec::new(),
+                    usage: Usage::default(),
+                }])
+                .await
+                .unwrap()
+        );
+
+        let resumed = runner.last_output.as_ref().unwrap();
+        assert_eq!(resumed.session.as_deref(), Some("session-1"));
+        assert_eq!(
+            resumed.content,
+            "history=compacted handoff; input=continue after compaction"
+        );
+
+        let recorded = requests.lock().clone();
+        assert_eq!(recorded.len(), 3);
+        assert_eq!(
+            recorded[2]
+                .chat_history
+                .iter()
+                .filter_map(Message::text)
+                .collect::<Vec<_>>(),
+            vec!["compacted handoff".to_string()]
+        );
+        assert_eq!(request_text(&recorded[2]), "continue after compaction");
     }
 
     #[test]

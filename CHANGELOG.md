@@ -3,6 +3,15 @@
 All notable changes to the Anda project will be documented in this file.
 
 
+
+## [0.12.23] — 2026-05-27
+
+### Changed — anda_engine v0.12.23
+
+- **Shell foreground commands auto-move to background after 42 seconds** — Previously native foreground commands were waited on with `wait_with_output()`, and if they exceeded `SHELL_TIMEOUT_SECS` (180s) the tool would return a timeout error. Now `execute_command` uses `tokio::select!` with `SHELL_AUTO_BACKGROUND_SECS` (42s): if the process hasn't finished within that window, it is transparently moved to background execution with a "moved to background" message containing the task ID for hook delivery. The `RunningProcess` struct now bundles child/stdout/stderr/readers immediately after spawn, and extracted `finalize_process_output()` is shared between the foreground-completed and background-completed paths. Added test `execute_auto_moves_long_running_foreground_to_background` verifying the auto-transition and hook delivery.
+- **Comprehensive sub-session compaction tests** — New mock infrastructure (`UsageCompleter`, `RecordingCompactionCompleter`, `RecordingAgentHook`, `request_text` helper) and three new tests: `needs_compaction_respects_usage_threshold` verifies compaction triggers at exactly 100,000 input tokens; `needs_compaction_triggers_at_turn_limit` verifies compaction after `MAX_TURNS_TO_COMPACT` turns with unbound runner; `subsession_runner_compacts_context_and_continues_from_handoff` exercises the full compaction flow — context is compacted into a single assistant handoff message, instructions/role/output_schema are preserved, and subsequent follow-up input resumes correctly from the compacted history.
+
+
 ## [0.12.21] — 2026-05-25
 
 ### Changed — anda_engine v0.12.21
