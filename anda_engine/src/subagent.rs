@@ -29,6 +29,7 @@ const CONVERSATION_IDLE_MS: u64 = 10 * 60 * 1000; // 10 minutes
 const CONVERSATION_WAIT_BACKGROUND_TASK_MS: u64 = 60 * 60 * 1000; // 1 hour
 const MAX_TURNS_TO_COMPACT: usize = 81; // The number of turns after which the conversation history will be compacted. This is to prevent the conversation history from growing indefinitely and causing performance issues. The optimal value may depend on the typical length of conversations and the token limits of the language model.
 const SUBAGENT_STORE_PATH: &str = "subagents";
+const SUBAGENT_METADATA_LIST_LIMIT: usize = 8;
 static COMPACTION_PROMPT: &str = r#"
 Compress the current conversation into a concise continuation handoff. This is not a final answer to the user. Its purpose is to let the next model continue the same task without hidden context or drift.
 
@@ -67,6 +68,61 @@ pub struct SubAgent {
     pub subsessions: Arc<SubSessions>,
 }
 
+impl SubAgent {
+    fn definition_description(&self) -> String {
+        let mut parts = vec![self.description.trim().to_string()];
+        if parts[0].is_empty() {
+            parts[0] = "Delegated subagent worker.".to_string();
+        }
+
+        if !self.tags.is_empty() {
+            parts.push(format!(
+                "Tags: {}.",
+                summarize_items(&self.tags, SUBAGENT_METADATA_LIST_LIMIT)
+            ));
+        }
+
+        if !self.tools.is_empty() {
+            parts.push(format!(
+                "Allowed tools: {}.",
+                summarize_items(&self.tools, SUBAGENT_METADATA_LIST_LIMIT)
+            ));
+        }
+
+        if self.output_schema.is_some() {
+            parts.push("Returns structured output.".to_string());
+        }
+
+        let sessions = self.subsessions.active_session_ids();
+        if !sessions.is_empty() {
+            parts.push(format!(
+                "Active sessions: {}.",
+                summarize_items(&sessions, SUBAGENT_METADATA_LIST_LIMIT)
+            ));
+        }
+
+        parts.join(" ")
+    }
+}
+
+fn summarize_items(items: &[String], limit: usize) -> String {
+    let mut summary = items
+        .iter()
+        .take(limit)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    if items.len() > limit {
+        if !summary.is_empty() {
+            summary.push_str(", ");
+        }
+        summary.push_str(&format!("and {} more", items.len() - limit));
+    }
+
+    summary
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct SubAgentArgs {
     pub prompt: String,
@@ -99,10 +155,19 @@ impl SubAgentArgs {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SubAgentManagerArgs {
+    /// Operation to perform. Defaults to creating or updating a subagent.
+    #[serde(default = "default_manager_operation")]
+    pub operation: String,
+
+    #[serde(default)]
     pub name: String,
+
+    #[serde(default)]
     pub description: String,
+
+    #[serde(default)]
     pub instructions: String,
 
     #[serde(default)]
@@ -125,6 +190,27 @@ pub struct SubAgentManagerArgs {
     /// Persist the subagent to storage so it remains available after restart.
     #[serde(default)]
     pub persist: bool,
+}
+
+fn default_manager_operation() -> String {
+    "upsert".to_string()
+}
+
+impl Default for SubAgentManagerArgs {
+    fn default() -> Self {
+        Self {
+            operation: default_manager_operation(),
+            name: String::new(),
+            description: String::new(),
+            instructions: String::new(),
+            tools: Vec::new(),
+            tags: Vec::new(),
+            output_schema: None,
+            task: String::new(),
+            session: String::new(),
+            persist: false,
+        }
+    }
 }
 
 fn deserialize_optional_json_schema<'de, D>(deserializer: D) -> Result<Option<Json>, D::Error>
@@ -163,7 +249,7 @@ impl SubAgentManagerArgs {
         let session = self.session.trim().to_ascii_lowercase();
         let persist = self.persist;
         let agent = SubAgent {
-            name: self.name,
+            name: self.name.trim().to_string(),
             description: self.description,
             instructions: self.instructions,
             tools: self.tools,
@@ -479,6 +565,12 @@ impl SubSessions {
         self.sessions.write().insert(sess.id.clone(), sess);
     }
 
+    pub fn active_session_ids(&self) -> Vec<String> {
+        let mut sessions = self.sessions.write();
+        sessions.retain(|_, sess| !sess.sender.is_closed());
+        sessions.keys().cloned().collect()
+    }
+
     pub fn get_session(&self, id: &str) -> Option<Arc<SubSession>> {
         let mut sessions = self.sessions.write();
         sessions.retain(|_, sess| !sess.sender.is_closed());
@@ -504,18 +596,18 @@ impl Agent<AgentCtx> for SubAgent {
     fn definition(&self) -> FunctionDefinition {
         FunctionDefinition {
             name: self.name(),
-            description: self.description(),
+            description: self.definition_description(),
             parameters: json!({
                 "type": "object",
-                "description": "Run this subagent on a focused task. Leave session empty for normal blocking mode, or provide a session ID for non-blocking session mode with hook-delivered progress and final output.",
+                "description": "Run this subagent as a focused worker process. The caller acts as the scheduler: use blocking mode for short one-shot work, or session mode for long-running, parallel, asynchronous, or follow-up work. Keep each prompt as a self-contained handoff.",
                 "properties": {
                     "prompt": {
                         "type": "string",
-                        "description": "The task for this subagent. Include the objective, relevant context, constraints, preferred workflow or deliverable, and any success criteria needed to complete the work."
+                        "description": "Self-contained task handoff for this subagent. Include objective, context/resources, constraints, dependencies, expected deliverable, success criteria, and what progress/final output should contain."
                     },
                     "session": {
                         "type": "string",
-                        "description": "Optional case-insensitive session ID. Leave empty for normal blocking mode. Provide a stable ID to run asynchronously, continue the same subagent conversation across calls, and receive progress/final output through hooks.",
+                        "description": "Optional case-insensitive session ID. Leave empty for blocking one-shot work. Provide a stable ID for non-blocking, parallel, asynchronous, or follow-up work; reuse it to continue the same conversation.",
                         "default": ""
                     },
                 },
@@ -590,6 +682,10 @@ impl Agent<AgentCtx> for SubAgent {
             match session.sender.send(input).await {
                 Ok(_) => {
                     let rt = AgentOutput {
+                        content: format!(
+                            "prompt queued for subagent {} session {}. Progress and final output will be pushed through the hooks.",
+                            session.agent, session_id
+                        ),
                         session: Some(session_id.clone()),
                         ..Default::default()
                     };
@@ -636,8 +732,8 @@ impl Agent<AgentCtx> for SubAgent {
 
         let rt = AgentOutput {
             content: format!(
-                "subagent {} is running in the background with session mode. The output will be pushed to you through the hooks.",
-                session.agent
+                "subagent {} is running in the background with session mode (session: {}). The output will be pushed to you through the hooks.",
+                session.agent, session.id
             ),
             session: Some(session.id.clone()),
             ..Default::default()
@@ -779,10 +875,10 @@ impl SubAgentManager {
         if let Ok(agents) = ctx.root.store_list(Some(&prefix), &offset).await {
             for meta in agents {
                 let (data, _) = ctx.root.store_get(&meta.location).await?;
-                if let Ok(agent) = from_reader::<SubAgent, _>(&data[..]) {
-                    self.agents
-                        .write()
-                        .insert(agent.name.to_ascii_lowercase(), agent);
+                if let Ok(mut agent) = from_reader::<SubAgent, _>(&data[..]) {
+                    let name = agent.name.to_ascii_lowercase();
+                    self.preserve_runtime_state(&name, &mut agent);
+                    self.agents.write().insert(name, agent);
                 }
             }
         };
@@ -790,10 +886,46 @@ impl SubAgentManager {
         Ok(())
     }
 
+    fn preserve_runtime_state(&self, name: &str, agent: &mut SubAgent) {
+        if let Some(existing) = self.agents.read().get(name) {
+            agent.subsessions = existing.subsessions.clone();
+        }
+    }
+
+    fn catalog(&self) -> Json {
+        let agents = self.agents.read().values().cloned().collect::<Vec<_>>();
+        let subagents = agents
+            .into_iter()
+            .map(|agent| {
+                let name = agent.name.to_ascii_lowercase();
+                let callable = format!("SA_{name}");
+                let has_output_schema = agent.output_schema.is_some();
+                let active_sessions = agent.subsessions.active_session_ids();
+                json!({
+                    "name": name,
+                    "callable": callable,
+                    "description": agent.description,
+                    "tools": agent.tools,
+                    "tags": agent.tags,
+                    "has_output_schema": has_output_schema,
+                    "active_sessions": active_sessions,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        json!({
+            "result": "listed",
+            "count": subagents.len(),
+            "subagents": subagents,
+            "hint": "Use SA_<name> for delegated work. Use a stable session ID for long-running, parallel, asynchronous, or follow-up tasks."
+        })
+    }
+
     /// Creates or updates a subagent. The name is normalised to lowercase and validated. If an agent with the same name exists, it will be overwritten.
-    pub async fn upsert(&self, ctx: AgentCtx, agent: SubAgent) -> Result<(), BoxError> {
+    pub async fn upsert(&self, ctx: AgentCtx, mut agent: SubAgent) -> Result<(), BoxError> {
         let name = agent.name.to_ascii_lowercase();
         validate_function_name(&name)?;
+        self.preserve_runtime_state(&name, &mut agent);
 
         let data = deterministic_cbor_into_vec(&agent)?;
         self.agents.write().insert(name.clone(), agent);
@@ -805,16 +937,17 @@ impl SubAgentManager {
     }
 
     /// Creates or updates an in-memory subagent without writing it to the store.
-    pub fn upsert_temporary(&self, agent: SubAgent) -> Result<String, BoxError> {
+    pub fn upsert_temporary(&self, mut agent: SubAgent) -> Result<String, BoxError> {
         let name = agent.name.to_ascii_lowercase();
         validate_function_name(&name)?;
+        self.preserve_runtime_state(&name, &mut agent);
 
         self.agents.write().insert(name.clone(), agent);
         Ok(name)
     }
 
     fn description_text() -> String {
-        "Create, update, optionally run, and optionally persist reusable subagents. Use this when a task would benefit from a focused temporary helper with stable instructions or a restricted toolset. By default the subagent is temporary for the current engine process and can be called immediately as `SA_<name>`. If it proves useful, call this again with `persist: true` to save or update it for future sessions and restarts.".to_string()
+        "Scheduler control plane for reusable subagents. Use it to list available workers, create or update focused helpers with stable instructions and restricted toolsets, optionally run an initial delegated task, and optionally persist useful helpers for future sessions and restarts. Temporary subagents are callable immediately as `SA_<name>`.".to_string()
     }
 
     fn manager_definition(&self) -> FunctionDefinition {
@@ -823,19 +956,25 @@ impl SubAgentManager {
             description: Self::description_text(),
             parameters: json!({
                 "type": "object",
-                "description": "Create or update a subagent configuration, optionally run it immediately, and optionally persist it for future reuse.",
+                "description": "List the subagent registry, or create/update a subagent configuration, optionally run it immediately, and optionally persist it for future reuse.",
                 "properties": {
+                    "operation": {
+                        "type": "string",
+                        "enum": ["upsert", "list"],
+                        "description": "Use `list` to inspect registered subagents and active sessions. Use `upsert` to create or update a worker and optionally run a delegated task.",
+                        "default": "upsert"
+                    },
                     "name": {
                         "type": "string",
-                        "description": "Unique callable subagent name. Must be lowercase snake_case, start with a letter, contain only letters, digits, or underscores, and be no longer than 64 characters. The subagent becomes callable as SA_<name>."
+                        "description": "For operation=upsert, the unique callable subagent name. Must be lowercase snake_case, start with a letter, contain only letters, digits, or underscores, and be no longer than 64 characters. The subagent becomes callable as SA_<name>. For operation=list, use an empty string."
                     },
                     "description": {
                         "type": "string",
-                        "description": "Short routing description shown when models decide whether to call this subagent. State when it should be used and what outcome it produces."
+                        "description": "For operation=upsert, the routing description shown when models decide whether to call this subagent. State when it should be used and what outcome it produces. For operation=list, use an empty string."
                     },
                     "instructions": {
                         "type": "string",
-                        "description": "Durable system-style instructions for the subagent. Define its role, scope, workflow, constraints, decision rules, and expected output style. Write reusable guidance, not a one-off task prompt."
+                        "description": "For operation=upsert, durable system-style instructions for the subagent. Define its role, scope, workflow, constraints, decision rules, and expected output style. Write reusable guidance, not a one-off task prompt. For operation=list, use an empty string."
                     },
                     "tools": {
                         "type": "array",
@@ -856,12 +995,12 @@ impl SubAgentManager {
                     },
                     "task": {
                         "type": "string",
-                        "description": "Optional immediate task to run with the newly created or updated subagent. Leave empty to only create or update the subagent.",
+                        "description": "Optional immediate task handoff to run with the newly created or updated subagent. Include objective, context/resources, constraints, dependencies, expected deliverable, and success criteria. Leave empty to only create/update or when operation=list.",
                         "default": ""
                     },
                     "session": {
                         "type": "string",
-                        "description": "Optional session ID for the immediate task. Leave empty for normal blocking mode. Provide a stable ID for non-blocking session mode with hook-delivered progress and final output.",
+                        "description": "Optional session ID for the immediate task. Leave empty for blocking one-shot mode. Provide a stable ID for non-blocking, parallel, asynchronous, or follow-up work with hook-delivered progress and final output.",
                         "default": ""
                     },
                     "persist": {
@@ -870,7 +1009,7 @@ impl SubAgentManager {
                         "default": false
                     }
                 },
-                "required": ["name", "description", "instructions", "tools", "tags", "output_schema", "task", "session", "persist"],
+                "required": ["operation", "name", "description", "instructions", "tools", "tags", "output_schema", "task", "session", "persist"],
                 "additionalProperties": false
             }),
             strict: Some(true),
@@ -882,8 +1021,9 @@ impl SubAgentManager {
         ctx: AgentCtx,
         args: SubAgentManagerArgs,
     ) -> Result<(String, SubAgent, Option<String>, String, bool), BoxError> {
-        let (agent, task, session, persist) = args.into_subagent();
+        let (mut agent, task, session, persist) = args.into_subagent();
         let name = agent.name.to_ascii_lowercase();
+        self.preserve_runtime_state(&name, &mut agent);
 
         if persist {
             self.upsert(ctx, agent.clone()).await?;
@@ -923,6 +1063,18 @@ impl Agent<AgentCtx> for SubAgentManager {
         resources: Vec<Resource>,
     ) -> Result<AgentOutput, BoxError> {
         let args = SubAgentManagerArgs::from_prompt(prompt)?;
+        let operation = args.operation.trim().to_ascii_lowercase();
+        if matches!(operation.as_str(), "list" | "status" | "catalog") {
+            return Ok(AgentOutput {
+                content: self.catalog().to_string(),
+                ..Default::default()
+            });
+        }
+
+        if !matches!(operation.as_str(), "" | "upsert" | "create" | "update") {
+            return Err(format!("unsupported subagent manager operation: {operation}").into());
+        }
+
         let (name, agent, task, session, persist) = self.configure(ctx.clone(), args).await?;
         let callable = format!("SA_{name}");
         let subagent = json!({
@@ -930,7 +1082,8 @@ impl Agent<AgentCtx> for SubAgentManager {
             "name": name,
             "callable": callable,
             "persisted": persist,
-            "hint": "Call the subagent by this callable name. If a temporary subagent proves useful, call subagents_manager again with persist=true to save it."
+            "active_sessions": agent.subsessions.active_session_ids(),
+            "hint": "Call the subagent by this callable name. Use a stable session ID for long-running, parallel, asynchronous, or follow-up tasks. If a temporary subagent proves useful, call subagents_manager again with persist=true to save it."
         });
         let Some(task) = task else {
             return Ok(AgentOutput {
@@ -1431,15 +1584,27 @@ mod tests {
         let definition = agent.definition();
 
         assert_eq!(definition.name, "research_assistant");
-        assert_eq!(
-            definition.description,
-            "Handles recurring research tasks with concise synthesis."
+        assert!(
+            definition
+                .description
+                .starts_with("Handles recurring research tasks with concise synthesis.")
+        );
+        assert!(
+            definition
+                .description
+                .contains("Allowed tools: google_web_search.")
         );
         assert_eq!(
             definition.parameters["description"],
             json!(
-                "Run this subagent on a focused task. Leave session empty for normal blocking mode, or provide a session ID for non-blocking session mode with hook-delivered progress and final output."
+                "Run this subagent as a focused worker process. The caller acts as the scheduler: use blocking mode for short one-shot work, or session mode for long-running, parallel, asynchronous, or follow-up work. Keep each prompt as a self-contained handoff."
             )
+        );
+        assert!(
+            definition.parameters["properties"]["prompt"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("Self-contained task handoff")
         );
         assert_eq!(
             definition.parameters["properties"]["session"]["default"],
@@ -1457,6 +1622,16 @@ mod tests {
         assert_eq!(
             definition.parameters["properties"]["output_schema"]["type"],
             json!(["string", "null"])
+        );
+        assert_eq!(
+            definition.parameters["properties"]["operation"]["default"],
+            json!("upsert")
+        );
+        assert!(
+            definition.parameters["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("operation"))
         );
         assert_eq!(definition.parameters["additionalProperties"], json!(false));
     }
@@ -1488,7 +1663,42 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(args.operation, "upsert");
         assert_eq!(args.output_schema, Some(schema));
+    }
+
+    #[test]
+    fn subagents_manager_upsert_preserves_active_sessions() {
+        let manager = SubAgentManager::new();
+        let agent = SubAgent {
+            name: "worker".to_string(),
+            description: "Handles delegated work.".to_string(),
+            instructions: "Work carefully.".to_string(),
+            ..Default::default()
+        };
+        let (sender, _rx) = tokio::sync::mpsc::channel(4);
+        agent.subsessions.insert_session(Arc::new(SubSession {
+            id: "job-1".to_string(),
+            agent: "worker".to_string(),
+            sender,
+            background_tasks: Arc::new(RwLock::new(HashMap::new())),
+            active_at: AtomicU64::new(unix_ms()),
+        }));
+
+        manager.upsert_temporary(agent).unwrap();
+        manager
+            .upsert_temporary(SubAgent {
+                name: "worker".to_string(),
+                description: "Updated routing description.".to_string(),
+                instructions: "Use the updated workflow.".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let loaded = manager.get_lowercase("worker").unwrap();
+        assert_eq!(loaded.description, "Updated routing description.");
+        assert_eq!(loaded.subsessions.active_session_ids(), vec!["job-1"]);
+        assert!(loaded.subsessions.get_session("job-1").is_some());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1550,6 +1760,52 @@ mod tests {
         assert_eq!(content["subagent"]["result"], json!("created"));
         assert_eq!(content["output"], json!("agent task"));
         assert!(manager.get_lowercase("agent_helper").is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn subagents_manager_lists_registry_and_active_sessions() {
+        let ctx = EngineBuilder::new().mock_ctx();
+        let manager: Arc<SubAgentManager> = ctx.subagents.get().unwrap();
+        let agent = SubAgent {
+            name: "planner".to_string(),
+            description: "Plans delegated work.".to_string(),
+            instructions: "Break work into concrete steps.".to_string(),
+            tools: vec!["tools_select".to_string()],
+            tags: vec!["planning".to_string()],
+            ..Default::default()
+        };
+        let (sender, _rx) = tokio::sync::mpsc::channel(4);
+        agent.subsessions.insert_session(Arc::new(SubSession {
+            id: "plan-1".to_string(),
+            agent: "planner".to_string(),
+            sender,
+            background_tasks: Arc::new(RwLock::new(HashMap::new())),
+            active_at: AtomicU64::new(unix_ms()),
+        }));
+        manager.upsert_temporary(agent).unwrap();
+
+        let output = Agent::<AgentCtx>::run(
+            manager.as_ref(),
+            ctx,
+            serde_json::to_string(&SubAgentManagerArgs {
+                operation: "list".to_string(),
+                ..Default::default()
+            })
+            .unwrap(),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let content: Json = serde_json::from_str(&output.content).unwrap();
+
+        assert_eq!(content["result"], json!("listed"));
+        assert_eq!(content["count"], json!(1));
+        assert_eq!(content["subagents"][0]["name"], json!("planner"));
+        assert_eq!(content["subagents"][0]["callable"], json!("SA_planner"));
+        assert_eq!(
+            content["subagents"][0]["active_sessions"],
+            json!(["plan-1"])
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

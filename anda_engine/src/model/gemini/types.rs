@@ -266,7 +266,7 @@ impl From<ContentPart> for Part {
             } => Part {
                 data: PartKind::FunctionResponse {
                     name,
-                    response: if is_error.map_or(false, |b| b) {
+                    response: if is_error.is_some_and(|b| b) {
                         FunctionResponseValue {
                             error: Some(output),
                             ..Default::default()
