@@ -32,7 +32,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, json};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     fmt,
     sync::{Arc, LazyLock},
 };
@@ -975,7 +975,17 @@ impl Tool<BaseCtx> for MemoryManagement {
         _resources: Vec<Resource>,
     ) -> Result<ToolOutput<Self::Output>, BoxError> {
         let (_, res) = request.execute(self.nexus.as_ref()).await;
-        Ok(ToolOutput::new(res))
+        Ok(ToolOutput {
+            is_error: if matches!(res, Response::Err { .. }) {
+                Some(true)
+            } else {
+                None
+            },
+            output: res,
+            artifacts: Vec::new(),
+            usage: Usage::default(),
+            tools_usage: HashMap::new(),
+        })
     }
 }
 
@@ -1022,7 +1032,17 @@ impl Tool<BaseCtx> for MemoryReadonly {
         _resources: Vec<Resource>,
     ) -> Result<ToolOutput<Self::Output>, BoxError> {
         let (_, res) = request.readonly().execute(self.memory.nexus.as_ref()).await;
-        Ok(ToolOutput::new(res))
+        Ok(ToolOutput {
+            is_error: if matches!(res, Response::Err { .. }) {
+                Some(true)
+            } else {
+                None
+            },
+            output: res,
+            artifacts: Vec::new(),
+            usage: Usage::default(),
+            tools_usage: HashMap::new(),
+        })
     }
 }
 

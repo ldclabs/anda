@@ -1272,6 +1272,7 @@ impl CompletionRunner {
                                                 "tool call failed: {}",
                                                 err
                                             )}),
+                                            is_error: Some(true),
                                             ..Default::default()
                                         });
                                         (Some(tool), None)
@@ -1321,6 +1322,7 @@ impl CompletionRunner {
                                                 "agent run failed: {}",
                                                 err
                                             )}),
+                                            is_error: Some(true),
                                             ..Default::default()
                                         });
                                         (Some(tool), None)
@@ -1335,6 +1337,7 @@ impl CompletionRunner {
                                     "tool call failed: {} not found",
                                     tool.name
                                 )}),
+                                is_error: Some(true),
                                 ..Default::default()
                             });
                             (Some(tool), None)
@@ -1367,6 +1370,7 @@ impl CompletionRunner {
                             tool_calls_continue.push(ContentPart::ToolOutput {
                                 name: tool.name.clone(),
                                 output: res.output.clone(),
+                                is_error: res.is_error,
                                 call_id: tool.call_id.clone(),
                                 remote_id: tool.remote_id,
                             });

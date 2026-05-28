@@ -533,7 +533,12 @@ impl CompletionFeaturesDyn for CompletionModel {
                 )
             } else {
                 let status = response.status();
-                let msg = response.text().await?;
+                let msg = response.text().await.map_err(|err| {
+                    format!(
+                        "Failed to read no-success response, model: {}, error: {}",
+                        model, err
+                    )
+                })?;
                 log::error!(
                     model = model,
                     request:serde = r;

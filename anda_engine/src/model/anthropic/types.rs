@@ -1144,6 +1144,7 @@ impl From<ContentPart> for ContentBlock {
             ContentPart::ToolOutput {
                 name: _,
                 output,
+                is_error,
                 call_id,
                 ..
             } => ContentBlock::ToolResult {
@@ -1153,7 +1154,7 @@ impl From<ContentPart> for ContentBlock {
                     _ => serde_json::to_string(&output).unwrap_or_default(),
                 })),
                 cache_control: None,
-                is_error: None,
+                is_error,
             },
             ContentPart::Any(json) => {
                 serde_json::from_value(json.clone()).unwrap_or_else(|_| ContentBlock::Text {
@@ -1226,6 +1227,7 @@ impl From<ContentBlock> for ContentPart {
             ContentBlock::ToolResult {
                 tool_use_id,
                 content,
+                is_error,
                 ..
             } => {
                 let output = match content {
@@ -1242,6 +1244,7 @@ impl From<ContentBlock> for ContentPart {
                 ContentPart::ToolOutput {
                     name: String::new(),
                     output,
+                    is_error,
                     call_id: if tool_use_id.is_empty() {
                         None
                     } else {

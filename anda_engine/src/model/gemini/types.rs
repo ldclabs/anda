@@ -260,14 +260,22 @@ impl From<ContentPart> for Part {
             ContentPart::ToolOutput {
                 name,
                 output,
+                is_error,
                 call_id,
                 ..
             } => Part {
                 data: PartKind::FunctionResponse {
                     name,
-                    response: FunctionResponseValue {
-                        output: Some(output),
-                        ..Default::default()
+                    response: if is_error.map_or(false, |b| b) {
+                        FunctionResponseValue {
+                            error: Some(output),
+                            ..Default::default()
+                        }
+                    } else {
+                        FunctionResponseValue {
+                            output: Some(output),
+                            ..Default::default()
+                        }
                     },
                     id: call_id,
                     will_continue: None,
@@ -320,6 +328,7 @@ impl From<Part> for ContentPart {
             } => ContentPart::ToolOutput {
                 name,
                 output: response.to_output(),
+                is_error: response.error.as_ref().map(|_| true),
                 call_id: id,
                 remote_id: None,
             },

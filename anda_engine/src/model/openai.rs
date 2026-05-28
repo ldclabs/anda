@@ -2012,12 +2012,14 @@ mod tests {
                 ContentPart::ToolOutput {
                     name: "lookup".into(),
                     output: json!({"temperature": 20}),
+                    is_error: None,
                     call_id: Some("call_1".into()),
                     remote_id: None,
                 },
                 ContentPart::ToolOutput {
                     name: "lookup".into(),
                     output: json!({"temperature": 24}),
+                    is_error: None,
                     call_id: Some("call_2".into()),
                     remote_id: None,
                 },

@@ -113,6 +113,7 @@ where
 
             Ok(ToolOutput {
                 output,
+                is_error: result.is_error,
                 artifacts: result.artifacts,
                 usage: result.usage,
                 tools_usage: result.tools_usage,

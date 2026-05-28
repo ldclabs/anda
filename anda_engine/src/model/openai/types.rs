@@ -137,7 +137,7 @@ pub(crate) fn raw_history_into(value: Json) -> Vec<MessageItem> {
     }
 }
 
-/// The completion request type for OpenAI's Response API: <https://platform.openai.com/docs/api-reference/responses/create>
+/// The completion request type for OpenAI's Response API: <https://developers.openai.com/api/reference/resources/responses/methods/create>
 #[derive(Debug, Default, Deserialize, Serialize, Clone)]
 pub struct CompletionRequest {
     /// Message inputs
@@ -1722,6 +1722,7 @@ pub fn message_from(output: Vec<MessageItem>) -> (Option<Message>, Option<String
                 msg.content.push(ContentPart::ToolOutput {
                     name: "".to_string(),
                     output,
+                    is_error: None,
                     call_id: Some(call_id),
                     remote_id: None,
                 });
@@ -2829,6 +2830,7 @@ mod tests {
                 ContentPart::ToolOutput {
                     name: "sum".into(),
                     output: json!({ "ok": true }),
+                    is_error: None,
                     call_id: Some("c1".into()),
                     remote_id: None,
                 },
@@ -3098,11 +3100,13 @@ mod tests {
             ContentPart::ToolOutput {
                 name,
                 output,
+                is_error,
                 call_id,
                 remote_id,
             } => {
                 assert_eq!(name, "");
                 assert_eq!(output, &json!({"ok":true}));
+                assert!(is_error.is_none());
                 assert_eq!(call_id.as_deref(), Some("c1"));
                 assert!(remote_id.is_none());
             }
@@ -3126,6 +3130,7 @@ mod tests {
                 content: vec![ContentPart::ToolOutput {
                     name: "".into(),
                     output: json!({"ok":true}),
+                    is_error: None,
                     call_id: Some("cid".into()),
                     remote_id: None,
                 }],
@@ -3158,6 +3163,7 @@ mod tests {
                 content: vec![ContentPart::ToolOutput {
                     name: "".into(),
                     output: json!([{"type": "input_text", "text": "result"}]),
+                    is_error: None,
                     call_id: Some("cid".into()),
                     remote_id: None,
                 }],
