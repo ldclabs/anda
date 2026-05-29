@@ -13,10 +13,22 @@ use reqwest::header::ACCEPT;
 use serde_json::json;
 use std::collections::BTreeMap;
 
-use super::{CompletionFeaturesDyn, read_sse_json_events, request_client_builder};
+use super::{CompletionFeaturesDyn, ModelEffort, read_sse_json_events, request_client_builder};
 use crate::{rfc3339_datetime, unix_ms};
 
 pub mod types;
+
+impl From<ModelEffort> for types::ThinkingLevel {
+    fn from(value: ModelEffort) -> Self {
+        match value {
+            ModelEffort::Minimal => Self::Minimal,
+            ModelEffort::Low => Self::Low,
+            ModelEffort::Medium => Self::Medium,
+            ModelEffort::High => Self::High,
+            ModelEffort::XHigh => Self::High,
+        }
+    }
+}
 
 // ================================================================
 // Main Gemini Client
@@ -114,6 +126,19 @@ impl CompletionModel {
     /// Sets whether the completion request should run in streaming mode
     pub fn with_stream(mut self, stream: bool) -> Self {
         self.default_request.stream = stream;
+        self
+    }
+
+    /// Sets the default thinking effort for compatible models
+    pub fn with_effort(mut self, effort: Option<ModelEffort>) -> Self {
+        if let Some(effort) = effort {
+            let thinking_config = self
+                .default_request
+                .generation_config
+                .thinking_config
+                .get_or_insert_with(types::ThinkingConfig::default);
+            thinking_config.thinking_level = Some(effort.into());
+        }
         self
     }
 
@@ -424,6 +449,23 @@ impl CompletionFeaturesDyn for CompletionModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completion_model_applies_default_effort() {
+        let model = Client::new("test-key", Some("http://localhost".into()))
+            .completion_model("gemini-3-pro")
+            .with_effort(Some(ModelEffort::High));
+
+        let thinking_config = model
+            .default_request
+            .generation_config
+            .thinking_config
+            .expect("thinking config should be configured");
+        assert_eq!(
+            thinking_config.thinking_level,
+            Some(types::ThinkingLevel::High)
+        );
+    }
 
     #[test]
     fn aggregates_gemini_stream_chunks() {

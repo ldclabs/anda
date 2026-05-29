@@ -13,10 +13,22 @@ use reqwest::header::ACCEPT;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
-use super::{CompletionFeaturesDyn, read_sse_json_events, request_client_builder};
+use super::{CompletionFeaturesDyn, ModelEffort, read_sse_json_events, request_client_builder};
 use crate::{rfc3339_datetime, unix_ms};
 
 pub mod types;
+
+impl From<ModelEffort> for types::OutputEffort {
+    fn from(value: ModelEffort) -> Self {
+        match value {
+            ModelEffort::Minimal => Self::Low,
+            ModelEffort::Low => Self::Medium,
+            ModelEffort::Medium => Self::High,
+            ModelEffort::High => Self::XHigh,
+            ModelEffort::XHigh => Self::Max,
+        }
+    }
+}
 
 // ================================================================
 // Main Anthropic Client
@@ -142,6 +154,21 @@ impl CompletionModel {
     /// Sets whether the completion request should run in streaming mode
     pub fn with_stream(mut self, stream: bool) -> Self {
         self.default_request.stream = Some(stream);
+        self
+    }
+
+    /// Sets the default reasoning effort for compatible models
+    pub fn with_effort(mut self, effort: Option<ModelEffort>) -> Self {
+        if let Some(effort) = effort {
+            let output_config =
+                self.default_request
+                    .output_config
+                    .get_or_insert(types::OutputConfig {
+                        effort: None,
+                        format: None,
+                    });
+            output_config.effort = Some(effort.into());
+        }
         self
     }
 
@@ -554,6 +581,18 @@ impl CompletionFeaturesDyn for CompletionModel {
 mod tests {
     use super::*;
     use anda_core::ContentPart;
+
+    #[test]
+    fn completion_model_applies_default_effort() {
+        let model = Client::new("test-key", Some("http://localhost".into()))
+            .completion_model("claude-sonnet-4-6")
+            .with_effort(Some(ModelEffort::XHigh));
+
+        assert_eq!(
+            model.default_request.output_config.unwrap().effort,
+            Some(types::OutputEffort::Max)
+        );
+    }
 
     #[test]
     fn aggregates_anthropic_stream_events() {

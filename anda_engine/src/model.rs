@@ -50,7 +50,7 @@ pub struct ModelConfig {
     /// Optional labels for selecting this model in the engine.
     ///
     /// If omitted, the provider model name is used as the only label. Common
-    /// labels include `primary`, `fallback`, `pro`, `flash`, and `lite`.
+    /// labels include `primary`, `fallback`, `pro`, `flash`, `lite`, `audio`, `video`, `image`, `memory`.
     #[serde(default)]
     pub labels: Vec<String>,
 
@@ -59,6 +59,13 @@ pub struct ModelConfig {
 
     #[serde(default)]
     pub max_output: usize,
+
+    /// Optional reasoning/thinking effort for providers and models that support it.
+    ///
+    /// Supported config values are `minimal`, `low`, `medium`, `high`, and `xhigh`.
+    /// The effective set depends on the selected provider and model.
+    #[serde(default)]
+    pub effort: Option<ModelEffort>,
 
     /// Skips this model when loading a list of configs.
     #[serde(default)]
@@ -71,6 +78,17 @@ pub struct ModelConfig {
 
     #[serde(default)]
     pub stream: bool,
+}
+
+/// Provider-agnostic reasoning/thinking effort requested by model config.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelEffort {
+    Minimal,
+    Low,
+    Medium,
+    High,
+    XHigh,
 }
 
 impl ModelConfig {
@@ -97,7 +115,8 @@ impl ModelConfig {
                 gemini::Client::new(&self.api_key, Some(self.api_base.clone()))
                     .with_client(http_client)
                     .completion_model(&self.model)
-                    .with_stream(self.stream),
+                    .with_stream(self.stream)
+                    .with_effort(self.effort),
             )),
             "anthropic" => {
                 let mut cli = anthropic::Client::new(&self.api_key, Some(self.api_base.clone()))
@@ -106,7 +125,9 @@ impl ModelConfig {
                     cli = cli.with_bearer_auth(true);
                 }
                 Model::with_completer(Arc::new(
-                    cli.completion_model(&self.model).with_stream(self.stream),
+                    cli.completion_model(&self.model)
+                        .with_stream(self.stream)
+                        .with_effort(self.effort),
                 ))
             }
             "openai" => {
@@ -115,14 +136,16 @@ impl ModelConfig {
                         openai::Client::new(&self.api_key, Some(self.api_base.clone()))
                             .with_client(http_client)
                             .completion_model_v2(&self.model)
-                            .with_stream(self.stream),
+                            .with_stream(self.stream)
+                            .with_effort(self.effort),
                     ))
                 } else {
                     Model::with_completer(Arc::new(
                         openai::Client::new(&self.api_key, Some(self.api_base.clone()))
                             .with_client(http_client)
                             .completion_model(&self.model)
-                            .with_stream(self.stream),
+                            .with_stream(self.stream)
+                            .with_effort(self.effort),
                     ))
                 }
             }
@@ -624,6 +647,24 @@ mod tests {
 
     fn test_model(name: &'static str) -> Model {
         Model::new(Arc::new(TestCompleter { name }))
+    }
+
+    #[test]
+    fn model_effort_serializes_config_values() {
+        let config: ModelConfig = serde_json::from_value(serde_json::json!({
+            "family": "openai",
+            "model": "gpt-5",
+            "api_base": "http://localhost",
+            "api_key": "test-key",
+            "effort": "xhigh"
+        }))
+        .unwrap();
+
+        assert_eq!(config.effort, Some(ModelEffort::XHigh));
+        assert_eq!(
+            serde_json::to_value(ModelEffort::Minimal).unwrap(),
+            "minimal"
+        );
     }
 
     #[test]

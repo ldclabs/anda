@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, HashMap};
 
 pub mod types;
 
-use super::{CompletionFeaturesDyn, read_sse_json_events, request_client_builder};
+use super::{CompletionFeaturesDyn, ModelEffort, read_sse_json_events, request_client_builder};
 use crate::{rfc3339_datetime, unix_ms};
 
 // ================================================================
@@ -348,6 +348,31 @@ pub enum ReasoningEffort {
     Medium,
     High,
     XHigh,
+    Max,
+}
+
+impl From<ModelEffort> for ReasoningEffort {
+    fn from(value: ModelEffort) -> Self {
+        match value {
+            ModelEffort::Minimal => Self::Minimal,
+            ModelEffort::Low => Self::Low,
+            ModelEffort::Medium => Self::Medium,
+            ModelEffort::High => Self::High,
+            ModelEffort::XHigh => Self::XHigh,
+        }
+    }
+}
+
+impl From<ModelEffort> for types::ReasoningEffort {
+    fn from(value: ModelEffort) -> Self {
+        match value {
+            ModelEffort::Minimal => Self::Minimal,
+            ModelEffort::Low => Self::Low,
+            ModelEffort::Medium => Self::Medium,
+            ModelEffort::High => Self::High,
+            ModelEffort::XHigh => Self::XHigh,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1469,6 +1494,14 @@ impl CompletionModel {
         self
     }
 
+    /// Sets the default reasoning effort for compatible models
+    pub fn with_effort(mut self, effort: Option<ModelEffort>) -> Self {
+        if let Some(effort) = effort {
+            self.default_request.reasoning_effort = Some(effort.into());
+        }
+        self
+    }
+
     /// Sets a default request template for the model
     pub fn with_default_request(mut self, req: ChatCompletionRequest) -> Self {
         self.default_request = req;
@@ -1677,6 +1710,23 @@ impl CompletionModelV2 {
         self
     }
 
+    /// Sets the default reasoning effort for compatible models
+    pub fn with_effort(mut self, effort: Option<ModelEffort>) -> Self {
+        if let Some(effort) = effort {
+            let reasoning = self
+                .default_request
+                .additional_parameters
+                .reasoning
+                .get_or_insert(types::Reasoning {
+                    effort: None,
+                    generate_summary: None,
+                    summary: None,
+                });
+            reasoning.effort = Some(effort.into());
+        }
+        self
+    }
+
     /// Sets a default request template for the model
     pub fn with_default_request(mut self, req: types::CompletionRequest) -> Self {
         self.default_request = req;
@@ -1872,6 +1922,37 @@ mod tests {
             model.default_request.additional_parameters.store,
             Some(false)
         );
+    }
+
+    #[test]
+    fn chat_completion_model_applies_default_effort() {
+        let model = Client::new("test-key", Some("http://localhost".into()))
+            .completion_model("deepseek-reasoner")
+            .with_effort(Some(ModelEffort::High));
+
+        assert_eq!(
+            model.default_request.reasoning_effort,
+            Some(ReasoningEffort::High)
+        );
+    }
+
+    #[test]
+    fn response_completion_model_applies_default_effort() {
+        let model = Client::new("test-key", Some("http://localhost".into()))
+            .completion_model_v2("gpt-5.5")
+            .with_effort(Some(ModelEffort::XHigh));
+
+        let reasoning = model
+            .default_request
+            .additional_parameters
+            .reasoning
+            .as_ref()
+            .expect("reasoning should be configured");
+        assert!(matches!(
+            reasoning.effort.as_ref(),
+            Some(types::ReasoningEffort::XHigh)
+        ));
+        assert!(reasoning.summary.is_none());
     }
 
     #[test]
