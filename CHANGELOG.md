@@ -4,6 +4,27 @@ All notable changes to the Anda project will be documented in this file.
 
 
 
+## [0.12.24] — 2026-05-29
+
+### Added — anda_core v0.12.4
+
+- **`ModelEffort` — provider-agnostic reasoning/thinking effort** — New `ModelEffort` enum (`minimal`, `low`, `medium`, `high`, `max`) provides a single vocabulary for reasoning effort across all model providers. Includes `as_str()` and `Display` impl.
+- **Per-request effort on `CompletionRequest`** — `CompletionRequest` now carries an `effort: Option<ModelEffort>` field, enabling callers (including subagents) to select reasoning effort per completion rather than only at model-config time.
+
+### Added — anda_engine v0.12.24
+
+- **Tool error propagation via `is_error`** — `ToolOutput` and `ContentPart::ToolOutput` now carry `is_error: Option<bool>`. Agent runner sets `is_error: Some(true)` on tool/agent execution failures and tool-not-found paths. Memory tools signal Nexus errors through the same flag. Anthropic passes `is_error` through to `ToolResult`; Gemini routes errors to `FunctionResponseValue.error` instead of the normal `output` field.
+- **Subagent catalog, operation routing, and runtime state preservation** — `SubAgentManager` gains `operation` field (`"upsert"` or `"list"`), `catalog()` method returning all registered subagents with metadata, and `preserve_runtime_state()` to keep active subsessions alive across upserts. `SubAgent::definition_description()` now enriches descriptions with tags, allowed tools, output schema info, active sessions, default model, and default effort. Session-mode responses include session ID.
+- **Provider-agnostic `ModelEffort` with per-request application** — `ModelEffort` (promoted from engine to core) maps to each provider's native reasoning level: Anthropic `OutputEffort` (saturates at `Max`), Gemini `ThinkingLevel` (saturates at `High`), OpenAI `ReasoningEffort` (now includes `Max` variant), and OpenAI Responses v2 `Reasoning`. All three providers now apply `req.effort` during `completion()`, not only model-config defaults.
+- **Subagent model and effort selection** — `SubAgent` and `SubAgentArgs` gain `model: String` and `effort: Option<ModelEffort>` fields, with case-insensitive deserialization (accepts `"HIGH"`, `"max"`, `null`, empty string, or JSON value). Session compaction preserves model and effort across context cycles. Both `SubAgent` and `SubAgentManager` function schemas expose `model` and `effort` parameters.
+- **Model label resolution** — `AgentCtx` now resolves models by label via `models.resolve(label)` instead of the previous name-only lookup. `CompletionRunner` gains `set_model()` and `set_effort()` methods for mid-run model/effort switching.
+- **Subagent tests for model/effort selection** — New `subagent_run_allows_model_and_effort_selection` test verifies end-to-end flow: subagent receives a model label, the correct `CompletionRequest` reaches the provider with the expected model and effort. New `RecordingRequestCompleter` mock captures `CompletionRequest` for assertion. All existing tests updated for new fields.
+
+### Changed — anda_engine v0.12.24
+
+- **Anthropic error messages include model name** — Non-200 HTTP responses now include the model name in the error text for easier debugging of provider failures.
+
+
 ## [0.12.23] — 2026-05-27
 
 ### Changed — anda_engine v0.12.23
