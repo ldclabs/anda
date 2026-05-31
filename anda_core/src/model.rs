@@ -1579,6 +1579,63 @@ mod tests {
     }
 
     #[test]
+    fn test_content_part_any_supports_resource_serde() {
+        let mut metadata = Map::new();
+        metadata.insert("source".into(), json!("upload"));
+        metadata.insert("priority".into(), json!(3));
+
+        let resource = Resource {
+            _id: 42,
+            name: "note.txt".into(),
+            tags: vec!["text".into(), "note".into()],
+            description: Some("A note resource".into()),
+            uri: Some("file:///tmp/note.txt".into()),
+            mime_type: Some("text/plain".into()),
+            blob: Some(b"hello world".to_vec().into()),
+            size: Some(11),
+            metadata: Some(metadata),
+            ..Default::default()
+        };
+
+        let resource_json = json!(resource);
+        let part: ContentPart = resource_json.clone().into();
+        assert_eq!(part, ContentPart::Any(resource_json.clone()));
+
+        let serialized = serde_json::to_value(&part).unwrap();
+        assert_eq!(serialized, resource_json);
+
+        let back: ContentPart = serde_json::from_value(serialized.clone()).unwrap();
+        assert_eq!(back, ContentPart::Any(resource_json));
+
+        let resource_back: Resource = serde_json::from_value(serialized).unwrap();
+        assert_eq!(resource_back._id, 42);
+        assert_eq!(resource_back.name, "note.txt");
+        assert_eq!(resource_back.tags, vec!["text", "note"]);
+        assert_eq!(
+            resource_back.description.as_deref(),
+            Some("A note resource")
+        );
+        assert_eq!(resource_back.uri.as_deref(), Some("file:///tmp/note.txt"));
+        assert_eq!(resource_back.mime_type.as_deref(), Some("text/plain"));
+        assert_eq!(resource_back.blob, Some(b"hello world".to_vec().into()));
+        assert_eq!(resource_back.size, Some(11));
+        assert_eq!(
+            resource_back
+                .metadata
+                .as_ref()
+                .and_then(|meta| meta.get("source")),
+            Some(&json!("upload"))
+        );
+        assert_eq!(
+            resource_back
+                .metadata
+                .as_ref()
+                .and_then(|meta| meta.get("priority")),
+            Some(&json!(3))
+        );
+    }
+
+    #[test]
     fn test_content_part_toolcall_and_tooloutput_serde() {
         let call = ContentPart::ToolCall {
             name: "sum".into(),

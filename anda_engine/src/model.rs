@@ -64,7 +64,7 @@ pub struct ModelConfig {
 
     /// Optional reasoning/thinking effort for providers and models that support it.
     ///
-    /// Supported config values are `minimal`, `low`, `medium`, `high`, and `xhigh`.
+    /// Supported config values are `minimal`, `low`, `medium`, `high`, and `max`.
     /// The effective set depends on the selected provider and model.
     #[serde(default)]
     pub effort: Option<ModelEffort>,
@@ -214,6 +214,7 @@ impl Models {
         self.models.load().contains_key(&label.to_ascii_lowercase())
     }
 
+    /// Returns the set of all registered model names across all labels.
     pub fn model_names(&self) -> BTreeSet<String> {
         self.models
             .load()

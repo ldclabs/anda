@@ -184,6 +184,10 @@ impl Conversation {
                 Fv::array_from(cbor!(self.messages).unwrap(), &[Ft::Json])?,
             ),
             (
+                "resources".to_string(),
+                Fv::array_from(cbor!(self.resources).unwrap(), &[Resource::field_type()])?,
+            ),
+            (
                 "artifacts".to_string(),
                 Fv::array_from(cbor!(self.artifacts).unwrap(), &[Resource::field_type()])?,
             ),

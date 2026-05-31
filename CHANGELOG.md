@@ -4,6 +4,21 @@ All notable changes to the Anda project will be documented in this file.
 
 
 
+
+## [0.12.25] — 2026-05-31
+
+### Added — anda_engine v0.12.25
+
+- **Model-aware subagent manager descriptions** — `SubAgentManager` now carries a `models: Vec<String>` field set via `with_models()` builder. When models are registered, the tool description dynamically includes available model names for routing decisions (e.g. "This manager supports the following models for routing decisions: flash, pro, primary.").
+- **`resources` field in conversation storage** — `Conversation::to_fields()` now persists the `resources` field alongside `messages` and `artifacts`. Previously, resources attached to a conversation were lost on save/load cycles.
+- **`ContentPart::Any` Resource serde test** — New `test_content_part_any_supports_resource_serde` validates round-trip serialization of `Resource` through `ContentPart::Any`, covering all fields including `blob`, `metadata`, `uri`, and `mime_type`.
+
+### Changed — anda_engine v0.12.25
+
+- **Effort enum values: `xhigh` → `max`** — SubAgent and SubAgentManager function schemas now list `"max"` instead of `"xhigh"` in the `effort` enum, aligning with the `ModelEffort` rename in v0.12.24. Updated in three locations (subagent schema, manager schema, test assertion).
+- **`model_names()` doc comment** — Added documentation for the `Models::model_names()` method describing its return value.
+- **`ModelConfig.effort` doc: `xhigh` → `max`** — Documentation string updated to reflect the renamed variant.
+
 ## [0.12.24] — 2026-05-29
 
 ### Added — anda_core v0.12.4

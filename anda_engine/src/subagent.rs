@@ -711,7 +711,7 @@ impl Agent<AgentCtx> for SubAgent {
                     },
                     "effort": {
                         "type": ["string", "null"],
-                        "enum": ["minimal", "low", "medium", "high", "xhigh", null],
+                        "enum": ["minimal", "low", "medium", "high", "max", null],
                         "description": "Optional reasoning/thinking effort for this subagent run. Use null to keep the subagent default.",
                         "default": null
                     },
@@ -961,6 +961,7 @@ pub trait SubAgentSet: Send + Sync {
 
 pub struct SubAgentManager {
     agents: RwLock<BTreeMap<String, SubAgent>>,
+    models: Vec<String>,
 }
 
 impl Default for SubAgentManager {
@@ -975,7 +976,13 @@ impl SubAgentManager {
     pub fn new() -> Self {
         Self {
             agents: RwLock::new(BTreeMap::new()),
+            models: Vec::new(),
         }
+    }
+
+    pub fn with_models(mut self, models: Vec<String>) -> Self {
+        self.models = models;
+        self
     }
 
     fn store_prefix() -> Path {
@@ -1066,14 +1073,21 @@ impl SubAgentManager {
         Ok(name)
     }
 
-    fn description_text() -> String {
-        "Scheduler control plane for reusable subagents. Use it to list available workers, create or update focused helpers with stable instructions and restricted toolsets, optionally run an initial delegated task, and optionally persist useful helpers for future sessions and restarts. Temporary subagents are callable immediately as `SA_<name>`.".to_string()
+    fn description_text(&self) -> String {
+        if self.models.is_empty() {
+            "Scheduler control plane for reusable subagents. Use it to list available workers, create or update focused helpers with stable instructions and restricted toolsets, optionally run an initial delegated task, and optionally persist useful helpers for future sessions and restarts. Temporary subagents are callable immediately as `SA_<name>`.".to_string()
+        } else {
+            format!(
+                "Scheduler control plane for reusable subagents with model-aware routing. Use it to list available workers, create or update focused helpers with stable instructions and restricted toolsets, optionally run an initial delegated task, and optionally persist useful helpers for future sessions and restarts. Temporary subagents are callable immediately as `SA_<name>`. This manager supports the following models for routing decisions: {}.",
+                self.models.join(", ")
+            )
+        }
     }
 
     fn manager_definition(&self) -> FunctionDefinition {
         FunctionDefinition {
             name: Self::NAME.to_string(),
-            description: Self::description_text(),
+            description: self.description_text(),
             parameters: json!({
                 "type": "object",
                 "description": "List the subagent registry, or create/update a subagent configuration, optionally run it immediately, and optionally persist it for future reuse.",
@@ -1120,7 +1134,7 @@ impl SubAgentManager {
                     },
                     "effort": {
                         "type": ["string", "null"],
-                        "enum": ["minimal", "low", "medium", "high", "xhigh", null],
+                        "enum": ["minimal", "low", "medium", "high", "max", null],
                         "description": "Optional default reasoning/thinking effort used to run this subagent. Use null to leave the selected model's default effort unchanged. For operation=list, use null.",
                         "default": null
                     },
@@ -1172,7 +1186,7 @@ impl Agent<AgentCtx> for SubAgentManager {
     }
 
     fn description(&self) -> String {
-        Self::description_text()
+        self.description_text()
     }
 
     fn definition(&self) -> FunctionDefinition {
@@ -1790,7 +1804,7 @@ mod tests {
         );
         assert_eq!(
             definition.parameters["properties"]["effort"]["enum"],
-            json!(["minimal", "low", "medium", "high", "xhigh", null])
+            json!(["minimal", "low", "medium", "high", "max", null])
         );
         assert_eq!(definition.parameters["additionalProperties"], json!(false));
     }
