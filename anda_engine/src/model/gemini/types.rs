@@ -284,17 +284,26 @@ impl From<ContentPart> for Part {
                 },
                 ..Default::default()
             },
-            ContentPart::Any(json) => {
-                serde_json::from_value(json.clone()).unwrap_or_else(|_| Part {
-                    data: PartKind::Text(serde_json::to_string(&json).unwrap_or_default()),
-                    ..Default::default()
-                })
-            }
+            ContentPart::Any(json) => part_from_any(json),
             _ => Part {
                 data: PartKind::Text(serde_json::to_string(&value).unwrap_or_default()),
                 ..Default::default()
             },
         }
+    }
+}
+
+fn text_part_from_json(value: &Value) -> Part {
+    Part {
+        data: PartKind::Text(serde_json::to_string(value).unwrap_or_default()),
+        ..Default::default()
+    }
+}
+
+fn part_from_any(value: Value) -> Part {
+    match serde_json::from_value::<Part>(value.clone()) {
+        Ok(part) if !matches!(&part.data, PartKind::Any(_)) => part,
+        _ => text_part_from_json(&value),
     }
 }
 
@@ -1771,6 +1780,32 @@ mod tests {
                 assert_eq!(parsed, serde_json::to_value(&file_part).unwrap());
             }
             _ => panic!("non-remote FileData should fall back to Text"),
+        }
+    }
+
+    #[test]
+    fn content_part_any_only_preserves_known_gemini_parts() {
+        let raw_text: Part = ContentPart::Any(json!({"text": "raw text"})).into();
+        assert!(matches!(raw_text.data, PartKind::Text(text) if text == "raw text"));
+
+        let unknown = json!({"type": "mystery_part", "foo": "bar"});
+        let unknown_part: Part = ContentPart::Any(unknown.clone()).into();
+        match unknown_part.data {
+            PartKind::Text(text) => {
+                let parsed: Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(parsed, unknown);
+            }
+            _ => panic!("unknown Any part should fall back to Text"),
+        }
+
+        let malformed = json!({"functionCall": {"name": 1}});
+        let malformed_part: Part = ContentPart::Any(malformed.clone()).into();
+        match malformed_part.data {
+            PartKind::Text(text) => {
+                let parsed: Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(parsed, malformed);
+            }
+            _ => panic!("malformed Any part should fall back to Text"),
         }
     }
 

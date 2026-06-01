@@ -2,6 +2,19 @@
 
 All notable changes to the Anda project will be documented in this file.
 
+## [0.12.27] — 2026-06-01
+
+### Changed — anda_engine v0.12.27
+
+- **`ContentPart::Any` handling unified across providers** — Refactored the `ContentPart::Any` → typed-part conversion paths in OpenAI, Anthropic, and Gemini modules to consistently (1) attempt deserialization into the provider's known typed form, and (2) fall back to wrapping the original JSON as a text part. Each provider now uses a dedicated helper (`chat_completion_content_part_from_any` / `content_item_from_any` / `message_item_from_any` / `content_block_from_any` / `part_from_any`) and explicitly filters out the catch-all `Any` variant so a round-trip through `Any` never silently replaces a typed part. This guarantees that structured content (e.g. `input_image`, `web_search_call`, `tool_use`) round-trips with full semantics, while truly unknown JSON is preserved verbatim as a stringified text payload for downstream inspection.
+
+### Added — anda_engine v0.12.27
+
+- **`to_message_inputs_only_preserves_known_any_content_parts`** — New test in `anda_engine/src/model/openai.rs` asserts that `ContentPart::Any` JSON with a known `image_url` shape is preserved as-is, while unknown shapes are wrapped as text with the original JSON serialized inside.
+- **`message_into_only_preserves_known_any_items`** — New test in `anda_engine/src/model/openai/types.rs` covers both `ContentItem` and `MessageItem` deserialization paths: a known `input_image` stays in the user message content, a known `web_search_call` becomes its own `MessageItem`, and an unknown shape falls back to a text payload carrying the original JSON.
+- **Anthropic `ContentBlock::Any` test coverage** — Extended the existing `content_part_into_preserves_anthropic_specific_variants` test in `anda_engine/src/model/anthropic/types.rs` with three additional cases: raw `text` blocks round-trip as `ContentBlock::Text`, unknown `type` values fall back to text-wrapped JSON, and malformed `tool_use` shapes also fall back to text-wrapped JSON instead of erroring.
+- **`content_part_any_only_preserves_known_gemini_parts`** — New test in `anda_engine/src/model/gemini/types.rs` covers the same fallback contract for Gemini parts: raw `text` shapes become `PartKind::Text`, unknown shapes are wrapped as text, and malformed `functionCall` shapes fall back to text-wrapped JSON.
+
 ## [0.12.26] — 2026-06-01
 
 ### Changed — anda_engine v0.12.26

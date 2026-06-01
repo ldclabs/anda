@@ -700,6 +700,23 @@ fn tool_output_to_string(output: &Json) -> String {
     serde_json::to_string(output).unwrap_or_default()
 }
 
+fn chat_completion_text_content_part_from_json(value: &Json) -> Json {
+    json!({
+        "type": "text",
+        "text": serde_json::to_string(value).unwrap_or_default(),
+    })
+}
+
+fn chat_completion_content_part_from_any(value: &Json) -> Json {
+    match serde_json::from_value::<ChatCompletionContentPart>(value.clone()) {
+        Ok(part) if !matches!(&part, ChatCompletionContentPart::Any(_)) => {
+            serde_json::to_value(part)
+                .unwrap_or_else(|_| chat_completion_text_content_part_from_json(value))
+        }
+        _ => chat_completion_text_content_part_from_json(value),
+    }
+}
+
 fn to_message_inputs(msg: &Message) -> Vec<MessageInput> {
     let mut messages: Vec<MessageInput> = Vec::new();
     let mut content: Vec<Json> = Vec::new();
@@ -806,6 +823,7 @@ fn to_message_inputs(msg: &Message) -> Vec<MessageInput> {
                     })),
                 };
             }
+            ContentPart::Any(json) => content.push(chat_completion_content_part_from_any(json)),
             v => content.push(json!({
                 "type": "text",
                 "text": serde_json::to_string(v).unwrap_or_default(),
@@ -2168,6 +2186,36 @@ mod tests {
             .expect("text content should be serialized");
         let parsed: Json = serde_json::from_str(text).unwrap();
         assert_eq!(parsed, serde_json::to_value(&file_part).unwrap());
+    }
+
+    #[test]
+    fn to_message_inputs_only_preserves_known_any_content_parts() {
+        let known = json!({
+            "type": "image_url",
+            "image_url": {"url": "https://example.com/image.png"},
+        });
+        let unknown = json!({"type": "mystery_part", "foo": "bar"});
+        let msg = Message {
+            role: "user".into(),
+            content: vec![
+                ContentPart::Any(known.clone()),
+                ContentPart::Any(unknown.clone()),
+            ],
+            ..Default::default()
+        };
+
+        let values = to_message_inputs(&msg)
+            .into_iter()
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0]["content"][0], known);
+        assert_eq!(values[0]["content"][1]["type"], "text");
+        let parsed: Json =
+            serde_json::from_str(values[0]["content"][1]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(parsed, unknown);
     }
 
     #[test]

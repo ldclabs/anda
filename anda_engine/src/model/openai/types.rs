@@ -86,6 +86,26 @@ fn push_message_item(rt: &mut Vec<MessageItem>, role: &str, content: &mut Vec<Co
     }
 }
 
+fn content_item_from_any(value: &Json) -> Option<ContentItem> {
+    match serde_json::from_value::<ContentItem>(value.clone()) {
+        Ok(item) if !matches!(&item, ContentItem::Any(_)) => Some(item),
+        _ => None,
+    }
+}
+
+fn message_item_from_any(value: &Json) -> Option<MessageItem> {
+    match serde_json::from_value::<MessageItem>(value.clone()) {
+        Ok(item) if !matches!(&item, MessageItem::Any(_)) => Some(item),
+        _ => None,
+    }
+}
+
+fn text_content_item_from_json(value: &Json) -> ContentItem {
+    ContentItem::Text {
+        text: serde_json::to_string(value).unwrap_or_default(),
+    }
+}
+
 fn normalize_message_item(item: MessageItem) -> Option<MessageItem> {
     match item {
         MessageItem::Message {
@@ -1602,6 +1622,18 @@ pub fn message_into(msg: Message) -> Vec<MessageItem> {
                     created_by: None,
                 });
             }
+            ContentPart::Any(json) => {
+                if let Some(item) = message_item_from_any(&json) {
+                    push_message_item(&mut rt, &msg.role, &mut content);
+                    if let Some(item) = normalize_message_item(item) {
+                        rt.push(item);
+                    }
+                } else if let Some(item) = content_item_from_any(&json) {
+                    content.push(item);
+                } else {
+                    content.push(text_content_item_from_json(&json));
+                }
+            }
             v => content.push(ContentItem::Text {
                 text: serde_json::to_string(&v).unwrap_or_default(),
             }),
@@ -2928,6 +2960,57 @@ mod tests {
             }
         } else {
             panic!("items[4] should be Message");
+        }
+    }
+
+    #[test]
+    fn message_into_only_preserves_known_any_items() {
+        let known_content = json!({
+            "type": "input_image",
+            "image_url": "https://example.com/image.png",
+        });
+        let known_message_item = json!({
+            "type": "web_search_call",
+            "id": "ws_1",
+            "action": {"type": "search", "queries": ["rust serde"]},
+            "status": "completed",
+        });
+        let unknown = json!({"type": "mystery_item", "foo": "bar"});
+        let msg = Message {
+            role: "user".into(),
+            content: vec![
+                ContentPart::Any(known_content.clone()),
+                ContentPart::Any(known_message_item.clone()),
+                ContentPart::Any(unknown.clone()),
+            ],
+            ..Default::default()
+        };
+
+        let items = message_into(msg);
+        assert_eq!(items.len(), 3);
+
+        match &items[0] {
+            MessageItem::Message { content, .. } => {
+                assert!(matches!(
+                    &content[0],
+                    ContentItem::Image { image_url, .. }
+                        if image_url == "https://example.com/image.png"
+                ));
+            }
+            _ => panic!("known content Any should stay in message content"),
+        }
+
+        assert!(matches!(items[1], MessageItem::WebSearchCall { .. }));
+
+        match &items[2] {
+            MessageItem::Message { content, .. } => match &content[0] {
+                ContentItem::Text { text } => {
+                    let parsed: Json = serde_json::from_str(text).unwrap();
+                    assert_eq!(parsed, unknown);
+                }
+                _ => panic!("unknown Any item should fall back to text"),
+            },
+            _ => panic!("unknown Any item should be emitted as message text"),
         }
     }
 

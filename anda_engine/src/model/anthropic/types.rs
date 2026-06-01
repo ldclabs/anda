@@ -1060,6 +1060,21 @@ impl ContentBlock {
     }
 }
 
+fn text_block_from_json(value: &Value) -> ContentBlock {
+    ContentBlock::Text {
+        text: serde_json::to_string(value).unwrap_or_default(),
+        cache_control: None,
+        citations: None,
+    }
+}
+
+fn content_block_from_any(value: Value) -> ContentBlock {
+    match serde_json::from_value::<ContentBlock>(value.clone()) {
+        Ok(block) if !matches!(&block, ContentBlock::Any(_)) => block,
+        _ => text_block_from_json(&value),
+    }
+}
+
 // --- Conversions between Anthropic types and anda_core types ---
 
 impl From<ContentPart> for ContentBlock {
@@ -1156,13 +1171,7 @@ impl From<ContentPart> for ContentBlock {
                 cache_control: None,
                 is_error,
             },
-            ContentPart::Any(json) => {
-                serde_json::from_value(json.clone()).unwrap_or_else(|_| ContentBlock::Text {
-                    text: serde_json::to_string(&json).unwrap_or_default(),
-                    cache_control: None,
-                    citations: None,
-                })
-            }
+            ContentPart::Any(json) => content_block_from_any(json),
             other => ContentBlock::Text {
                 text: serde_json::to_string(&other).unwrap_or_default(),
                 cache_control: None,
@@ -1602,6 +1611,36 @@ mod tests {
                 && value["source"]["type"] == "base64"
                 && value["source"]["data"] == "not-base64"
         ));
+
+        let raw_text_block: ContentBlock = ContentPart::Any(json!({
+            "type": "text",
+            "text": "raw text",
+        }))
+        .into();
+        assert!(matches!(
+            raw_text_block,
+            ContentBlock::Text { text, .. } if text == "raw text"
+        ));
+
+        let unknown = json!({"type": "mystery_block", "foo": "bar"});
+        let unknown_block: ContentBlock = ContentPart::Any(unknown.clone()).into();
+        match unknown_block {
+            ContentBlock::Text { text, .. } => {
+                let parsed: Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(parsed, unknown);
+            }
+            _ => panic!("unknown Any block should fall back to Text"),
+        }
+
+        let malformed = json!({"type": "tool_use", "id": "toolu_1"});
+        let malformed_block: ContentBlock = ContentPart::Any(malformed.clone()).into();
+        match malformed_block {
+            ContentBlock::Text { text, .. } => {
+                let parsed: Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(parsed, malformed);
+            }
+            _ => panic!("malformed Any block should fall back to Text"),
+        }
     }
 
     #[test]
