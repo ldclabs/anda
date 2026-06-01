@@ -2,6 +2,12 @@
 
 All notable changes to the Anda project will be documented in this file.
 
+## [0.12.26] — 2026-06-01
+
+### Changed — anda_engine v0.12.26
+
+- **`Models::resolve()` simplified fallback chain** — Removed the deprecated `fallback_model()` path and the arbitrary-first-model extraction from `resolve()`. The resolution order is now: exact label match → `get_model()` (which returns the primary model, or the first available if none is configured). This eliminates a code path that could silently return an unexpected model and aligns `resolve()` with the well-tested `get_model()` behavior. Updated doc comment and test expectation accordingly.
+
 ## [0.12.25] — 2026-05-31
 
 ### Added — anda_core v0.12.5

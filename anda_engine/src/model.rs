@@ -312,21 +312,13 @@ impl Models {
     ///
     /// Resolution order is:
     /// - the exact label match when `label` is non-empty
-    /// - the configured fallback model
     /// - the default routing result from [`Models::get_model`]
     pub fn resolve(&self, label: &str) -> Option<Model> {
         if label.is_empty() {
             return self.get_model();
         }
         self.get(&label.to_ascii_lowercase())
-            .or_else(|| self.fallback_model())
-            .or_else(|| {
-                self.models
-                    .load()
-                    .values()
-                    .next()
-                    .and_then(|v| v.last().cloned())
-            })
+            .or_else(|| self.get_model())
     }
 }
 
@@ -750,7 +742,7 @@ mod tests {
                 .resolve("missing")
                 .expect("missing label should use fallback")
                 .model_name(),
-            "fallback"
+            "primary"
         );
         assert_eq!(
             models
