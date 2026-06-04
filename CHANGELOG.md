@@ -8,6 +8,10 @@ All notable changes to the Anda project will be documented in this file.
 
 - **Multiple skill directories in `SkillManager`** — Added `SkillManager::new_with_dirs()` so skill loading and lookup can scan the default skill creation directory plus additional read-only skill roots. Skill descriptions now list all configured directories, duplicate directory entries are deduplicated, duplicate skill names are skipped after the first load root, and displayed `SKILL.md` paths are made relative to the matching configured root. Added coverage for loading and reading skills across multiple directories.
 
+### Fixed — anda_engine v0.12.29
+
+- **Agent completion runner edge cases** — Fixed completion streams so a pending model future is retained across polls instead of being recreated, document-only requests now execute without requiring prompt/content text, steering after tool calls prunes only unanswered raw tool-call items while preserving prior raw history and assistant reasoning, completed runners ignore late steering/follow-up queues, and remote agent resource selection now uses the unprefixed agent name. Added regression coverage for the stream polling, raw-history pruning, steering, and document-only paths.
+
 ### Changed — anda_engine v0.12.29
 
 - **Hardened OpenAI-compatible response parsing** — Chat Completions and Responses now tolerate DeepSeek-compatible variants: nullable usage detail objects and counters, unknown `service_tier` strings, `reasoning` aliases for reasoning content, `tool_call`/`tool_use`/`function_call` finish reasons, JSON object tool arguments/inputs, and missing message/tool-call role/type/id fields. Added tests for non-streaming and streaming compatibility shapes.
