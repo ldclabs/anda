@@ -1558,7 +1558,7 @@ pub struct CountMessageTokensResponse {
     pub input_tokens: u32,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(tag = "type")]
 pub enum StreamEvent {
     #[serde(rename = "message_start")]
@@ -1586,6 +1586,97 @@ pub enum StreamEvent {
     Ping,
     #[serde(rename = "error")]
     Error { error: StreamError },
+    #[serde(untagged)]
+    Any(Value),
+}
+
+impl<'de> Deserialize<'de> for StreamEvent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        match &value {
+            Value::Object(map)
+                if matches!(
+                    map.get("type").and_then(|t| t.as_str()),
+                    Some(
+                        "message_start"
+                            | "content_block_start"
+                            | "content_block_delta"
+                            | "content_block_stop"
+                            | "message_delta"
+                            | "message_stop"
+                            | "ping"
+                            | "error"
+                    )
+                ) =>
+            {
+                #[derive(Deserialize)]
+                #[serde(tag = "type")]
+                enum Helper {
+                    #[serde(rename = "message_start")]
+                    MessageStart { message: MessageStartContent },
+                    #[serde(rename = "content_block_start")]
+                    ContentBlockStart {
+                        #[serde(default)]
+                        index: usize,
+                        content_block: ContentBlock,
+                    },
+                    #[serde(rename = "content_block_delta")]
+                    ContentBlockDelta {
+                        #[serde(default)]
+                        index: usize,
+                        delta: ContentBlockDelta,
+                    },
+                    #[serde(rename = "content_block_stop")]
+                    ContentBlockStop {
+                        #[serde(default)]
+                        index: usize,
+                    },
+                    #[serde(rename = "message_delta")]
+                    MessageDelta {
+                        #[serde(default)]
+                        delta: MessageDeltaContent,
+                        usage: Option<Usage>,
+                    },
+                    #[serde(rename = "message_stop")]
+                    MessageStop,
+                    #[serde(rename = "ping")]
+                    Ping,
+                    #[serde(rename = "error")]
+                    Error { error: StreamError },
+                }
+
+                match serde_json::from_value::<Helper>(value.clone()) {
+                    Ok(Helper::MessageStart { message }) => {
+                        Ok(StreamEvent::MessageStart { message })
+                    }
+                    Ok(Helper::ContentBlockStart {
+                        index,
+                        content_block,
+                    }) => Ok(StreamEvent::ContentBlockStart {
+                        index,
+                        content_block,
+                    }),
+                    Ok(Helper::ContentBlockDelta { index, delta }) => {
+                        Ok(StreamEvent::ContentBlockDelta { index, delta })
+                    }
+                    Ok(Helper::ContentBlockStop { index }) => {
+                        Ok(StreamEvent::ContentBlockStop { index })
+                    }
+                    Ok(Helper::MessageDelta { delta, usage }) => {
+                        Ok(StreamEvent::MessageDelta { delta, usage })
+                    }
+                    Ok(Helper::MessageStop) => Ok(StreamEvent::MessageStop),
+                    Ok(Helper::Ping) => Ok(StreamEvent::Ping),
+                    Ok(Helper::Error { error }) => Ok(StreamEvent::Error { error }),
+                    Err(_) => Ok(StreamEvent::Any(value)),
+                }
+            }
+            _ => Ok(StreamEvent::Any(value)),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1601,7 +1692,7 @@ pub struct MessageStartContent {
     pub usage: Usage,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(tag = "type")]
 pub enum ContentBlockDelta {
     #[serde(rename = "text_delta")]
@@ -1614,9 +1705,79 @@ pub enum ContentBlockDelta {
     SignatureDelta { signature: String },
     #[serde(rename = "citations_delta")]
     CitationsDelta { citation: TextCitation },
+    #[serde(untagged)]
+    Any(Value),
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+impl<'de> Deserialize<'de> for ContentBlockDelta {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        match &value {
+            Value::Object(map)
+                if matches!(
+                    map.get("type").and_then(|t| t.as_str()),
+                    Some(
+                        "text_delta"
+                            | "input_json_delta"
+                            | "thinking_delta"
+                            | "signature_delta"
+                            | "citations_delta"
+                    )
+                ) =>
+            {
+                #[derive(Deserialize)]
+                #[serde(tag = "type")]
+                enum Helper {
+                    #[serde(rename = "text_delta")]
+                    TextDelta {
+                        #[serde(default)]
+                        text: String,
+                    },
+                    #[serde(rename = "input_json_delta")]
+                    InputJsonDelta {
+                        #[serde(default)]
+                        partial_json: String,
+                    },
+                    #[serde(rename = "thinking_delta")]
+                    ThinkingDelta {
+                        #[serde(default)]
+                        thinking: String,
+                    },
+                    #[serde(rename = "signature_delta")]
+                    SignatureDelta {
+                        #[serde(default)]
+                        signature: String,
+                    },
+                    #[serde(rename = "citations_delta")]
+                    CitationsDelta { citation: TextCitation },
+                }
+
+                match serde_json::from_value::<Helper>(value.clone()) {
+                    Ok(Helper::TextDelta { text }) => Ok(ContentBlockDelta::TextDelta { text }),
+                    Ok(Helper::InputJsonDelta { partial_json }) => {
+                        Ok(ContentBlockDelta::InputJsonDelta { partial_json })
+                    }
+                    Ok(Helper::ThinkingDelta { thinking }) => {
+                        Ok(ContentBlockDelta::ThinkingDelta { thinking })
+                    }
+                    Ok(Helper::SignatureDelta { signature }) => {
+                        Ok(ContentBlockDelta::SignatureDelta { signature })
+                    }
+                    Ok(Helper::CitationsDelta { citation }) => {
+                        Ok(ContentBlockDelta::CitationsDelta { citation })
+                    }
+                    Err(_) => Ok(ContentBlockDelta::Any(value)),
+                }
+            }
+            _ => Ok(ContentBlockDelta::Any(value)),
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
 pub struct MessageDeltaContent {
     pub stop_reason: Option<StopReason>,
     pub stop_sequence: Option<String>,

@@ -496,11 +496,26 @@ mod tests {
                 "candidates": [{
                     "index": 0,
                     "content": {"parts": [{"text": "lo"}]},
+                    "safetyRatings": [{
+                        "category": "HARM_CATEGORY_VENDOR_SPECIFIC",
+                        "probability": "VERY_LOW"
+                    }]
+                }]
+            }))
+            .unwrap(),
+            serde_json::from_value::<types::GenerateContentResponse>(json!({
+                "candidates": [{
+                    "index": 0,
                     "finishReason": "STOP"
                 }],
                 "usageMetadata": {
                     "promptTokenCount": 2,
-                    "candidatesTokenCount": 1
+                    "candidatesTokenCount": 1,
+                    "promptTokensDetails": null,
+                    "candidatesTokensDetails": [{
+                        "modality": "FUTURE_MODALITY",
+                        "tokenCount": null
+                    }]
                 },
                 "responseId": "resp_1"
             }))
@@ -510,6 +525,19 @@ mod tests {
         let response = response_from_stream_chunks(chunks).unwrap();
         assert!(!response.maybe_failed());
         assert_eq!(response.response_id.as_deref(), Some("resp_1"));
+        assert!(matches!(
+            &response.candidates[0]
+                .safety_ratings
+                .as_ref()
+                .unwrap()[0]
+                .category,
+            types::HarmCategory::Unknown(category)
+                if category == "HARM_CATEGORY_VENDOR_SPECIFIC"
+        ));
+        assert!(matches!(
+            &response.usage_metadata.candidates_tokens_details[0].modality,
+            Some(types::Modality::Unknown(modality)) if modality == "FUTURE_MODALITY"
+        ));
 
         let output = response.try_into(vec![], vec![]).unwrap();
         assert_eq!(output.content, "Hello");

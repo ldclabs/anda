@@ -301,6 +301,7 @@ fn apply_content_delta(
                 citations.get_or_insert_with(Vec::new).push(citation);
             }
         }
+        types::ContentBlockDelta::Any(_) => {}
     }
 }
 
@@ -382,7 +383,9 @@ fn response_from_stream_events(
                 )
                 .into());
             }
-            types::StreamEvent::MessageStop | types::StreamEvent::Ping => {}
+            types::StreamEvent::MessageStop
+            | types::StreamEvent::Ping
+            | types::StreamEvent::Any(_) => {}
         }
     }
 
@@ -649,6 +652,18 @@ mod tests {
                 "type": "content_block_delta",
                 "index": 0,
                 "delta": {"type": "text_delta", "text": "Hi "}
+            }))
+            .unwrap(),
+            serde_json::from_value::<types::StreamEvent>(json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "server_tool_delta", "foo": "bar"}
+            }))
+            .unwrap(),
+            serde_json::from_value::<types::StreamEvent>(json!({
+                "type": "content_block_pause",
+                "index": 0,
+                "metadata": {"vendor": "compat"}
             }))
             .unwrap(),
             serde_json::from_value::<types::StreamEvent>(json!({

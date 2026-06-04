@@ -2697,9 +2697,8 @@ pub struct ResponseError {
     pub message: String,
 }
 
-/// The response status as an enum (ensures type validation)
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
+/// The response status as an enum.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub enum ResponseStatus {
     #[default]
     InProgress,
@@ -2708,6 +2707,48 @@ pub enum ResponseStatus {
     Cancelled,
     Queued,
     Incomplete,
+    Other(String),
+}
+
+impl ResponseStatus {
+    fn as_str(&self) -> &str {
+        match self {
+            Self::InProgress => "in_progress",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Queued => "queued",
+            Self::Incomplete => "incomplete",
+            Self::Other(value) => value.as_str(),
+        }
+    }
+}
+
+impl Serialize for ResponseStatus {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ResponseStatus {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(match value.as_str() {
+            "in_progress" => Self::InProgress,
+            "completed" => Self::Completed,
+            "failed" => Self::Failed,
+            "cancelled" => Self::Cancelled,
+            "queued" => Self::Queued,
+            "incomplete" => Self::Incomplete,
+            _ => Self::Other(value),
+        })
+    }
 }
 
 /// The truncation strategy.

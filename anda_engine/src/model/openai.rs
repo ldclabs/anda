@@ -937,6 +937,7 @@ struct ChatCompletionStreamChunk {
 
 #[derive(Debug, Deserialize)]
 struct ChatCompletionStreamChoice {
+    #[serde(default)]
     pub index: usize,
     #[serde(default, deserialize_with = "null_default")]
     pub delta: ChatCompletionStreamDelta,
@@ -987,6 +988,7 @@ struct CustomToolCallDelta {
 
 #[derive(Debug, Default, Deserialize)]
 struct ToolCallDelta {
+    #[serde(default)]
     pub index: usize,
     #[serde(default)]
     pub id: Option<String>,
@@ -2559,12 +2561,10 @@ mod tests {
                 "created": 1777373352,
                 "model": "deepseek-v4-pro",
                 "choices": [{
-                    "index": 0,
                     "delta": {
                         "role": "assistant",
                         "reasoning": "Need lookup.",
                         "tool_calls": [{
-                            "index": 0,
                             "id": "call_1",
                             "function": {
                                 "name": "lookup",
@@ -2660,7 +2660,7 @@ mod tests {
                     "created_at": 1741569957,
                     "model": "gpt-5.5",
                     "output": [],
-                    "status": "in_progress",
+                    "status": "streaming",
                     "usage": null
                 }
             }))
@@ -2680,6 +2680,10 @@ mod tests {
         ];
 
         let response = responses_response_from_stream_events(events).unwrap();
+        assert!(matches!(
+            response.status,
+            types::ResponseStatus::Other(ref status) if status == "streaming"
+        ));
         assert_eq!(response.output.len(), 1);
 
         let output = response.try_into(vec![], vec![]).unwrap();

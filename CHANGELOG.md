@@ -7,6 +7,7 @@ All notable changes to the Anda project will be documented in this file.
 ### Changed — anda_engine v0.12.29
 
 - **Hardened OpenAI-compatible response parsing** — Chat Completions and Responses now tolerate DeepSeek-compatible variants: nullable usage detail objects and counters, unknown `service_tier` strings, `reasoning` aliases for reasoning content, `tool_call`/`tool_use`/`function_call` finish reasons, JSON object tool arguments/inputs, and missing message/tool-call role/type/id fields. Added tests for non-streaming and streaming compatibility shapes.
+- **Expanded provider compatibility tolerance** — Anthropic streaming now ignores unknown stream events and content deltas instead of failing; Gemini now preserves unknown enum values, accepts nullable usage/safety metadata, and treats missing/unspecified finish reasons as successful candidate output. OpenAI Responses now preserves unknown statuses and streaming tool-call chunks can omit indexes. Added provider tests for these compatibility shapes.
 
 ## [0.12.28] — 2026-06-04
 

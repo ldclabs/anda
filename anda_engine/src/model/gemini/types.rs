@@ -12,6 +12,49 @@ fn is_zero(value: &u32) -> bool {
     *value == 0
 }
 
+fn null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+macro_rules! string_enum_serde {
+    ($ty:ident, { $($wire:literal => $variant:ident),+ $(,)? }, $unknown:ident) => {
+        impl $ty {
+            fn as_str(&self) -> &str {
+                match self {
+                    $(Self::$variant => $wire,)+
+                    Self::$unknown(value) => value.as_str(),
+                }
+            }
+        }
+
+        impl Serialize for $ty {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                serializer.serialize_str(self.as_str())
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $ty {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                let value = String::deserialize(deserializer)?;
+                Ok(match value.as_str() {
+                    $($wire => Self::$variant,)+
+                    _ => Self::$unknown(value),
+                })
+            }
+        }
+    };
+}
+
 // https://ai.google.dev/api/generate-content
 // https://googleapis.github.io/js-genai/release_docs/index.html
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
@@ -119,13 +162,13 @@ impl GenerateContentResponse {
                 msg.timestamp = Some(timestamp);
 
                 match candidate.finish_reason {
-                    Some(FinishReason::Stop) => {
+                    Some(reason) if !reason.is_success() => {
+                        output.failed_reason = serde_json::to_string(&reason).ok();
+                    }
+                    _ => {
                         output.content = msg.text().unwrap_or_default();
                         output.thoughts = msg.thoughts();
                         output.tool_calls = msg.tool_calls();
-                    }
-                    v => {
-                        output.failed_reason = serde_json::to_string(&v).ok();
                     }
                 }
                 output.chat_history.push(msg);
@@ -138,7 +181,12 @@ impl GenerateContentResponse {
     pub fn maybe_failed(&self) -> bool {
         self.prompt_feedback.is_some()
             || !self.candidates.iter().any(|candidate| {
-                matches!(candidate.finish_reason.as_ref(), Some(FinishReason::Stop))
+                !candidate.content.parts.is_empty()
+                    && candidate
+                        .finish_reason
+                        .as_ref()
+                        .map(FinishReason::is_success)
+                        .unwrap_or(true)
             })
     }
 }
@@ -148,6 +196,7 @@ impl GenerateContentResponse {
 #[serde(rename_all = "camelCase")]
 pub struct Candidate {
     /// Generated content returned from the model.
+    #[serde(default)]
     pub content: Content,
     /// The reason why the model stopped generating tokens. If empty, the model
     /// has not stopped generating tokens.
@@ -190,7 +239,7 @@ pub struct Candidate {
     pub finish_message: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Content {
     // Optional. The producer of the content. Must be either 'user' or 'model'.
@@ -887,8 +936,7 @@ pub enum ModelStage {
     Retired,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub enum Modality {
     #[default]
     ModalityUnspecified,
@@ -897,7 +945,17 @@ pub enum Modality {
     Audio,
     Video,
     Document,
+    Unknown(String),
 }
+
+string_enum_serde!(Modality, {
+    "MODALITY_UNSPECIFIED" => ModalityUnspecified,
+    "TEXT" => Text,
+    "IMAGE" => Image,
+    "AUDIO" => Audio,
+    "VIDEO" => Video,
+    "DOCUMENT" => Document,
+}, Unknown);
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -1212,7 +1270,11 @@ pub struct ModalityTokenCount {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub modality: Option<Modality>,
 
-    #[serde(default, skip_serializing_if = "is_zero")]
+    #[serde(
+        default,
+        deserialize_with = "null_default",
+        skip_serializing_if = "is_zero"
+    )]
     pub token_count: u32,
 }
 
@@ -1322,8 +1384,7 @@ pub struct PromptFeedback {
 }
 
 /// Reason why a prompt was blocked by the model
-#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub enum BlockReason {
     /// Default value. This value is unused.
     #[default]
@@ -1338,39 +1399,65 @@ pub enum BlockReason {
     ProhibitedContent,
     /// Candidates blocked due to unsafe image generation content.
     ImageSafety,
+    Unknown(String),
 }
+
+string_enum_serde!(BlockReason, {
+    "BLOCK_REASON_UNSPECIFIED" => BlockReasonUnspecified,
+    "SAFETY" => Safety,
+    "OTHER" => Other,
+    "BLOCKLIST" => Blocklist,
+    "PROHIBITED_CONTENT" => ProhibitedContent,
+    "IMAGE_SAFETY" => ImageSafety,
+}, Unknown);
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageMetadata {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub prompt_token_count: u32,
 
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub total_token_count: u32,
 
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub candidates_token_count: u32,
 
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub thoughts_token_count: u32,
 
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub tool_use_prompt_token_count: u32,
 
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub cached_content_token_count: u32,
 
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "null_default",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub prompt_tokens_details: Vec<ModalityTokenCount>,
 
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "null_default",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub cache_tokens_details: Vec<ModalityTokenCount>,
 
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "null_default",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub candidates_tokens_details: Vec<ModalityTokenCount>,
 
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "null_default",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub tool_use_prompt_tokens_details: Vec<ModalityTokenCount>,
 }
 
@@ -1439,8 +1526,10 @@ pub struct CitationSource {
 #[serde(rename_all = "camelCase")]
 pub struct SafetyRating {
     /// The category for this rating.
+    #[serde(default, deserialize_with = "null_default")]
     pub category: HarmCategory,
     /// The probability of harm for this content.
+    #[serde(default, deserialize_with = "null_default")]
     pub probability: HarmProbability,
     /// Was this content blocked because of this rating?
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1449,8 +1538,7 @@ pub struct SafetyRating {
 
 pub type SatisfyRating = SafetyRating;
 
-#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub enum HarmProbability {
     /// Default value. This value is unused.
     #[default]
@@ -1463,7 +1551,16 @@ pub enum HarmProbability {
     Medium,
     /// Content has a high chance of being unsafe.
     High,
+    Unknown(String),
 }
+
+string_enum_serde!(HarmProbability, {
+    "HARM_PROBABILITY_UNSPECIFIED" => HarmProbabilityUnspecified,
+    "NEGLIGIBLE" => Negligible,
+    "LOW" => Low,
+    "MEDIUM" => Medium,
+    "HIGH" => High,
+}, Unknown);
 
 // HarmCategory
 //
@@ -1471,8 +1568,7 @@ pub enum HarmProbability {
 //
 // These categories cover various kinds of harms that developers may wish to
 // adjust.
-#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub enum HarmCategory {
     #[default]
     HarmCategoryUnspecified,
@@ -1488,10 +1584,26 @@ pub enum HarmCategory {
     HarmCategorySexuallyExplicit,
     HarmCategoryDangerousContent,
     HarmCategoryCivicIntegrity,
+    Unknown(String),
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+string_enum_serde!(HarmCategory, {
+    "HARM_CATEGORY_UNSPECIFIED" => HarmCategoryUnspecified,
+    "HARM_CATEGORY_DEROGATORY" => HarmCategoryDerogatory,
+    "HARM_CATEGORY_TOXICITY" => HarmCategoryToxicity,
+    "HARM_CATEGORY_VIOLENCE" => HarmCategoryViolence,
+    "HARM_CATEGORY_SEXUAL" => HarmCategorySexual,
+    "HARM_CATEGORY_SEXUALLY" => HarmCategorySexually,
+    "HARM_CATEGORY_MEDICAL" => HarmCategoryMedical,
+    "HARM_CATEGORY_DANGEROUS" => HarmCategoryDangerous,
+    "HARM_CATEGORY_HARASSMENT" => HarmCategoryHarassment,
+    "HARM_CATEGORY_HATE_SPEECH" => HarmCategoryHateSpeech,
+    "HARM_CATEGORY_SEXUALLY_EXPLICIT" => HarmCategorySexuallyExplicit,
+    "HARM_CATEGORY_DANGEROUS_CONTENT" => HarmCategoryDangerousContent,
+    "HARM_CATEGORY_CIVIC_INTEGRITY" => HarmCategoryCivicIntegrity,
+}, Unknown);
+
+#[derive(Debug, Clone, Default, PartialEq)]
 pub enum FinishReason {
     /// Default value. This value is unused.
     #[default]
@@ -1537,7 +1649,37 @@ pub enum FinishReason {
     MissingThoughtSignature,
     /// Finished due to malformed response.
     MalformedResponse,
+    Unknown(String),
 }
+
+impl FinishReason {
+    pub fn is_success(&self) -> bool {
+        matches!(self, Self::Stop | Self::FinishReasonUnspecified)
+    }
+}
+
+string_enum_serde!(FinishReason, {
+    "FINISH_REASON_UNSPECIFIED" => FinishReasonUnspecified,
+    "STOP" => Stop,
+    "MAX_TOKENS" => MaxTokens,
+    "SAFETY" => Safety,
+    "RECITATION" => Recitation,
+    "LANGUAGE" => Language,
+    "OTHER" => Other,
+    "BLOCKLIST" => Blocklist,
+    "PROHIBITED_CONTENT" => ProhibitedContent,
+    "SPII" => Spii,
+    "MALFORMED_FUNCTION_CALL" => MalformedFunctionCall,
+    "IMAGE_SAFETY" => ImageSafety,
+    "IMAGE_PROHIBITED_CONTENT" => ImageProhibitedContent,
+    "IMAGE_OTHER" => ImageOther,
+    "NO_IMAGE" => NoImage,
+    "IMAGE_RECITATION" => ImageRecitation,
+    "UNEXPECTED_TOOL_CALL" => UnexpectedToolCall,
+    "TOO_MANY_TOOL_CALLS" => TooManyToolCalls,
+    "MISSING_THOUGHT_SIGNATURE" => MissingThoughtSignature,
+    "MALFORMED_RESPONSE" => MalformedResponse,
+}, Unknown);
 
 #[cfg(test)]
 mod tests {
@@ -2108,6 +2250,20 @@ mod tests {
         assert_eq!(
             &candidate.safety_ratings.unwrap()[0].category,
             &HarmCategory::HarmCategoryHateSpeech
+        );
+
+        let candidate: Candidate = serde_json::from_value(json!({
+            "finishReason": "VENDOR_STOP"
+        }))
+        .unwrap();
+        assert!(candidate.content.parts.is_empty());
+        assert!(matches!(
+            candidate.finish_reason.as_ref(),
+            Some(FinishReason::Unknown(reason)) if reason == "VENDOR_STOP"
+        ));
+        assert_eq!(
+            serde_json::to_value(candidate.finish_reason).unwrap(),
+            json!("VENDOR_STOP")
         );
     }
 
