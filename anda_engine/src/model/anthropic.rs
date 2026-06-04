@@ -522,6 +522,7 @@ impl CompletionFeaturesDyn for CompletionModel {
 
             r.system = None; // avoid logging tedious instructions
             if response.status().is_success() {
+                let mut assistant_raw_message = None;
                 let res = if r.stream == Some(true) {
                     let events = read_sse_json_events(response, &model).await?;
                     response_from_stream_events(events)?
@@ -533,7 +534,23 @@ impl CompletionFeaturesDyn for CompletionModel {
                         )
                     })?;
 
-                    match serde_json::from_slice::<types::CreateMessageResponse>(&data) {
+                    let raw_response = match serde_json::from_slice::<Value>(&data) {
+                        Ok(value) => value,
+                        Err(err) => {
+                            return Err(format!(
+                                "Completion error, model: {}, error: {}, body: {}",
+                                model,
+                                err,
+                                String::from_utf8_lossy(&data)
+                            )
+                            .into());
+                        }
+                    };
+                    assistant_raw_message = types::assistant_raw_history_message(&raw_response);
+
+                    match serde_json::from_value::<types::CreateMessageResponse>(
+                        raw_response.clone(),
+                    ) {
                         Ok(res) => res,
                         Err(err) => {
                             return Err(format!(
@@ -564,9 +581,10 @@ impl CompletionFeaturesDyn for CompletionModel {
                     r.messages.drain(0..skip_raw);
                 }
 
-                res.try_into(
+                res.try_into_with_raw(
                     r.messages.into_iter().map(|v| json!(v)).collect(),
                     chat_history,
+                    assistant_raw_message,
                 )
             } else {
                 let status = response.status();

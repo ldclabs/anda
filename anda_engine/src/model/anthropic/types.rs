@@ -565,7 +565,11 @@ impl<'de> Deserialize<'de> for ContentBlock {
                         is_error: Option<bool>,
                     },
                     #[serde(rename = "thinking")]
-                    Thinking { thinking: String, signature: String },
+                    Thinking {
+                        thinking: String,
+                        #[serde(default)]
+                        signature: String,
+                    },
                     #[serde(rename = "redacted_thinking")]
                     RedactedThinking { data: String },
                     #[serde(rename = "server_tool_use")]
@@ -786,6 +790,21 @@ impl<'de> Deserialize<'de> for ContentBlock {
     }
 }
 
+fn deserialize_content_blocks<'de, D>(deserializer: D) -> Result<Vec<ContentBlock>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    match value {
+        Value::Null => Ok(Vec::new()),
+        Value::String(text) => Ok(vec![ContentBlock::text(text)]),
+        Value::Array(_) => {
+            Vec::<ContentBlock>::deserialize(value).map_err(serde::de::Error::custom)
+        }
+        value => Ok(vec![ContentBlock::Any(value)]),
+    }
+}
+
 /// Tool definition
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Tool {
@@ -923,6 +942,7 @@ pub enum StopDetails {
 #[derive(Debug, Deserialize, Serialize)]
 pub struct CreateMessageResponse {
     /// Content blocks in the response
+    #[serde(default, deserialize_with = "deserialize_content_blocks")]
     pub content: Vec<ContentBlock>,
     /// Unique message identifier
     pub id: String,
@@ -947,8 +967,7 @@ pub struct CreateMessageResponse {
 }
 
 /// Reason for stopping message generation
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StopReason {
     EndTurn,
     MaxTokens,
@@ -956,6 +975,51 @@ pub enum StopReason {
     ToolUse,
     PauseTurn,
     Refusal,
+    Other(String),
+}
+
+impl StopReason {
+    fn as_str(&self) -> &str {
+        match self {
+            Self::EndTurn => "end_turn",
+            Self::MaxTokens => "max_tokens",
+            Self::StopSequence => "stop_sequence",
+            Self::ToolUse => "tool_use",
+            Self::PauseTurn => "pause_turn",
+            Self::Refusal => "refusal",
+            Self::Other(value) => value.as_str(),
+        }
+    }
+}
+
+impl Serialize for StopReason {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for StopReason {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(match value.as_str() {
+            "end_turn" => Self::EndTurn,
+            "stop" => Self::EndTurn,
+            "max_tokens" => Self::MaxTokens,
+            "length" => Self::MaxTokens,
+            "stop_sequence" => Self::StopSequence,
+            "tool_use" => Self::ToolUse,
+            "tool_calls" => Self::ToolUse,
+            "pause_turn" => Self::PauseTurn,
+            "refusal" => Self::Refusal,
+            _ => Self::Other(value),
+        })
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -974,12 +1038,47 @@ pub struct ServerToolUsage {
     pub web_search_requests: u32,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UsageServiceTier {
     Standard,
     Priority,
     Batch,
+    Other(String),
+}
+
+impl UsageServiceTier {
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Standard => "standard",
+            Self::Priority => "priority",
+            Self::Batch => "batch",
+            Self::Other(value) => value.as_str(),
+        }
+    }
+}
+
+impl Serialize for UsageServiceTier {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for UsageServiceTier {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(match value.as_str() {
+            "standard" => Self::Standard,
+            "priority" => Self::Priority,
+            "batch" => Self::Batch,
+            _ => Self::Other(value),
+        })
+    }
 }
 
 /// Token usage statistics
@@ -1348,6 +1447,15 @@ impl CreateMessageResponse {
         raw_history: Vec<Value>,
         chat_history: Vec<CoreMessage>,
     ) -> Result<AgentOutput, BoxError> {
+        self.try_into_with_raw(raw_history, chat_history, None)
+    }
+
+    pub fn try_into_with_raw(
+        self,
+        raw_history: Vec<Value>,
+        chat_history: Vec<CoreMessage>,
+        assistant_raw_message: Option<Value>,
+    ) -> Result<AgentOutput, BoxError> {
         let timestamp = unix_ms();
         let mut output = AgentOutput {
             raw_history,
@@ -1370,10 +1478,14 @@ impl CreateMessageResponse {
         } else {
             let content_parts: Vec<ContentPart> =
                 self.content.iter().cloned().map(|v| v.into()).collect();
-            output.raw_history.push(json!({
-                "role": self.role,
-                "content": self.content,
-            }));
+            output
+                .raw_history
+                .push(assistant_raw_message.unwrap_or_else(|| {
+                    json!({
+                        "role": self.role,
+                        "content": self.content,
+                    })
+                }));
 
             let msg = CoreMessage {
                 role: "assistant".to_string(),
@@ -1403,10 +1515,28 @@ impl CreateMessageResponse {
 
     pub fn maybe_failed(&self) -> bool {
         !matches!(
-            self.stop_reason,
+            self.stop_reason.as_ref(),
             Some(StopReason::EndTurn) | Some(StopReason::StopSequence) | Some(StopReason::ToolUse)
         )
     }
+}
+
+pub(crate) fn assistant_raw_history_message(value: &Value) -> Option<Value> {
+    let object = value.as_object()?;
+    let role = object.get("role")?;
+    let content = object.get("content")?;
+
+    let mut message = serde_json::Map::new();
+    message.insert("role".to_string(), role.clone());
+    message.insert("content".to_string(), content.clone());
+
+    for key in ["reasoning_content", "thinking", "tool_calls"] {
+        if let Some(value) = object.get(key) {
+            message.insert(key.to_string(), value.clone());
+        }
+    }
+
+    Some(Value::Object(message))
 }
 
 #[derive(Debug, Serialize, Default)]
@@ -1463,6 +1593,7 @@ pub struct MessageStartContent {
     pub id: String,
     pub r#type: String,
     pub role: Role,
+    #[serde(default, deserialize_with = "deserialize_content_blocks")]
     pub content: Vec<ContentBlock>,
     pub model: String,
     pub stop_reason: Option<StopReason>,
@@ -1510,6 +1641,16 @@ mod tests {
         let malformed_known = json!({"type": "tool_use", "id": "toolu_1"});
         let block: ContentBlock = serde_json::from_value(malformed_known.clone()).unwrap();
         assert_eq!(block, ContentBlock::Any(malformed_known));
+
+        let thinking_without_signature = json!({"type": "thinking", "thinking": "plan"});
+        let block: ContentBlock = serde_json::from_value(thinking_without_signature).unwrap();
+        assert_eq!(
+            block,
+            ContentBlock::Thinking {
+                thinking: "plan".to_string(),
+                signature: String::new(),
+            }
+        );
     }
 
     #[test]
@@ -1712,6 +1853,97 @@ mod tests {
         assert_eq!(output.usage.cached_tokens, 3);
         assert_eq!(output.chat_history.len(), 1);
         assert_eq!(output.raw_history.len(), 1);
+    }
+
+    #[test]
+    fn deserializes_deepseek_nonstream_compat_response_shapes() {
+        let response: CreateMessageResponse = serde_json::from_value(json!({
+            "id": "msg_deepseek_1",
+            "type": "message",
+            "role": "assistant",
+            "model": "deepseek-v4-pro",
+            "content": "done",
+            "stop_reason": "stop",
+            "stop_sequence": null,
+            "usage": {
+                "input_tokens": 2,
+                "output_tokens": 3,
+                "service_tier": "default"
+            }
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            response.stop_reason.as_ref(),
+            Some(StopReason::EndTurn)
+        ));
+        assert!(matches!(
+            response.usage.service_tier,
+            Some(UsageServiceTier::Other(ref tier)) if tier == "default"
+        ));
+        assert!(matches!(
+            response.content.first(),
+            Some(ContentBlock::Text { text, .. }) if text == "done"
+        ));
+
+        let response: CreateMessageResponse = serde_json::from_value(json!({
+            "id": "msg_deepseek_2",
+            "type": "message",
+            "role": "assistant",
+            "model": "deepseek-v4-pro",
+            "content": [{
+                "type": "tool_use",
+                "id": "toolu_1",
+                "name": "lookup",
+                "input": {"query": "anda"}
+            }],
+            "stop_reason": "tool_calls",
+            "stop_sequence": null,
+            "usage": {"input_tokens": 2, "output_tokens": 3}
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            response.stop_reason.as_ref(),
+            Some(StopReason::ToolUse)
+        ));
+        assert!(!response.maybe_failed());
+    }
+
+    #[test]
+    fn try_into_with_raw_preserves_deepseek_assistant_history_extensions() {
+        let raw = json!({
+            "id": "msg_deepseek_3",
+            "type": "message",
+            "role": "assistant",
+            "model": "deepseek-v4-pro",
+            "content": [{
+                "type": "thinking",
+                "thinking": "Need lookup",
+                "signature": "sig_1",
+                "provider_extra": {"keep": true}
+            }, {
+                "type": "text",
+                "text": "done"
+            }],
+            "reasoning_content": "Need lookup",
+            "stop_reason": "end_turn",
+            "stop_sequence": null,
+            "usage": {"input_tokens": 2, "output_tokens": 3}
+        });
+        let response: CreateMessageResponse = serde_json::from_value(raw.clone()).unwrap();
+
+        let output = response
+            .try_into_with_raw(Vec::new(), Vec::new(), assistant_raw_history_message(&raw))
+            .unwrap();
+
+        assert_eq!(output.content, "done");
+        assert_eq!(
+            output.raw_history[0]["content"][0]["provider_extra"],
+            json!({"keep": true})
+        );
+        assert_eq!(output.raw_history[0]["reasoning_content"], "Need lookup");
+        assert!(output.raw_history[0].get("id").is_none());
     }
 
     #[test]
