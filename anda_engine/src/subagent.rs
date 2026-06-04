@@ -1,8 +1,7 @@
 use anda_core::{
     Agent, AgentContext, AgentOutput, BoxError, CompletionFeatures, CompletionRequest, ContentPart,
     FunctionDefinition, Json, Message, ModelEffort, Path, PromptCommand, PutMode, Resource,
-    StoreFeatures, ToolOutput, Usage, prompt_with_resources, select_resources,
-    validate_function_name,
+    StoreFeatures, ToolOutput, Usage, select_resources, validate_function_name,
 };
 use async_trait::async_trait;
 use ciborium::from_reader;
@@ -363,6 +362,25 @@ pub struct SubSession {
     active_at: AtomicU64,
 }
 
+fn resources_into_content(resources: Vec<Resource>) -> Vec<ContentPart> {
+    resources
+        .into_iter()
+        .filter_map(|resource| ContentPart::try_from(resource).ok())
+        .collect()
+}
+
+fn prompt_and_resources_into_content(
+    prompt: String,
+    resources: &mut Vec<Resource>,
+) -> Vec<ContentPart> {
+    let mut content = Vec::new();
+    if !prompt.is_empty() {
+        content.push(prompt.into());
+    }
+    content.extend(resources_into_content(std::mem::take(resources)));
+    content
+}
+
 struct SubSessionRunner {
     session: Arc<SubSession>,
     agent_hook: Option<DynAgentHook>,
@@ -392,6 +410,16 @@ impl SubSessionRunner {
             || !output.tools_usage.is_empty()
     }
 
+    fn has_reportable_output(output: &AgentOutput) -> bool {
+        !output.content.is_empty()
+            || output.thoughts.is_some()
+            || output.failed_reason.is_some()
+            || !output.tool_calls.is_empty()
+            || !output.artifacts.is_empty()
+            || output.usage.requests > 0
+            || !output.tools_usage.is_empty()
+    }
+
     fn latest_output(&mut self) -> AgentOutput {
         let output = self
             .last_output
@@ -406,7 +434,14 @@ impl SubSessionRunner {
         let fallback = self.latest_output();
 
         match self.runner.finalize(None).await {
-            Ok(output) => self.with_session(output),
+            Ok(output) => {
+                let output = self.with_session(output);
+                if Self::has_reportable_output(&output) || !Self::has_observable_output(&fallback) {
+                    output
+                } else {
+                    fallback
+                }
+            }
             Err(err) => {
                 if Self::has_observable_output(&fallback) {
                     fallback
@@ -456,12 +491,18 @@ impl SubSessionRunner {
 
             match input.command {
                 PromptCommand::Ping => {
-                    // PING from the user to keep the conversation alive.
+                    let content =
+                        prompt_and_resources_into_content(String::new(), &mut input.resources);
+                    if !content.is_empty() {
+                        self.runner.follow_up_content(content);
+                    }
                     continue;
                 }
                 PromptCommand::Plain { prompt } => {
-                    self.runner
-                        .follow_up(prompt_with_resources(prompt, &mut input.resources));
+                    let content = prompt_and_resources_into_content(prompt, &mut input.resources);
+                    if !content.is_empty() {
+                        self.runner.follow_up_content(content);
+                    }
                 }
                 PromptCommand::Command { command, prompt } => match command.as_str() {
                     "stop" | "cancel" => {
@@ -469,12 +510,18 @@ impl SubSessionRunner {
                         break;
                     }
                     "steer" => {
-                        self.runner
-                            .steer(prompt_with_resources(prompt, &mut input.resources));
+                        let content =
+                            prompt_and_resources_into_content(prompt, &mut input.resources);
+                        if !content.is_empty() {
+                            self.runner.steer_content(content);
+                        }
                     }
                     _ => {
-                        self.runner
-                            .follow_up(prompt_with_resources(prompt, &mut input.resources));
+                        let content =
+                            prompt_and_resources_into_content(prompt, &mut input.resources);
+                        if !content.is_empty() {
+                            self.runner.follow_up_content(content);
+                        }
                     }
                 },
             }
@@ -512,6 +559,8 @@ impl SubSessionRunner {
 
                 if needs_compaction(&self.runner) {
                     // 上下文过长，先进行一次压缩总结，更新conversation状态和历史消息，再继续后续的处理
+                    let handoff_req = self.runner.req().clone();
+                    self.runner.set_tools(Vec::new());
                     let output = match self
                         .runner
                         .finalize(Some(COMPACTION_PROMPT.to_string()))
@@ -538,15 +587,14 @@ impl SubSessionRunner {
                         ..Default::default()
                     };
 
-                    let req = self.runner.req();
                     let req = CompletionRequest {
-                        instructions: req.instructions.clone(),
-                        role: req.role.clone(),
+                        instructions: handoff_req.instructions,
+                        role: handoff_req.role,
                         chat_history: vec![compaction_msg.clone()],
-                        tools: req.tools.clone(),
-                        output_schema: req.output_schema.clone(),
-                        model: req.model.clone(),
-                        effort: req.effort,
+                        tools: handoff_req.tools,
+                        output_schema: handoff_req.output_schema,
+                        model: handoff_req.model,
+                        effort: handoff_req.effort,
                         ..Default::default()
                     };
 
@@ -830,12 +878,7 @@ impl Agent<AgentCtx> for SubAgent {
                     CompletionRequest {
                         instructions: self.instructions.clone(),
                         prompt: args.prompt,
-                        content: resources
-                            .into_iter()
-                            .map(ContentPart::try_from)
-                            .collect::<Result<Vec<_>, _>>()
-                            .ok()
-                            .unwrap_or_default(),
+                        content: resources_into_content(resources),
                         tools: ctx.definitions(Some(&self.tools)).await,
                         output_schema: self.output_schema.clone(),
                         model,
@@ -900,7 +943,10 @@ impl Agent<AgentCtx> for SubAgent {
         } = input;
 
         let prompt = match command {
-            PromptCommand::Ping => return Err("prompt cannot be empty".into()),
+            PromptCommand::Ping if resources.is_empty() => {
+                return Err("prompt cannot be empty".into());
+            }
+            PromptCommand::Ping => String::new(),
             PromptCommand::Plain { prompt } => prompt,
             PromptCommand::Command { command, prompt } => match command.as_str() {
                 "stop" | "cancel" => {
@@ -931,22 +977,13 @@ impl Agent<AgentCtx> for SubAgent {
         let req = CompletionRequest {
             instructions: self.instructions.clone(),
             prompt,
-            content: resources
-                .into_iter()
-                .map(ContentPart::try_from)
-                .collect::<Result<Vec<_>, _>>()
-                .ok()
-                .unwrap_or_default(),
+            content: resources_into_content(resources),
             tools: ctx.definitions(Some(&self.tools)).await,
             output_schema: self.output_schema.clone(),
             model: input_model,
             effort: input_effort,
             ..Default::default()
         };
-
-        if let Some(hook) = &agent_hook {
-            hook.on_background_start(&ctx, &session.id, &req).await;
-        }
 
         let rt = if let Some(hook) = &agent_hook {
             hook.after_agent_run(&ctx, rt).await?
@@ -958,6 +995,10 @@ impl Agent<AgentCtx> for SubAgent {
         ctx.base.set_state(DynToolJsonHook::new(session.clone()));
 
         subsessions.insert_session(session.clone());
+        if let Some(hook) = &agent_hook {
+            hook.on_background_start(&ctx, &session.id, &req).await;
+        }
+
         let runner = ctx.clone().completion_iter(req, vec![]).unbound();
         tokio::spawn(async move {
             let mut runner = SubSessionRunner {
@@ -1619,6 +1660,31 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct FailingAfterAgentHook {
+        starts: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl AgentHook for FailingAfterAgentHook {
+        async fn after_agent_run(
+            &self,
+            _ctx: &AgentCtx,
+            _output: AgentOutput,
+        ) -> Result<AgentOutput, BoxError> {
+            Err("after hook rejected output".into())
+        }
+
+        async fn on_background_start(
+            &self,
+            _ctx: &AgentCtx,
+            session_id: &str,
+            _req: &CompletionRequest,
+        ) {
+            self.starts.lock().push(session_id.to_string());
+        }
+    }
+
     #[async_trait]
     impl AgentHook for RecordingAgentHook {
         async fn on_background_progress(
@@ -1738,6 +1804,16 @@ mod tests {
             instructions: "Keep working".to_string(),
             prompt: "seed task".to_string(),
             role: Some("user".to_string()),
+            tools: vec![FunctionDefinition {
+                name: "lookup".to_string(),
+                description: "Lookup data.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }),
+                strict: Some(true),
+            }],
             output_schema: Some(json!({
                 "type": "object",
                 "additionalProperties": false
@@ -1785,6 +1861,7 @@ mod tests {
         assert_eq!(recorded.len(), 2);
         assert_eq!(request_text(&recorded[0]), "seed task");
         assert_eq!(request_text(&recorded[1]).trim(), COMPACTION_PROMPT.trim());
+        assert!(recorded[1].tools.is_empty());
 
         assert_eq!(runner.runner.chat_history().len(), 1);
         assert_eq!(runner.runner.chat_history()[0].role, "assistant");
@@ -1800,6 +1877,8 @@ mod tests {
         );
         assert_eq!(runner.runner.req().model, model_before_compaction);
         assert_eq!(runner.runner.req().effort, effort_before_compaction);
+        assert_eq!(runner.runner.req().tools.len(), 1);
+        assert_eq!(runner.runner.req().tools[0].name, "lookup");
         assert!(runner.runner.req().prompt.is_empty());
         assert!(runner.runner.req().content.is_empty());
         assert!(runner.last_output.is_none());
@@ -1837,6 +1916,107 @@ mod tests {
             vec!["compacted handoff".to_string()]
         );
         assert_eq!(request_text(&recorded[2]), "continue after compaction");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn subsession_runner_accepts_resource_only_follow_up() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let model = Model::with_completer(Arc::new(RecordingRequestCompleter {
+            name: "recorder",
+            requests: requests.clone(),
+        }));
+        let ctx = EngineBuilder::new().with_model(model).mock_ctx();
+
+        let req = CompletionRequest {
+            prompt: "seed task".to_string(),
+            ..Default::default()
+        };
+
+        let (sender, _rx) = tokio::sync::mpsc::channel(4);
+        let session = Arc::new(SubSession {
+            id: "session-1".to_string(),
+            agent: "worker".to_string(),
+            sender,
+            background_tasks: Arc::new(RwLock::new(HashMap::new())),
+            active_at: AtomicU64::new(unix_ms()),
+        });
+
+        let mut runner = SubSessionRunner {
+            session,
+            agent_hook: None,
+            runner: ctx.completion_iter(req, Vec::new()).unbound(),
+            last_output: None,
+        };
+
+        assert!(runner.run(Vec::new()).await.unwrap());
+        assert_eq!(runner.last_output.as_ref().unwrap().content, "seed task");
+
+        assert!(
+            runner
+                .run(vec![SubAgentInput {
+                    command: PromptCommand::Ping,
+                    resources: vec![Resource {
+                        blob: Some(b"resource follow-up".to_vec().into()),
+                        ..Default::default()
+                    }],
+                    usage: Usage::default(),
+                    model: None,
+                    effort: None,
+                }])
+                .await
+                .unwrap()
+        );
+
+        assert_eq!(
+            runner.last_output.as_ref().unwrap().content,
+            "resource follow-up"
+        );
+        let recorded = requests.lock().clone();
+        assert_eq!(recorded.len(), 2);
+        assert!(recorded[1].prompt.is_empty());
+        assert_eq!(request_text(&recorded[1]), "resource follow-up");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn subsession_runner_finalizes_with_latest_visible_output_after_compaction() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let model = Model::with_completer(Arc::new(RecordingCompactionCompleter {
+            requests: requests.clone(),
+        }));
+        let ctx = EngineBuilder::new().with_model(model).mock_ctx();
+
+        let req = CompletionRequest {
+            instructions: "Keep working".to_string(),
+            prompt: "seed task".to_string(),
+            ..Default::default()
+        };
+
+        let (sender, _rx) = tokio::sync::mpsc::channel(4);
+        let session = Arc::new(SubSession {
+            id: "session-1".to_string(),
+            agent: "compactor".to_string(),
+            sender,
+            background_tasks: Arc::new(RwLock::new(HashMap::new())),
+            active_at: AtomicU64::new(unix_ms()),
+        });
+
+        let mut runner = SubSessionRunner {
+            session,
+            agent_hook: None,
+            runner: ctx.completion_iter(req, Vec::new()).unbound(),
+            last_output: None,
+        };
+
+        assert!(runner.run(Vec::new()).await.unwrap());
+        assert!(runner.run(Vec::new()).await.unwrap());
+        assert_eq!(
+            runner.runner.chat_history()[0].text().as_deref(),
+            Some("compacted handoff")
+        );
+
+        let output = runner.finalize_output().await;
+        assert_eq!(output.content, "seed task");
+        assert_eq!(output.session.as_deref(), Some("session-1"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2166,6 +2346,40 @@ mod tests {
             .unwrap();
         assert_eq!(output.session.as_deref(), Some("threada"));
         assert!(output.content.contains("session mode"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn subagent_session_does_not_emit_start_hook_when_ack_hook_fails() {
+        let model = Model::with_completer(Arc::new(EchoCompleter));
+        let ctx = EngineBuilder::new().with_model(model).mock_ctx();
+        let hook = Arc::new(FailingAfterAgentHook::default());
+        ctx.base.set_state(DynAgentHook::new(hook.clone()));
+
+        let agent = SubAgent {
+            name: "echo_helper".to_string(),
+            description: "Echoes input.".to_string(),
+            instructions: "Echo the prompt.".to_string(),
+            ..Default::default()
+        };
+
+        let err = agent
+            .run(
+                ctx,
+                serde_json::to_string(&SubAgentArgs {
+                    prompt: "session task".to_string(),
+                    session: "ThreadA".to_string(),
+                    model: String::new(),
+                    effort: None,
+                })
+                .unwrap(),
+                Vec::new(),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.to_string(), "after hook rejected output");
+        assert!(hook.starts.lock().is_empty());
+        assert!(agent.subsessions.active_session_ids().is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]

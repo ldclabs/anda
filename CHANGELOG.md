@@ -10,6 +10,8 @@ All notable changes to the Anda project will be documented in this file.
 
 ### Fixed — anda_engine v0.12.29
 
+- **Subagent session resource and compaction edge cases** — Resource-only session follow-ups now run instead of being dropped, resource attachments are converted independently so one invalid resource no longer discards all content, compaction handoff calls temporarily disable tool definitions while preserving them for subsequent turns, final session output falls back to the latest visible progress when compaction produces no reportable result, and background session start hooks are emitted only after acknowledgement hooks succeed. Added regression coverage for resource-only follow-ups, compaction finalization, tool restoration after compaction, and failed acknowledgement hooks.
+
 - **Agent completion runner edge cases** — Fixed completion streams so a pending model future is retained across polls instead of being recreated, document-only requests now execute without requiring prompt/content text, steering after tool calls prunes only unanswered raw tool-call items while preserving prior raw history and assistant reasoning, completed runners ignore late steering/follow-up queues, and remote agent resource selection now uses the unprefixed agent name. Added regression coverage for the stream polling, raw-history pruning, steering, and document-only paths.
 
 ### Changed — anda_engine v0.12.29

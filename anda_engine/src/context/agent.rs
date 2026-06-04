@@ -1144,6 +1144,11 @@ impl CompletionRunner {
         self.req.effort = effort;
     }
 
+    /// Selects the tool definitions to use for subsequent completion turns.
+    pub fn set_tools(&mut self, tools: Vec<FunctionDefinition>) {
+        self.req.tools = tools;
+    }
+
     /// Accumulate usage from an intermediate step into the runner's total usage.
     pub fn accumulate(&mut self, other: &Usage) {
         self.total_usage.accumulate(other);
