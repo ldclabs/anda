@@ -4,6 +4,10 @@ All notable changes to the Anda project will be documented in this file.
 
 ## [0.12.29] — 2026-06-04
 
+### Added — anda_engine v0.12.29
+
+- **Multiple skill directories in `SkillManager`** — Added `SkillManager::new_with_dirs()` so skill loading and lookup can scan the default skill creation directory plus additional read-only skill roots. Skill descriptions now list all configured directories, duplicate directory entries are deduplicated, duplicate skill names are skipped after the first load root, and displayed `SKILL.md` paths are made relative to the matching configured root. Added coverage for loading and reading skills across multiple directories.
+
 ### Changed — anda_engine v0.12.29
 
 - **Hardened OpenAI-compatible response parsing** — Chat Completions and Responses now tolerate DeepSeek-compatible variants: nullable usage detail objects and counters, unknown `service_tier` strings, `reasoning` aliases for reasoning content, `tool_call`/`tool_use`/`function_call` finish reasons, JSON object tool arguments/inputs, and missing message/tool-call role/type/id fields. Added tests for non-streaming and streaming compatibility shapes.

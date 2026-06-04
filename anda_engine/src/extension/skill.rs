@@ -1,7 +1,7 @@
 //! Skills manager extension.
 //!
 //! This module provides:
-//! - Loading skills from a directory tree of `SKILL.md` files into [`SubAgent`] instances.
+//! - Loading skills from directory trees of `SKILL.md` files into [`SubAgent`] instances.
 //! - Reading loaded skill files via the [`SkillManager`] tool.
 //!
 //! Each `SKILL.md` follows the [Agent Skills specification](https://agentskills.io):
@@ -59,7 +59,7 @@ pub struct SkillContentOutput {
     pub agent_name: String,
     /// Skill description from the SKILL.md frontmatter.
     pub description: String,
-    /// Path to SKILL.md, relative to the configured skills directory when possible.
+    /// Path to SKILL.md, relative to a configured skills directory when possible.
     pub path: String,
     /// Full SKILL.md content including YAML frontmatter and Markdown body.
     pub content: String,
@@ -71,7 +71,10 @@ pub struct SkillContentOutput {
 /// files at runtime. Skills loaded here are exposed as [`SubAgent`] instances
 /// that the engine can invoke.
 pub struct SkillManager {
-    skills_dir: PathBuf,
+    /// Directory used by skill creation workflows. Loading also includes this directory.
+    default_skills_dir: PathBuf,
+    /// Directories scanned for skills, with `default_skills_dir` first.
+    skills_dirs: Vec<PathBuf>,
     skills: RwLock<BTreeMap<String, Skill>>,
     description: String,
     default_skill_tools: Vec<String>,
@@ -87,23 +90,74 @@ static DEFAULT_SKILL_TOOLS: &[&str] = &[
     "tools_select",
 ];
 
+fn build_skills_dirs(
+    default_skills_dir: PathBuf,
+    additional_skills_dirs: Vec<PathBuf>,
+) -> Vec<PathBuf> {
+    let mut skills_dirs = vec![default_skills_dir];
+    for dir in additional_skills_dirs {
+        if !skills_dirs.iter().any(|existing| existing == &dir) {
+            skills_dirs.push(dir);
+        }
+    }
+    skills_dirs
+}
+
+fn format_path_list(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn build_description(default_skills_dir: &Path, skills_dirs: &[PathBuf]) -> String {
+    format!(
+        "Load reusable skills following the Agent Skills specification and read \
+        a skill's SKILL.md content by name. Agent Skills are folders of instructions, \
+        scripts, and resources that agents can follow directly or invoke as subagents. \
+        Skill directories: {}. Default skill creation directory: {}",
+        format_path_list(skills_dirs),
+        default_skills_dir.display()
+    )
+}
+
 impl SkillManager {
     /// Tool name used for registration.
     pub const NAME: &'static str = "skills_manager";
 
     /// Create a new, empty manager rooted at `skills_dir`.
     pub fn new(skills_dir: PathBuf) -> Self {
+        Self::new_with_dirs(skills_dir, Vec::new())
+    }
+
+    /// Create a new, empty manager that loads from the default directory and
+    /// additional skill directories.
+    ///
+    /// New skills should still be created under `default_skills_dir`; additional
+    /// directories are read-only load roots from the manager's perspective.
+    pub fn new_with_dirs(
+        default_skills_dir: PathBuf,
+        additional_skills_dirs: Vec<PathBuf>,
+    ) -> Self {
+        let skills_dirs = build_skills_dirs(default_skills_dir.clone(), additional_skills_dirs);
         Self {
             skills: RwLock::new(BTreeMap::new()),
-            description: format!(
-                "Load reusable skills following the Agent Skills specification and read \
-            a skill's SKILL.md content by name. Agent Skills are folders of instructions, \
-            scripts, and resources that agents can follow directly or invoke as subagents. Skills: {}",
-                skills_dir.display()
-            ),
-            skills_dir,
+            description: build_description(&default_skills_dir, &skills_dirs),
+            default_skills_dir,
+            skills_dirs,
             default_skill_tools: DEFAULT_SKILL_TOOLS.iter().map(|s| s.to_string()).collect(),
         }
+    }
+
+    /// Directory where new skills should be created.
+    pub fn default_skills_dir(&self) -> &Path {
+        &self.default_skills_dir
+    }
+
+    /// Directories scanned when loading or reading skills.
+    pub fn skills_dirs(&self) -> &[PathBuf] {
+        &self.skills_dirs
     }
 
     pub fn with_description(mut self, description: String) -> Self {
@@ -166,27 +220,29 @@ impl SkillManager {
             }
         }
 
-        if self.skills_dir.is_dir() {
-            for path in find_skill_files(&self.skills_dir).await? {
-                let Some(base_dir) = path.parent() else {
-                    continue;
-                };
-                let base_dir = base_dir.to_path_buf();
-                let dir_name_matches = base_dir.file_name() == Some(OsStr::new(name));
-                let frontmatter_name_matches = if dir_name_matches {
-                    true
-                } else if let Ok(content) = tokio::fs::read_to_string(&path).await {
-                    parse_skill_md(base_dir.clone(), &content)
-                        .map(|skill| skill.frontmatter.name == name)
-                        .unwrap_or(false)
-                } else {
-                    false
-                };
+        for skills_dir in &self.skills_dirs {
+            if skills_dir.is_dir() {
+                for path in find_skill_files(skills_dir).await? {
+                    let Some(base_dir) = path.parent() else {
+                        continue;
+                    };
+                    let base_dir = base_dir.to_path_buf();
+                    let dir_name_matches = base_dir.file_name() == Some(OsStr::new(name));
+                    let frontmatter_name_matches = if dir_name_matches {
+                        true
+                    } else if let Ok(content) = tokio::fs::read_to_string(&path).await {
+                        parse_skill_md(base_dir.clone(), &content)
+                            .map(|skill| skill.frontmatter.name == name)
+                            .unwrap_or(false)
+                    } else {
+                        false
+                    };
 
-                if frontmatter_name_matches
-                    && !matches.iter().any(|candidate| candidate == &base_dir)
-                {
-                    matches.push(base_dir);
+                    if frontmatter_name_matches
+                        && !matches.iter().any(|candidate| candidate == &base_dir)
+                    {
+                        matches.push(base_dir);
+                    }
                 }
             }
         }
@@ -195,23 +251,29 @@ impl SkillManager {
             0 => Ok(None),
             1 => Ok(matches.pop()),
             _ => Err(format!(
-                "multiple skills named {:?} exist under {}",
+                "multiple skills named {:?} exist under configured skills directories: {}",
                 name,
-                self.skills_dir.display()
+                format_path_list(&self.skills_dirs)
             )
             .into()),
         }
     }
 
     fn display_path(&self, path: &Path) -> String {
-        if let Ok(stripped) = path.strip_prefix(&self.skills_dir) {
-            return stripped.display().to_string();
+        for skills_dir in &self.skills_dirs {
+            if let Ok(stripped) = path.strip_prefix(skills_dir) {
+                return stripped.display().to_string();
+            }
         }
 
-        if let Ok(root) = std::fs::canonicalize(&self.skills_dir)
-            && let Ok(stripped) = path.strip_prefix(&root)
-        {
-            return stripped.display().to_string();
+        if let Ok(canonical_path) = std::fs::canonicalize(path) {
+            for skills_dir in &self.skills_dirs {
+                if let Ok(root) = std::fs::canonicalize(skills_dir)
+                    && let Ok(stripped) = canonical_path.strip_prefix(&root)
+                {
+                    return stripped.display().to_string();
+                }
+            }
         }
 
         path.display().to_string()
@@ -248,21 +310,43 @@ impl SkillManager {
         })
     }
 
-    /// Recursively load all `SKILL.md` files from the configured directory.
+    /// Recursively load all `SKILL.md` files from the configured directories.
     pub async fn load(&self) -> Result<(), BoxError> {
-        if !self.skills_dir.is_dir() {
-            log::error!(
-                "skills directory {} does not exist, skipping load",
-                self.skills_dir.display()
-            );
+        let mut skills = BTreeMap::new();
+        let mut loaded_dirs = 0usize;
+
+        for skills_dir in &self.skills_dirs {
+            if !skills_dir.is_dir() {
+                log::error!(
+                    "skills directory {} does not exist, skipping load",
+                    skills_dir.display()
+                );
+                continue;
+            }
+
+            loaded_dirs += 1;
+            for (agent_name, skill) in load_skills_from_dir(skills_dir).await? {
+                if skills.contains_key(&agent_name) {
+                    log::warn!(
+                        "duplicate skill name {} at {}, skipping",
+                        agent_name,
+                        skill.base_dir.join("SKILL.md").display()
+                    );
+                } else {
+                    skills.insert(agent_name, skill);
+                }
+            }
+        }
+
+        if loaded_dirs == 0 {
             return Ok(());
         }
 
-        let skills = load_skills_from_dir(&self.skills_dir).await?;
         log::info!(
-            "loaded {} skill(s) from {}",
+            "loaded {} skill(s) from {} configured skill directories: {}",
             skills.len(),
-            self.skills_dir.display()
+            loaded_dirs,
+            format_path_list(&self.skills_dirs)
         );
         *self.skills.write() = skills;
         Ok(())
@@ -549,6 +633,77 @@ Beta instructions.
 
         // Clean up.
         let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    #[tokio::test]
+    async fn load_and_read_from_multiple_dirs() {
+        let root =
+            std::env::temp_dir().join(format!("anda-skills-multi-{:016x}", rand::random::<u64>()));
+        let default_dir = root.join("default");
+        let extra_dir = root.join("extra");
+
+        tokio::fs::create_dir_all(default_dir.join("alpha"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(extra_dir.join("beta"))
+            .await
+            .unwrap();
+
+        tokio::fs::write(
+            default_dir.join("alpha/SKILL.md"),
+            skill_md(
+                "alpha",
+                "Alpha skill from default directory.",
+                "Alpha instructions.",
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+
+        tokio::fs::write(
+            extra_dir.join("beta/SKILL.md"),
+            skill_md(
+                "beta",
+                "Beta skill from extra directory.",
+                "Beta instructions.",
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+
+        let mgr = SkillManager::new_with_dirs(
+            default_dir.clone(),
+            vec![extra_dir.clone(), default_dir.clone()],
+        );
+        let expected_dirs = vec![default_dir.clone(), extra_dir.clone()];
+        assert_eq!(mgr.default_skills_dir(), default_dir.as_path());
+        assert_eq!(mgr.skills_dirs(), expected_dirs.as_slice());
+
+        mgr.load().await.unwrap();
+
+        assert!(mgr.contains_lowercase("skill_alpha"));
+        assert!(mgr.contains_lowercase("skill_beta"));
+
+        let beta_content = mgr
+            .call_raw(mock_ctx(), json!({ "name": "beta" }), Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(beta_content.output["name"], json!("beta"));
+        assert_eq!(beta_content.output["agent_name"], json!("skill_beta"));
+        assert_eq!(beta_content.output["path"], json!("beta/SKILL.md"));
+        assert!(
+            beta_content.output["content"]
+                .as_str()
+                .unwrap()
+                .contains("Beta instructions.")
+        );
+
+        // Creation workflows should keep using the original default directory.
+        assert!(mgr.default_skills_dir().ends_with("default"));
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
     }
 
     #[tokio::test]
