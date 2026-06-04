@@ -1657,8 +1657,10 @@ impl CompletionRunner {
 /// `set_unbound(true)`, drive [`CompletionRunner::next`] directly instead of using this stream.
 pub struct CompletionStream {
     pub runner: CompletionRunner,
-    pending: Option<BoxPinFut<(CompletionRunner, Result<Option<AgentOutput>, BoxError>)>>,
+    pending: Option<PendingCompletion>,
 }
+
+type PendingCompletion = BoxPinFut<(CompletionRunner, Result<Option<AgentOutput>, BoxError>)>;
 
 impl Stream for CompletionStream {
     type Item = Result<AgentOutput, BoxError>;

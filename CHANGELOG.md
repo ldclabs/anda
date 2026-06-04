@@ -2,6 +2,16 @@
 
 All notable changes to the Anda project will be documented in this file.
 
+## [0.12.30] — 2026-06-04
+
+### Changed — anda_core v0.12.7
+
+- **Recursive strict JSON Schema normalization** — `normalize_strict_schema()` now recursively applies `additionalProperties: false`, `properties: {}`, and `required: []` defaults to all nested object schemas, not just the root. Previously propertyless nested objects (e.g. `parameters` without explicit `properties`) were left open, breaking strict-mode contracts for tools with nested object parameters. Added tests for nested propertyless object closure and recursive normalization.
+
+### Changed — anda_engine v0.12.30
+
+- **Reasoning content merged into message text** — `ContentPart::Reasoning { text }` in `message_into()` is now appended as `ContentItem::Text` in the current message content block instead of being emitted as a separate `MessageItem::Reasoning`. This simplifies the OpenRouter-facing message structure and avoids injecting standalone reasoning items that providers may reject or misinterpret.
+
 ## [0.12.29] — 2026-06-04
 
 ### Added — anda_engine v0.12.29

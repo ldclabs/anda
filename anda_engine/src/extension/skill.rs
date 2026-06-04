@@ -326,6 +326,7 @@ impl SkillManager {
 
             loaded_dirs += 1;
             for (agent_name, skill) in load_skills_from_dir(skills_dir).await? {
+                #[allow(clippy::map_entry)]
                 if skills.contains_key(&agent_name) {
                     log::warn!(
                         "duplicate skill name {} at {}, skipping",

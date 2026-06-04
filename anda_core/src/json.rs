@@ -33,31 +33,30 @@ pub fn gen_schema_for<T: JsonSchema>() -> serde_json::Value {
 
 /// Normalizes a JSON Schema for strict function calling.
 ///
-/// For every object schema that declares `properties`, `required` is rewritten
-/// to contain all property keys and `additionalProperties` defaults to `false`.
-/// The root schema is also normalized to an empty object schema when it is just
-/// `{ "type": "object" }`.
+/// For every object schema, `additionalProperties` defaults to `false` and
+/// `required` is rewritten to contain all property keys. Object schemas without
+/// explicit properties are normalized to empty closed objects.
 pub fn normalize_strict_schema(mut schema: Value) -> Value {
-    normalize_schema_value(&mut schema, true);
+    normalize_schema_value(&mut schema);
     schema
 }
 
-fn normalize_schema_value(schema: &mut Value, is_root: bool) {
+fn normalize_schema_value(schema: &mut Value) {
     match schema {
-        Value::Object(map) => normalize_schema_object(map, is_root),
+        Value::Object(map) => normalize_schema_object(map),
         Value::Array(items) => {
             for item in items {
-                normalize_schema_value(item, false);
+                normalize_schema_value(item);
             }
         }
         _ => {}
     }
 }
 
-fn normalize_schema_object(map: &mut Map<String, Value>, is_root: bool) {
+fn normalize_schema_object(map: &mut Map<String, Value>) {
     let is_object = schema_type_contains_object(map.get("type"));
 
-    if is_root && is_object && !map.contains_key("properties") {
+    if is_object && !map.contains_key("properties") {
         map.insert("properties".to_string(), json!({}));
     }
 
@@ -74,7 +73,7 @@ fn normalize_schema_object(map: &mut Map<String, Value>, is_root: bool) {
     for key in ["properties", "$defs", "definitions", "patternProperties"] {
         if let Some(Value::Object(children)) = map.get_mut(key) {
             for child in children.values_mut() {
-                normalize_schema_value(child, false);
+                normalize_schema_value(child);
             }
         }
     }
@@ -83,14 +82,14 @@ fn normalize_schema_object(map: &mut Map<String, Value>, is_root: bool) {
         if let Some(child) = map.get_mut(key)
             && child.is_object()
         {
-            normalize_schema_value(child, false);
+            normalize_schema_value(child);
         }
     }
 
     for key in ["allOf", "anyOf", "oneOf", "prefixItems"] {
         if let Some(Value::Array(children)) = map.get_mut(key) {
             for child in children {
-                normalize_schema_value(child, false);
+                normalize_schema_value(child);
             }
         }
     }
@@ -184,5 +183,44 @@ mod tests {
         );
         assert_eq!(schema["properties"]["maybe"]["additionalProperties"], false);
         assert_eq!(schema["properties"]["empty"]["additionalProperties"], false);
+        assert_eq!(
+            schema["properties"]["empty"]["properties"],
+            serde_json::json!({})
+        );
+        assert_eq!(
+            schema["properties"]["empty"]["required"],
+            serde_json::json!([])
+        );
+    }
+
+    #[test]
+    fn test_normalize_strict_schema_closes_propertyless_nested_objects() {
+        let schema = normalize_strict_schema(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "commands": {
+                    "type": "array",
+                    "items": { "type": "string" }
+                },
+                "parameters": {
+                    "type": "object",
+                    "description": "An optional JSON object."
+                }
+            },
+            "required": ["commands"]
+        }));
+
+        assert_eq!(
+            schema["properties"]["parameters"]["properties"],
+            serde_json::json!({})
+        );
+        assert_eq!(
+            schema["properties"]["parameters"]["required"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            schema["properties"]["parameters"]["additionalProperties"],
+            false
+        );
     }
 }

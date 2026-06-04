@@ -1537,16 +1537,7 @@ pub fn message_into(msg: Message) -> Vec<MessageItem> {
             ContentPart::Text { text } => {
                 content.push(ContentItem::Text { text });
             }
-            ContentPart::Reasoning { text } => {
-                push_message_item(&mut rt, &msg.role, &mut content);
-                rt.push(MessageItem::Reasoning {
-                    id: "".to_string(),
-                    summary: vec![ReasoningSummary::SummaryText { text }],
-                    content: None,
-                    encrypted_content: None,
-                    status: None,
-                });
-            }
+            ContentPart::Reasoning { text } => content.push(ContentItem::Text { text }),
             ContentPart::FileData {
                 file_uri,
                 mime_type,
@@ -2961,37 +2952,27 @@ mod tests {
 
         let items = message_into(msg);
         // Expected order:
-        // 0) Message (accumulated content: Text)
-        // 1) Reasoning
-        // 2) FunctionCall
-        // 3) FunctionCallOutput
-        // 4) Message (accumulated content: File)
-        assert_eq!(items.len(), 5);
+        // 0) Message (accumulated content: Text, Reasoning as Text)
+        // 1) FunctionCall
+        // 2) FunctionCallOutput
+        // 3) Message (accumulated content: File)
+        assert_eq!(items.len(), 4);
 
         // Text
         if let MessageItem::Message { role, content, .. } = &items[0] {
             assert_eq!(role, "user");
-            assert_eq!(content.len(), 1);
+            assert_eq!(content.len(), 2);
 
-            // content[0] should be Text("hello")
             match &content[0] {
                 ContentItem::Text { text } => assert_eq!(text, "hello"),
                 _ => panic!("content[0] should be Text"),
             }
+            match &content[1] {
+                ContentItem::Text { text } => assert_eq!(text, "thinking..."),
+                _ => panic!("content[1] should be Text"),
+            }
         } else {
             panic!("items[0] should be Message");
-        }
-
-        // Reasoning
-        if let MessageItem::Reasoning { summary, .. } = &items[1] {
-            assert_eq!(
-                summary,
-                &vec![ReasoningSummary::SummaryText {
-                    text: "thinking...".into()
-                }]
-            );
-        } else {
-            panic!("items[1] should be Reasoning");
         }
 
         // FunctionCall
@@ -3000,19 +2981,19 @@ mod tests {
             arguments,
             call_id,
             ..
-        } = &items[2]
+        } = &items[1]
         {
             assert_eq!(name, "sum");
             assert_eq!(arguments, r#"{"x":1}"#);
             assert_eq!(call_id, "c1");
         } else {
-            panic!("items[2] should be FunctionCall");
+            panic!("items[1] should be FunctionCall");
         }
 
         // FunctionCallOutput
         if let MessageItem::FunctionCallOutput {
             output, call_id, ..
-        } = &items[3]
+        } = &items[2]
         {
             assert_eq!(
                 output,
@@ -3020,11 +3001,11 @@ mod tests {
             );
             assert_eq!(call_id, "c1");
         } else {
-            panic!("items[3] should be FunctionCallOutput");
+            panic!("items[2] should be FunctionCallOutput");
         }
 
         // Message with accumulated non-tool content
-        if let MessageItem::Message { role, content, .. } = &items[4] {
+        if let MessageItem::Message { role, content, .. } = &items[3] {
             assert_eq!(role, "user");
             assert_eq!(content.len(), 1);
 
@@ -3044,7 +3025,7 @@ mod tests {
                 _ => panic!("content[0] should be File"),
             }
         } else {
-            panic!("items[4] should be Message");
+            panic!("items[3] should be Message");
         }
     }
 

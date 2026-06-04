@@ -1728,6 +1728,7 @@ impl<'de> Deserialize<'de> for ContentBlockDelta {
                     )
                 ) =>
             {
+                #[allow(clippy::enum_variant_names)]
                 #[derive(Deserialize)]
                 #[serde(tag = "type")]
                 enum Helper {
