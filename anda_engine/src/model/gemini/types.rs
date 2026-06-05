@@ -1952,6 +1952,505 @@ mod tests {
     }
 
     #[test]
+    fn content_part_conversions_cover_all_normalized_variants() {
+        let reasoning: Part = ContentPart::Reasoning {
+            text: "chain".to_string(),
+        }
+        .into();
+        assert_eq!(reasoning.thought, Some(true));
+        assert!(matches!(reasoning.data, PartKind::Text(text) if text == "chain"));
+
+        let file_data: Part = ContentPart::FileData {
+            file_uri: "https://example.com/image.png".to_string(),
+            mime_type: Some("image/png".to_string()),
+        }
+        .into();
+        assert!(matches!(
+            file_data.data,
+            PartKind::FileData { ref file_uri, ref mime_type }
+                if file_uri == "https://example.com/image.png"
+                    && mime_type.as_deref() == Some("image/png")
+        ));
+
+        let inline_data: Part = ContentPart::InlineData {
+            mime_type: "application/octet-stream".to_string(),
+            data: ByteBufB64(vec![1, 2, 3]),
+        }
+        .into();
+        assert!(matches!(
+            inline_data.data,
+            PartKind::InlineData { ref mime_type, ref data }
+                if mime_type == "application/octet-stream"
+                    && data == &ByteBufB64(vec![1, 2, 3]).to_base64()
+        ));
+
+        let tool_call: Part = ContentPart::ToolCall {
+            name: "lookup".to_string(),
+            args: json!({"q": "anda"}),
+            call_id: Some("call-1".to_string()),
+        }
+        .into();
+        assert!(matches!(
+            tool_call.data,
+            PartKind::FunctionCall { ref name, ref args, ref id }
+                if name == "lookup"
+                    && args.as_ref() == Some(&json!({"q": "anda"}))
+                    && id.as_deref() == Some("call-1")
+        ));
+
+        let tool_output: Part = ContentPart::ToolOutput {
+            name: "lookup".to_string(),
+            output: json!({"ok": true}),
+            is_error: Some(false),
+            call_id: Some("call-1".to_string()),
+            remote_id: None,
+        }
+        .into();
+        assert!(matches!(
+            tool_output.data,
+            PartKind::FunctionResponse { ref response, ref id, .. }
+                if response.output.as_ref() == Some(&json!({"ok": true}))
+                    && response.error.is_none()
+                    && id.as_deref() == Some("call-1")
+        ));
+
+        let tool_error: Part = ContentPart::ToolOutput {
+            name: "lookup".to_string(),
+            output: json!("boom"),
+            is_error: Some(true),
+            call_id: None,
+            remote_id: None,
+        }
+        .into();
+        assert!(matches!(
+            tool_error.data,
+            PartKind::FunctionResponse { ref response, .. }
+                if response.error.as_ref() == Some(&json!("boom"))
+                    && response.output.is_none()
+        ));
+
+        let text: ContentPart = Part {
+            data: PartKind::Text("visible".to_string()),
+            ..Default::default()
+        }
+        .into();
+        assert_eq!(
+            text,
+            ContentPart::Text {
+                text: "visible".to_string()
+            }
+        );
+
+        let thought: ContentPart = Part {
+            thought: Some(true),
+            data: PartKind::Text("hidden".to_string()),
+            ..Default::default()
+        }
+        .into();
+        assert_eq!(
+            thought,
+            ContentPart::Reasoning {
+                text: "hidden".to_string()
+            }
+        );
+
+        let file: ContentPart = Part {
+            data: PartKind::FileData {
+                file_uri: "data:text/plain;base64,aGk=".to_string(),
+                mime_type: Some("text/plain".to_string()),
+            },
+            ..Default::default()
+        }
+        .into();
+        assert_eq!(
+            file,
+            ContentPart::FileData {
+                file_uri: "data:text/plain;base64,aGk=".to_string(),
+                mime_type: Some("text/plain".to_string())
+            }
+        );
+
+        let inline: ContentPart = Part {
+            data: PartKind::InlineData {
+                mime_type: "text/plain".to_string(),
+                data: ByteBufB64(b"hi".to_vec()).to_base64(),
+            },
+            ..Default::default()
+        }
+        .into();
+        assert_eq!(
+            inline,
+            ContentPart::InlineData {
+                mime_type: "text/plain".to_string(),
+                data: ByteBufB64(b"hi".to_vec())
+            }
+        );
+
+        let invalid_inline: ContentPart = Part {
+            data: PartKind::InlineData {
+                mime_type: "text/plain".to_string(),
+                data: "not-base64".to_string(),
+            },
+            ..Default::default()
+        }
+        .into();
+        assert_eq!(
+            invalid_inline,
+            ContentPart::Any(json!({
+                "type": "InlineData",
+                "mimeType": "text/plain",
+                "data": "not-base64"
+            }))
+        );
+
+        let call_without_args: ContentPart = Part {
+            data: PartKind::FunctionCall {
+                name: "empty".to_string(),
+                args: None,
+                id: None,
+            },
+            ..Default::default()
+        }
+        .into();
+        assert_eq!(
+            call_without_args,
+            ContentPart::ToolCall {
+                name: "empty".to_string(),
+                args: Value::Null,
+                call_id: None
+            }
+        );
+
+        let response_output: ContentPart = Part {
+            data: PartKind::FunctionResponse {
+                name: "tool".to_string(),
+                response: FunctionResponseValue {
+                    output: Some(json!({"answer": 42})),
+                    ..Default::default()
+                },
+                id: Some("id-1".to_string()),
+                will_continue: Some(true),
+                scheduling: Some("INTERRUPT".to_string()),
+                parts: Some(vec![json!({"text": "ignored by normalizer"})]),
+            },
+            ..Default::default()
+        }
+        .into();
+        assert_eq!(
+            response_output,
+            ContentPart::ToolOutput {
+                name: "tool".to_string(),
+                output: json!({"answer": 42}),
+                is_error: None,
+                call_id: Some("id-1".to_string()),
+                remote_id: None
+            }
+        );
+
+        let response_error: ContentPart = Part {
+            data: PartKind::FunctionResponse {
+                name: "tool".to_string(),
+                response: FunctionResponseValue {
+                    error: Some(json!({"message": "bad"})),
+                    ..Default::default()
+                },
+                id: None,
+                will_continue: None,
+                scheduling: None,
+                parts: None,
+            },
+            ..Default::default()
+        }
+        .into();
+        assert_eq!(
+            response_error,
+            ContentPart::ToolOutput {
+                name: "tool".to_string(),
+                output: json!({"error": {"message": "bad"}}),
+                is_error: Some(true),
+                call_id: None,
+                remote_id: None
+            }
+        );
+
+        let any: ContentPart = Part {
+            data: PartKind::Any(json!({"provider": "raw"})),
+            ..Default::default()
+        }
+        .into();
+        assert_eq!(any, ContentPart::Any(json!({"provider": "raw"})));
+
+        let code_result: ContentPart = Part {
+            thought_signature: Some("sig".to_string()),
+            data: PartKind::CodeExecutionResult {
+                outcome: "OUTCOME_OK".to_string(),
+                output: "done".to_string(),
+            },
+            ..Default::default()
+        }
+        .into();
+        assert_eq!(
+            code_result,
+            ContentPart::Any(json!({
+                "codeExecutionResult": {
+                    "outcome": "OUTCOME_OK",
+                    "output": "done"
+                }
+            }))
+        );
+    }
+
+    #[test]
+    fn function_response_value_and_roles_cover_edge_outputs() {
+        assert_eq!(
+            FunctionResponseValue {
+                output: Some(json!("ok")),
+                ..Default::default()
+            }
+            .to_output(),
+            json!("ok")
+        );
+        assert_eq!(
+            FunctionResponseValue {
+                error: Some(json!("bad")),
+                ..Default::default()
+            }
+            .to_output(),
+            json!({"error": "bad"})
+        );
+
+        let mut extra = Map::new();
+        extra.insert("count".to_string(), json!(2));
+        extra.insert("status".to_string(), json!("cached"));
+        let extra_output = FunctionResponseValue {
+            extra: extra.clone(),
+            ..Default::default()
+        }
+        .to_output();
+        assert_eq!(extra_output, Value::Object(extra));
+
+        assert_eq!(Role::from("user"), Role::User);
+        assert_eq!(Role::from("tool"), Role::User);
+        assert_eq!(Role::from("assistant"), Role::Model);
+        assert_eq!(Role::User.to_string(), "user");
+        assert_eq!(Role::Model.to_string(), "assistant");
+
+        let content: Content = Message {
+            role: "tool".to_string(),
+            content: vec![ContentPart::Text {
+                text: "tool result".to_string(),
+            }],
+            ..Default::default()
+        }
+        .into();
+        assert_eq!(content.role, Some(Role::User));
+        let message: Message = content.into();
+        assert_eq!(message.role, "user");
+        assert_eq!(message.text().as_deref(), Some("tool result"));
+    }
+
+    #[test]
+    fn generate_content_response_try_into_reports_success_and_failures() {
+        let response: GenerateContentResponse = serde_json::from_value(json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [
+                        {"text": "visible"},
+                        {"thought": true, "text": "hidden"},
+                        {"functionCall": {
+                            "name": "lookup",
+                            "args": {"q": "anda"},
+                            "id": "call-1"
+                        }}
+                    ]
+                },
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 7,
+                "cachedContentTokenCount": 4,
+                "candidatesTokenCount": 5,
+                "thoughtsTokenCount": 2,
+                "toolUsePromptTokenCount": 3
+            },
+            "modelVersion": "gemini-test"
+        }))
+        .unwrap();
+
+        assert!(!response.maybe_failed());
+        let output = response
+            .try_into(
+                vec![json!({"request": true})],
+                vec![Message {
+                    role: "user".to_string(),
+                    content: vec![ContentPart::Text {
+                        text: "hi".to_string(),
+                    }],
+                    ..Default::default()
+                }],
+            )
+            .unwrap();
+        assert_eq!(output.content, "visible");
+        assert_eq!(output.thoughts.as_deref(), Some("hidden"));
+        assert_eq!(output.model.as_deref(), Some("gemini-test"));
+        assert_eq!(output.usage.input_tokens, 7);
+        assert_eq!(output.usage.output_tokens, 10);
+        assert_eq!(output.usage.cached_tokens, 4);
+        assert_eq!(output.usage.requests, 1);
+        assert_eq!(output.raw_history.len(), 2);
+        assert_eq!(output.chat_history.len(), 2);
+        assert_eq!(output.chat_history[1].role, "assistant");
+        assert_eq!(output.chat_history[1].name.as_deref(), Some("gemini-test"));
+        assert_eq!(output.tool_calls.len(), 1);
+        assert_eq!(output.tool_calls[0].name, "lookup");
+        assert_eq!(output.tool_calls[0].args, json!({"q": "anda"}));
+        assert_eq!(output.tool_calls[0].call_id.as_deref(), Some("call-1"));
+
+        let prompt_blocked: GenerateContentResponse = serde_json::from_value(json!({
+            "promptFeedback": {"blockReason": "SAFETY"},
+            "usageMetadata": {"promptTokenCount": 1}
+        }))
+        .unwrap();
+        assert!(prompt_blocked.maybe_failed());
+        let blocked_output = prompt_blocked.try_into(Vec::new(), Vec::new()).unwrap();
+        assert!(
+            blocked_output
+                .failed_reason
+                .as_deref()
+                .unwrap()
+                .contains("SAFETY")
+        );
+        assert!(blocked_output.chat_history.is_empty());
+
+        let empty_response = GenerateContentResponse {
+            candidates: Vec::new(),
+            prompt_feedback: None,
+            usage_metadata: UsageMetadata::default(),
+            model_version: None,
+            response_id: None,
+            model_status: None,
+        };
+        assert!(empty_response.maybe_failed());
+        assert_eq!(
+            empty_response
+                .try_into(Vec::new(), Vec::new())
+                .unwrap_err()
+                .to_string(),
+            "No completion choice"
+        );
+
+        let empty_candidate: GenerateContentResponse = serde_json::from_value(json!({
+            "candidates": [{"finishReason": "SAFETY"}],
+            "usageMetadata": {}
+        }))
+        .unwrap();
+        assert!(empty_candidate.maybe_failed());
+        let empty_candidate_output = empty_candidate.try_into(Vec::new(), Vec::new()).unwrap();
+        assert_eq!(
+            empty_candidate_output.failed_reason.as_deref(),
+            Some("\"SAFETY\"")
+        );
+        assert!(empty_candidate_output.raw_history.is_empty());
+
+        let failed_finish: GenerateContentResponse = serde_json::from_value(json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": "partial"}]},
+                "finishReason": "MAX_TOKENS"
+            }],
+            "usageMetadata": {}
+        }))
+        .unwrap();
+        assert!(failed_finish.maybe_failed());
+        let failed_finish_output = failed_finish.try_into(Vec::new(), Vec::new()).unwrap();
+        assert_eq!(
+            failed_finish_output.failed_reason.as_deref(),
+            Some("\"MAX_TOKENS\"")
+        );
+        assert!(failed_finish_output.content.is_empty());
+        assert_eq!(
+            failed_finish_output.chat_history[0].text().as_deref(),
+            Some("partial")
+        );
+    }
+
+    #[test]
+    fn null_defaults_and_string_enums_round_trip_unknown_values() {
+        let usage: UsageMetadata = serde_json::from_value(json!({
+            "promptTokenCount": null,
+            "totalTokenCount": null,
+            "candidatesTokenCount": null,
+            "thoughtsTokenCount": null,
+            "toolUsePromptTokenCount": null,
+            "cachedContentTokenCount": null,
+            "promptTokensDetails": null,
+            "cacheTokensDetails": null,
+            "candidatesTokensDetails": null,
+            "toolUsePromptTokensDetails": null
+        }))
+        .unwrap();
+        assert_eq!(usage, UsageMetadata::default());
+
+        let modality_count: ModalityTokenCount = serde_json::from_value(json!({
+            "modality": "X_CUSTOM",
+            "tokenCount": null
+        }))
+        .unwrap();
+        assert_eq!(modality_count.token_count, 0);
+        assert!(matches!(
+            modality_count.modality,
+            Some(Modality::Unknown(ref value)) if value == "X_CUSTOM"
+        ));
+        assert_eq!(
+            serde_json::to_value(modality_count).unwrap(),
+            json!({"modality": "X_CUSTOM"})
+        );
+
+        let safety: SafetyRating = serde_json::from_value(json!({
+            "category": null,
+            "probability": null,
+            "blocked": true
+        }))
+        .unwrap();
+        assert_eq!(safety.category, HarmCategory::HarmCategoryUnspecified);
+        assert_eq!(
+            safety.probability,
+            HarmProbability::HarmProbabilityUnspecified
+        );
+        assert_eq!(safety.blocked, Some(true));
+
+        let block_reason: BlockReason = serde_json::from_value(json!("VENDOR_BLOCK")).unwrap();
+        assert!(matches!(
+            block_reason,
+            BlockReason::Unknown(ref value) if value == "VENDOR_BLOCK"
+        ));
+        assert_eq!(
+            serde_json::to_value(block_reason).unwrap(),
+            json!("VENDOR_BLOCK")
+        );
+
+        let probability: HarmProbability = serde_json::from_value(json!("VENDOR_LOW")).unwrap();
+        assert!(matches!(
+            probability,
+            HarmProbability::Unknown(ref value) if value == "VENDOR_LOW"
+        ));
+        assert_eq!(
+            serde_json::to_value(probability).unwrap(),
+            json!("VENDOR_LOW")
+        );
+
+        let category: HarmCategory = serde_json::from_value(json!("HARM_CATEGORY_VENDOR")).unwrap();
+        assert!(matches!(
+            category,
+            HarmCategory::Unknown(ref value) if value == "HARM_CATEGORY_VENDOR"
+        ));
+        assert_eq!(
+            serde_json::to_value(category).unwrap(),
+            json!("HARM_CATEGORY_VENDOR")
+        );
+    }
+
+    #[test]
     fn test_generate_content_request_serde() {
         let mut req = GenerateContentRequest::default();
         req.contents.push(json!({

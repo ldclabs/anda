@@ -495,6 +495,8 @@ fn is_missing_store_object(err: &(dyn std::error::Error + 'static)) -> bool {
 mod tests {
     use super::*;
     use crate::{context::AgentCtx, engine::EngineBuilder};
+    use async_trait::async_trait;
+    use std::sync::Arc;
 
     fn agent_ctx(name: &str) -> AgentCtx {
         EngineBuilder::new()
@@ -507,6 +509,30 @@ mod tests {
         agent_ctx(name)
             .child_base(NoteTool::NAME)
             .expect("create note tool ctx")
+    }
+
+    struct MutatingHook;
+
+    #[async_trait]
+    impl ToolHook<NoteArgs, NoteOutput> for MutatingHook {
+        async fn before_tool_call(
+            &self,
+            _ctx: &BaseCtx,
+            mut args: NoteArgs,
+        ) -> Result<NoteArgs, BoxError> {
+            args.action = Some(NOTE_ACTION_ADD.to_string());
+            args.content = Some("hook inserted note".to_string());
+            Ok(args)
+        }
+
+        async fn after_tool_call(
+            &self,
+            _ctx: &BaseCtx,
+            mut output: ToolOutput<NoteOutput>,
+        ) -> Result<ToolOutput<NoteOutput>, BoxError> {
+            output.output.message = Some("hook observed output".to_string());
+            Ok(output)
+        }
     }
 
     #[test]
@@ -553,6 +579,72 @@ mod tests {
         assert!(!output.success);
         assert_eq!(store.notes.len(), 2);
         assert_eq!(output.matches.unwrap().len(), 2);
+    }
+
+    #[test]
+    fn store_reports_empty_missing_limit_and_preview_errors() {
+        let mut store = NoteStore::default();
+        assert_eq!(store.usage(10), "0% - 0/10 chars");
+        assert_eq!(
+            store.add("   ".into(), NOTE_CHAR_LIMIT).error.as_deref(),
+            Some(NOTE_EMPTY_CONTENT)
+        );
+
+        store.notes = vec![
+            "alpha exact".to_string(),
+            "alpha exact".to_string(),
+            format!("alpha {}", "x".repeat(NOTE_MATCH_PREVIEW_LIMIT + 20)),
+        ];
+        let duplicate_match = store.replace("exact".into(), "changed".into(), NOTE_CHAR_LIMIT);
+        assert!(duplicate_match.success);
+        assert_eq!(store.notes[0], "changed");
+
+        assert_eq!(
+            store
+                .replace(" ".into(), "new".into(), NOTE_CHAR_LIMIT)
+                .error
+                .as_deref(),
+            Some(NOTE_EMPTY_OLD_TEXT)
+        );
+        assert_eq!(
+            store
+                .replace("alpha".into(), " ".into(), NOTE_CHAR_LIMIT)
+                .error
+                .as_deref(),
+            Some(NOTE_EMPTY_CONTENT)
+        );
+        assert!(
+            store
+                .replace("missing".into(), "new".into(), NOTE_CHAR_LIMIT)
+                .error
+                .unwrap()
+                .contains("No entry matched")
+        );
+
+        let ambiguous = store.remove("alpha".into(), NOTE_CHAR_LIMIT);
+        assert!(!ambiguous.success);
+        let previews = ambiguous.matches.unwrap();
+        assert_eq!(previews.len(), 2);
+        assert!(previews[1].ends_with("..."));
+
+        assert_eq!(
+            store.remove(" ".into(), NOTE_CHAR_LIMIT).error.as_deref(),
+            Some(NOTE_EMPTY_OLD_TEXT)
+        );
+        assert!(
+            store
+                .remove("missing".into(), NOTE_CHAR_LIMIT)
+                .error
+                .unwrap()
+                .contains("No entry matched")
+        );
+
+        let oversized = "x".repeat(NOTE_CHAR_LIMIT + 1);
+        assert!(
+            validate_note_size(&[oversized])
+                .unwrap_err()
+                .contains("Shorten")
+        );
     }
 
     #[tokio::test]
@@ -640,6 +732,132 @@ mod tests {
             .unwrap();
         assert!(reviewer.output.success);
         assert!(reviewer.output.notes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn tool_reports_validation_errors_and_unknown_actions_without_persisting() {
+        let tool = NoteTool::default()
+            .with_char_limit(32)
+            .with_description("custom note description".to_string());
+        assert_eq!(tool.description(), "custom note description");
+        let ctx = note_ctx("validation");
+
+        let missing_content = tool
+            .call(
+                ctx.clone(),
+                NoteArgs {
+                    action: Some(NOTE_ACTION_ADD.to_string()),
+                    content: None,
+                    old_text: None,
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            missing_content.output.error.as_deref(),
+            Some("content is required for add")
+        );
+        assert_eq!(
+            missing_content.output.usage.as_deref(),
+            Some("0% - 0/32 chars")
+        );
+
+        for (action, expected) in [
+            (NOTE_ACTION_REPLACE, "old_text is required for replace"),
+            (NOTE_ACTION_REMOVE, "old_text is required for remove"),
+        ] {
+            let output = tool
+                .call(
+                    ctx.clone(),
+                    NoteArgs {
+                        action: Some(action.to_string()),
+                        content: None,
+                        old_text: None,
+                    },
+                    Vec::new(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(output.output.error.as_deref(), Some(expected));
+        }
+
+        let missing_replace_content = tool
+            .call(
+                ctx.clone(),
+                NoteArgs {
+                    action: Some(NOTE_ACTION_REPLACE.to_string()),
+                    content: None,
+                    old_text: Some("entry".to_string()),
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            missing_replace_content.output.error.as_deref(),
+            Some("content is required for replace")
+        );
+
+        let unknown = tool
+            .call(
+                ctx.clone(),
+                NoteArgs {
+                    action: Some("archive".to_string()),
+                    content: None,
+                    old_text: None,
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            unknown
+                .output
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("Unknown action"))
+        );
+
+        let read = tool
+            .call(ctx, NoteArgs::default(), Vec::new())
+            .await
+            .unwrap();
+        assert!(read.output.notes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn tool_hooks_and_load_notes_use_agent_scoped_store() {
+        let engine_ctx = EngineBuilder::new().mock_ctx();
+        let agent = engine_ctx
+            .child("hooked", "hooked")
+            .expect("create child agent ctx");
+        let ctx = agent.child_base(NoteTool::NAME).unwrap();
+        ctx.set_state(NoteToolHook::new(Arc::new(MutatingHook)));
+
+        let tool = NoteTool::new();
+        let output = tool
+            .call(
+                ctx,
+                NoteArgs {
+                    action: Some(NOTE_ACTION_READ.to_string()),
+                    content: None,
+                    old_text: None,
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.output.notes, vec!["hook inserted note".to_string()]);
+        assert_eq!(
+            output.output.message.as_deref(),
+            Some("hook observed output")
+        );
+
+        let loaded = load_notes(&agent).await.unwrap();
+        assert!(loaded.success);
+        assert_eq!(loaded.notes, vec!["hook inserted note".to_string()]);
+        assert!(loaded.usage.is_none());
     }
 
     #[test]

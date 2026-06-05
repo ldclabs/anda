@@ -2916,8 +2916,33 @@ pub enum ReasoningSummaryLevel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anda_core::{ContentPart, Message};
+    use anda_core::{ByteBufB64, ContentPart, Message};
     use serde_json::json;
+
+    fn minimal_response_json(status: &str) -> Json {
+        json!({
+            "id": format!("resp_{status}"),
+            "created_at": 1741290958,
+            "status": status,
+            "error": null,
+            "incomplete_details": null,
+            "instructions": null,
+            "metadata": {},
+            "model": "gpt-test",
+            "output": [],
+            "tools": [],
+            "usage": null
+        })
+    }
+
+    fn message_item_json(text: &str) -> Json {
+        json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": text}],
+            "status": "completed"
+        })
+    }
 
     #[test]
     fn test_message_into_mixed_parts() {
@@ -3135,6 +3160,73 @@ mod tests {
 
         let value = serde_json::to_value(&items[0]).unwrap();
         assert_eq!(value["content"][0]["type"], "output_text");
+    }
+
+    #[test]
+    fn normalize_message_content_covers_role_specific_filtering() {
+        let assistant_content = normalize_message_content(
+            "ASSISTANT",
+            vec![
+                ContentItem::Text {
+                    text: "done".into(),
+                },
+                ContentItem::Refusal {
+                    refusal: "blocked".into(),
+                },
+                ContentItem::Image {
+                    detail: "auto".into(),
+                    image_url: "https://example.com/image.png".into(),
+                    file_id: None,
+                },
+            ],
+        );
+        assert_eq!(
+            assistant_content,
+            vec![
+                ContentItem::OutputText {
+                    text: "done".into()
+                },
+                ContentItem::Refusal {
+                    refusal: "blocked".into()
+                },
+            ]
+        );
+
+        let user_content = normalize_message_content(
+            "user",
+            vec![
+                ContentItem::OutputText {
+                    text: "question".into(),
+                },
+                ContentItem::Refusal {
+                    refusal: "retry".into(),
+                },
+            ],
+        );
+        assert_eq!(
+            user_content,
+            vec![
+                ContentItem::Text {
+                    text: "question".into()
+                },
+                ContentItem::Text {
+                    text: "retry".into()
+                },
+            ]
+        );
+
+        let mut rt = Vec::new();
+        let mut empty = Vec::new();
+        push_message_item(&mut rt, "assistant", &mut empty);
+        assert!(rt.is_empty());
+
+        let mut output_only_media = vec![ContentItem::Image {
+            detail: "auto".into(),
+            image_url: "https://example.com/image.png".into(),
+            file_id: None,
+        }];
+        push_message_item(&mut rt, "assistant", &mut output_only_media);
+        assert!(rt.is_empty());
     }
 
     #[test]
@@ -3636,6 +3728,174 @@ mod tests {
     }
 
     #[test]
+    fn deserializes_extended_response_output_item_variants() {
+        let items: Vec<MessageItem> = serde_json::from_value(json!([
+            {
+                "type": "file_search_call",
+                "id": "fs_1",
+                "queries": ["anda memory"],
+                "status": "completed",
+                "results": [{
+                    "file_id": "file_1",
+                    "filename": "notes.md",
+                    "score": 0.9,
+                    "text": "result"
+                }]
+            },
+            {
+                "type": "computer_call",
+                "id": "cc_1",
+                "call_id": "call_computer",
+                "pending_safety_checks": [{"id": "safe_1", "code": "confirm", "message": "ok?"}],
+                "status": "completed",
+                "action": {"type": "click", "x": 1, "y": 2},
+                "actions": [{"type": "screenshot"}]
+            },
+            {
+                "type": "computer_call_output",
+                "id": "cco_1",
+                "call_id": "call_computer",
+                "output": {"type": "computer_screenshot", "image_url": "data:image/png;base64,AAA"},
+                "acknowledged_safety_checks": [{"id": "safe_1"}],
+                "status": "completed",
+                "created_by": "client"
+            },
+            {
+                "type": "tool_search_call",
+                "id": "ts_1",
+                "call_id": "call_tool_search",
+                "arguments": {"query": "files"},
+                "execution": "client",
+                "status": "completed",
+                "created_by": "model"
+            },
+            {
+                "type": "tool_search_output",
+                "id": "tso_1",
+                "call_id": "call_tool_search",
+                "tools": [{
+                    "type": "function",
+                    "name": "lookup",
+                    "description": "Lookup docs",
+                    "parameters": {"type": "object"},
+                    "strict": true
+                }],
+                "execution": "client",
+                "status": "completed",
+                "created_by": "client"
+            },
+            {
+                "type": "image_generation_call",
+                "id": "img_1",
+                "result": "image-b64",
+                "status": "completed"
+            },
+            {
+                "type": "local_shell_call",
+                "id": "lsh_1",
+                "action": {
+                    "type": "exec",
+                    "command": ["echo", "ok"],
+                    "env": {"A": "B"},
+                    "timeout_ms": 1000,
+                    "user": "runner",
+                    "working_directory": "/tmp"
+                },
+                "call_id": "call_local_shell",
+                "status": "completed"
+            },
+            {
+                "type": "local_shell_call_output",
+                "id": "lsho_1",
+                "output": "ok",
+                "status": "completed"
+            },
+            {
+                "type": "shell_call",
+                "id": "sh_1",
+                "action": {"commands": ["pwd"], "max_output_length": 1200, "timeout_ms": 5000},
+                "call_id": "call_shell",
+                "environment": {"type": "shell", "cwd": "/tmp"},
+                "status": "completed",
+                "created_by": "model"
+            },
+            {
+                "type": "apply_patch_call",
+                "id": "ap_1",
+                "call_id": "call_patch",
+                "operation": {"type": "update", "path": "src/lib.rs", "diff": "@@"},
+                "status": "completed",
+                "created_by": "model"
+            },
+            {
+                "type": "apply_patch_call_output",
+                "id": "apo_1",
+                "call_id": "call_patch",
+                "status": "completed",
+                "output": "ok",
+                "created_by": "client"
+            },
+            {
+                "type": "mcp_list_tools",
+                "id": "mlt_1",
+                "server_label": "deepwiki",
+                "tools": [{"name": "search", "description": "Search", "input_schema": {"type": "object"}}],
+                "error": null
+            },
+            {
+                "type": "mcp_approval_request",
+                "id": "mar_1",
+                "arguments": "{\"path\":\"/tmp\"}",
+                "name": "read_file",
+                "server_label": "fs"
+            },
+            {
+                "type": "mcp_approval_response",
+                "id": "map_1",
+                "approval_request_id": "mar_1",
+                "approve": true,
+                "reason": "allowed"
+            },
+            {
+                "type": "custom_tool_call",
+                "id": "ctc_1",
+                "call_id": "call_custom",
+                "input": "select 1",
+                "name": "sql",
+                "namespace": "db"
+            },
+            {"type": "compaction_trigger"},
+            {"type": "item_reference", "id": "msg_1"}
+        ]))
+        .unwrap();
+
+        assert!(matches!(items[0], MessageItem::FileSearchCall { .. }));
+        assert!(matches!(items[1], MessageItem::ComputerCall { .. }));
+        assert!(matches!(items[2], MessageItem::ComputerCallOutput { .. }));
+        assert!(matches!(items[3], MessageItem::ToolSearchCall { .. }));
+        assert!(matches!(items[4], MessageItem::ToolSearchOutput { .. }));
+        assert!(matches!(items[5], MessageItem::ImageGenerationCall { .. }));
+        assert!(matches!(items[6], MessageItem::LocalShellCall { .. }));
+        assert!(matches!(items[7], MessageItem::LocalShellCallOutput { .. }));
+        assert!(matches!(items[8], MessageItem::ShellCall { .. }));
+        assert!(matches!(items[9], MessageItem::ApplyPatchCall { .. }));
+        assert!(matches!(
+            items[10],
+            MessageItem::ApplyPatchCallOutput { .. }
+        ));
+        assert!(matches!(items[11], MessageItem::McpListTools { .. }));
+        assert!(matches!(items[12], MessageItem::McpApprovalRequest { .. }));
+        assert!(matches!(items[13], MessageItem::McpApprovalResponse { .. }));
+        assert!(matches!(items[14], MessageItem::CustomToolCall { .. }));
+        assert!(matches!(items[15], MessageItem::CompactionTrigger));
+        assert!(matches!(items[16], MessageItem::ItemReference { .. }));
+
+        for item in items {
+            assert!(serde_json::to_value(item).unwrap().is_object());
+        }
+    }
+
+    #[test]
     fn deserializes_stream_events_with_nullable_response_usage() {
         let event: StreamEvent = serde_json::from_value(json!({
             "type": "response.created",
@@ -3695,5 +3955,593 @@ mod tests {
             event,
             StreamEvent::ResponseOutputTextDelta { delta, .. } if delta == "Hi"
         ));
+    }
+
+    #[test]
+    fn deserializes_all_stream_event_variants_and_fallbacks() {
+        let response_events = [
+            ("response.in_progress", "in_progress"),
+            ("response.completed", "completed"),
+            ("response.failed", "failed"),
+            ("response.incomplete", "incomplete"),
+        ];
+        for (event_type, status) in response_events {
+            let event: StreamEvent = serde_json::from_value(json!({
+                "type": event_type,
+                "response": minimal_response_json(status)
+            }))
+            .unwrap();
+            match (event_type, event) {
+                ("response.in_progress", StreamEvent::ResponseInProgress { response }) => {
+                    assert_eq!(response.status, ResponseStatus::InProgress);
+                }
+                ("response.completed", StreamEvent::ResponseCompleted { response }) => {
+                    assert_eq!(response.status, ResponseStatus::Completed);
+                }
+                ("response.failed", StreamEvent::ResponseFailed { response }) => {
+                    assert_eq!(response.status, ResponseStatus::Failed);
+                }
+                ("response.incomplete", StreamEvent::ResponseIncomplete { response }) => {
+                    assert_eq!(response.status, ResponseStatus::Incomplete);
+                }
+                _ => panic!("unexpected response event variant"),
+            }
+        }
+
+        let event: StreamEvent = serde_json::from_value(json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": message_item_json("added")
+        }))
+        .unwrap();
+        assert!(matches!(
+            event,
+            StreamEvent::ResponseOutputItemAdded {
+                output_index: 0,
+                item: MessageItem::Message { .. }
+            }
+        ));
+
+        let event: StreamEvent = serde_json::from_value(json!({
+            "type": "response.output_item.done",
+            "output_index": 1,
+            "item": message_item_json("done")
+        }))
+        .unwrap();
+        assert!(matches!(
+            event,
+            StreamEvent::ResponseOutputItemDone {
+                output_index: 1,
+                item: MessageItem::Message { .. }
+            }
+        ));
+
+        let event: StreamEvent = serde_json::from_value(json!({
+            "type": "response.content_part.done",
+            "item_id": "msg_1",
+            "output_index": 0,
+            "content_index": 0,
+            "part": {"type": "output_text", "text": "final"}
+        }))
+        .unwrap();
+        assert!(matches!(
+            event,
+            StreamEvent::ResponseContentPartDone {
+                part: ContentItem::OutputText { .. },
+                ..
+            }
+        ));
+
+        let event: StreamEvent = serde_json::from_value(json!({
+            "type": "response.output_text.done",
+            "item_id": "msg_1",
+            "output_index": 0,
+            "content_index": 0,
+            "text": "final"
+        }))
+        .unwrap();
+        assert!(matches!(
+            event,
+            StreamEvent::ResponseOutputTextDone { text, .. } if text == "final"
+        ));
+
+        let malformed: StreamEvent = serde_json::from_value(json!({
+            "type": "response.output_text.done",
+            "item_id": "msg_1"
+        }))
+        .unwrap();
+        assert!(matches!(malformed, StreamEvent::Any(_)));
+
+        let unknown: StreamEvent = serde_json::from_value(json!({
+            "type": "response.unknown",
+            "value": true
+        }))
+        .unwrap();
+        assert!(matches!(unknown, StreamEvent::Any(_)));
+
+        let scalar: StreamEvent = serde_json::from_value(json!("not an event")).unwrap();
+        assert!(matches!(scalar, StreamEvent::Any(_)));
+    }
+
+    #[test]
+    fn completion_response_error_and_non_message_branches() {
+        let response: CompletionResponse = serde_json::from_value(json!({
+            "id": "resp_error",
+            "created_at": 1741290958,
+            "error": {"code": "bad_request", "message": "nope"},
+            "incomplete_details": null,
+            "instructions": null,
+            "metadata": {},
+            "model": "gpt-test",
+            "output": [],
+            "tools": [],
+            "usage": null
+        }))
+        .unwrap();
+
+        let output = response
+            .try_into(vec![json!({"old": true})], vec![])
+            .unwrap();
+        assert_eq!(output.raw_history, vec![json!({"old": true})]);
+        assert!(
+            output
+                .failed_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("bad_request"))
+        );
+
+        let mut response: CompletionResponse = serde_json::from_value(json!({
+            "id": "resp_tool",
+            "created_at": 1741290958,
+            "error": null,
+            "incomplete_details": null,
+            "instructions": null,
+            "metadata": {},
+            "model": "gpt-test",
+            "output": [{
+                "type": "function_call",
+                "name": "lookup",
+                "arguments": "{}",
+                "call_id": "call_1"
+            }],
+            "tools": [],
+            "usage": null
+        }))
+        .unwrap();
+        response.parse_output();
+        assert!(!response.maybe_failed());
+    }
+
+    #[test]
+    fn deserializes_tool_definitions_defaults_and_fallbacks() {
+        let tools: Vec<ToolDefinition> = serde_json::from_value(json!([
+            {"type": "function", "name": "lookup"},
+            {
+                "type": "computer_use_preview",
+                "display_height": 768,
+                "display_width": 1024,
+                "environment": "browser"
+            },
+            {
+                "type": "web_search",
+                "filters": {"allowed_domains": ["example.com"]},
+                "search_context_size": "low",
+                "user_location": {"type": "approximate", "city": "SF"}
+            },
+            {
+                "type": "web_search_2025_08_26",
+                "filters": {"allowed_domains": ["ldclabs.com"]},
+                "search_context_size": "medium",
+                "user_location": {"country": "US"}
+            },
+            {
+                "type": "mcp",
+                "server_label": "docs",
+                "allowed_tools": {"read_only": true, "tool_names": ["search"]},
+                "authorization": "Bearer token",
+                "connector_id": "conn_1",
+                "defer_loading": true,
+                "headers": {"x-test": "1"},
+                "require_approval": {"never": true},
+                "server_description": "Docs",
+                "server_url": "https://mcp.example.com"
+            },
+            {
+                "type": "code_interpreter",
+                "container": {
+                    "type": "auto",
+                    "file_ids": ["file_1"],
+                    "memory_limit": "2gb",
+                    "network_policy": {"type": "none"}
+                }
+            },
+            {
+                "type": "image_generation",
+                "action": "generate",
+                "background": "transparent",
+                "input_fidelity": "high",
+                "input_image_mask": {"file_id": "mask_1"},
+                "model": "gpt-image-1",
+                "moderation": "low",
+                "output_compression": 90,
+                "output_format": "png",
+                "partial_images": 2,
+                "quality": "high",
+                "size": "1024x1024"
+            },
+            {"type": "local_shell"},
+            {"type": "shell", "environment": {"type": "unix", "cwd": "/tmp"}},
+            {
+                "type": "custom",
+                "name": "sql",
+                "defer_loading": false,
+                "description": "Run SQL",
+                "format": {"type": "grammar", "definition": "root ::= select", "syntax": "lark"}
+            },
+            {
+                "type": "namespace",
+                "description": "Grouped tools",
+                "name": "ops",
+                "tools": [
+                    {"type": "function", "name": "restart", "parameters": {"type": "object"}, "strict": true},
+                    {"type": "custom", "name": "script", "format": {"type": "text"}}
+                ]
+            },
+            {"type": "web_search_preview_2025_03_11", "search_content_types": ["text"]},
+            {"type": "computer"},
+            {"type": "apply_patch"}
+        ]))
+        .unwrap();
+
+        assert!(matches!(
+            &tools[0],
+            ToolDefinition::Function {
+                name,
+                strict: true,
+                parameters,
+                ..
+            } if name == "lookup" && parameters == &Json::Null
+        ));
+        assert!(matches!(
+            tools[1],
+            ToolDefinition::ComputerUsePreview { .. }
+        ));
+        assert!(matches!(tools[2], ToolDefinition::WebSearch { .. }));
+        assert!(matches!(tools[3], ToolDefinition::WebSearch20250826 { .. }));
+        assert!(matches!(tools[4], ToolDefinition::Mcp { .. }));
+        assert!(matches!(tools[5], ToolDefinition::CodeInterpreter { .. }));
+        assert!(matches!(tools[6], ToolDefinition::ImageGeneration { .. }));
+        assert!(matches!(tools[7], ToolDefinition::LocalShell));
+        assert!(matches!(tools[8], ToolDefinition::Shell { .. }));
+        assert!(matches!(tools[9], ToolDefinition::Custom { .. }));
+        assert!(matches!(
+            &tools[10],
+            ToolDefinition::Namespace { tools, .. }
+                if matches!(tools.as_slice(), [
+                    NamespaceToolDefinition::Function { .. },
+                    NamespaceToolDefinition::Custom { .. }
+                ])
+        ));
+        assert!(matches!(
+            tools[11],
+            ToolDefinition::WebSearchPreview20250311 { .. }
+        ));
+        assert!(matches!(tools[12], ToolDefinition::Computer));
+        assert!(matches!(tools[13], ToolDefinition::ApplyPatch));
+
+        for tool in tools {
+            assert!(serde_json::to_value(tool).unwrap().is_object());
+        }
+
+        let malformed: ToolDefinition =
+            serde_json::from_value(json!({"type": "function"})).unwrap();
+        assert!(matches!(malformed, ToolDefinition::Any(_)));
+
+        let unknown: ToolDefinition =
+            serde_json::from_value(json!({"type": "future_tool", "enabled": true})).unwrap();
+        assert!(matches!(unknown, ToolDefinition::Any(_)));
+
+        let scalar: ToolDefinition = serde_json::from_value(json!(false)).unwrap();
+        assert!(matches!(scalar, ToolDefinition::Any(_)));
+    }
+
+    #[test]
+    fn content_items_and_message_items_cover_defaults_and_fallbacks() {
+        let item: MessageItem = serde_json::from_value(json!({
+            "type": "message",
+            "role": "user",
+            "content": "hello"
+        }))
+        .unwrap();
+        assert!(matches!(
+            item,
+            MessageItem::Message {
+                content,
+                ..
+            } if matches!(content.as_slice(), [ContentItem::Text { text }] if text == "hello")
+        ));
+
+        let items: Vec<ContentItem> = serde_json::from_value(json!([
+            {"type": "input_image"},
+            {"type": "input_file", "file_id": "file_1", "filename": "a.pdf"},
+            {"type": "input_audio", "input_audio": {"data": "data:audio/wav;base64,aGk=", "format": "wav"}},
+            {"type": "input_text"},
+            {"type": "future_content", "x": 1},
+            7
+        ]))
+        .unwrap();
+
+        assert!(matches!(
+            &items[0],
+            ContentItem::Image {
+                detail,
+                image_url,
+                file_id: None
+            } if detail == "auto" && image_url.is_empty()
+        ));
+        assert!(matches!(items[1], ContentItem::File { .. }));
+        assert!(matches!(items[2], ContentItem::Audio { .. }));
+        assert!(matches!(items[3], ContentItem::Any(_)));
+        assert!(matches!(items[4], ContentItem::Any(_)));
+        assert!(matches!(items[5], ContentItem::Any(_)));
+
+        let malformed: MessageItem =
+            serde_json::from_value(json!({"type": "function_call"})).unwrap();
+        assert!(matches!(malformed, MessageItem::Any(_)));
+
+        let scalar: MessageItem = serde_json::from_value(json!(null)).unwrap();
+        assert!(matches!(scalar, MessageItem::Any(_)));
+    }
+
+    #[test]
+    fn message_from_handles_media_any_and_unmapped_items() {
+        let (message, failed_reason) = message_from(vec![
+            MessageItem::Message {
+                role: "assistant".into(),
+                content: vec![
+                    ContentItem::Image {
+                        detail: "auto".into(),
+                        image_url: "data:image/png;base64,aGk=".into(),
+                        file_id: None,
+                    },
+                    ContentItem::Audio {
+                        input_audio: InputAudio {
+                            data: "data:audio/wav;base64,aGk=".into(),
+                            format: "wav".into(),
+                        },
+                    },
+                    ContentItem::File {
+                        file_data: Some("data:text/plain;base64,aGk=".into()),
+                        file_url: None,
+                        file_id: None,
+                        filename: None,
+                    },
+                    ContentItem::File {
+                        file_data: None,
+                        file_url: Some("https://example.com/report.pdf".into()),
+                        file_id: None,
+                        filename: None,
+                    },
+                    ContentItem::File {
+                        file_data: None,
+                        file_url: None,
+                        file_id: Some("file_1".into()),
+                        filename: Some("report.pdf".into()),
+                    },
+                    ContentItem::Any(json!({"raw": true})),
+                ],
+                status: None,
+                id: None,
+                phase: None,
+            },
+            MessageItem::FunctionCall {
+                name: "bad_args".into(),
+                arguments: "not json".into(),
+                call_id: "call_bad".into(),
+                namespace: None,
+                id: None,
+                status: None,
+            },
+            MessageItem::FunctionCallOutput {
+                id: None,
+                call_id: "call_plain".into(),
+                output: FunctionCallOutput::String("plain".into()),
+                status: None,
+                created_by: None,
+            },
+            MessageItem::Reasoning {
+                id: "rs_1".into(),
+                summary: vec![],
+                content: Some(vec![ReasoningContent::ReasoningText {
+                    text: "deeper".into(),
+                }]),
+                encrypted_content: None,
+                status: None,
+            },
+            MessageItem::CompactionTrigger,
+        ]);
+
+        assert!(failed_reason.is_none());
+        let message = message.unwrap();
+        assert_eq!(message.role, "assistant");
+        assert!(matches!(
+            &message.content[0],
+            ContentPart::InlineData { mime_type, .. } if mime_type == "image/png"
+        ));
+        assert!(matches!(
+            &message.content[1],
+            ContentPart::InlineData { mime_type, .. } if mime_type == "audio/wav"
+        ));
+        assert!(matches!(
+            &message.content[2],
+            ContentPart::InlineData { mime_type, .. } if mime_type == "text/plain"
+        ));
+        assert!(matches!(
+            &message.content[3],
+            ContentPart::FileData { file_uri, .. } if file_uri == "https://example.com/report.pdf"
+        ));
+        assert!(matches!(&message.content[4], ContentPart::Any(_)));
+        assert!(matches!(&message.content[5], ContentPart::Any(_)));
+        assert!(matches!(
+            &message.content[6],
+            ContentPart::ToolCall { args, .. } if args == &Json::Null
+        ));
+        assert!(matches!(
+            &message.content[7],
+            ContentPart::ToolOutput { output, .. } if output == &json!("plain")
+        ));
+        assert!(matches!(
+            &message.content[8],
+            ContentPart::Reasoning { text } if text == "deeper"
+        ));
+        assert!(matches!(&message.content[9], ContentPart::Any(_)));
+    }
+
+    #[test]
+    fn message_into_maps_inline_and_remote_media() {
+        let items = message_into(Message {
+            role: "user".into(),
+            content: vec![
+                ContentPart::FileData {
+                    file_uri: "https://example.com/image.png".into(),
+                    mime_type: Some("image/png".into()),
+                },
+                ContentPart::InlineData {
+                    mime_type: "image/png".into(),
+                    data: ByteBufB64(b"png".to_vec()),
+                },
+                ContentPart::InlineData {
+                    mime_type: "audio/wav".into(),
+                    data: ByteBufB64(b"hi".to_vec()),
+                },
+                ContentPart::InlineData {
+                    mime_type: "application/pdf".into(),
+                    data: ByteBufB64(b"pdf".to_vec()),
+                },
+            ],
+            ..Default::default()
+        });
+
+        assert_eq!(items.len(), 1);
+        match &items[0] {
+            MessageItem::Message { content, .. } => {
+                assert!(matches!(
+                    &content[0],
+                    ContentItem::Image { image_url, detail, .. }
+                        if image_url == "https://example.com/image.png" && detail == "auto"
+                ));
+                assert!(matches!(
+                    &content[1],
+                    ContentItem::Image { image_url, detail, .. }
+                        if image_url.starts_with("data:image/png;base64,") && detail == "auto"
+                ));
+                assert!(matches!(
+                    &content[2],
+                    ContentItem::Audio { input_audio }
+                        if input_audio.format == "wav"
+                            && input_audio.data.starts_with("data:audio/wav;base64,")
+                ));
+                assert!(matches!(
+                    &content[3],
+                    ContentItem::File {
+                        file_data: Some(data),
+                        ..
+                    } if data.starts_with("data:application/pdf;base64,")
+                ));
+            }
+            _ => panic!("expected a message item"),
+        }
+    }
+
+    #[test]
+    fn message_from_maps_media_url_fallbacks_and_file_url_data() {
+        let (message, failed_reason) = message_from(vec![MessageItem::Message {
+            role: "assistant".into(),
+            content: vec![
+                ContentItem::Image {
+                    detail: "auto".into(),
+                    image_url: "https://example.com/image.png".into(),
+                    file_id: None,
+                },
+                ContentItem::Audio {
+                    input_audio: InputAudio {
+                        data: "https://example.com/audio.wav".into(),
+                        format: "wav".into(),
+                    },
+                },
+                ContentItem::File {
+                    file_data: None,
+                    file_url: Some("data:text/plain;base64,aGk=".into()),
+                    file_id: None,
+                    filename: None,
+                },
+            ],
+            status: None,
+            id: None,
+            phase: None,
+        }]);
+
+        assert!(failed_reason.is_none());
+        let message = message.unwrap();
+        assert!(matches!(
+            &message.content[0],
+            ContentPart::FileData { file_uri, mime_type }
+                if file_uri == "https://example.com/image.png" && mime_type.is_none()
+        ));
+        assert!(matches!(
+            &message.content[1],
+            ContentPart::FileData { file_uri, mime_type }
+                if file_uri == "https://example.com/audio.wav" && mime_type.is_none()
+        ));
+        assert!(matches!(
+            &message.content[2],
+            ContentPart::InlineData { mime_type, data }
+                if mime_type == "text/plain" && data == &ByteBufB64(b"hi".to_vec())
+        ));
+    }
+
+    #[test]
+    fn response_status_service_tier_and_structured_output_roundtrip() {
+        let statuses = [
+            ("in_progress", ResponseStatus::InProgress),
+            ("completed", ResponseStatus::Completed),
+            ("failed", ResponseStatus::Failed),
+            ("cancelled", ResponseStatus::Cancelled),
+            ("queued", ResponseStatus::Queued),
+            ("incomplete", ResponseStatus::Incomplete),
+            ("paused", ResponseStatus::Other("paused".into())),
+        ];
+        for (raw, expected) in statuses {
+            let status: ResponseStatus = serde_json::from_value(json!(raw)).unwrap();
+            assert_eq!(status, expected);
+            assert_eq!(serde_json::to_value(status).unwrap(), json!(raw));
+        }
+
+        let tiers = [
+            ("auto", OpenAIServiceTier::Auto),
+            ("default", OpenAIServiceTier::Default),
+            ("flex", OpenAIServiceTier::Flex),
+            ("scale", OpenAIServiceTier::Scale),
+            ("priority", OpenAIServiceTier::Priority),
+            ("economy", OpenAIServiceTier::Other("economy".into())),
+        ];
+        for (raw, expected) in tiers {
+            let tier: OpenAIServiceTier = serde_json::from_value(json!(raw)).unwrap();
+            assert_eq!(tier, expected);
+            assert_eq!(serde_json::to_value(tier).unwrap(), json!(raw));
+        }
+
+        let reasoning = Reasoning::default();
+        assert_eq!(serde_json::to_value(reasoning).unwrap()["effort"], "medium");
+
+        let text_config = TextConfig::structured_output(
+            "answer",
+            json!({"type": "object", "properties": {"value": {"type": "string"}}}),
+        );
+        let value = serde_json::to_value(text_config).unwrap();
+        assert_eq!(value["format"]["type"], "json_schema");
+        assert_eq!(value["format"]["name"], "answer");
+        assert_eq!(value["format"]["strict"], true);
+        assert_eq!(value["format"]["schema"]["type"], "object");
     }
 }

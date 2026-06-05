@@ -241,7 +241,10 @@ mod tests {
     use super::*;
     use crate::engine::EngineBuilder;
     use serde_json::json;
-    use std::path::{Path, PathBuf};
+    use std::{
+        path::{Path, PathBuf},
+        sync::Arc,
+    };
 
     struct TestTempDir(PathBuf);
 
@@ -279,6 +282,113 @@ mod tests {
 
     fn edit_tool(workspace: &Path) -> EditFileTool {
         EditFileTool::new(workspace.to_path_buf())
+    }
+
+    struct RewritingEditHook;
+
+    #[async_trait::async_trait]
+    impl ToolHook<EditFileArgs, EditFileOutput> for RewritingEditHook {
+        async fn before_tool_call(
+            &self,
+            _ctx: &BaseCtx,
+            mut args: EditFileArgs,
+        ) -> Result<EditFileArgs, BoxError> {
+            args.path = "notes.txt".to_string();
+            args.old_string = "alpha".to_string();
+            args.new_string = "beta".to_string();
+            args.limit = 1;
+            Ok(args)
+        }
+
+        async fn after_tool_call(
+            &self,
+            _ctx: &BaseCtx,
+            mut output: ToolOutput<EditFileOutput>,
+        ) -> Result<ToolOutput<EditFileOutput>, BoxError> {
+            output.output.replacements += 10;
+            Ok(output)
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_hooks_missing_files_and_same_string_branch_are_covered() {
+        let temp_dir = TestTempDir::new().await;
+        let workspace = temp_dir.path().join("workspace");
+        let target = workspace.join("notes.txt");
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+        tokio::fs::write(&target, "alpha alpha").await.unwrap();
+
+        let tool = edit_tool(&workspace).with_description("custom edit".to_string());
+        assert_eq!(tool.name(), EditFileTool::NAME);
+        assert_eq!(tool.description(), "custom edit");
+        let definition = tool.definition();
+        assert_eq!(definition.name, EditFileTool::NAME);
+        assert_eq!(definition.strict, Some(true));
+        assert_eq!(
+            definition.parameters["required"],
+            json!(["path", "old_string", "new_string", "limit"])
+        );
+
+        let unchanged = tool
+            .call(
+                mock_ctx(),
+                EditFileArgs {
+                    path: "notes.txt".to_string(),
+                    old_string: "alpha".to_string(),
+                    new_string: "alpha".to_string(),
+                    limit: 0,
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unchanged.output.replacements, 2);
+        assert_eq!(unchanged.output.total_matches, 2);
+        assert_eq!(
+            tokio::fs::read_to_string(&target).await.unwrap(),
+            "alpha alpha"
+        );
+
+        let missing = tool
+            .call(
+                mock_ctx(),
+                EditFileArgs {
+                    path: "missing.txt".to_string(),
+                    old_string: "alpha".to_string(),
+                    new_string: "beta".to_string(),
+                    limit: 0,
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            missing
+                .to_string()
+                .contains("Path does not point to an existing file")
+        );
+
+        let ctx = mock_ctx();
+        ctx.set_state(EditFileHook::new(Arc::new(RewritingEditHook)));
+        let hooked = tool
+            .call(
+                ctx,
+                EditFileArgs {
+                    path: "ignored.txt".to_string(),
+                    old_string: "ignored".to_string(),
+                    new_string: "ignored".to_string(),
+                    limit: 0,
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(hooked.output.replacements, 11);
+        assert_eq!(hooked.output.total_matches, 2);
+        assert_eq!(
+            tokio::fs::read_to_string(&target).await.unwrap(),
+            "beta alpha"
+        );
     }
 
     #[tokio::test]

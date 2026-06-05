@@ -476,3 +476,392 @@ impl HttpFeatures for &Web3SDK {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candid::encode_args;
+
+    struct MockWeb3Client {
+        principal: Principal,
+    }
+
+    impl MockWeb3Client {
+        fn new(principal: Principal) -> Self {
+            Self { principal }
+        }
+    }
+
+    impl Web3ClientFeatures for MockWeb3Client {
+        fn get_principal(&self) -> Principal {
+            self.principal
+        }
+
+        fn sign_envelope(
+            &self,
+            _message_digest: [u8; 32],
+        ) -> BoxPinFut<Result<SignedEnvelope, BoxError>> {
+            Box::pin(futures::future::ready(Err(
+                "mock envelope unavailable".into()
+            )))
+        }
+
+        fn a256gcm_key(
+            &self,
+            _derivation_path: Vec<Vec<u8>>,
+        ) -> BoxPinFut<Result<[u8; 32], BoxError>> {
+            Box::pin(futures::future::ready(Ok([1; 32])))
+        }
+
+        fn ed25519_sign_message(
+            &self,
+            _derivation_path: Vec<Vec<u8>>,
+            _message: &[u8],
+        ) -> BoxPinFut<Result<[u8; 64], BoxError>> {
+            Box::pin(futures::future::ready(Ok([2; 64])))
+        }
+
+        fn ed25519_verify(
+            &self,
+            _derivation_path: Vec<Vec<u8>>,
+            _message: &[u8],
+            _signature: &[u8],
+        ) -> BoxPinFut<Result<(), BoxError>> {
+            Box::pin(futures::future::ready(Ok(())))
+        }
+
+        fn ed25519_public_key(
+            &self,
+            _derivation_path: Vec<Vec<u8>>,
+        ) -> BoxPinFut<Result<[u8; 32], BoxError>> {
+            Box::pin(futures::future::ready(Ok([3; 32])))
+        }
+
+        fn secp256k1_sign_message_bip340(
+            &self,
+            _derivation_path: Vec<Vec<u8>>,
+            _message: &[u8],
+        ) -> BoxPinFut<Result<[u8; 64], BoxError>> {
+            Box::pin(futures::future::ready(Ok([4; 64])))
+        }
+
+        fn secp256k1_verify_bip340(
+            &self,
+            _derivation_path: Vec<Vec<u8>>,
+            _message: &[u8],
+            _signature: &[u8],
+        ) -> BoxPinFut<Result<(), BoxError>> {
+            Box::pin(futures::future::ready(Ok(())))
+        }
+
+        fn secp256k1_sign_message_ecdsa(
+            &self,
+            _derivation_path: Vec<Vec<u8>>,
+            _message: &[u8],
+        ) -> BoxPinFut<Result<[u8; 64], BoxError>> {
+            Box::pin(futures::future::ready(Ok([5; 64])))
+        }
+
+        fn secp256k1_sign_digest_ecdsa(
+            &self,
+            _derivation_path: Vec<Vec<u8>>,
+            _message_hash: &[u8],
+        ) -> BoxPinFut<Result<[u8; 64], BoxError>> {
+            Box::pin(futures::future::ready(Ok([6; 64])))
+        }
+
+        fn secp256k1_verify_ecdsa(
+            &self,
+            _derivation_path: Vec<Vec<u8>>,
+            _message_hash: &[u8],
+            _signature: &[u8],
+        ) -> BoxPinFut<Result<(), BoxError>> {
+            Box::pin(futures::future::ready(Ok(())))
+        }
+
+        fn secp256k1_public_key(
+            &self,
+            _derivation_path: Vec<Vec<u8>>,
+        ) -> BoxPinFut<Result<[u8; 33], BoxError>> {
+            Box::pin(futures::future::ready(Ok([7; 33])))
+        }
+
+        fn canister_query_raw(
+            &self,
+            _canister: Principal,
+            method: String,
+            _args: Vec<u8>,
+        ) -> BoxPinFut<Result<Vec<u8>, BoxError>> {
+            Box::pin(futures::future::ready(Ok(encode_args((format!(
+                "query:{method}"
+            ),))
+            .unwrap())))
+        }
+
+        fn canister_update_raw(
+            &self,
+            _canister: Principal,
+            method: String,
+            _args: Vec<u8>,
+        ) -> BoxPinFut<Result<Vec<u8>, BoxError>> {
+            Box::pin(futures::future::ready(Ok(encode_args((format!(
+                "update:{method}"
+            ),))
+            .unwrap())))
+        }
+
+        fn https_call(
+            &self,
+            url: String,
+            _method: http::Method,
+            _headers: Option<http::HeaderMap>,
+            _body: Option<Vec<u8>>,
+        ) -> BoxPinFut<Result<reqwest::Response, BoxError>> {
+            Box::pin(futures::future::ready(
+                Err(format!("no http: {url}").into()),
+            ))
+        }
+
+        fn https_signed_call(
+            &self,
+            url: String,
+            _method: http::Method,
+            _message_digest: [u8; 32],
+            _headers: Option<http::HeaderMap>,
+            _body: Option<Vec<u8>>,
+        ) -> BoxPinFut<Result<reqwest::Response, BoxError>> {
+            Box::pin(futures::future::ready(Err(format!(
+                "no signed http: {url}"
+            )
+            .into())))
+        }
+
+        fn https_signed_rpc_raw(
+            &self,
+            _endpoint: String,
+            method: String,
+            _args: Vec<u8>,
+        ) -> BoxPinFut<Result<Vec<u8>, BoxError>> {
+            Box::pin(futures::future::ready(
+                deterministic_cbor_into_vec(&format!("rpc:{method}")).map_err(|err| err.into()),
+            ))
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn web3_sdk_delegates_to_mock_client_and_decodes_results() {
+        let principal = Principal::self_authenticating([1; 32]);
+        let sdk = Web3SDK::from_web3(Arc::new(MockWeb3Client::new(principal)));
+
+        assert_eq!(sdk.get_principal(), principal);
+        let Web3SDK::Web3(Web3Client { client }) = &sdk else {
+            panic!("expected web3 client");
+        };
+        assert_eq!(
+            client.a256gcm_key(vec![b"path".to_vec()]).await.unwrap(),
+            [1; 32]
+        );
+        assert_eq!(
+            client
+                .ed25519_sign_message(vec![b"path".to_vec()], b"message")
+                .await
+                .unwrap(),
+            [2; 64]
+        );
+        client
+            .ed25519_verify(vec![b"path".to_vec()], b"message", &[0; 64])
+            .await
+            .unwrap();
+        assert_eq!(
+            client
+                .ed25519_public_key(vec![b"path".to_vec()])
+                .await
+                .unwrap(),
+            [3; 32]
+        );
+        assert_eq!(
+            client
+                .secp256k1_sign_message_bip340(vec![b"path".to_vec()], b"message")
+                .await
+                .unwrap(),
+            [4; 64]
+        );
+        client
+            .secp256k1_verify_bip340(vec![b"path".to_vec()], b"message", &[0; 64])
+            .await
+            .unwrap();
+        assert_eq!(
+            client
+                .secp256k1_sign_message_ecdsa(vec![b"path".to_vec()], b"message")
+                .await
+                .unwrap(),
+            [5; 64]
+        );
+        assert_eq!(
+            client
+                .secp256k1_sign_digest_ecdsa(vec![b"path".to_vec()], &[0; 32])
+                .await
+                .unwrap(),
+            [6; 64]
+        );
+        client
+            .secp256k1_verify_ecdsa(vec![b"path".to_vec()], &[0; 32], &[0; 64])
+            .await
+            .unwrap();
+        assert_eq!(
+            client
+                .secp256k1_public_key(vec![b"path".to_vec()])
+                .await
+                .unwrap(),
+            [7; 33]
+        );
+
+        let query: String = (&sdk)
+            .canister_query(&Principal::anonymous(), "status", ())
+            .await
+            .unwrap();
+        assert_eq!(query, "query:status");
+        let update: String = (&sdk)
+            .canister_update(&Principal::anonymous(), "commit", ())
+            .await
+            .unwrap();
+        assert_eq!(update, "update:commit");
+        let rpc: String = (&sdk)
+            .https_signed_rpc("https://example.test/rpc", "ping", &("arg",))
+            .await
+            .unwrap();
+        assert_eq!(rpc, "rpc:ping");
+
+        assert!(
+            (&sdk)
+                .https_call("https://example.test", http::Method::GET, None, None)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("no http")
+        );
+        assert!(
+            (&sdk)
+                .https_signed_call(
+                    "https://example.test",
+                    http::Method::POST,
+                    [0; 32],
+                    None,
+                    None,
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("no signed http")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn not_implemented_web3_client_reports_errors_for_all_operations() {
+        let sdk = Web3SDK::not_implemented();
+        assert_eq!(sdk.get_principal(), Principal::anonymous());
+        let Web3SDK::Web3(Web3Client { client }) = &sdk else {
+            panic!("expected web3 client");
+        };
+
+        assert!(client.sign_envelope([0; 32]).await.is_err());
+        assert!(client.a256gcm_key(Vec::new()).await.is_err());
+        assert!(client.ed25519_sign_message(Vec::new(), b"m").await.is_err());
+        assert!(
+            client
+                .ed25519_verify(Vec::new(), b"m", &[0; 64])
+                .await
+                .is_err()
+        );
+        assert!(client.ed25519_public_key(Vec::new()).await.is_err());
+        assert!(
+            client
+                .secp256k1_sign_message_bip340(Vec::new(), b"m")
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .secp256k1_verify_bip340(Vec::new(), b"m", &[0; 64])
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .secp256k1_sign_message_ecdsa(Vec::new(), b"m")
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .secp256k1_sign_digest_ecdsa(Vec::new(), &[0; 32])
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .secp256k1_verify_ecdsa(Vec::new(), &[0; 32], &[0; 64])
+                .await
+                .is_err()
+        );
+        assert!(client.secp256k1_public_key(Vec::new()).await.is_err());
+        assert!(
+            client
+                .canister_query_raw(Principal::anonymous(), "q".to_string(), Vec::new())
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .canister_update_raw(Principal::anonymous(), "u".to_string(), Vec::new())
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .https_call(
+                    "https://example.test".to_string(),
+                    http::Method::GET,
+                    None,
+                    None
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .https_signed_call(
+                    "https://example.test".to_string(),
+                    http::Method::POST,
+                    [0; 32],
+                    None,
+                    None,
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .https_signed_rpc_raw(
+                    "https://example.test".to_string(),
+                    "rpc".to_string(),
+                    Vec::new(),
+                )
+                .await
+                .is_err()
+        );
+
+        let query: Result<String, BoxError> = (&sdk)
+            .canister_query(&Principal::anonymous(), "status", ())
+            .await;
+        assert!(query.is_err());
+        let update: Result<String, BoxError> = (&sdk)
+            .canister_update(&Principal::anonymous(), "commit", ())
+            .await;
+        assert!(update.is_err());
+        let rpc: Result<String, BoxError> = (&sdk)
+            .https_signed_rpc("https://example.test/rpc", "ping", &())
+            .await;
+        assert!(rpc.is_err());
+    }
+}

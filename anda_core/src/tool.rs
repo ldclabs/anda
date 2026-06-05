@@ -364,8 +364,9 @@ mod tests {
     use std::{sync::Arc, time::Duration};
 
     use crate::{
-        CacheExpiry, CacheFeatures, CancellationToken, HttpFeatures, KeysFeatures, ObjectMeta,
-        Path, PutMode, PutResult, RequestMeta, StateFeatures, StoreFeatures, ToolInput,
+        BaseContext, CacheExpiry, CacheFeatures, CancellationToken, CanisterCaller, HttpFeatures,
+        KeysFeatures, ObjectMeta, Path, PutMode, PutResult, RequestMeta, StateFeatures,
+        StoreFeatures, ToolInput,
     };
 
     #[derive(Clone)]
@@ -654,6 +655,25 @@ mod tests {
 
     struct OtherTool;
 
+    #[derive(serde::Deserialize)]
+    struct EchoArgs {
+        value: String,
+        fail: bool,
+    }
+
+    struct TaggedTool;
+
+    struct InvalidTool;
+
+    fn resource(id: u64, tags: &[&str]) -> Resource {
+        Resource {
+            _id: id,
+            name: format!("resource-{id}"),
+            tags: tags.iter().map(|tag| tag.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
     impl Tool<TestContext> for ExampleTool {
         type Args = ();
         type Output = String;
@@ -726,6 +746,89 @@ mod tests {
         }
     }
 
+    impl Tool<TestContext> for TaggedTool {
+        type Args = EchoArgs;
+        type Output = Json;
+
+        fn name(&self) -> String {
+            "tagged_tool".to_string()
+        }
+
+        fn description(&self) -> String {
+            "Tool that consumes text and code resources".to_string()
+        }
+
+        fn definition(&self) -> FunctionDefinition {
+            FunctionDefinition {
+                name: self.name(),
+                description: self.description(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "value": {"type": "string"},
+                        "fail": {"type": "boolean"}
+                    },
+                    "required": ["value", "fail"],
+                    "additionalProperties": false
+                }),
+                strict: Some(true),
+            }
+        }
+
+        fn supported_resource_tags(&self) -> Vec<String> {
+            vec!["text".to_string(), "code".to_string()]
+        }
+
+        async fn call(
+            &self,
+            _ctx: TestContext,
+            args: Self::Args,
+            resources: Vec<Resource>,
+        ) -> Result<ToolOutput<Self::Output>, BoxError> {
+            if args.fail {
+                return Err("forced failure".into());
+            }
+
+            let mut output = ToolOutput::new(json!({
+                "value": args.value,
+                "resources": resources.len(),
+            }));
+            output.is_error = Some(false);
+            Ok(output)
+        }
+    }
+
+    impl Tool<TestContext> for InvalidTool {
+        type Args = ();
+        type Output = String;
+
+        fn name(&self) -> String {
+            "bad-tool".to_string()
+        }
+
+        fn description(&self) -> String {
+            "Invalid function name".to_string()
+        }
+
+        fn definition(&self) -> FunctionDefinition {
+            FunctionDefinition {
+                name: self.name(),
+                description: self.description(),
+                parameters: json!({"type": "object"}),
+                strict: Some(true),
+            }
+        }
+
+        async fn call(
+            &self,
+            _ctx: TestContext,
+            _args: Self::Args,
+            _resources: Vec<Resource>,
+        ) -> Result<ToolOutput<Self::Output>, BoxError> {
+            Ok(ToolOutput::new(String::new()))
+        }
+    }
+
     #[test]
     fn dyn_tool_downcast_ref_returns_inner_tool() {
         let tool = Arc::new(ExampleTool { id: 7 });
@@ -770,5 +873,295 @@ mod tests {
 
         assert!(Arc::ptr_eq(&err, &original));
         assert_eq!(err.name(), "example_tool");
+    }
+
+    #[test]
+    fn fixture_tools_cover_direct_methods() {
+        futures::executor::block_on(async {
+            let other = OtherTool;
+            assert_eq!(other.name(), "other_tool");
+            assert_eq!(other.description(), "Other tool used for downcast tests");
+            let definition = other.definition();
+            assert_eq!(definition.name, "other_tool");
+            assert_eq!(definition.description, "Other tool used for downcast tests");
+            assert_eq!(definition.parameters["type"], "object");
+            let output = other
+                .call(TestContext::default(), (), Vec::new())
+                .await
+                .unwrap();
+            assert_eq!(output.output, "other");
+
+            let invalid = InvalidTool;
+            assert_eq!(invalid.name(), "bad-tool");
+            assert_eq!(invalid.description(), "Invalid function name");
+            let definition = invalid.definition();
+            assert_eq!(definition.name, "bad-tool");
+            assert_eq!(definition.description, "Invalid function name");
+            assert_eq!(definition.parameters["type"], "object");
+            let output = invalid
+                .call(TestContext::default(), (), Vec::new())
+                .await
+                .unwrap();
+            assert!(output.output.is_empty());
+        });
+    }
+
+    #[test]
+    fn tool_default_methods_call_raw_and_dyn_wrapper_forward_calls() {
+        futures::executor::block_on(async {
+            let tool = Arc::new(ExampleTool { id: 42 });
+            let mut resources = vec![resource(1, &["text"])];
+
+            assert!(tool.supported_resource_tags().is_empty());
+            assert!(tool.select_resources(&mut resources).is_empty());
+            assert_eq!(resources.len(), 1);
+            tool.init(TestContext::default()).await.unwrap();
+
+            let raw = tool
+                .call_raw(TestContext::default(), Json::Null, Vec::new())
+                .await
+                .unwrap();
+            assert_eq!(raw.output, json!("42"));
+            assert_eq!(raw.usage.requests, 1);
+
+            let invalid = tool
+                .call_raw(TestContext::default(), json!({"bad": true}), Vec::new())
+                .await
+                .unwrap_err();
+            assert!(invalid.to_string().contains("invalid args"));
+
+            let mut tool_set = ToolSet::<TestContext>::new();
+            tool_set.add(tool).unwrap();
+            let dyn_tool = tool_set.get("EXAMPLE_TOOL").unwrap();
+
+            assert_eq!(dyn_tool.name(), "example_tool");
+            assert_eq!(dyn_tool.definition().name, "example_tool");
+            assert!(dyn_tool.supported_resource_tags().is_empty());
+            dyn_tool.init(TestContext::default()).await.unwrap();
+
+            let output = dyn_tool
+                .call(TestContext::default(), Json::Null, Vec::new())
+                .await
+                .unwrap();
+            assert_eq!(output.output, json!("42"));
+            assert_eq!(output.usage.requests, 1);
+        });
+    }
+
+    #[test]
+    fn tool_set_registry_filters_resources_and_reports_errors() {
+        futures::executor::block_on(async {
+            let mut tool_set = ToolSet::<TestContext>::new();
+            tool_set.add(Arc::new(ExampleTool { id: 1 })).unwrap();
+            tool_set.add(Arc::new(TaggedTool)).unwrap();
+
+            assert!(tool_set.contains("EXAMPLE_TOOL"));
+            assert!(tool_set.contains_lowercase("tagged_tool"));
+            assert!(!tool_set.contains("missing_tool"));
+            assert_eq!(
+                tool_set.names(),
+                vec!["example_tool".to_string(), "tagged_tool".to_string()]
+            );
+
+            let definition = tool_set.definition("TAGGED_TOOL").unwrap();
+            assert_eq!(definition.name, "tagged_tool");
+            assert!(tool_set.definition("missing_tool").is_none());
+
+            let selected_names = vec!["TAGGED_TOOL".to_string(), "missing_tool".to_string()];
+            let selected_definitions = tool_set.definitions(Some(&selected_names));
+            assert_eq!(selected_definitions.len(), 1);
+            assert_eq!(selected_definitions[0].name, "tagged_tool");
+            assert_eq!(tool_set.definitions(None).len(), 2);
+
+            let selected_functions = tool_set.functions(Some(&selected_names));
+            assert_eq!(selected_functions.len(), 1);
+            assert_eq!(
+                selected_functions[0].supported_resource_tags,
+                vec!["text".to_string(), "code".to_string()]
+            );
+            assert_eq!(tool_set.functions(None).len(), 2);
+
+            let mut resources = vec![
+                resource(1, &["image"]),
+                resource(2, &["text"]),
+                resource(3, &["code", "text"]),
+                resource(4, &["audio"]),
+            ];
+            let selected = tool_set.select_resources("TAGGED_TOOL", &mut resources);
+            assert_eq!(
+                selected
+                    .iter()
+                    .map(|resource| resource._id)
+                    .collect::<Vec<_>>(),
+                vec![2, 3]
+            );
+            assert_eq!(
+                resources
+                    .iter()
+                    .map(|resource| resource._id)
+                    .collect::<Vec<_>>(),
+                vec![1, 4]
+            );
+            assert!(
+                tool_set
+                    .select_resources("missing_tool", &mut resources)
+                    .is_empty()
+            );
+
+            let dyn_tool = tool_set.get_lowercase("tagged_tool").unwrap();
+            let output = dyn_tool
+                .call(
+                    TestContext::default(),
+                    json!({"value": "ok", "fail": false}),
+                    vec![resource(9, &["text"])],
+                )
+                .await
+                .unwrap();
+            assert_eq!(output.output["value"], "ok");
+            assert_eq!(output.output["resources"], 1);
+            assert_eq!(output.is_error, Some(false));
+            assert_eq!(output.usage.requests, 1);
+            assert!(tool_set.get("missing_tool").is_none());
+            assert!(tool_set.get_lowercase("missing_tool").is_none());
+
+            let failed = dyn_tool
+                .call(
+                    TestContext::default(),
+                    json!({"value": "bad", "fail": true}),
+                    Vec::new(),
+                )
+                .await
+                .unwrap_err();
+            assert!(failed.to_string().contains("call failed"));
+
+            let duplicate = tool_set.add(Arc::new(ExampleTool { id: 2 })).unwrap_err();
+            assert!(duplicate.to_string().contains("already exists"));
+
+            let invalid = tool_set.add(Arc::new(InvalidTool)).unwrap_err();
+            assert!(invalid.to_string().contains("invalid character"));
+        });
+    }
+
+    #[test]
+    fn test_tool_context_mock_features_cover_default_paths() {
+        futures::executor::block_on(async {
+            let ctx = TestContext::default();
+            assert_eq!(*ctx.engine_id(), Principal::management_canister());
+            assert_eq!(ctx.engine_name(), "test-engine");
+            assert_eq!(*ctx.caller(), Principal::anonymous());
+            assert!(ctx.meta().user.is_none());
+            assert!(!ctx.cancellation_token().is_cancelled());
+            assert_eq!(ctx.time_elapsed(), Duration::ZERO);
+
+            assert_eq!(ctx.a256gcm_key(Vec::new()).await.unwrap(), [0; 32]);
+            assert_eq!(
+                ctx.ed25519_sign_message(Vec::new(), b"message")
+                    .await
+                    .unwrap(),
+                [0; 64]
+            );
+            ctx.ed25519_verify(Vec::new(), b"message", &[0; 64])
+                .await
+                .unwrap();
+            assert_eq!(ctx.ed25519_public_key(Vec::new()).await.unwrap(), [0; 32]);
+            assert_eq!(
+                ctx.secp256k1_sign_message_bip340(Vec::new(), b"message")
+                    .await
+                    .unwrap(),
+                [0; 64]
+            );
+            ctx.secp256k1_verify_bip340(Vec::new(), b"message", &[0; 64])
+                .await
+                .unwrap();
+            assert_eq!(
+                ctx.secp256k1_sign_message_ecdsa(Vec::new(), b"message")
+                    .await
+                    .unwrap(),
+                [0; 64]
+            );
+            assert_eq!(
+                ctx.secp256k1_sign_digest_ecdsa(Vec::new(), &[0; 32])
+                    .await
+                    .unwrap(),
+                [0; 64]
+            );
+            ctx.secp256k1_verify_ecdsa(Vec::new(), &[0; 32], &[0; 64])
+                .await
+                .unwrap();
+            assert_eq!(ctx.secp256k1_public_key(Vec::new()).await.unwrap(), [0; 33]);
+
+            assert!(ctx.store_get(&Path::from("missing")).await.is_err());
+            assert!(
+                ctx.store_list(None, &Path::default())
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                ctx.store_put(&Path::from("file"), PutMode::Overwrite, bytes::Bytes::new())
+                    .await
+                    .is_err()
+            );
+            assert!(
+                ctx.store_rename_if_not_exists(&Path::from("a"), &Path::from("b"))
+                    .await
+                    .is_err()
+            );
+            ctx.store_delete(&Path::from("file")).await.unwrap();
+
+            assert!(!ctx.cache_contains("key"));
+            assert!(ctx.cache_get::<String>("key").await.is_err());
+            assert!(
+                ctx.cache_get_with("key", async { Ok(("value".to_string(), None)) })
+                    .await
+                    .is_err()
+            );
+            ctx.cache_set("key", ("value".to_string(), None)).await;
+            assert!(
+                !ctx.cache_set_if_not_exists("key", ("value".to_string(), None))
+                    .await
+            );
+            assert!(!ctx.cache_delete("key").await);
+            assert_eq!(ctx.cache_raw_iter().count(), 0);
+
+            assert!(
+                ctx.https_call("https://example.test", http::Method::GET, None, None)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                ctx.https_signed_call(
+                    "https://example.test",
+                    http::Method::POST,
+                    [0; 32],
+                    None,
+                    None,
+                )
+                .await
+                .is_err()
+            );
+            let rpc: Result<String, BoxError> = ctx
+                .https_signed_rpc("https://example.test", "method", &())
+                .await;
+            assert!(rpc.is_err());
+
+            let query: Result<String, BoxError> = ctx
+                .canister_query(&Principal::anonymous(), "query", ())
+                .await;
+            assert!(query.is_err());
+            let update: Result<String, BoxError> = ctx
+                .canister_update(&Principal::anonymous(), "update", ())
+                .await;
+            assert!(update.is_err());
+
+            assert!(
+                ctx.remote_tool_call(
+                    "https://example.test",
+                    ToolInput::new("tool".to_string(), Json::Null),
+                )
+                .await
+                .is_err()
+            );
+        });
     }
 }

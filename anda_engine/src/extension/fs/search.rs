@@ -342,7 +342,10 @@ mod tests {
     use super::*;
     use crate::engine::EngineBuilder;
     use serde_json::json;
-    use std::path::{Path, PathBuf};
+    use std::{
+        path::{Path, PathBuf},
+        sync::Arc,
+    };
 
     struct TestTempDir(PathBuf);
 
@@ -389,6 +392,106 @@ mod tests {
 
     fn glob_tool(workspace: &Path) -> SearchFileTool {
         SearchFileTool::new(workspace.to_path_buf())
+    }
+
+    struct RewritingSearchHook;
+
+    #[async_trait::async_trait]
+    impl ToolHook<SearchFileArgs, SearchFileOutput> for RewritingSearchHook {
+        async fn before_tool_call(
+            &self,
+            _ctx: &BaseCtx,
+            mut args: SearchFileArgs,
+        ) -> Result<SearchFileArgs, BoxError> {
+            args.pattern = "src/*.rs".to_string();
+            args.limit = 1;
+            Ok(args)
+        }
+
+        async fn after_tool_call(
+            &self,
+            _ctx: &BaseCtx,
+            mut output: ToolOutput<SearchFileOutput>,
+        ) -> Result<ToolOutput<SearchFileOutput>, BoxError> {
+            output.output.paths.push("hook-added.rs".to_string());
+            Ok(output)
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_hooks_empty_patterns_and_parent_paths_are_covered() {
+        let temp_dir = TestTempDir::new().await;
+        let workspace = temp_dir.path().join("workspace");
+        tokio::fs::create_dir_all(workspace.join("src"))
+            .await
+            .unwrap();
+        tokio::fs::write(workspace.join("src/a.rs"), "a")
+            .await
+            .unwrap();
+        tokio::fs::write(workspace.join("src/b.rs"), "b")
+            .await
+            .unwrap();
+
+        let tool = glob_tool(&workspace).with_description("custom search".to_string());
+        assert_eq!(tool.name(), SearchFileTool::NAME);
+        assert_eq!(tool.description(), "custom search");
+        let definition = tool.definition();
+        assert_eq!(definition.name, SearchFileTool::NAME);
+        assert_eq!(definition.strict, Some(true));
+        assert_eq!(
+            definition.parameters["required"],
+            json!(["pattern", "limit"])
+        );
+
+        let empty_err = tool
+            .call(
+                mock_ctx(),
+                SearchFileArgs {
+                    pattern: "   ".to_string(),
+                    limit: 0,
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            empty_err
+                .to_string()
+                .contains("Glob pattern must not be empty")
+        );
+
+        let parent_result = glob_tool(&workspace)
+            .call(
+                mock_ctx(),
+                SearchFileArgs {
+                    pattern: "src/../src/*.rs".to_string(),
+                    limit: 0,
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            parent_result.output.paths,
+            ["src/../src/a.rs", "src/../src/b.rs"]
+        );
+        assert_eq!(parent_result.output.total_matches, 2);
+
+        let ctx = mock_ctx();
+        ctx.set_state(SearchFileHook::new(Arc::new(RewritingSearchHook)));
+        let hooked = glob_tool(&workspace)
+            .call(
+                ctx,
+                SearchFileArgs {
+                    pattern: "ignored/*.txt".to_string(),
+                    limit: 100,
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(hooked.output.total_matches, 2);
+        assert_eq!(hooked.output.paths, ["src/a.rs", "hook-added.rs"]);
     }
 
     #[tokio::test]

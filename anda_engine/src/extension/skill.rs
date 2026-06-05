@@ -707,9 +707,208 @@ Beta instructions.
         let _ = tokio::fs::remove_dir_all(&root).await;
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn manager_custom_options_lists_subagents_and_selects_resource_paths() {
+        let root = std::env::temp_dir().join(format!(
+            "anda-skills-manager-{:016x}",
+            rand::random::<u64>()
+        ));
+        tokio::fs::create_dir_all(root.join("alpha")).await.unwrap();
+        tokio::fs::write(
+            root.join("alpha/SKILL.md"),
+            skill_md(
+                "alpha",
+                "Alpha skill for manager coverage.",
+                "Alpha body.",
+                Some("shell todo shell custom_tool"),
+            ),
+        )
+        .await
+        .unwrap();
+
+        let mgr = Arc::new(
+            SkillManager::new(root.clone())
+                .with_description("custom skill reader".to_string())
+                .with_default_skill_tools(vec!["read_file".to_string(), "todo".to_string()]),
+        );
+        assert_eq!(mgr.description(), "custom skill reader");
+        assert_eq!(mgr.list().len(), 0);
+
+        mgr.load().await.unwrap();
+        assert_eq!(mgr.list().len(), 1);
+
+        let subagents = mgr.subagents();
+        assert_eq!(subagents.len(), 1);
+        assert_eq!(subagents[0].name, "skill_alpha");
+        assert_eq!(
+            subagents[0].tools,
+            vec!["read_file", "todo", "shell", "custom_tool",]
+        );
+
+        let any = mgr.clone().into_any();
+        assert!(any.downcast_ref::<SkillManager>().is_some());
+
+        let mut resources = vec![Resource {
+            _id: 1,
+            name: "text".to_string(),
+            tags: vec!["text".to_string()],
+            ..Default::default()
+        }];
+        assert!(SubAgentSet::select_resources(mgr.as_ref(), "missing", &mut resources).is_empty());
+        assert!(
+            SubAgentSet::select_resources(mgr.as_ref(), "skill_alpha", &mut resources).is_empty()
+        );
+        assert_eq!(resources.len(), 1);
+        resources.clear();
+        assert!(
+            SubAgentSet::select_resources(mgr.as_ref(), "skill_alpha", &mut resources).is_empty()
+        );
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn manager_finds_frontmatter_names_and_reports_duplicates_or_bad_files() {
+        let root =
+            std::env::temp_dir().join(format!("anda-skills-find-{:016x}", rand::random::<u64>()));
+        let default_dir = root.join("default");
+        let extra_dir = root.join("extra");
+        tokio::fs::create_dir_all(default_dir.join("folder-name"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(extra_dir.join("duplicate-one"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(extra_dir.join("duplicate-two"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(extra_dir.join("bad"))
+            .await
+            .unwrap();
+
+        tokio::fs::write(
+            default_dir.join("folder-name/SKILL.md"),
+            skill_md(
+                "frontmatter-name",
+                "Looked up by parsed frontmatter.",
+                "Frontmatter body.",
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            extra_dir.join("duplicate-one/SKILL.md"),
+            skill_md("dupe", "Duplicate one.", "One.", None),
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            extra_dir.join("duplicate-two/SKILL.md"),
+            skill_md("dupe", "Duplicate two.", "Two.", None),
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(extra_dir.join("bad/SKILL.md"), "not frontmatter")
+            .await
+            .unwrap();
+
+        let mgr = SkillManager::new_with_dirs(default_dir.clone(), vec![extra_dir.clone()]);
+        mgr.load().await.unwrap();
+        assert!(mgr.contains_lowercase("skill_frontmatter_name"));
+
+        let read = mgr
+            .call_raw(mock_ctx(), json!({"name": "frontmatter-name"}), Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(read.output["agent_name"], json!("skill_frontmatter_name"));
+        assert_eq!(read.output["path"], json!("folder-name/SKILL.md"));
+
+        let duplicate = mgr
+            .call_raw(mock_ctx(), json!({"name": "dupe"}), Vec::new())
+            .await
+            .unwrap_err();
+        assert!(duplicate.to_string().contains("multiple skills named"));
+
+        let missing = mgr
+            .call_raw(mock_ctx(), json!({"name": "missing"}), Vec::new())
+            .await
+            .unwrap_err();
+        assert!(missing.to_string().contains("skill \"missing\" not found"));
+
+        let invalid = mgr
+            .call_raw(mock_ctx(), json!({"name": "Bad"}), Vec::new())
+            .await
+            .unwrap_err();
+        assert!(invalid.to_string().contains("invalid character"));
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn manager_read_rejects_unsafe_large_non_utf8_or_mismatched_skill_files() {
+        let root =
+            std::env::temp_dir().join(format!("anda-skills-errors-{:016x}", rand::random::<u64>()));
+        tokio::fs::create_dir_all(root.join("mismatch"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            root.join("mismatch/SKILL.md"),
+            skill_md(
+                "other-name",
+                "Mismatched frontmatter name.",
+                "Mismatch body.",
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+
+        let mgr = SkillManager::new(root.clone());
+        let mismatch = mgr
+            .call_raw(mock_ctx(), json!({"name": "mismatch"}), Vec::new())
+            .await
+            .unwrap_err();
+        assert!(
+            mismatch
+                .to_string()
+                .contains("must match requested skill name")
+        );
+
+        tokio::fs::create_dir_all(root.join("binary"))
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("binary/SKILL.md"), vec![0xFF, 0xFE])
+            .await
+            .unwrap();
+        let binary = mgr
+            .call_raw(mock_ctx(), json!({"name": "binary"}), Vec::new())
+            .await
+            .unwrap_err();
+        assert!(binary.to_string().contains("Only UTF-8 skill files"));
+
+        tokio::fs::create_dir_all(root.join("large")).await.unwrap();
+        tokio::fs::write(
+            root.join("large/SKILL.md"),
+            vec![b'a'; MAX_SKILL_FILE_BYTES as usize + 1],
+        )
+        .await
+        .unwrap();
+        let large = mgr
+            .call_raw(mock_ctx(), json!({"name": "large"}), Vec::new())
+            .await
+            .unwrap_err();
+        assert!(large.to_string().contains("exceeds maximum"));
+
+        let missing_dirs = SkillManager::new(root.join("missing-default"));
+        missing_dirs.load().await.unwrap();
+        assert!(missing_dirs.list().is_empty());
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
     #[tokio::test]
-    #[ignore = "skip"]
-    async fn load_skips_mismatched_dir_name() {
+    async fn load_uses_frontmatter_name_when_dir_differs() {
         let tmp = std::env::temp_dir().join(format!(
             "anda-skills-mismatch-{:016x}",
             rand::random::<u64>()
@@ -735,8 +934,8 @@ Body.
         let mgr = SkillManager::new(tmp.clone());
         mgr.load().await.unwrap();
 
-        // Should be skipped because dir name != skill name.
-        assert!(!mgr.contains_lowercase("skill_correct_name"));
+        assert!(mgr.contains_lowercase("skill_correct_name"));
+        assert!(mgr.list().contains_key("skill_correct_name"));
 
         let _ = tokio::fs::remove_dir_all(&tmp).await;
     }

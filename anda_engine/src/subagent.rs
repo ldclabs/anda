@@ -1649,6 +1649,19 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Debug)]
+    struct ErrorCompleter;
+
+    impl CompletionFeaturesDyn for ErrorCompleter {
+        fn model_name(&self) -> String {
+            "error".to_string()
+        }
+
+        fn completion(&self, _req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
+            Box::pin(futures::future::ready(Err("model failed".into())))
+        }
+    }
+
     #[derive(Clone, Default)]
     struct RecordingAgentHook {
         progress: Arc<Mutex<Vec<(String, AgentOutput)>>>,
@@ -1663,6 +1676,31 @@ mod tests {
     #[derive(Clone, Default)]
     struct FailingAfterAgentHook {
         starts: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[derive(Default)]
+    struct EmptySubAgentSet;
+
+    impl SubAgentSet for EmptySubAgentSet {
+        fn into_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
+            self
+        }
+
+        fn contains_lowercase(&self, _lowercase_name: &str) -> bool {
+            false
+        }
+
+        fn get_lowercase(&self, _lowercase_name: &str) -> Option<SubAgent> {
+            None
+        }
+
+        fn definitions(&self, _names: Option<&[String]>) -> Vec<FunctionDefinition> {
+            Vec::new()
+        }
+
+        fn select_resources(&self, _name: &str, _resources: &mut Vec<Resource>) -> Vec<Resource> {
+            Vec::new()
+        }
     }
 
     #[async_trait]
@@ -1708,6 +1746,305 @@ mod tests {
         }
         .text()
         .unwrap_or_default()
+    }
+
+    async fn recv_subagent_prompt(rx: &mut tokio::sync::mpsc::Receiver<SubAgentInput>) -> String {
+        match rx.recv().await.unwrap().command {
+            PromptCommand::Plain { prompt } => prompt,
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    fn resource(id: u64, tags: &[&str]) -> Resource {
+        Resource {
+            _id: id,
+            name: format!("resource-{id}"),
+            tags: tags.iter().map(|tag| tag.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn subagent_metadata_args_and_content_helpers_cover_edge_inputs() {
+        assert_eq!(
+            summarize_items(&["a".to_string(), "b".to_string(), "c".to_string()], 1),
+            "a, and 2 more"
+        );
+        assert_eq!(selected_model_label("  Pro "), Some("pro".to_string()));
+        assert_eq!(selected_model_label("  "), None);
+
+        let agent = SubAgent {
+            name: "meta_worker".to_string(),
+            description: "  ".to_string(),
+            tools: (0..10).map(|idx| format!("tool_{idx}")).collect(),
+            tags: (0..10).map(|idx| format!("tag_{idx}")).collect(),
+            output_schema: Some(json!({"type": "object"})),
+            model: " Pro ".to_string(),
+            effort: Some(ModelEffort::Max),
+            ..Default::default()
+        };
+        let (sender, _rx) = tokio::sync::mpsc::channel(4);
+        agent.subsessions.insert_session(Arc::new(SubSession {
+            id: "Job-A".to_string(),
+            agent: "meta_worker".to_string(),
+            sender,
+            background_tasks: Arc::new(RwLock::new(HashMap::new())),
+            active_at: AtomicU64::new(unix_ms()),
+        }));
+        let definition = agent.definition();
+        assert!(
+            definition
+                .description
+                .starts_with("Delegated subagent worker.")
+        );
+        assert!(definition.description.contains("Tags: tag_0"));
+        assert!(definition.description.contains("and 2 more"));
+        assert!(
+            definition
+                .description
+                .contains("Returns structured output.")
+        );
+        assert!(definition.description.contains("Default model label: pro."));
+        assert!(definition.description.contains("Default effort: max."));
+        assert!(definition.description.contains("Active sessions: Job-A."));
+        assert_eq!(Agent::<AgentCtx>::description(&agent), "  ");
+        assert_eq!(
+            Agent::<AgentCtx>::tool_dependencies(&agent),
+            (0..10).map(|idx| format!("tool_{idx}")).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            Agent::<AgentCtx>::supported_resource_tags(&agent),
+            (0..10).map(|idx| format!("tag_{idx}")).collect::<Vec<_>>()
+        );
+
+        let args = SubAgentArgs::from_prompt(
+            json!({
+                "prompt": "structured",
+                "session": "CASE",
+                "model": "Flash",
+                "effort": null
+            })
+            .to_string(),
+        );
+        assert_eq!(args.prompt, "structured");
+        assert_eq!(args.effort, None);
+        assert_eq!(
+            SubAgentArgs::from_prompt("plain".to_string()).prompt,
+            "plain"
+        );
+
+        let manager_args = SubAgentManagerArgs::from_prompt(
+            json!({
+                "output_schema": {"type": "object"},
+                "effort": null,
+                "task": "  run task  ",
+                "session": "  Thread  ",
+                "model": "  Pro  ",
+                "persist": true
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(manager_args.output_schema, Some(json!({"type": "object"})));
+        assert_eq!(manager_args.effort, None);
+        let (agent, task, session, persist) = manager_args.into_subagent();
+        assert_eq!(task.as_deref(), Some("run task"));
+        assert_eq!(session, "thread");
+        assert_eq!(agent.model, "Pro");
+        assert!(persist);
+        assert!(SubAgentManagerArgs::from_prompt("not json".to_string()).is_err());
+
+        let manager_args = SubAgentManagerArgs::from_prompt(
+            json!({
+                "output_schema": "{\"type\":\"array\"}",
+                "effort": " HIGH "
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(manager_args.output_schema, Some(json!({"type": "array"})));
+        assert_eq!(manager_args.effort, Some(ModelEffort::High));
+
+        let manager_args = SubAgentManagerArgs::from_prompt(
+            json!({
+                "output_schema": "",
+                "effort": ""
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(manager_args.output_schema, None);
+        assert_eq!(manager_args.effort, None);
+
+        let manager_args = SubAgentManagerArgs::from_prompt(
+            json!({
+                "output_schema": null,
+                "effort": null
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(manager_args.output_schema, None);
+        assert_eq!(manager_args.effort, None);
+
+        assert!(
+            SubAgentManagerArgs::from_prompt(json!({"output_schema": "{"}).to_string()).is_err()
+        );
+        assert!(
+            SubAgentManagerArgs::from_prompt(json!({"effort": {"bad": true}}).to_string()).is_err()
+        );
+
+        let mut resources = vec![
+            Resource {
+                blob: Some(b"text resource".to_vec().into()),
+                ..Default::default()
+            },
+            Resource {
+                uri: Some("file://image.png".to_string()),
+                mime_type: Some("image/png".to_string()),
+                ..Default::default()
+            },
+            Resource::default(),
+        ];
+        let content = prompt_and_resources_into_content("prompt".to_string(), &mut resources);
+        assert_eq!(content.len(), 3);
+        assert!(resources.is_empty());
+        assert!(resources_into_content(vec![Resource::default()]).is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn subagent_managers_cover_status_errors_persistence_and_set_routing() {
+        let ctx = EngineBuilder::new()
+            .with_model(Model::with_completer(Arc::new(EchoCompleter)))
+            .mock_ctx();
+        let manager =
+            SubAgentManager::new().with_models(vec!["flash".to_string(), "pro".to_string()]);
+        assert!(manager.description().contains("flash, pro"));
+        assert_eq!(manager.supported_resource_tags(), vec!["*".to_string()]);
+        assert_eq!(manager.name(), SubAgentManager::NAME);
+
+        let unsupported = Agent::<AgentCtx>::run(
+            &manager,
+            ctx.clone(),
+            serde_json::to_string(&SubAgentManagerArgs {
+                operation: "delete".to_string(),
+                ..Default::default()
+            })
+            .unwrap(),
+            Vec::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(unsupported.to_string().contains("unsupported"));
+
+        let created = Agent::<AgentCtx>::run(
+            &manager,
+            ctx.clone(),
+            serde_json::to_string(&SubAgentManagerArgs {
+                operation: "create".to_string(),
+                name: "router".to_string(),
+                description: "Routes tagged resources.".to_string(),
+                instructions: "Echo tasks.".to_string(),
+                tags: vec!["text".to_string()],
+                persist: true,
+                ..Default::default()
+            })
+            .unwrap(),
+            vec![resource(9, &["text"])],
+        )
+        .await
+        .unwrap();
+        let created_json: Json = serde_json::from_str(&created.content).unwrap();
+        assert_eq!(created_json["result"], json!("persisted"));
+        assert_eq!(created_json["callable"], json!("SA_router"));
+
+        let status = Agent::<AgentCtx>::run(
+            &manager,
+            ctx.clone(),
+            serde_json::to_string(&SubAgentManagerArgs {
+                operation: "status".to_string(),
+                ..Default::default()
+            })
+            .unwrap(),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Json>(&status.content).unwrap()["count"],
+            json!(1)
+        );
+
+        let filtered = manager.definitions(Some(&["ROUTER".to_string(), "missing".to_string()]));
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "router");
+
+        let mut resources = vec![resource(1, &["image"]), resource(2, &["text"])];
+        let selected = SubAgentSet::select_resources(&manager, "ROUTER", &mut resources);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|resource| resource._id)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+        assert_eq!(
+            resources
+                .iter()
+                .map(|resource| resource._id)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert!(SubAgentSet::select_resources(&manager, "missing", &mut resources).is_empty());
+        resources.clear();
+        assert!(SubAgentSet::select_resources(&manager, "router", &mut resources).is_empty());
+
+        let set_manager = Arc::new(SubAgentSetManager::default());
+        assert!(set_manager.definitions(None).is_empty());
+        assert!(!set_manager.contains_lowercase("router"));
+        assert!(set_manager.get_lowercase("router").is_none());
+        let downcast = set_manager.clone().into_any();
+        assert!(downcast.downcast_ref::<SubAgentSetManager>().is_some());
+        assert!(set_manager.insert(Arc::new(manager)).is_none());
+        assert!(set_manager.contains_lowercase("router"));
+        assert!(set_manager.get::<SubAgentManager>().is_some());
+        assert!(set_manager.get_lowercase("router").is_some());
+        assert_eq!(
+            set_manager.definitions(Some(&["router".to_string()])).len(),
+            1
+        );
+        let mut resources = vec![resource(3, &["text"]), resource(4, &["audio"])];
+        let selected =
+            SubAgentSet::select_resources(set_manager.as_ref(), "router", &mut resources);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|resource| resource._id)
+                .collect::<Vec<_>>(),
+            vec![3]
+        );
+
+        let empty_set_manager = Arc::new(SubAgentSetManager::default());
+        assert!(
+            empty_set_manager
+                .insert(Arc::new(EmptySubAgentSet))
+                .is_none()
+        );
+        assert!(!empty_set_manager.contains_lowercase("router"));
+        assert!(empty_set_manager.get_lowercase("router").is_none());
+        assert!(empty_set_manager.definitions(None).is_empty());
+        let mut resources = vec![resource(5, &["text"])];
+        assert!(
+            SubAgentSet::select_resources(empty_set_manager.as_ref(), "router", &mut resources)
+                .is_empty()
+        );
+        assert_eq!(
+            resources
+                .iter()
+                .map(|resource| resource._id)
+                .collect::<Vec<_>>(),
+            vec![5]
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1978,6 +2315,119 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn subsession_runner_handles_control_inputs_model_effort_and_finalize_errors() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let model = Model::with_completer(Arc::new(RecordingRequestCompleter {
+            name: "recorder",
+            requests: requests.clone(),
+        }));
+        let ctx = EngineBuilder::new().with_model(model).mock_ctx();
+
+        let (sender, _rx) = tokio::sync::mpsc::channel(4);
+        let session = Arc::new(SubSession {
+            id: "session-1".to_string(),
+            agent: "worker".to_string(),
+            sender,
+            background_tasks: Arc::new(RwLock::new(HashMap::new())),
+            active_at: AtomicU64::new(unix_ms()),
+        });
+
+        let mut runner = SubSessionRunner {
+            session,
+            agent_hook: None,
+            runner: ctx
+                .completion_iter(
+                    CompletionRequest {
+                        prompt: "seed task".to_string(),
+                        ..Default::default()
+                    },
+                    Vec::new(),
+                )
+                .unbound(),
+            last_output: None,
+        };
+
+        assert!(runner.run(Vec::new()).await.unwrap());
+        assert!(
+            runner
+                .run(vec![SubAgentInput {
+                    command: PromptCommand::Command {
+                        command: "steer".to_string(),
+                        prompt: "correct course".to_string(),
+                    },
+                    resources: Vec::new(),
+                    usage: Usage {
+                        input_tokens: 3,
+                        output_tokens: 4,
+                        cached_tokens: 1,
+                        requests: 1,
+                    },
+                    model: Some("analysis".to_string()),
+                    effort: Some(ModelEffort::Low),
+                }])
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            runner.last_output.as_ref().unwrap().session.as_deref(),
+            Some("session-1")
+        );
+
+        assert!(
+            runner
+                .run(vec![SubAgentInput {
+                    command: PromptCommand::Command {
+                        command: "note".to_string(),
+                        prompt: "/note custom follow-up".to_string(),
+                    },
+                    resources: Vec::new(),
+                    usage: Usage::default(),
+                    model: None,
+                    effort: None,
+                }])
+                .await
+                .unwrap()
+        );
+
+        let recorded = requests.lock().clone();
+        assert_eq!(recorded.len(), 3);
+        assert_eq!(request_text(&recorded[0]), "seed task");
+        assert_eq!(request_text(&recorded[1]), "correct course");
+        assert_eq!(recorded[1].model.as_deref(), Some("analysis"));
+        assert_eq!(recorded[1].effort, Some(ModelEffort::Low));
+        assert_eq!(request_text(&recorded[2]), "/note custom follow-up");
+
+        let error_ctx = EngineBuilder::new()
+            .with_model(Model::with_completer(Arc::new(ErrorCompleter)))
+            .mock_ctx();
+        let (sender, _rx) = tokio::sync::mpsc::channel(4);
+        let session = Arc::new(SubSession {
+            id: "session-err".to_string(),
+            agent: "worker".to_string(),
+            sender,
+            background_tasks: Arc::new(RwLock::new(HashMap::new())),
+            active_at: AtomicU64::new(unix_ms()),
+        });
+        let mut runner = SubSessionRunner {
+            session,
+            agent_hook: None,
+            runner: error_ctx
+                .completion_iter(
+                    CompletionRequest {
+                        prompt: "will fail".to_string(),
+                        ..Default::default()
+                    },
+                    Vec::new(),
+                )
+                .unbound(),
+            last_output: None,
+        };
+        let output = runner.finalize_output().await;
+        assert_eq!(output.failed_reason.as_deref(), Some("model failed"));
+        assert_eq!(output.session.as_deref(), Some("session-err"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn subsession_runner_finalizes_with_latest_visible_output_after_compaction() {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let model = Model::with_completer(Arc::new(RecordingCompactionCompleter {
@@ -2062,6 +2512,112 @@ mod tests {
         assert_eq!(final_output.session.as_deref(), Some("session-1"));
         assert!(final_output.failed_reason.is_none());
         assert!(runner.runner.is_done());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn subsession_runner_output_classification_and_failure_defaults_are_covered() {
+        assert!(!SubSessionRunner::has_observable_output(
+            &AgentOutput::default()
+        ));
+
+        for output in [
+            AgentOutput {
+                thoughts: Some("thinking".to_string()),
+                ..Default::default()
+            },
+            AgentOutput {
+                failed_reason: Some("failed".to_string()),
+                ..Default::default()
+            },
+            AgentOutput {
+                tool_calls: vec![anda_core::ToolCall {
+                    name: "lookup".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            AgentOutput {
+                chat_history: vec![Message {
+                    role: "assistant".to_string(),
+                    content: vec!["history".to_string().into()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            AgentOutput {
+                artifacts: vec![Resource {
+                    _id: 42,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            AgentOutput {
+                conversation: Some(7),
+                ..Default::default()
+            },
+            AgentOutput {
+                model: Some("flash".to_string()),
+                ..Default::default()
+            },
+            AgentOutput {
+                usage: Usage {
+                    requests: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            AgentOutput {
+                tools_usage: HashMap::from([(
+                    "lookup".to_string(),
+                    Usage {
+                        requests: 1,
+                        ..Default::default()
+                    },
+                )]),
+                ..Default::default()
+            },
+        ] {
+            assert!(SubSessionRunner::has_observable_output(&output));
+        }
+
+        let model = Model::with_completer(Arc::new(EchoCompleter));
+        let ctx = EngineBuilder::new().with_model(model).mock_ctx();
+
+        let (sender, _rx) = tokio::sync::mpsc::channel(4);
+        let session = Arc::new(SubSession {
+            id: "session-1".to_string(),
+            agent: "worker".to_string(),
+            sender,
+            background_tasks: Arc::new(RwLock::new(HashMap::new())),
+            active_at: AtomicU64::new(unix_ms()),
+        });
+
+        let mut runner = SubSessionRunner {
+            session,
+            agent_hook: None,
+            runner: ctx
+                .completion_iter(
+                    CompletionRequest {
+                        prompt: "seed task".to_string(),
+                        ..Default::default()
+                    },
+                    Vec::new(),
+                )
+                .unbound(),
+            last_output: None,
+        };
+
+        assert_eq!(
+            runner.record_failed_output(""),
+            "subagent session cancelled"
+        );
+        let output = runner.latest_output();
+        assert_eq!(
+            output.failed_reason.as_deref(),
+            Some("subagent session cancelled")
+        );
+        assert_eq!(output.session.as_deref(), Some("session-1"));
+        assert!(output.content.is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2380,6 +2936,193 @@ mod tests {
         assert_eq!(err.to_string(), "after hook rejected output");
         assert!(hook.starts.lock().is_empty());
         assert!(agent.subsessions.active_session_ids().is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn subsession_background_hooks_forward_outputs_and_manage_registry() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let session = Arc::new(SubSession {
+            id: "session-1".into(),
+            agent: "worker".into(),
+            sender: tx,
+            background_tasks: Arc::new(RwLock::new(HashMap::new())),
+            active_at: AtomicU64::new(unix_ms()),
+        });
+        let ctx = EngineBuilder::new().mock_ctx();
+
+        let sessions = SubSessions::default();
+        sessions.insert_session(session.clone());
+        assert_eq!(sessions.active_session_ids(), vec!["session-1".to_string()]);
+        assert!(sessions.get_session("session-1").is_some());
+
+        AgentHook::on_background_start(
+            session.as_ref(),
+            &ctx,
+            "child-session",
+            &CompletionRequest::default(),
+        )
+        .await;
+        assert_eq!(
+            session
+                .background_tasks
+                .read()
+                .get("child-session")
+                .unwrap()
+                .agent_name,
+            "Mocker"
+        );
+
+        AgentHook::on_background_progress(
+            session.as_ref(),
+            &ctx,
+            "child-session".into(),
+            AgentOutput {
+                content: "partial".into(),
+                usage: Usage {
+                    requests: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(
+            recv_subagent_prompt(&mut rx)
+                .await
+                .contains("intermediate output")
+        );
+
+        AgentHook::on_background_progress(
+            session.as_ref(),
+            &ctx,
+            "child-session".into(),
+            AgentOutput {
+                failed_reason: Some("bad".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(
+            recv_subagent_prompt(&mut rx)
+                .await
+                .contains("failed with reason")
+        );
+
+        AgentHook::on_background_progress(
+            session.as_ref(),
+            &ctx,
+            "child-session".into(),
+            AgentOutput::default(),
+        )
+        .await;
+        assert!(recv_subagent_prompt(&mut rx).await.contains("completed"));
+
+        AgentHook::on_background_end(
+            session.as_ref(),
+            &ctx,
+            "child-session".into(),
+            AgentOutput {
+                content: "final".into(),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(
+            !session
+                .background_tasks
+                .read()
+                .contains_key("child-session")
+        );
+        assert!(recv_subagent_prompt(&mut rx).await.contains("final output"));
+
+        ToolBackgroundHook::on_background_start(
+            session.as_ref(),
+            &ctx.base,
+            "fetch:task-1",
+            json!({"url": "https://example.test"}),
+        )
+        .await;
+        assert_eq!(
+            session
+                .background_tasks
+                .read()
+                .get("fetch:task-1")
+                .unwrap()
+                .tool_name
+                .as_deref(),
+            Some("fetch")
+        );
+
+        ToolBackgroundHook::on_background_progress(
+            session.as_ref(),
+            &ctx.base,
+            "fetch:task-1".into(),
+            ToolOutput::new(json!({"status": "half"})),
+        )
+        .await;
+        assert_eq!(
+            session
+                .background_tasks
+                .read()
+                .get("fetch:task-1")
+                .unwrap()
+                .progress_message
+                .as_deref(),
+            Some(r#"{"status":"half"}"#)
+        );
+
+        ToolBackgroundHook::on_background_start(
+            session.as_ref(),
+            &ctx.base,
+            "unprefixed",
+            Json::Null,
+        )
+        .await;
+        assert!(
+            session
+                .background_tasks
+                .read()
+                .get("unprefixed")
+                .unwrap()
+                .tool_name
+                .is_none()
+        );
+
+        ToolBackgroundHook::on_background_end(
+            session.as_ref(),
+            &ctx.base,
+            "fetch:task-1".into(),
+            ToolOutput {
+                output: json!({"done": true}),
+                artifacts: vec![resource(7, &["artifact"])],
+                usage: Usage {
+                    requests: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(!session.background_tasks.read().contains_key("fetch:task-1"));
+        let forwarded = rx.recv().await.unwrap();
+        assert!(matches!(forwarded.command, PromptCommand::Plain { .. }));
+        assert_eq!(forwarded.resources.len(), 1);
+        assert_eq!(forwarded.usage.requests, 1);
+
+        sessions.remove_session("session-1");
+        assert!(sessions.get_session("session-1").is_none());
+
+        let (closed_tx, closed_rx) = tokio::sync::mpsc::channel(1);
+        let closed = Arc::new(SubSession {
+            id: "closed".into(),
+            agent: "worker".into(),
+            sender: closed_tx,
+            background_tasks: Arc::new(RwLock::new(HashMap::new())),
+            active_at: AtomicU64::new(unix_ms()),
+        });
+        drop(closed_rx);
+        sessions.insert_session(closed);
+        assert!(sessions.active_session_ids().is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]

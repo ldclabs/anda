@@ -53,6 +53,7 @@ serde-saphyr = { workspace = true }
 glob = { workspace = true }
 
 [dev-dependencies]
+axum = { workspace = true }
 dotenv = { workspace = true }
 
 [lib]

@@ -2023,7 +2023,297 @@ impl CompletionFeaturesDyn for CompletionModelV2 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{Router, body::Bytes, extract::State, response::IntoResponse, routing::any};
+    use http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
     use serde_json::{Map, json};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct MockResponse {
+        status: StatusCode,
+        headers: HeaderMap,
+        body: Vec<u8>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct RecordedRequest {
+        method: Method,
+        uri: Uri,
+        headers: HeaderMap,
+        body: Vec<u8>,
+    }
+
+    type MockState = Arc<Mutex<(MockResponse, Option<RecordedRequest>)>>;
+
+    async fn mock_handler(
+        State(state): State<MockState>,
+        method: Method,
+        uri: Uri,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> impl IntoResponse {
+        let mut state = state.lock().unwrap();
+        state.1 = Some(RecordedRequest {
+            method,
+            uri,
+            headers,
+            body: body.to_vec(),
+        });
+
+        let mut response = (state.0.status, state.0.body.clone()).into_response();
+        for (name, value) in state.0.headers.iter() {
+            response.headers_mut().insert(name, value.clone());
+        }
+        response
+    }
+
+    async fn spawn_mock_server(
+        status: StatusCode,
+        headers: HeaderMap,
+        body: impl Into<Vec<u8>>,
+    ) -> (String, MockState) {
+        let state = Arc::new(Mutex::new((
+            MockResponse {
+                status,
+                headers,
+                body: body.into(),
+            },
+            None,
+        )));
+        let app = Router::new()
+            .fallback(any(mock_handler))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), state)
+    }
+
+    fn no_proxy_client() -> reqwest::Client {
+        reqwest::Client::builder().no_proxy().build().unwrap()
+    }
+
+    fn recorded(state: &MockState) -> RecordedRequest {
+        state.lock().unwrap().1.clone().unwrap()
+    }
+
+    fn sse_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        headers
+    }
+
+    #[test]
+    fn client_defaults_usage_display_service_tier_and_effort_mappings() {
+        let client = Client::new("test-key", Some(String::new()));
+        assert_eq!(client.endpoint, API_BASE_URL);
+        assert_eq!(client.completion_model("").model, DEFAULT_COMPLETION_MODEL);
+        assert_eq!(
+            client.completion_model_v2("").model,
+            DEFAULT_COMPLETION_MODEL
+        );
+        assert_eq!(
+            Usage {
+                prompt_tokens: 3,
+                completion_tokens: 5,
+                ..Default::default()
+            }
+            .to_string(),
+            "Prompt tokens: 3, completion tokens: 5"
+        );
+
+        for (tier, text) in [
+            (ServiceTier::Auto, "auto"),
+            (ServiceTier::Default, "default"),
+            (ServiceTier::Flex, "flex"),
+            (ServiceTier::Scale, "scale"),
+            (ServiceTier::Priority, "priority"),
+            (ServiceTier::Other("custom".to_string()), "custom"),
+        ] {
+            assert_eq!(serde_json::to_value(&tier).unwrap(), json!(text));
+            let parsed: ServiceTier = serde_json::from_value(json!(text)).unwrap();
+            assert_eq!(parsed, tier);
+        }
+
+        assert_eq!(
+            ReasoningEffort::from(ModelEffort::Minimal),
+            ReasoningEffort::Minimal
+        );
+        assert_eq!(
+            ReasoningEffort::from(ModelEffort::Medium),
+            ReasoningEffort::Medium
+        );
+        assert_eq!(
+            ReasoningEffort::from(ModelEffort::Max),
+            ReasoningEffort::XHigh
+        );
+        assert_eq!(
+            serde_json::to_value(types::ReasoningEffort::from(ModelEffort::Minimal)).unwrap(),
+            json!("minimal")
+        );
+        assert_eq!(
+            serde_json::to_value(types::ReasoningEffort::from(ModelEffort::Low)).unwrap(),
+            json!("low")
+        );
+        assert_eq!(
+            serde_json::to_value(types::ReasoningEffort::from(ModelEffort::High)).unwrap(),
+            json!("high")
+        );
+    }
+
+    #[test]
+    fn to_message_inputs_serializes_remote_and_inline_media_variants() {
+        let msg = Message {
+            role: "user".to_string(),
+            content: vec![
+                ContentPart::FileData {
+                    file_uri: "https://example.test/image.png".to_string(),
+                    mime_type: Some("image/png".to_string()),
+                },
+                ContentPart::FileData {
+                    file_uri: "https://example.test/video.mp4".to_string(),
+                    mime_type: Some("video/mp4".to_string()),
+                },
+                ContentPart::FileData {
+                    file_uri: "https://example.test/audio.wav".to_string(),
+                    mime_type: Some("audio/wav".to_string()),
+                },
+                ContentPart::FileData {
+                    file_uri: "https://example.test/file.bin".to_string(),
+                    mime_type: Some("application/octet-stream".to_string()),
+                },
+                ContentPart::InlineData {
+                    mime_type: "image/png".to_string(),
+                    data: ic_auth_types::ByteBufB64(vec![1, 2, 3]),
+                },
+                ContentPart::InlineData {
+                    mime_type: "video/mp4".to_string(),
+                    data: ic_auth_types::ByteBufB64(vec![4, 5, 6]),
+                },
+                ContentPart::InlineData {
+                    mime_type: "audio/mpeg".to_string(),
+                    data: ic_auth_types::ByteBufB64(vec![7, 8, 9]),
+                },
+                ContentPart::InlineData {
+                    mime_type: "application/octet-stream".to_string(),
+                    data: ic_auth_types::ByteBufB64(vec![10, 11, 12]),
+                },
+            ],
+            ..Default::default()
+        };
+
+        let inputs = to_message_inputs(&msg);
+        assert_eq!(inputs.len(), 1);
+        let value = serde_json::to_value(&inputs[0]).unwrap();
+        let content = value["content"].as_array().unwrap();
+
+        assert_eq!(content[0]["type"], "image_url");
+        assert_eq!(content[1]["type"], "video_url");
+        assert_eq!(content[2]["type"], "input_audio");
+        assert_eq!(content[2]["input_audio"]["format"], "wav");
+        assert_eq!(content[3]["type"], "file");
+        assert_eq!(content[4]["type"], "image_url");
+        assert_eq!(content[5]["type"], "video_url");
+        assert_eq!(content[6]["type"], "input_audio");
+        assert_eq!(content[6]["input_audio"]["format"], "mp3");
+        assert_eq!(content[7]["type"], "file");
+    }
+
+    #[test]
+    fn chat_completion_stream_builder_handles_parts_refusals_and_legacy_calls() {
+        let chunks = vec![
+            serde_json::from_value::<ChatCompletionStreamChunk>(json!({
+                "id": "chatcmpl_stream_extended",
+                "object": "chat.completion.chunk",
+                "created": 1741569955,
+                "model": "gpt-5.4",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "Part "}],
+                        "reasoning": "think ",
+                        "refusal": "no",
+                        "function_call": {"name": "legacy", "arguments": "{\"x\""},
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call_fn",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": "{\"q\""}
+                        }, {
+                            "index": 1,
+                            "id": "call_custom",
+                            "type": "custom",
+                            "custom": {"name": "sql", "input": "select"}
+                        }]
+                    },
+                    "finish_reason": null
+                }]
+            }))
+            .unwrap(),
+            serde_json::from_value::<ChatCompletionStreamChunk>(json!({
+                "id": "chatcmpl_stream_extended",
+                "object": "chat.completion.chunk",
+                "created": 1741569955,
+                "model": "gpt-5.4",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "content": "tail",
+                        "reasoning_content": "again",
+                        "function_call": {"arguments": ":1}"},
+                        "tool_calls": [{
+                            "index": 0,
+                            "function": {"arguments": ":\"anda\"}"}
+                        }, {
+                            "index": 1,
+                            "custom": {"input": " 1"}
+                        }]
+                    },
+                    "finish_reason": "stop"
+                }],
+                "service_tier": "priority",
+                "system_fingerprint": "fp_stream"
+            }))
+            .unwrap(),
+        ];
+
+        let response = chat_completion_response_from_stream_chunks(chunks).unwrap();
+        assert_eq!(response.service_tier, Some(ServiceTier::Priority));
+        assert_eq!(response.system_fingerprint.as_deref(), Some("fp_stream"));
+        let choice = &response.choices[0];
+        assert_eq!(choice.finish_reason, "stop");
+        assert_eq!(choice.message["content"][0]["text"], "tail");
+        assert_eq!(choice.message["content"][1]["text"], "Part ");
+        assert_eq!(choice.message["reasoning_content"], "think again");
+        assert_eq!(choice.message["refusal"], "no");
+        assert_eq!(choice.message["function_call"]["name"], "legacy");
+        assert_eq!(choice.message["function_call"]["arguments"], "{\"x\":1}");
+        assert_eq!(
+            choice.message["tool_calls"][0]["function"]["name"],
+            "lookup"
+        );
+        assert_eq!(
+            choice.message["tool_calls"][0]["function"]["arguments"],
+            "{\"q\":\"anda\"}"
+        );
+        assert_eq!(
+            choice.message["tool_calls"][1]["custom"]["input"],
+            "select 1"
+        );
+
+        assert!(
+            chat_completion_response_from_stream_chunks(Vec::new())
+                .unwrap_err()
+                .to_string()
+                .contains("No streamed completion choice")
+        );
+    }
 
     #[test]
     fn response_v2_defaults_to_streaming_stateless_requests() {
@@ -2066,6 +2356,383 @@ mod tests {
             Some(types::ReasoningEffort::XHigh)
         ));
         assert!(reasoning.summary.is_none());
+    }
+
+    #[tokio::test]
+    async fn chat_completion_model_posts_request_and_parses_non_stream_response() {
+        let body = serde_json::to_vec(&json!({
+            "id": "chatcmpl_test",
+            "object": "chat.completion",
+            "created": 1741569952,
+            "model": "gpt-test",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "hello from chat"},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 4,
+                "total_tokens": 14,
+                "prompt_tokens_details": {"cached_tokens": 3}
+            }
+        }))
+        .unwrap();
+        let (endpoint, state) = spawn_mock_server(StatusCode::OK, HeaderMap::new(), body).await;
+        let model = Client::new("test-key", Some(endpoint))
+            .with_client(no_proxy_client())
+            .completion_model("gpt-test")
+            .with_stream(false);
+
+        let output = model
+            .completion(CompletionRequest {
+                instructions: "system rules".into(),
+                prompt: "say hello".into(),
+                temperature: Some(0.2),
+                max_output_tokens: Some(64),
+                output_schema: Some(json!({"type": "object"})),
+                stop: Some(vec!["END".into()]),
+                effort: Some(ModelEffort::Low),
+                tool_choice_required: true,
+                tools: vec![FunctionDefinition {
+                    name: "lookup".into(),
+                    description: "Lookup docs".into(),
+                    parameters: json!({"type": "object", "properties": {}}),
+                    strict: Some(true),
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(output.content, "hello from chat");
+        assert_eq!(output.model.as_deref(), Some("gpt-test"));
+        assert_eq!(output.usage.input_tokens, 10);
+        assert_eq!(output.usage.cached_tokens, 3);
+        assert_eq!(output.chat_history.len(), 2);
+
+        let req = recorded(&state);
+        assert_eq!(req.method, Method::POST);
+        assert_eq!(req.uri.path(), "/chat/completions");
+        assert_eq!(
+            req.headers.get(http::header::AUTHORIZATION).unwrap(),
+            "Bearer test-key"
+        );
+        assert_ne!(
+            req.headers.get(ACCEPT).and_then(|v| v.to_str().ok()),
+            Some("text/event-stream")
+        );
+        let sent: Json = serde_json::from_slice(&req.body).unwrap();
+        assert_eq!(sent["model"], "gpt-test");
+        assert_eq!(sent["messages"][0]["role"], "system");
+        assert_eq!(sent["messages"][1]["role"], "user");
+        assert_eq!(sent["temperature"], 0.2);
+        assert_eq!(sent["max_tokens"], 64);
+        assert_eq!(sent["stop"], json!(["END"]));
+        assert_eq!(sent["reasoning_effort"], "low");
+        assert_eq!(sent["response_format"]["type"], "json_schema");
+        assert_eq!(sent["tool_choice"], "required");
+        assert_eq!(sent["tools"][0]["function"]["name"], "lookup");
+    }
+
+    #[tokio::test]
+    async fn chat_completion_model_reports_http_and_invalid_json_errors() {
+        let (endpoint, _) = spawn_mock_server(
+            StatusCode::TOO_MANY_REQUESTS,
+            HeaderMap::new(),
+            "rate limited",
+        )
+        .await;
+        let model = Client::new("test-key", Some(endpoint))
+            .with_client(no_proxy_client())
+            .completion_model("gpt-test")
+            .with_stream(false);
+        let err = model
+            .completion(CompletionRequest {
+                prompt: "hello".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Completion failed"));
+        assert!(err.to_string().contains("rate limited"));
+
+        let (endpoint, _) = spawn_mock_server(StatusCode::OK, HeaderMap::new(), "not json").await;
+        let model = Client::new("test-key", Some(endpoint))
+            .with_client(no_proxy_client())
+            .completion_model("gpt-test")
+            .with_stream(false);
+        let err = model
+            .completion(CompletionRequest {
+                prompt: "hello".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Invalid completion response"));
+        assert!(err.to_string().contains("not json"));
+    }
+
+    #[tokio::test]
+    async fn chat_completion_model_streams_sse_chunks() {
+        let sse = [
+            json!({
+                "id": "chatcmpl_stream",
+                "object": "chat.completion.chunk",
+                "created": 1741569952,
+                "model": "gpt-stream",
+                "choices": [{
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": "Hel"}
+                }]
+            }),
+            json!({
+                "id": "chatcmpl_stream",
+                "object": "chat.completion.chunk",
+                "created": 1741569952,
+                "model": "gpt-stream",
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": "lo"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3}
+            }),
+        ]
+        .into_iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect::<String>()
+            + "data: [DONE]\n\n";
+
+        let (endpoint, state) =
+            spawn_mock_server(StatusCode::OK, sse_headers(), sse.into_bytes()).await;
+        let model = Client::new("test-key", Some(endpoint))
+            .with_client(no_proxy_client())
+            .completion_model("gpt-stream")
+            .with_stream(true);
+
+        let output = model
+            .completion(CompletionRequest {
+                prompt: "stream".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.content, "Hello");
+        assert_eq!(output.usage.input_tokens, 2);
+
+        let req = recorded(&state);
+        assert_eq!(req.uri.path(), "/chat/completions");
+        assert_eq!(
+            req.headers.get(ACCEPT).and_then(|v| v.to_str().ok()),
+            Some("text/event-stream")
+        );
+        let sent: Json = serde_json::from_slice(&req.body).unwrap();
+        assert_eq!(sent["stream"], true);
+    }
+
+    #[tokio::test]
+    async fn chat_completion_model_builds_history_documents_and_auto_tool_choice() {
+        let body = serde_json::to_vec(&json!({
+            "id": "chatcmpl_history",
+            "object": "chat.completion",
+            "created": 1741569958,
+            "model": "gpt-history",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "history ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+        }))
+        .unwrap();
+        let (endpoint, state) = spawn_mock_server(StatusCode::OK, HeaderMap::new(), body).await;
+        let model = Client::new("test-key", Some(endpoint))
+            .with_client(no_proxy_client())
+            .completion_model("gpt-history")
+            .with_stream(false);
+
+        let output = model
+            .completion(
+                CompletionRequest {
+                    raw_history: vec![json!({"role": "system", "content": "raw history"})],
+                    chat_history: vec![Message {
+                        role: "assistant".into(),
+                        content: vec![ContentPart::Text {
+                            text: "prior answer".into(),
+                        }],
+                        ..Default::default()
+                    }],
+                    prompt: "current prompt".into(),
+                    role: Some("developer".into()),
+                    tools: vec![FunctionDefinition {
+                        name: "lookup".into(),
+                        description: "Lookup docs".into(),
+                        parameters: json!({"type": "object"}),
+                        strict: Some(false),
+                    }],
+                    tool_choice_required: false,
+                    ..Default::default()
+                }
+                .context("doc-1".into(), "document body".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.content, "history ok");
+        assert_eq!(output.raw_history.len(), 4);
+
+        let req = recorded(&state);
+        let sent: Json = serde_json::from_slice(&req.body).unwrap();
+        assert_eq!(sent["messages"][0]["role"], "system");
+        assert_eq!(sent["messages"][1]["role"], "assistant");
+        assert_eq!(sent["messages"][2]["name"], "$system");
+        assert_eq!(sent["messages"][3]["role"], "developer");
+        assert_eq!(sent["tool_choice"], "auto");
+    }
+
+    #[tokio::test]
+    async fn responses_completion_model_streams_events_and_forces_streaming() {
+        fn response(status: &str) -> Json {
+            json!({
+                "id": "resp_stream",
+                "object": "response",
+                "created_at": 1741290958,
+                "status": status,
+                "error": null,
+                "incomplete_details": null,
+                "instructions": null,
+                "model": "gpt-5.5",
+                "output": [],
+                "parallel_tool_calls": true,
+                "reasoning": {"effort": null, "summary": null},
+                "text": {"format": {"type": "text"}},
+                "tools": [],
+                "usage": {
+                    "input_tokens": 5,
+                    "output_tokens": 2,
+                    "total_tokens": 7,
+                    "input_tokens_details": {"cached_tokens": 1},
+                    "output_tokens_details": {"reasoning_tokens": 0}
+                },
+                "metadata": {}
+            })
+        }
+
+        let events = [
+            json!({"type": "response.created", "response": response("in_progress")}),
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "type": "message",
+                    "id": "msg_1",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "hello from responses"}]
+                }
+            }),
+            json!({"type": "response.completed", "response": response("completed")}),
+        ]
+        .into_iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect::<String>()
+            + "data: [DONE]\n\n";
+
+        let (endpoint, state) =
+            spawn_mock_server(StatusCode::OK, sse_headers(), events.into_bytes()).await;
+        let model = Client::new("test-key", Some(endpoint))
+            .with_client(no_proxy_client())
+            .completion_model_v2("gpt-5.5")
+            .with_stream(false);
+
+        let output = model
+            .completion(CompletionRequest {
+                prompt: "respond".into(),
+                max_output_tokens: Some(128),
+                temperature: Some(0.1),
+                output_schema: Some(json!({"type": "object", "properties": {}})),
+                effort: Some(ModelEffort::Medium),
+                tool_choice_required: false,
+                tools: vec![FunctionDefinition {
+                    name: "lookup".into(),
+                    description: String::new(),
+                    parameters: json!({"type": "object"}),
+                    strict: Some(false),
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.content, "hello from responses");
+        assert_eq!(output.usage.input_tokens, 5);
+        assert_eq!(output.usage.cached_tokens, 1);
+
+        let req = recorded(&state);
+        assert_eq!(req.uri.path(), "/responses");
+        assert_eq!(
+            req.headers.get(ACCEPT).and_then(|v| v.to_str().ok()),
+            Some("text/event-stream")
+        );
+        let sent: Json = serde_json::from_slice(&req.body).unwrap();
+        assert_eq!(sent["stream"], true);
+        assert_eq!(sent["store"], false);
+        assert_eq!(sent["max_output_tokens"], 128);
+        assert_eq!(sent["temperature"], 0.1);
+        assert_eq!(sent["tools"][0]["name"], "lookup");
+        assert_eq!(sent["tool_choice"], "auto");
+        assert_eq!(sent["text"]["format"]["name"], "structured_output");
+    }
+
+    #[tokio::test]
+    async fn responses_completion_model_reports_http_error_after_full_request_build() {
+        let (endpoint, state) =
+            spawn_mock_server(StatusCode::BAD_REQUEST, HeaderMap::new(), "bad response").await;
+        let model = Client::new("test-key", Some(endpoint))
+            .with_client(no_proxy_client())
+            .completion_model_v2("gpt-5.5");
+
+        let err = model
+            .completion(
+                CompletionRequest {
+                    instructions: "system".into(),
+                    raw_history: vec![json!({
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "raw"}]
+                    })],
+                    chat_history: vec![Message {
+                        role: "assistant".into(),
+                        content: vec![ContentPart::Text {
+                            text: "prior".into(),
+                        }],
+                        ..Default::default()
+                    }],
+                    prompt: "respond".into(),
+                    tools: vec![FunctionDefinition {
+                        name: "lookup".into(),
+                        description: "Lookup docs".into(),
+                        parameters: json!({"type": "object"}),
+                        strict: Some(true),
+                    }],
+                    tool_choice_required: true,
+                    ..Default::default()
+                }
+                .context("doc-1".into(), "document body".into()),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Completion failed"));
+        assert!(err.to_string().contains("bad response"));
+
+        let req = recorded(&state);
+        assert_eq!(req.uri.path(), "/responses");
+        let sent: Json = serde_json::from_slice(&req.body).unwrap();
+        assert_eq!(sent["instructions"], "system");
+        assert_eq!(sent["input"].as_array().unwrap().len(), 4);
+        assert_eq!(sent["tools"][0]["description"], "Lookup docs");
+        assert_eq!(sent["tool_choice"], "required");
+        assert_eq!(sent["stream"], true);
+        assert_eq!(sent["store"], false);
     }
 
     #[test]
@@ -2691,6 +3358,163 @@ mod tests {
     }
 
     #[test]
+    fn response_and_message_output_error_edges_are_covered() {
+        let empty = CompletionResponse {
+            id: "empty".into(),
+            object: "chat.completion".into(),
+            created: 0,
+            model: "gpt-empty".into(),
+            choices: Vec::new(),
+            service_tier: None,
+            system_fingerprint: None,
+            usage: Usage::default(),
+        };
+        assert!(
+            empty
+                .try_into(vec![], vec![])
+                .unwrap_err()
+                .to_string()
+                .contains("No completion choice")
+        );
+
+        let mut failed: CompletionResponse = serde_json::from_value(json!({
+            "id": "chatcmpl_failed",
+            "object": "chat.completion",
+            "created": 1741569959,
+            "model": "gpt-failed",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "discarded"},
+                "finish_reason": "length"
+            }]
+        }))
+        .unwrap();
+        failed.parse_output();
+        assert!(failed.maybe_failed());
+        let output = failed.try_into(vec![], vec![]).unwrap();
+        assert_eq!(output.failed_reason.as_deref(), Some("length"));
+        assert!(output.raw_history.is_empty());
+
+        let msg: Message = serde_json::from_value::<MessageOutput>(json!({
+            "role": "assistant",
+            "function_call": {"name": "legacy", "arguments": {"x": 1}}
+        }))
+        .unwrap()
+        .into();
+        assert_eq!(msg.tool_calls()[0].name, "legacy");
+        assert_eq!(msg.tool_calls()[0].args, json!({"x": 1}));
+
+        let msg: Message = serde_json::from_value::<MessageOutput>(json!({
+            "role": "assistant",
+            "tool_calls": [{
+                "id": "custom_json",
+                "type": "custom",
+                "custom": {"name": "sql", "input": {"select": 1}}
+            }, {
+                "id": "bare",
+                "type": "unknown"
+            }]
+        }))
+        .unwrap()
+        .into();
+        let calls = msg.tool_calls();
+        assert_eq!(calls[0].name, "sql");
+        assert_eq!(calls[0].args, json!({"select": 1}));
+        assert_eq!(
+            msg.content[1],
+            ContentPart::Any(json!({"id": "bare", "type": "unknown"}))
+        );
+
+        let msg: Message = serde_json::from_value::<MessageOutput>(json!({
+            "role": "assistant",
+            "content": [
+                {"type": "image_url", "image_url": {"url": "data:text/plain;base64,aGk="}},
+                {"type": "file", "file": {"file_data": "data:text/plain;base64,Ynll"}},
+                {"type": "file", "file": {}}
+            ]
+        }))
+        .unwrap()
+        .into();
+        assert!(matches!(msg.content[0], ContentPart::InlineData { .. }));
+        assert!(matches!(msg.content[1], ContentPart::InlineData { .. }));
+        assert_eq!(msg.content.len(), 2);
+    }
+
+    #[test]
+    fn stream_aggregators_cover_logprobs_status_and_ignored_events() {
+        let chunks = vec![
+            serde_json::from_value::<ChatCompletionStreamChunk>(json!({
+                "id": "chatcmpl_logprobs",
+                "object": "custom.chunk",
+                "created": 1741569960,
+                "model": "gpt-logprobs",
+                "choices": [{
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": "log"},
+                    "logprobs": {
+                        "content": [{
+                            "token": "log",
+                            "bytes": null,
+                            "logprob": -0.2,
+                            "top_logprobs": [{
+                                "token": "lag",
+                                "bytes": [108, 97, 103],
+                                "logprob": -1.0
+                            }]
+                        }],
+                        "refusal": []
+                    },
+                    "finish_reason": "stop"
+                }]
+            }))
+            .unwrap(),
+        ];
+        let chat_response = chat_completion_response_from_stream_chunks(chunks).unwrap();
+        assert_eq!(chat_response.object, "custom.chunk");
+        assert_eq!(
+            chat_response.choices[0].logprobs.as_ref().unwrap().content[0].top_logprobs[0].token,
+            "lag"
+        );
+
+        fn response(status: &str) -> Json {
+            json!({
+                "id": "resp_status",
+                "created_at": 1741569961,
+                "model": "gpt-5.5",
+                "output": [],
+                "status": status,
+                "usage": null
+            })
+        }
+
+        let events = vec![
+            serde_json::from_value::<types::StreamEvent>(
+                json!({"type": "response.in_progress", "response": response("in_progress")}),
+            )
+            .unwrap(),
+            serde_json::from_value::<types::StreamEvent>(json!({"type": "unknown.event"})).unwrap(),
+            serde_json::from_value::<types::StreamEvent>(
+                json!({"type": "response.failed", "response": response("failed")}),
+            )
+            .unwrap(),
+            serde_json::from_value::<types::StreamEvent>(
+                json!({"type": "response.incomplete", "response": response("incomplete")}),
+            )
+            .unwrap(),
+        ];
+        let response = responses_response_from_stream_events(events).unwrap();
+        assert!(matches!(response.status, types::ResponseStatus::Incomplete));
+        assert!(response.maybe_failed());
+
+        assert!(
+            responses_response_from_stream_events(Vec::new())
+                .unwrap_err()
+                .to_string()
+                .contains("No streamed completion response")
+        );
+    }
+
+    #[test]
     fn deserializes_content_parts_custom_tool_calls_and_refusals() {
         let mut response: CompletionResponse = serde_json::from_value(json!({
             "id": "chatcmpl_2",
@@ -2751,22 +3575,5 @@ mod tests {
         assert!(response.maybe_failed());
         let output = response.try_into(vec![], vec![]).unwrap();
         assert_eq!(output.failed_reason.as_deref(), Some("policy fail"));
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    #[ignore]
-    async fn test_openai() {
-        let cli = Client::new(
-            "sk-or-v1-0**",
-            Some("https://openrouter.ai/api/v1".to_string()),
-        )
-        .completion_model_v2("openai/gpt-5.4-mini");
-        let res = cli
-            .completion(CompletionRequest {
-                prompt: "What is 1+1?".to_string(),
-                ..Default::default()
-            })
-            .await;
-        println!("res: {:#?}", res);
     }
 }

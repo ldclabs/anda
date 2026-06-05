@@ -1648,6 +1648,126 @@ impl Tool<BaseCtx> for MemoryTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        context::{RemoteEngines, Web3SDK},
+        store::{InMemory, Store},
+    };
+    use anda_core::CancellationToken;
+    use anda_db::database::DBConfig;
+    use std::collections::BTreeSet;
+
+    fn principal(seed: u8) -> Principal {
+        Principal::self_authenticating([seed; 32])
+    }
+
+    fn message(role: &str, text: &str) -> Message {
+        Message {
+            role: role.to_string(),
+            content: vec![ContentPart::Text {
+                text: text.to_string(),
+            }],
+            user: Some(principal(7)),
+            timestamp: Some(1_700_000_000_000),
+            ..Default::default()
+        }
+    }
+
+    fn resource(name: &str, blob: Option<&[u8]>) -> Resource {
+        Resource {
+            name: name.to_string(),
+            tags: vec!["text".to_string()],
+            description: Some(format!("{name} description")),
+            mime_type: Some("text/plain".to_string()),
+            blob: blob.map(|v| ByteBufB64(v.to_vec())),
+            size: blob.map(|v| v.len() as u64),
+            metadata: Some(Map::from_iter([("source".to_string(), json!("test"))])),
+            ..Default::default()
+        }
+    }
+
+    fn conversation(user: Principal, text: &str, period: u64) -> Conversation {
+        let mut conversation = Conversation {
+            user,
+            thread: Some(Xid([period as u8; 12])),
+            resources: vec![resource("input", Some(b"input text"))],
+            artifacts: vec![resource("artifact", Some(b"artifact text"))],
+            status: ConversationStatus::Working,
+            failed_reason: Some("not finished".to_string()),
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 20,
+                cached_tokens: 3,
+                requests: 2,
+            },
+            steering_messages: Some(vec!["steer-one".to_string()]),
+            follow_up_messages: Some(vec!["follow-one".to_string()]),
+            child: Some(99),
+            ancestors: Some(vec![1, 2]),
+            label: Some("label-a".to_string()),
+            extra: Some(json!({"priority": "high"})),
+            period,
+            created_at: 1_700_000_000_000,
+            updated_at: 1_700_000_000_001,
+            ..Default::default()
+        };
+        conversation.append_messages(vec![
+            message("user", text),
+            Message {
+                role: "assistant".to_string(),
+                content: vec![
+                    ContentPart::Reasoning {
+                        text: "thinking".to_string(),
+                    },
+                    ContentPart::ToolCall {
+                        name: "lookup".to_string(),
+                        args: json!({"q": text}),
+                        call_id: Some("call-1".to_string()),
+                    },
+                ],
+                timestamp: Some(1_700_000_000_002),
+                ..Default::default()
+            },
+        ]);
+        conversation
+    }
+
+    async fn test_db() -> Arc<AndaDB> {
+        Arc::new(
+            AndaDB::connect(Arc::new(InMemory::new()), DBConfig::default())
+                .await
+                .unwrap(),
+        )
+    }
+
+    async fn test_conversations(name: &str) -> Conversations {
+        Conversations::connect(test_db().await, name.to_string())
+            .await
+            .unwrap()
+    }
+
+    async fn test_memory() -> Arc<MemoryManagement> {
+        let db = test_db().await;
+        let nexus = Arc::new(
+            CognitiveNexus::connect(db.clone(), async |_nexus| Ok(()))
+                .await
+                .unwrap(),
+        );
+        Arc::new(MemoryManagement::connect(db, nexus).await.unwrap())
+    }
+
+    fn test_ctx(caller: Principal) -> BaseCtx {
+        BaseCtx::new(
+            Principal::anonymous(),
+            "engine".to_string(),
+            "agent".to_string(),
+            CancellationToken::new(),
+            BTreeSet::new(),
+            Arc::new(Web3SDK::not_implemented()),
+            Store::new(Arc::new(InMemory::new())),
+            Arc::new(RemoteEngines::new()),
+        )
+        .with_caller(caller)
+    }
 
     #[test]
     fn test_conversation_status() {
@@ -1689,6 +1809,804 @@ mod tests {
         assert_eq!(required.len(), properties.len());
         for key in properties.keys() {
             assert!(required.iter().any(|item| item.as_str() == Some(key)));
+        }
+    }
+
+    #[test]
+    fn conversation_conversions_preserve_public_state() {
+        let user = principal(1);
+        let conversation = conversation(user, "alpha memory topic", 17);
+
+        let changes = conversation.to_changes().unwrap();
+        assert!(matches!(changes.get("messages"), Some(Fv::Array(_))));
+        assert!(matches!(changes.get("resources"), Some(Fv::Array(_))));
+        assert!(matches!(changes.get("artifacts"), Some(Fv::Array(_))));
+        assert!(matches!(
+            changes.get("status"),
+            Some(Fv::Text(v)) if v == "working"
+        ));
+        assert!(matches!(
+            changes.get("steering_messages"),
+            Some(Fv::Array(_))
+        ));
+        assert!(matches!(
+            changes.get("follow_up_messages"),
+            Some(Fv::Array(_))
+        ));
+        assert!(matches!(changes.get("label"), Some(Fv::Text(v)) if v == "label-a"));
+        assert!(!matches!(changes.get("extra"), Some(Fv::Null) | None));
+        assert!(matches!(changes.get("child"), Some(Fv::U64(99))));
+        assert!(matches!(
+            changes.get("failed_reason"),
+            Some(Fv::Text(v)) if v == "not finished"
+        ));
+
+        let delta = conversation.to_delta(1, 1);
+        assert_eq!(delta._id, conversation._id);
+        assert_eq!(delta.messages.len(), 1);
+        assert_eq!(delta.artifacts.len(), 0);
+        assert_eq!(delta.status, ConversationStatus::Working);
+        assert_eq!(delta.child, Some(99));
+
+        let owned_delta = conversation.clone().into_delta(0, 0);
+        assert_eq!(owned_delta.messages.len(), 2);
+        assert_eq!(owned_delta.artifacts.len(), 1);
+
+        let pruned = PrunedMessage::try_from(Message {
+            role: "assistant".to_string(),
+            content: vec![
+                ContentPart::Text {
+                    text: "visible".to_string(),
+                },
+                ContentPart::ToolCall {
+                    name: "hidden".to_string(),
+                    args: json!({}),
+                    call_id: None,
+                },
+            ],
+            user: Some(user),
+            timestamp: Some(1_700_000_000_000),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(pruned.role, "assistant");
+        assert_eq!(pruned.content.len(), 2);
+        assert_eq!(pruned.user, Some(user.to_string()));
+        assert_eq!(
+            pruned.timestamp.as_deref(),
+            Some("2023-11-14T22:13:20.000Z")
+        );
+
+        let doc = Document::from(conversation.clone());
+        assert_eq!(doc.metadata["_id"], json!(0));
+        assert_eq!(doc.metadata["type"], json!("Conversation"));
+        assert_eq!(doc.metadata["user"], json!(user.to_string()));
+        assert_eq!(doc.metadata["thread"], json!(Xid([17; 12]).to_string()));
+        assert_eq!(doc.metadata["label"], json!("label-a"));
+        assert!(doc.content.as_array().unwrap().len() >= 2);
+
+        let conversation_ref = ConversationRef::from(&conversation);
+        assert_eq!(conversation_ref.user, &user);
+        assert_eq!(conversation_ref.thread, conversation.thread.as_ref());
+        assert_eq!(conversation_ref.messages.len(), 2);
+        assert_eq!(conversation_ref.child, &Some(99));
+        assert_eq!(
+            ConversationState::from(&conversation_ref).status,
+            conversation.status
+        );
+        assert_eq!(ConversationState::from(&conversation)._id, conversation._id);
+
+        let sparse = Conversation {
+            user,
+            updated_at: 1_700_000_000_010,
+            ..Default::default()
+        };
+        let changes = sparse.to_changes().unwrap();
+        assert!(matches!(changes.get("steering_messages"), Some(Fv::Null)));
+        assert!(matches!(changes.get("follow_up_messages"), Some(Fv::Null)));
+        assert!(matches!(changes.get("label"), Some(Fv::Null)));
+        assert!(matches!(changes.get("extra"), Some(Fv::Null)));
+        assert!(!changes.contains_key("child"));
+        assert!(!changes.contains_key("failed_reason"));
+    }
+
+    #[test]
+    fn conversation_status_display_and_strict_args_cover_all_variants() {
+        let statuses = [
+            (ConversationStatus::Submitted, "submitted"),
+            (ConversationStatus::Working, "working"),
+            (ConversationStatus::Idle, "idle"),
+            (ConversationStatus::Completed, "completed"),
+            (ConversationStatus::Cancelled, "cancelled"),
+            (ConversationStatus::Failed, "failed"),
+        ];
+        for (status, expected) in statuses {
+            assert_eq!(status.to_string(), expected);
+        }
+
+        let cases = vec![
+            (
+                json!({
+                    "type": "GetResource",
+                    "_id": 7,
+                    "conversation": 3,
+                    "messages_offset": null,
+                    "artifacts_offset": null,
+                    "message": null,
+                    "cursor": null,
+                    "limit": null,
+                    "query": null
+                }),
+                MemoryToolArgs::GetResource {
+                    _id: 7,
+                    conversation: 3,
+                },
+            ),
+            (
+                json!({
+                    "type": "GetConversationDelta",
+                    "_id": 3,
+                    "conversation": null,
+                    "messages_offset": 1,
+                    "artifacts_offset": 2,
+                    "message": null,
+                    "cursor": null,
+                    "limit": null,
+                    "query": null
+                }),
+                MemoryToolArgs::GetConversationDelta {
+                    _id: 3,
+                    messages_offset: 1,
+                    artifacts_offset: 2,
+                },
+            ),
+            (
+                json!({
+                    "type": "StopConversation",
+                    "_id": 3,
+                    "conversation": null,
+                    "messages_offset": null,
+                    "artifacts_offset": null,
+                    "message": null,
+                    "cursor": null,
+                    "limit": null,
+                    "query": null
+                }),
+                MemoryToolArgs::StopConversation { _id: 3 },
+            ),
+            (
+                json!({
+                    "type": "SteerConversation",
+                    "_id": 3,
+                    "conversation": null,
+                    "messages_offset": null,
+                    "artifacts_offset": null,
+                    "message": "redirect",
+                    "cursor": null,
+                    "limit": null,
+                    "query": null
+                }),
+                MemoryToolArgs::SteerConversation {
+                    _id: 3,
+                    message: "redirect".to_string(),
+                },
+            ),
+            (
+                json!({
+                    "type": "FollowUpConversation",
+                    "_id": 3,
+                    "conversation": null,
+                    "messages_offset": null,
+                    "artifacts_offset": null,
+                    "message": "continue",
+                    "cursor": null,
+                    "limit": null,
+                    "query": null
+                }),
+                MemoryToolArgs::FollowUpConversation {
+                    _id: 3,
+                    message: "continue".to_string(),
+                },
+            ),
+            (
+                json!({
+                    "type": "DeleteConversation",
+                    "_id": 3,
+                    "conversation": null,
+                    "messages_offset": null,
+                    "artifacts_offset": null,
+                    "message": null,
+                    "cursor": null,
+                    "limit": null,
+                    "query": null
+                }),
+                MemoryToolArgs::DeleteConversation { _id: 3 },
+            ),
+            (
+                json!({
+                    "type": "ListPrevConversations",
+                    "_id": null,
+                    "conversation": null,
+                    "messages_offset": null,
+                    "artifacts_offset": null,
+                    "message": null,
+                    "cursor": "abc",
+                    "limit": 5,
+                    "query": null
+                }),
+                MemoryToolArgs::ListPrevConversations {
+                    cursor: Some("abc".to_string()),
+                    limit: Some(5),
+                },
+            ),
+            (
+                json!({
+                    "type": "SearchConversations",
+                    "_id": null,
+                    "conversation": null,
+                    "messages_offset": null,
+                    "artifacts_offset": null,
+                    "message": null,
+                    "cursor": null,
+                    "limit": 4,
+                    "query": "alpha"
+                }),
+                MemoryToolArgs::SearchConversations {
+                    query: "alpha".to_string(),
+                    limit: Some(4),
+                },
+            ),
+        ];
+
+        for (value, expected) in cases {
+            let parsed: MemoryToolArgs = serde_json::from_value(value).unwrap();
+            assert_eq!(parsed, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn conversations_collection_crud_search_and_expiry() {
+        let conversations = test_conversations("conversation_test").await;
+        let user = principal(2);
+        let other_user = principal(3);
+
+        let mut first = conversation(user, "alpha searchable topic", 1);
+        first.status = ConversationStatus::Submitted;
+        let first_id = conversations
+            .add_conversation(ConversationRef::from(&first))
+            .await
+            .unwrap();
+
+        let mut second = conversation(user, "beta searchable topic", 2);
+        second.status = ConversationStatus::Completed;
+        second.failed_reason = None;
+        let second_id = conversations
+            .add_conversation(ConversationRef::from(&second))
+            .await
+            .unwrap();
+
+        let other = conversation(other_user, "alpha from another user", 3);
+        let other_id = conversations
+            .add_conversation(ConversationRef::from(&other))
+            .await
+            .unwrap();
+
+        let fetched = conversations.get_conversation(first_id).await.unwrap();
+        assert_eq!(fetched.user, user);
+        assert_eq!(fetched.status, ConversationStatus::Submitted);
+
+        let mut changes = fetched.to_changes().unwrap();
+        changes.insert("status".to_string(), Fv::Text("idle".to_string()));
+        conversations
+            .update_conversation(first_id, changes)
+            .await
+            .unwrap();
+        assert_eq!(
+            conversations
+                .get_conversation(first_id)
+                .await
+                .unwrap()
+                .status,
+            ConversationStatus::Idle
+        );
+
+        let batch = conversations
+            .batch_get_conversations(&user, vec![first_id, other_id, second_id])
+            .await
+            .unwrap();
+        assert_eq!(batch.len(), 2);
+        assert!(batch.iter().all(|item| item.user == user));
+
+        let (page, cursor) = conversations
+            .list_conversations_by_user(&user, None, Some(1))
+            .await
+            .unwrap();
+        assert_eq!(page.len(), 1);
+        assert!(cursor.is_some());
+        let (next_page, _) = conversations
+            .list_conversations_by_user(&user, cursor, Some(10))
+            .await
+            .unwrap();
+        assert_eq!(next_page.len(), 1);
+
+        let search = conversations
+            .search_conversations(&user, "alpha".to_string(), Some(10))
+            .await
+            .unwrap();
+        assert!(search.iter().all(|item| item.user == user));
+
+        assert!(!conversations.delete_conversation(999_999).await.unwrap());
+        assert!(conversations.delete_conversation(other_id).await.unwrap());
+        let deleted = conversations
+            .delete_expired_conversations(2 * 3600 * 1000)
+            .await
+            .unwrap();
+        assert_eq!(deleted, 1);
+        assert!(conversations.get_conversation(first_id).await.is_err());
+        assert!(conversations.get_conversation(second_id).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn memory_management_resources_conversations_and_descriptions() {
+        let memory = test_memory().await;
+        let user = principal(4);
+
+        assert_eq!(memory.name(), "execute_kip");
+        assert!(
+            memory
+                .description()
+                .contains("Knowledge Interaction Protocol")
+        );
+        let definition = memory.definition();
+        assert_eq!(definition.name, "execute_kip");
+        assert_eq!(definition.strict, None);
+        assert_eq!(
+            memory
+                .as_ref()
+                .clone()
+                .with_kip_function_definitions(FunctionDefinition {
+                    name: "custom_kip".to_string(),
+                    description: "custom".to_string(),
+                    parameters: json!({"type": "object"}),
+                    strict: Some(false),
+                })
+                .name(),
+            "custom_kip"
+        );
+
+        let _ = memory.nexus();
+        assert!(memory.describe_primer().await.is_err());
+        assert!(memory.describe_system().await.is_err());
+        let caller = memory
+            .get_or_init_caller(&user, Some("Ada".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(caller["attributes"]["id"], json!(user.to_string()));
+        let described = memory.describe_caller(&user).await.unwrap();
+        assert_eq!(described["attributes"]["name"], json!("Ada"));
+
+        let added_resource = resource("resource-a", Some(b"hello resource"));
+        let resource_id = memory
+            .add_resource(ResourceRef::from(&added_resource))
+            .await
+            .unwrap();
+        let fetched_resource = memory.get_resource(resource_id).await.unwrap();
+        assert_eq!(fetched_resource.name, "resource-a");
+
+        let existing = Resource {
+            _id: resource_id,
+            blob: Some(ByteBufB64(b"ignored blob".to_vec())),
+            ..fetched_resource.clone()
+        };
+        let inserted = resource("resource-b", Some(b"new resource"));
+        let normalized = memory
+            .try_add_resources(&[existing, inserted])
+            .await
+            .unwrap();
+        assert_eq!(normalized.len(), 2);
+        assert_eq!(normalized[0]._id, resource_id);
+        assert!(normalized.iter().all(|item| item.blob.is_none()));
+
+        let mut stored = conversation(user, "gamma conversation", 1);
+        stored.resources = normalized.clone();
+        stored.artifacts = vec![Resource {
+            _id: normalized[1]._id,
+            ..normalized[1].clone()
+        }];
+        let conversation_id = memory
+            .add_conversation(ConversationRef::from(&stored))
+            .await
+            .unwrap();
+        assert!(memory.max_conversation_id() >= conversation_id);
+        assert_eq!(
+            memory.get_conversation(conversation_id).await.unwrap().user,
+            user
+        );
+
+        let (listed, _) = memory
+            .list_conversations_by_user(&user, None, Some(10))
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        let found = memory
+            .search_conversations(&user, "gamma".to_string(), Some(10))
+            .await
+            .unwrap();
+        assert!(found.iter().all(|item| item.user == user));
+
+        let deleted = memory
+            .delete_expired_conversations(2 * 3600 * 1000)
+            .await
+            .unwrap();
+        assert_eq!(deleted, 1);
+        assert!(memory.get_conversation(conversation_id).await.is_err());
+        assert!(memory.get_resource(resource_id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn memory_tools_expose_definitions_and_call_local_paths() {
+        let memory = test_memory().await;
+        let user = principal(5);
+        let ctx = test_ctx(user);
+
+        let text_resource = resource("text-resource", Some(b"plain text"));
+        let text_id = memory
+            .add_resource(ResourceRef::from(&text_resource))
+            .await
+            .unwrap();
+        let binary_resource = resource("binary-resource", Some(&[0, 159, 146, 150]));
+        let binary_id = memory
+            .add_resource(ResourceRef::from(&binary_resource))
+            .await
+            .unwrap();
+
+        let mut stored = conversation(user, "delta memory api", 3);
+        stored.resources = vec![Resource {
+            _id: text_id,
+            ..text_resource.clone()
+        }];
+        stored.status = ConversationStatus::Working;
+        let conversation_id = memory
+            .add_conversation(ConversationRef::from(&stored))
+            .await
+            .unwrap();
+
+        let readonly = MemoryReadonly::new(memory.clone());
+        assert_eq!(readonly.name(), MemoryReadonly::NAME);
+        assert!(readonly.description().contains("read"));
+        assert_eq!(readonly.definition().strict, Some(true));
+
+        let get_content = GetResourceContentTool::new(memory.clone());
+        assert_eq!(get_content.name(), GetResourceContentTool::NAME);
+        assert!(get_content.description().contains("stored resource"));
+        assert_eq!(get_content.definition().strict, Some(true));
+        let output = get_content
+            .call(
+                ctx.clone(),
+                GetResourceContentArgs { _id: text_id },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        match output.output {
+            Response::Ok { result, .. } => assert_eq!(result, json!("plain text")),
+            other => panic!("unexpected response: {other:?}"),
+        }
+        let output = get_content
+            .call(
+                ctx.clone(),
+                GetResourceContentArgs { _id: binary_id },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        match output.output {
+            Response::Ok { result, .. } => {
+                assert!(result.as_str().unwrap().starts_with("AJ-S"));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+        let missing_id = memory
+            .add_resource(ResourceRef::from(&Resource {
+                name: "empty".to_string(),
+                tags: vec!["text".to_string()],
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let err = get_content
+            .call(
+                ctx.clone(),
+                GetResourceContentArgs { _id: missing_id },
+                Vec::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no blob or uri"));
+
+        let list_tool = ListConversationsTool::new(Conversations {
+            conversations: memory.conversations.clone(),
+        })
+        .with_description("custom list".to_string());
+        assert_eq!(list_tool.name(), ListConversationsTool::NAME);
+        assert_eq!(list_tool.description(), "custom list");
+        assert_eq!(list_tool.definition().strict, Some(true));
+        let output = list_tool
+            .call(
+                ctx.clone(),
+                ListConversationsArgs {
+                    cursor: String::new(),
+                    limit: 0,
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(output.output, Response::Ok { .. }));
+        let err = list_tool
+            .call(
+                ctx.clone(),
+                ListConversationsArgs {
+                    cursor: "not-a-valid-cursor".to_string(),
+                    limit: 2,
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(!err.to_string().is_empty());
+
+        let search_tool = SearchConversationsTool::new(Conversations {
+            conversations: memory.conversations.clone(),
+        })
+        .with_description("custom search".to_string());
+        assert_eq!(search_tool.name(), SearchConversationsTool::NAME);
+        assert_eq!(search_tool.description(), "custom search");
+        assert_eq!(search_tool.definition().strict, Some(true));
+        let output = search_tool
+            .call(
+                ctx.clone(),
+                SearchConversationsArgs {
+                    query: "delta".to_string(),
+                    limit: 0,
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(output.output, Response::Ok { .. }));
+        let output = search_tool
+            .call(
+                ctx.clone(),
+                SearchConversationsArgs {
+                    query: "delta".to_string(),
+                    limit: 3,
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(output.output, Response::Ok { .. }));
+
+        let memory_tool = MemoryTool::new(memory.clone());
+        assert_eq!(memory_tool.name(), MemoryTool::NAME);
+        assert!(memory_tool.description().contains("managing conversations"));
+        assert_eq!(memory_tool.definition().strict, Some(true));
+
+        let output = memory_tool
+            .call(
+                ctx.clone(),
+                MemoryToolArgs::GetConversation {
+                    _id: conversation_id,
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(output.output, Response::Ok { .. }));
+
+        let output = memory_tool
+            .call(
+                ctx.clone(),
+                MemoryToolArgs::GetConversationDelta {
+                    _id: conversation_id,
+                    messages_offset: 1,
+                    artifacts_offset: 0,
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        match output.output {
+            Response::Ok { result, .. } => {
+                let delta: ConversationDelta = serde_json::from_value(result).unwrap();
+                assert_eq!(delta.messages.len(), 1);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        let output = memory_tool
+            .call(
+                ctx.clone(),
+                MemoryToolArgs::GetResource {
+                    _id: text_id,
+                    conversation: conversation_id,
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(output.output, Response::Ok { .. }));
+
+        for args in [
+            MemoryToolArgs::GetResource {
+                _id: text_id,
+                conversation: conversation_id,
+            },
+            MemoryToolArgs::GetConversationDelta {
+                _id: conversation_id,
+                messages_offset: 0,
+                artifacts_offset: 0,
+            },
+            MemoryToolArgs::StopConversation {
+                _id: conversation_id,
+            },
+            MemoryToolArgs::SteerConversation {
+                _id: conversation_id,
+                message: "denied steering".to_string(),
+            },
+            MemoryToolArgs::FollowUpConversation {
+                _id: conversation_id,
+                message: "denied follow-up".to_string(),
+            },
+            MemoryToolArgs::DeleteConversation {
+                _id: conversation_id,
+            },
+        ] {
+            let denied = memory_tool
+                .call(test_ctx(principal(6)), args, Vec::new())
+                .await
+                .unwrap_err();
+            assert!(denied.to_string().contains("permission denied"));
+        }
+
+        memory_tool
+            .call(
+                ctx.clone(),
+                MemoryToolArgs::SteerConversation {
+                    _id: conversation_id,
+                    message: "new steering".to_string(),
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        memory_tool
+            .call(
+                ctx.clone(),
+                MemoryToolArgs::FollowUpConversation {
+                    _id: conversation_id,
+                    message: "new follow-up".to_string(),
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let updated = memory.get_conversation(conversation_id).await.unwrap();
+        assert_eq!(updated.steering_messages.unwrap().len(), 2);
+        assert_eq!(updated.follow_up_messages.unwrap().len(), 2);
+
+        assert!(
+            memory_tool
+                .call(
+                    ctx.clone(),
+                    MemoryToolArgs::SteerConversation {
+                        _id: conversation_id,
+                        message: "  ".to_string(),
+                    },
+                    Vec::new(),
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("steering message cannot be empty")
+        );
+        assert!(
+            memory_tool
+                .call(
+                    ctx.clone(),
+                    MemoryToolArgs::FollowUpConversation {
+                        _id: conversation_id,
+                        message: String::new(),
+                    },
+                    Vec::new(),
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("follow-up message cannot be empty")
+        );
+
+        memory_tool
+            .call(
+                ctx.clone(),
+                MemoryToolArgs::StopConversation {
+                    _id: conversation_id,
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            memory
+                .get_conversation(conversation_id)
+                .await
+                .unwrap()
+                .status,
+            ConversationStatus::Cancelled
+        );
+        let output = memory_tool
+            .call(
+                ctx.clone(),
+                MemoryToolArgs::StopConversation {
+                    _id: conversation_id,
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(output.output, Response::Ok { .. }));
+
+        let output = memory_tool
+            .call(
+                ctx.clone(),
+                MemoryToolArgs::ListPrevConversations {
+                    cursor: None,
+                    limit: Some(10),
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(output.output, Response::Ok { .. }));
+        let output = memory_tool
+            .call(
+                ctx.clone(),
+                MemoryToolArgs::SearchConversations {
+                    query: "delta".to_string(),
+                    limit: Some(10),
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(output.output, Response::Ok { .. }));
+
+        let denied = memory_tool
+            .call(
+                test_ctx(principal(6)),
+                MemoryToolArgs::GetConversation {
+                    _id: conversation_id,
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(denied.to_string().contains("permission denied"));
+
+        let output = memory_tool
+            .call(
+                ctx,
+                MemoryToolArgs::DeleteConversation {
+                    _id: conversation_id,
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        match output.output {
+            Response::Ok { result, .. } => assert_eq!(result["deleted"], json!(true)),
+            other => panic!("unexpected response: {other:?}"),
         }
     }
 }

@@ -393,9 +393,9 @@ mod tests {
     use std::time::Duration;
 
     use crate::{
-        AgentInput, CacheExpiry, CacheFeatures, CancellationToken, CompletionFeatures,
-        CompletionRequest, HttpFeatures, Json, KeysFeatures, ObjectMeta, Path, PutMode, PutResult,
-        RequestMeta, StateFeatures, StoreFeatures, ToolInput, ToolOutput,
+        AgentInput, BaseContext, CacheExpiry, CacheFeatures, CancellationToken, CanisterCaller,
+        CompletionFeatures, CompletionRequest, HttpFeatures, Json, KeysFeatures, ObjectMeta, Path,
+        PutMode, PutResult, RequestMeta, StateFeatures, StoreFeatures, ToolInput, ToolOutput,
     };
 
     #[derive(Clone)]
@@ -766,6 +766,19 @@ mod tests {
 
     struct OtherAgent;
 
+    struct TaggedAgent;
+
+    struct InvalidAgent;
+
+    fn resource(id: u64, tags: &[&str]) -> Resource {
+        Resource {
+            _id: id,
+            name: format!("resource-{id}"),
+            tags: tags.iter().map(|tag| tag.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
     impl Agent<TestAgentContext> for ExampleAgent {
         fn name(&self) -> String {
             "example_agent".to_string()
@@ -810,6 +823,55 @@ mod tests {
         }
     }
 
+    impl Agent<TestAgentContext> for TaggedAgent {
+        fn name(&self) -> String {
+            "tagged_agent".to_string()
+        }
+
+        fn description(&self) -> String {
+            "Agent that consumes text and code resources".to_string()
+        }
+
+        fn supported_resource_tags(&self) -> Vec<String> {
+            vec!["text".to_string(), "code".to_string()]
+        }
+
+        fn tool_dependencies(&self) -> Vec<String> {
+            vec!["lookup".to_string(), "summarize".to_string()]
+        }
+
+        async fn run(
+            &self,
+            _ctx: TestAgentContext,
+            prompt: String,
+            resources: Vec<Resource>,
+        ) -> Result<AgentOutput, BoxError> {
+            Ok(AgentOutput {
+                content: format!("{prompt}:{}", resources.len()),
+                ..AgentOutput::default()
+            })
+        }
+    }
+
+    impl Agent<TestAgentContext> for InvalidAgent {
+        fn name(&self) -> String {
+            "bad-agent".to_string()
+        }
+
+        fn description(&self) -> String {
+            "Invalid function name".to_string()
+        }
+
+        async fn run(
+            &self,
+            _ctx: TestAgentContext,
+            _prompt: String,
+            _resources: Vec<Resource>,
+        ) -> Result<AgentOutput, BoxError> {
+            Ok(AgentOutput::default())
+        }
+    }
+
     #[test]
     fn dyn_agent_downcast_ref_returns_inner_agent() {
         let agent = Arc::new(ExampleAgent { id: 7 });
@@ -834,10 +896,10 @@ mod tests {
             .unwrap();
 
         let dyn_agent = agent_set.get("example_agent").unwrap();
-        let concrete = match dyn_agent.downcast::<ExampleAgent>() {
-            Ok(agent) => agent,
-            Err(_) => panic!("expected downcast to ExampleAgent to succeed"),
-        };
+        let concrete = dyn_agent
+            .downcast::<ExampleAgent>()
+            .ok()
+            .expect("expected downcast to ExampleAgent to succeed");
 
         assert_eq!(concrete.id, 9);
         assert!(Arc::ptr_eq(&concrete, &agent));
@@ -853,13 +915,387 @@ mod tests {
 
         let dyn_agent = agent_set.get("example_agent").unwrap();
         let original = dyn_agent.clone();
-        let err = match dyn_agent.downcast::<OtherAgent>() {
-            Ok(_) => panic!("expected downcast to OtherAgent to fail"),
-            Err(err) => err,
-        };
+        let err = dyn_agent
+            .downcast::<OtherAgent>()
+            .err()
+            .expect("expected downcast to OtherAgent to fail");
 
         assert!(Arc::ptr_eq(&err, &original));
         assert_eq!(err.name(), "example_agent");
         assert_eq!(err.label(), "test-label");
+    }
+
+    #[test]
+    fn agent_default_methods_and_dyn_wrapper_forward_calls() {
+        futures::executor::block_on(async {
+            let agent = Arc::new(ExampleAgent { id: 42 });
+            let mut resources = vec![resource(1, &["text"])];
+
+            let definition = agent.definition();
+            assert_eq!(definition.name, "example_agent");
+            assert_eq!(definition.description, agent.description());
+            assert_eq!(definition.strict, Some(true));
+            assert_eq!(definition.parameters["type"], "object");
+            assert_eq!(
+                definition.parameters["required"].as_array().unwrap()[0],
+                "prompt"
+            );
+            assert!(agent.supported_resource_tags().is_empty());
+            assert!(agent.select_resources(&mut resources).is_empty());
+            assert_eq!(resources.len(), 1);
+            agent.init(TestAgentContext::default()).await.unwrap();
+            assert!(agent.tool_dependencies().is_empty());
+
+            let mut agent_set = AgentSet::<TestAgentContext>::new();
+            agent_set
+                .add(agent, Some("example label".to_string()))
+                .unwrap();
+            let dyn_agent = agent_set.get("EXAMPLE_AGENT").unwrap();
+
+            assert_eq!(dyn_agent.label(), "example label");
+            assert_eq!(dyn_agent.name(), "example_agent");
+            assert_eq!(dyn_agent.definition().name, "example_agent");
+            assert!(dyn_agent.tool_dependencies().is_empty());
+            assert!(dyn_agent.supported_resource_tags().is_empty());
+            dyn_agent.init(TestAgentContext::default()).await.unwrap();
+
+            let output = dyn_agent
+                .run(
+                    TestAgentContext::default(),
+                    "ignored".to_string(),
+                    Vec::new(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(output.content, "42");
+        });
+    }
+
+    #[test]
+    fn fixture_agents_cover_direct_trait_methods() {
+        futures::executor::block_on(async {
+            let other = OtherAgent;
+            assert_eq!(other.name(), "other_agent");
+            assert_eq!(other.description(), "Other agent used for downcast tests");
+            assert_eq!(
+                other
+                    .run(
+                        TestAgentContext::default(),
+                        "prompt".to_string(),
+                        Vec::new()
+                    )
+                    .await
+                    .unwrap()
+                    .content,
+                "other"
+            );
+
+            let tagged = TaggedAgent;
+            assert_eq!(
+                tagged.tool_dependencies(),
+                vec!["lookup".to_string(), "summarize".to_string()]
+            );
+
+            let invalid = InvalidAgent;
+            assert_eq!(invalid.name(), "bad-agent");
+            assert_eq!(invalid.description(), "Invalid function name");
+            assert!(
+                invalid
+                    .run(
+                        TestAgentContext::default(),
+                        "prompt".to_string(),
+                        Vec::new()
+                    )
+                    .await
+                    .unwrap()
+                    .content
+                    .is_empty()
+            );
+        });
+    }
+
+    #[test]
+    fn agent_set_registry_filters_resources_and_reports_errors() {
+        futures::executor::block_on(async {
+            let mut agent_set = AgentSet::<TestAgentContext>::new();
+            agent_set
+                .add(Arc::new(ExampleAgent { id: 1 }), None)
+                .unwrap();
+            agent_set
+                .add(Arc::new(TaggedAgent), Some("tagged label".to_string()))
+                .unwrap();
+
+            assert!(agent_set.contains("EXAMPLE_AGENT"));
+            assert!(agent_set.contains_lowercase("tagged_agent"));
+            assert!(!agent_set.contains("missing_agent"));
+            assert_eq!(
+                agent_set.names(),
+                vec!["example_agent".to_string(), "tagged_agent".to_string()]
+            );
+
+            let definition = agent_set.definition("TAGGED_AGENT").unwrap();
+            assert_eq!(definition.name, "tagged_agent");
+            assert!(agent_set.definition("missing_agent").is_none());
+
+            let selected_names = vec!["TAGGED_AGENT".to_string(), "missing_agent".to_string()];
+            let selected_definitions = agent_set.definitions(Some(&selected_names));
+            assert_eq!(selected_definitions.len(), 1);
+            assert_eq!(selected_definitions[0].name, "tagged_agent");
+            assert_eq!(agent_set.definitions(None).len(), 2);
+
+            let selected_functions = agent_set.functions(Some(&selected_names));
+            assert_eq!(selected_functions.len(), 1);
+            assert_eq!(
+                selected_functions[0].supported_resource_tags,
+                vec!["text".to_string(), "code".to_string()]
+            );
+            assert_eq!(agent_set.functions(None).len(), 2);
+
+            let mut empty = Vec::new();
+            assert!(
+                agent_set
+                    .select_resources("tagged_agent", &mut empty)
+                    .is_empty()
+            );
+            let mut resources = vec![
+                resource(1, &["image"]),
+                resource(2, &["text"]),
+                resource(3, &["code", "text"]),
+                resource(4, &["audio"]),
+            ];
+            let selected = agent_set.select_resources("TAGGED_AGENT", &mut resources);
+            assert_eq!(
+                selected
+                    .iter()
+                    .map(|resource| resource._id)
+                    .collect::<Vec<_>>(),
+                vec![2, 3]
+            );
+            assert_eq!(
+                resources
+                    .iter()
+                    .map(|resource| resource._id)
+                    .collect::<Vec<_>>(),
+                vec![1, 4]
+            );
+            assert!(
+                agent_set
+                    .select_resources("missing_agent", &mut resources)
+                    .is_empty()
+            );
+
+            let dyn_agent = agent_set.get_lowercase("tagged_agent").unwrap();
+            assert_eq!(dyn_agent.label(), "tagged label");
+            let output = dyn_agent
+                .run(
+                    TestAgentContext::default(),
+                    "prompt".to_string(),
+                    vec![resource(9, &["text"])],
+                )
+                .await
+                .unwrap();
+            assert_eq!(output.content, "prompt:1");
+            assert!(agent_set.get("missing_agent").is_none());
+            assert!(agent_set.get_lowercase("missing_agent").is_none());
+
+            let duplicate = agent_set
+                .add(Arc::new(ExampleAgent { id: 2 }), None)
+                .unwrap_err();
+            assert!(duplicate.to_string().contains("already exists"));
+
+            let invalid = agent_set.add(Arc::new(InvalidAgent), None).unwrap_err();
+            assert!(invalid.to_string().contains("invalid character"));
+        });
+    }
+
+    #[test]
+    fn test_agent_context_mock_features_cover_default_paths() {
+        futures::executor::block_on(async {
+            let ctx = TestAgentContext::default();
+            assert_eq!(*ctx.engine_id(), Principal::management_canister());
+            assert_eq!(ctx.engine_name(), "test-engine");
+            assert_eq!(*ctx.caller(), Principal::anonymous());
+            assert!(ctx.meta().user.is_none());
+            assert!(!ctx.cancellation_token().is_cancelled());
+            assert_eq!(ctx.time_elapsed(), Duration::ZERO);
+
+            assert_eq!(ctx.a256gcm_key(Vec::new()).await.unwrap(), [0; 32]);
+            assert_eq!(
+                ctx.ed25519_sign_message(Vec::new(), b"message")
+                    .await
+                    .unwrap(),
+                [0; 64]
+            );
+            ctx.ed25519_verify(Vec::new(), b"message", &[0; 64])
+                .await
+                .unwrap();
+            assert_eq!(ctx.ed25519_public_key(Vec::new()).await.unwrap(), [0; 32]);
+            assert_eq!(
+                ctx.secp256k1_sign_message_bip340(Vec::new(), b"message")
+                    .await
+                    .unwrap(),
+                [0; 64]
+            );
+            ctx.secp256k1_verify_bip340(Vec::new(), b"message", &[0; 64])
+                .await
+                .unwrap();
+            assert_eq!(
+                ctx.secp256k1_sign_message_ecdsa(Vec::new(), b"message")
+                    .await
+                    .unwrap(),
+                [0; 64]
+            );
+            assert_eq!(
+                ctx.secp256k1_sign_digest_ecdsa(Vec::new(), &[0; 32])
+                    .await
+                    .unwrap(),
+                [0; 64]
+            );
+            ctx.secp256k1_verify_ecdsa(Vec::new(), &[0; 32], &[0; 64])
+                .await
+                .unwrap();
+            assert_eq!(ctx.secp256k1_public_key(Vec::new()).await.unwrap(), [0; 33]);
+
+            assert!(ctx.store_get(&Path::from("missing")).await.is_err());
+            assert!(
+                ctx.store_list(None, &Path::default())
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                ctx.store_put(&Path::from("file"), PutMode::Overwrite, bytes::Bytes::new())
+                    .await
+                    .is_err()
+            );
+            assert!(
+                ctx.store_rename_if_not_exists(&Path::from("a"), &Path::from("b"))
+                    .await
+                    .is_err()
+            );
+            ctx.store_delete(&Path::from("file")).await.unwrap();
+
+            assert!(!ctx.cache_contains("key"));
+            assert!(ctx.cache_get::<String>("key").await.is_err());
+            assert!(
+                ctx.cache_get_with("key", async { Ok(("value".to_string(), None)) })
+                    .await
+                    .is_err()
+            );
+            ctx.cache_set("key", ("value".to_string(), None)).await;
+            assert!(
+                !ctx.cache_set_if_not_exists("key", ("value".to_string(), None))
+                    .await
+            );
+            assert!(!ctx.cache_delete("key").await);
+            assert_eq!(ctx.cache_raw_iter().count(), 0);
+
+            assert!(
+                ctx.https_call("https://example.test", http::Method::GET, None, None)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                ctx.https_signed_call(
+                    "https://example.test",
+                    http::Method::POST,
+                    [0; 32],
+                    None,
+                    None,
+                )
+                .await
+                .is_err()
+            );
+            let rpc: Result<String, BoxError> = ctx
+                .https_signed_rpc("https://example.test", "method", &())
+                .await;
+            assert!(rpc.is_err());
+
+            let query: Result<String, BoxError> = ctx
+                .canister_query(&Principal::anonymous(), "query", ())
+                .await;
+            assert!(query.is_err());
+            let update: Result<String, BoxError> = ctx
+                .canister_update(&Principal::anonymous(), "update", ())
+                .await;
+            assert!(update.is_err());
+
+            assert!(
+                ctx.remote_tool_call(
+                    "https://example.test",
+                    ToolInput::new("tool".to_string(), Json::Null),
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(
+                ctx.completion(CompletionRequest::default(), Vec::new())
+                    .await
+                    .unwrap()
+                    .content,
+                ""
+            );
+            assert_eq!(ctx.model_name(), "test-model");
+            assert!(ctx.tool_definitions(None).is_empty());
+            assert!(
+                ctx.remote_tool_definitions(None, None)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                ctx.select_tool_resources("tool", &mut Vec::new())
+                    .await
+                    .is_empty()
+            );
+            assert!(ctx.agent_definitions(None).is_empty());
+            assert!(
+                ctx.remote_agent_definitions(None, None)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                ctx.select_agent_resources("agent", &mut Vec::new())
+                    .await
+                    .is_empty()
+            );
+            assert!(ctx.definitions(None).await.is_empty());
+            assert!(
+                ctx.tool_call(ToolInput::new("tool".to_string(), Json::Null))
+                    .await
+                    .unwrap()
+                    .0
+                    .output
+                    .is_null()
+            );
+            assert!(
+                ctx.clone()
+                    .agent_run(AgentInput {
+                        name: "agent".to_string(),
+                        prompt: "prompt".to_string(),
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap()
+                    .0
+                    .content
+                    .is_empty()
+            );
+            assert!(
+                ctx.remote_agent_run(
+                    "https://example.test",
+                    AgentInput {
+                        name: "agent".to_string(),
+                        prompt: "prompt".to_string(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap()
+                .content
+                .is_empty()
+            );
+        });
     }
 }

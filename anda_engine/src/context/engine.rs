@@ -204,6 +204,7 @@ impl RemoteEngines {
                         .collect();
                 }
             }
+            return Vec::new();
         }
 
         let mut definitions =
@@ -280,6 +281,7 @@ impl RemoteEngines {
                         .collect();
                 }
             }
+            return Vec::new();
         }
 
         let mut definitions =
@@ -469,6 +471,8 @@ impl Agent<AgentCtx> for RemoteAgent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::de::DeserializeOwned;
+    use serde_json::json;
 
     fn function(name: &str) -> Function {
         Function {
@@ -489,6 +493,67 @@ mod tests {
             },
             tools: tools.iter().map(|name| function(name)).collect(),
             agents: agents.iter().map(|name| function(name)).collect(),
+        }
+    }
+
+    fn tagged_function(name: &str, description: &str, tags: &[&str]) -> Function {
+        Function {
+            definition: FunctionDefinition {
+                name: name.to_string(),
+                description: description.to_string(),
+                ..Default::default()
+            },
+            supported_resource_tags: tags.iter().map(|tag| tag.to_string()).collect(),
+        }
+    }
+
+    fn resource(id: u64, tags: &[&str]) -> Resource {
+        Resource {
+            _id: id,
+            name: format!("resource-{id}"),
+            tags: tags.iter().map(|tag| tag.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[derive(Clone)]
+    struct MockHttp {
+        card: EngineCard,
+    }
+
+    impl HttpFeatures for MockHttp {
+        async fn https_call(
+            &self,
+            _url: &str,
+            _method: http::Method,
+            _headers: Option<http::HeaderMap>,
+            _body: Option<Vec<u8>>,
+        ) -> Result<reqwest::Response, BoxError> {
+            Err("unused https_call".into())
+        }
+
+        async fn https_signed_call(
+            &self,
+            _url: &str,
+            _method: http::Method,
+            _message_digest: [u8; 32],
+            _headers: Option<http::HeaderMap>,
+            _body: Option<Vec<u8>>,
+        ) -> Result<reqwest::Response, BoxError> {
+            Err("unused https_signed_call".into())
+        }
+
+        async fn https_signed_rpc<T>(
+            &self,
+            _endpoint: &str,
+            method: &str,
+            _args: impl Serialize + Send,
+        ) -> Result<T, BoxError>
+        where
+            T: DeserializeOwned,
+        {
+            assert_eq!(method, "information");
+            serde_json::from_value(serde_json::to_value(&self.card)?).map_err(|err| err.into())
         }
     }
 
@@ -534,5 +599,300 @@ mod tests {
         assert_eq!(endpoint, "https://alpha.example");
         assert_eq!(agent_name, "chat");
         assert!(remote.get_agent_endpoint("alpha_missing").is_none());
+    }
+
+    #[tokio::test]
+    async fn remote_engine_register_filters_definitions_ids_and_resources() {
+        let card = EngineCard {
+            id: Principal::management_canister(),
+            info: AgentInfo {
+                handle: "RemoteMain".to_string(),
+                endpoint: "https://remote.example".to_string(),
+                ..Default::default()
+            },
+            agents: vec![
+                tagged_function("chat", "Chat remotely", &["text"]),
+                tagged_function("draft", "Draft remotely", &["md"]),
+            ],
+            tools: vec![
+                tagged_function("lookup", "Lookup remotely", &["text"]),
+                tagged_function("render", "Render remotely", &["image"]),
+            ],
+        };
+        let mut remote = RemoteEngines::new();
+        remote
+            .register(
+                MockHttp { card },
+                RemoteEngineArgs {
+                    endpoint: "https://remote.example".to_string(),
+                    agents: vec!["chat".to_string()],
+                    tools: vec!["lookup".to_string()],
+                    handle: Some("remote".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            remote.get_id_by_endpoint("https://remote.example"),
+            Some(Principal::management_canister())
+        );
+        assert_eq!(
+            remote.get_endpoint_by_id(&Principal::management_canister()),
+            Some("https://remote.example".to_string())
+        );
+        assert!(
+            remote
+                .get_id_by_endpoint("https://missing.example")
+                .is_none()
+        );
+        assert!(remote.get_endpoint_by_id(&Principal::anonymous()).is_none());
+
+        assert_eq!(
+            remote
+                .tool_definitions(Some("https://remote.example"), None)
+                .into_iter()
+                .map(|definition| definition.name)
+                .collect::<Vec<_>>(),
+            vec!["remote_lookup"]
+        );
+        assert!(
+            remote
+                .tool_definitions(Some("https://missing.example"), None)
+                .is_empty()
+        );
+        assert_eq!(
+            remote
+                .tool_definitions(None, Some(&["lookup".to_string()]))
+                .into_iter()
+                .map(|definition| definition.name)
+                .collect::<Vec<_>>(),
+            vec!["remote_lookup"]
+        );
+        assert!(
+            remote
+                .tool_definitions(None, Some(&["render".to_string()]))
+                .is_empty()
+        );
+
+        assert_eq!(
+            remote
+                .agent_definitions(Some("https://remote.example"), None)
+                .into_iter()
+                .map(|definition| definition.name)
+                .collect::<Vec<_>>(),
+            vec!["remote_chat"]
+        );
+        assert!(
+            remote
+                .agent_definitions(Some("https://missing.example"), None)
+                .is_empty()
+        );
+        assert_eq!(
+            remote
+                .agent_definitions(None, Some(&["chat".to_string()]))
+                .into_iter()
+                .map(|definition| definition.name)
+                .collect::<Vec<_>>(),
+            vec!["remote_chat"]
+        );
+        assert!(
+            remote
+                .agent_definitions(None, Some(&["draft".to_string()]))
+                .is_empty()
+        );
+
+        let mut resources = vec![resource(1, &["text"]), resource(2, &["image"])];
+        let selected = remote.select_tool_resources("remote_lookup", &mut resources);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|resource| resource._id)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert_eq!(resources[0]._id, 2);
+        assert!(
+            remote
+                .select_tool_resources("remote_missing", &mut resources)
+                .is_empty()
+        );
+
+        let mut resources = vec![resource(3, &["text"]), resource(4, &["md"])];
+        let selected = remote.select_agent_resources("remote_chat", &mut resources);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|resource| resource._id)
+                .collect::<Vec<_>>(),
+            vec![3]
+        );
+        assert_eq!(resources[0]._id, 4);
+        assert!(
+            remote
+                .select_agent_resources("remote_missing", &mut resources)
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_engine_register_reports_invalid_filters_and_handles() {
+        let card = EngineCard {
+            id: Principal::anonymous(),
+            info: AgentInfo {
+                handle: "remote".to_string(),
+                endpoint: "https://remote.example".to_string(),
+                ..Default::default()
+            },
+            agents: vec![function("chat")],
+            tools: vec![function("lookup")],
+        };
+
+        let mut remote = RemoteEngines::new();
+        let err = remote
+            .register(
+                MockHttp { card: card.clone() },
+                RemoteEngineArgs {
+                    endpoint: "https://remote.example".to_string(),
+                    agents: vec!["missing".to_string()],
+                    tools: Vec::new(),
+                    handle: Some("remote".to_string()),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("agent \"missing\" not found"));
+
+        let mut remote = RemoteEngines::new();
+        let err = remote
+            .register(
+                MockHttp { card: card.clone() },
+                RemoteEngineArgs {
+                    endpoint: "https://remote.example".to_string(),
+                    agents: Vec::new(),
+                    tools: vec!["missing".to_string()],
+                    handle: Some("remote".to_string()),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("tool \"missing\" not found"));
+
+        let mut remote = RemoteEngines::new();
+        let err = remote
+            .register(
+                MockHttp { card },
+                RemoteEngineArgs {
+                    endpoint: "https://remote.example".to_string(),
+                    agents: Vec::new(),
+                    tools: Vec::new(),
+                    handle: Some("Invalid Handle".to_string()),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("invalid engine handle"));
+    }
+
+    #[test]
+    fn remote_tool_and_agent_wrap_definitions_and_validate_names() {
+        let tool_function = tagged_function("lookup", "Lookup docs", &["text"]);
+        let default_tool = RemoteTool::new(
+            Principal::anonymous(),
+            "https://remote.example".to_string(),
+            tool_function.clone(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(default_tool.name(), "lookup");
+        assert_eq!(default_tool.definition().name, "lookup");
+
+        let tool = RemoteTool::new(
+            Principal::anonymous(),
+            "https://remote.example".to_string(),
+            tool_function.clone(),
+            Some("remote_lookup".to_string()),
+        )
+        .unwrap();
+        assert_eq!(tool.name(), "remote_lookup");
+        assert_eq!(tool.description(), "Lookup docs");
+        assert_eq!(tool.definition().name, "remote_lookup");
+        assert_eq!(tool.supported_resource_tags(), vec!["text"]);
+        assert!(
+            RemoteTool::new(
+                Principal::anonymous(),
+                "https://remote.example".to_string(),
+                tool_function,
+                Some("bad name".to_string()),
+            )
+            .is_err()
+        );
+
+        let agent_function = tagged_function("chat", "Chat remotely", &["md"]);
+        let default_agent = RemoteAgent::new(
+            Principal::anonymous(),
+            "https://remote.example".to_string(),
+            agent_function.clone(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(default_agent.name(), "chat");
+        assert_eq!(default_agent.definition().name, "chat");
+
+        let agent = RemoteAgent::new(
+            Principal::anonymous(),
+            "https://remote.example".to_string(),
+            agent_function.clone(),
+            Some("RemoteChat".to_string()),
+        )
+        .unwrap();
+        assert_eq!(agent.name(), "RemoteChat");
+        assert_eq!(agent.description(), "Chat remotely");
+        assert_eq!(agent.definition().name, "remotechat");
+        assert_eq!(agent.supported_resource_tags(), vec!["md"]);
+        assert!(
+            RemoteAgent::new(
+                Principal::anonymous(),
+                "https://remote.example".to_string(),
+                agent_function,
+                Some("bad name".to_string()),
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_wrappers_forward_calls_to_context_and_report_missing_endpoints() {
+        let ctx = crate::engine::EngineBuilder::new().mock_ctx();
+
+        let tool = RemoteTool::new(
+            Principal::anonymous(),
+            "https://remote.example".to_string(),
+            tagged_function("lookup", "Lookup docs", &["text"]),
+            Some("remote_lookup".to_string()),
+        )
+        .unwrap();
+        let err = Tool::<BaseCtx>::call(
+            &tool,
+            ctx.base.clone(),
+            json!({"query": "anda"}),
+            vec![resource(7, &["text"])],
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("remote engine endpoint"));
+
+        let agent = RemoteAgent::new(
+            Principal::anonymous(),
+            "https://remote.example".to_string(),
+            tagged_function("chat", "Chat remotely", &["md"]),
+            Some("RemoteChat".to_string()),
+        )
+        .unwrap();
+        let err =
+            Agent::<AgentCtx>::run(&agent, ctx, "hello".to_string(), vec![resource(8, &["md"])])
+                .await
+                .unwrap_err();
+        assert!(err.to_string().contains("remote engine endpoint"));
     }
 }

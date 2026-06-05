@@ -747,3 +747,206 @@ impl HttpFeatures for BaseCtx {
             .await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anda_core::{AgentOutput, ToolInput};
+    use bytes::Bytes;
+
+    use crate::store::{InMemory, Store};
+
+    fn test_ctx() -> BaseCtx {
+        BaseCtx::new(
+            Principal::self_authenticating([1; 32]),
+            "EngineName".to_string(),
+            "root_agent".to_string(),
+            CancellationToken::new(),
+            BTreeSet::from([Path::default()]),
+            Arc::new(Web3SDK::not_implemented()),
+            Store::new(Arc::new(InMemory::new())),
+            Arc::new(RemoteEngines::new()),
+        )
+    }
+
+    #[test]
+    fn base_ctx_state_child_meta_and_depth_behaviour() {
+        let ctx = test_ctx();
+        assert_eq!(ctx.engine_name(), "EngineName");
+        assert_eq!(ctx.agent, "root_agent");
+        assert_eq!(*ctx.engine_id(), Principal::self_authenticating([1; 32]));
+        assert_eq!(*ctx.caller(), Principal::anonymous());
+        assert!(ctx.meta().user.is_none());
+        assert!(!ctx.cancellation_token().is_cancelled());
+        assert!(ctx.time_elapsed() <= Duration::from_secs(60));
+
+        assert!(ctx.get_state::<String>().is_none());
+        assert!(ctx.set_state("root-state".to_string()).is_none());
+        assert_eq!(ctx.get_state::<String>().as_deref(), Some("root-state"));
+
+        let child = ctx.child("MiXeD/Path".to_string()).unwrap();
+        assert_eq!(child.path.as_ref(), "mixed/path");
+        assert_eq!(child.depth, 1);
+        assert_eq!(child.get_state::<String>().as_deref(), Some("root-state"));
+
+        let caller = Principal::self_authenticating([2; 32]);
+        let meta = RequestMeta {
+            user: Some("external-user".to_string()),
+            ..Default::default()
+        };
+        let child_with = ctx
+            .child_with(
+                caller,
+                "AgentName".to_string(),
+                "Tool/Path".to_string(),
+                meta.clone(),
+            )
+            .unwrap();
+        assert_eq!(child_with.caller, caller);
+        assert_eq!(child_with.agent, "AgentName");
+        assert_eq!(child_with.path.as_ref(), "tool/path");
+        assert_eq!(child_with.meta.user, meta.user);
+
+        let cloned = ctx.with_caller(caller);
+        assert_eq!(cloned.caller, caller);
+        assert_eq!(cloned.get_state::<String>().as_deref(), Some("root-state"));
+
+        let target = Principal::self_authenticating([3; 32]);
+        let self_meta = ctx.self_meta(target);
+        assert_eq!(self_meta.engine, Some(target));
+        assert_eq!(self_meta.user.as_deref(), Some("EngineName"));
+
+        let mut deep = ctx;
+        for _ in 0..41 {
+            deep = deep.child("next".to_string()).unwrap();
+        }
+        let Err(err) = deep.child("too_deep".to_string()) else {
+            panic!("expected depth limit error");
+        };
+        assert!(err.to_string().contains("depth"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn base_ctx_store_cache_and_remote_feature_forwarding() {
+        let ctx = test_ctx();
+        let file = Path::from("File.TXT");
+        let renamed = Path::from("Renamed.TXT");
+
+        ctx.store_put(&file, PutMode::Overwrite, Bytes::from_static(b"data"))
+            .await
+            .unwrap();
+        let (data, meta) = ctx.store_get(&file).await.unwrap();
+        assert_eq!(data, Bytes::from_static(b"data"));
+        assert_eq!(meta.location, Path::from("file.txt"));
+        assert_eq!(
+            ctx.store_list(None, &Path::default()).await.unwrap().len(),
+            1
+        );
+        ctx.store_rename_if_not_exists(&file, &renamed)
+            .await
+            .unwrap();
+        assert_eq!(
+            ctx.store_get(&renamed).await.unwrap().0,
+            Bytes::from_static(b"data")
+        );
+        ctx.store_delete(&renamed).await.unwrap();
+        assert!(ctx.store_get(&renamed).await.is_err());
+
+        assert!(!ctx.cache_contains("a"));
+        ctx.cache_set("a", (1_u32, None)).await;
+        assert!(ctx.cache_contains("a"));
+        assert_eq!(ctx.cache_get::<u32>("a").await.unwrap(), 1);
+        assert_eq!(
+            ctx.cache_get_with("a", async { Ok((99_u32, None)) })
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            ctx.cache_get_with("b", async { Ok((2_u32, None)) })
+                .await
+                .unwrap(),
+            2
+        );
+        assert!(!ctx.cache_set_if_not_exists("b", (3_u32, None)).await);
+        assert!(ctx.cache_set_if_not_exists("c", (4_u32, None)).await);
+        assert!(ctx.cache_raw_iter().count() >= 3);
+        assert!(ctx.cache_delete("c").await);
+        assert!(!ctx.cache_delete("c").await);
+
+        assert!(
+            ctx.remote_tool_call(
+                "https://missing.example",
+                ToolInput::new("x".to_string(), Json::Null)
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("not found")
+        );
+
+        assert!(ctx.a256gcm_key(Vec::new()).await.is_err());
+        assert!(ctx.ed25519_sign_message(Vec::new(), b"m").await.is_err());
+        assert!(
+            ctx.ed25519_verify(Vec::new(), b"m", &[0; 64])
+                .await
+                .is_err()
+        );
+        assert!(ctx.ed25519_public_key(Vec::new()).await.is_err());
+        assert!(
+            ctx.secp256k1_sign_message_bip340(Vec::new(), b"m")
+                .await
+                .is_err()
+        );
+        assert!(
+            ctx.secp256k1_verify_bip340(Vec::new(), b"m", &[0; 64])
+                .await
+                .is_err()
+        );
+        assert!(
+            ctx.secp256k1_sign_message_ecdsa(Vec::new(), b"m")
+                .await
+                .is_err()
+        );
+        assert!(
+            ctx.secp256k1_sign_digest_ecdsa(Vec::new(), &[0; 32])
+                .await
+                .is_err()
+        );
+        assert!(
+            ctx.secp256k1_verify_ecdsa(Vec::new(), &[0; 32], &[0; 64])
+                .await
+                .is_err()
+        );
+        assert!(ctx.secp256k1_public_key(Vec::new()).await.is_err());
+
+        let query: Result<String, BoxError> = ctx
+            .canister_query(&Principal::anonymous(), "query", ())
+            .await;
+        assert!(query.is_err());
+        let update: Result<String, BoxError> = ctx
+            .canister_update(&Principal::anonymous(), "update", ())
+            .await;
+        assert!(update.is_err());
+        assert!(
+            ctx.https_call("https://example.test", http::Method::GET, None, None)
+                .await
+                .is_err()
+        );
+        assert!(
+            ctx.https_signed_call(
+                "https://example.test",
+                http::Method::POST,
+                [0; 32],
+                None,
+                None,
+            )
+            .await
+            .is_err()
+        );
+        let rpc: Result<AgentOutput, BoxError> = ctx
+            .https_signed_rpc("https://example.test/rpc", "agent_run", &())
+            .await;
+        assert!(rpc.is_err());
+    }
+}

@@ -590,6 +590,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anda_core::FunctionDefinition;
 
     #[derive(Clone)]
     struct TestCompleter {
@@ -608,6 +609,20 @@ mod tests {
 
     fn test_model(name: &'static str) -> Model {
         Model::new(Arc::new(TestCompleter { name }))
+    }
+
+    fn http_client() -> reqwest::Client {
+        reqwest::Client::builder().no_proxy().build().unwrap()
+    }
+
+    fn model_config(family: &str, model: &str) -> ModelConfig {
+        ModelConfig {
+            family: family.to_string(),
+            model: model.to_string(),
+            api_base: "https://example.com".to_string(),
+            api_key: "test-key".to_string(),
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -726,5 +741,206 @@ mod tests {
                 .model_name(),
             "primary"
         );
+    }
+
+    #[test]
+    fn model_config_validates_required_fields_and_builds_supported_families() {
+        let client = http_client();
+
+        let mut config = model_config("openai", "gpt-5");
+        config.disabled = true;
+        let Err(err) = config.model(client.clone()) else {
+            panic!("disabled model should fail");
+        };
+        assert!(err.to_string().contains("disabled"));
+
+        for (field, config) in [
+            (
+                "model name",
+                ModelConfig {
+                    model: String::new(),
+                    ..model_config("openai", "gpt-5")
+                },
+            ),
+            (
+                "model family",
+                ModelConfig {
+                    family: String::new(),
+                    ..model_config("openai", "gpt-5")
+                },
+            ),
+            (
+                "api_base",
+                ModelConfig {
+                    api_base: String::new(),
+                    ..model_config("openai", "gpt-5")
+                },
+            ),
+            (
+                "api_key",
+                ModelConfig {
+                    api_key: String::new(),
+                    ..model_config("openai", "gpt-5")
+                },
+            ),
+        ] {
+            let Err(err) = config.model(client.clone()) else {
+                panic!("{field} should fail");
+            };
+            let err = err.to_string();
+            assert!(err.contains(field), "{field}: {err}");
+        }
+
+        let Err(err) = model_config("unknown", "m").model(client.clone()) else {
+            panic!("unsupported family should fail");
+        };
+        assert!(err.to_string().contains("unsupported model family"));
+
+        let mut gemini = model_config("gemini", "gemini-2.5-pro");
+        gemini.context_window = 123;
+        gemini.max_output = 45;
+        let model = gemini.model(client.clone()).unwrap();
+        assert_eq!(model.model_name(), "gemini-2.5-pro");
+        assert_eq!(model.labels, vec!["gemini-2.5-pro"]);
+        assert_eq!(model.context_window, 123);
+        assert_eq!(model.max_output, 45);
+
+        let mut anthropic = model_config("anthropic", "claude-sonnet-4-5");
+        anthropic.labels = vec!["pro".to_string(), "primary".to_string()];
+        anthropic.bearer_auth = true;
+        anthropic.stream = true;
+        anthropic.effort = Some(ModelEffort::High);
+        let model = anthropic.model(client.clone()).unwrap();
+        assert_eq!(model.model_name(), "claude-sonnet-4-5");
+        assert_eq!(model.labels, vec!["pro", "primary"]);
+
+        let model = model_config("openai", "gpt-5")
+            .model(client.clone())
+            .unwrap();
+        assert_eq!(model.model_name(), "gpt-5");
+        let model = model_config("openai", "deepseek-chat")
+            .model(client)
+            .unwrap();
+        assert_eq!(model.model_name(), "deepseek-chat");
+    }
+
+    #[test]
+    fn models_registry_clones_names_replaces_labels_and_loads_configs() {
+        let models = Models::default();
+        models.set_model(test_model("flash-v1").with_labels(vec!["FAST".into()]));
+        assert!(models.contains("fast"));
+        assert_eq!(
+            models.model_names(),
+            BTreeSet::from(["flash-v1".to_string()])
+        );
+
+        models.set("flash".to_string(), test_model("flash-v2"));
+        assert!(models.contains("flash"));
+        assert_eq!(models.get("FLASH").unwrap().model_name(), "flash-v2");
+        assert_eq!(
+            models.model_names(),
+            BTreeSet::from(["flash-v1".to_string(), "flash-v2".to_string()])
+        );
+
+        models.set("primary".to_string(), test_model("primary-v2"));
+        assert_eq!(models.get_model().unwrap().model_name(), "primary-v2");
+
+        let cloned = Models::from_clone(&models);
+        assert_eq!(cloned.get("primary").unwrap().model_name(), "primary-v2");
+        assert_eq!(
+            cloned.resolve("missing").unwrap().model_name(),
+            "primary-v2"
+        );
+
+        let configs = vec![
+            ModelConfig {
+                labels: vec!["primary".to_string()],
+                ..model_config("openai", "gpt-5")
+            },
+            ModelConfig {
+                disabled: true,
+                ..model_config("openai", "disabled")
+            },
+        ];
+        let loaded = Models::from_configs(&configs, http_client());
+        assert!(loaded.contains("primary"));
+        assert!(!loaded.contains("disabled"));
+        assert_eq!(loaded.get_model().unwrap().model_name(), "gpt-5");
+    }
+
+    #[tokio::test]
+    async fn model_completion_placeholders_and_mock_tool_calls_are_stable() {
+        let not_implemented = Model::not_implemented();
+        assert_eq!(not_implemented.model_name(), "not_implemented");
+        let err = not_implemented
+            .completion(CompletionRequest::default())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not implemented"));
+
+        let mock = Model::mock_implemented().with_labels(vec!["mock".into()]);
+        assert_eq!(mock.model_name(), "not_implemented");
+        let output = mock
+            .completion(CompletionRequest {
+                prompt: "{\"q\":\"anda\"}".to_string(),
+                tools: vec![FunctionDefinition {
+                    name: "lookup".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.content, "{\"q\":\"anda\"}");
+        assert_eq!(output.tool_calls.len(), 1);
+        assert_eq!(output.tool_calls[0].name, "lookup");
+        assert_eq!(output.tool_calls[0].args["q"], "anda");
+
+        let output = mock
+            .completion(CompletionRequest {
+                prompt: String::new(),
+                tools: vec![FunctionDefinition {
+                    name: "lookup".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(output.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn request_client_builder_and_sse_line_parser_cover_success_and_error_paths() {
+        let _client = request_client_builder().no_proxy().build().unwrap();
+        assert!(AnyHost == "anything");
+
+        let mut data = String::new();
+        let mut events = Vec::<serde_json::Value>::new();
+
+        handle_sse_line(b": keep-alive", &mut data, &mut events, "test-model").unwrap();
+        handle_sse_line(b"event: ignored", &mut data, &mut events, "test-model").unwrap();
+        handle_sse_line(b"data: {\"a\":", &mut data, &mut events, "test-model").unwrap();
+        handle_sse_line(b"data: 1}", &mut data, &mut events, "test-model").unwrap();
+        handle_sse_line(b"", &mut data, &mut events, "test-model").unwrap();
+        assert_eq!(events, vec![serde_json::json!({"a": 1})]);
+
+        handle_sse_line(b"data: [DONE]", &mut data, &mut events, "test-model").unwrap();
+        handle_sse_line(b"", &mut data, &mut events, "test-model").unwrap();
+        assert!(data.is_empty());
+        assert_eq!(events.len(), 1);
+
+        let err = handle_sse_line(b"data: \xff", &mut data, &mut events, "test-model").unwrap_err();
+        assert!(err.to_string().contains("Invalid UTF-8"));
+
+        data.clear();
+        data.push_str("{bad json");
+        let err =
+            flush_sse_data::<serde_json::Value>(&mut data, &mut events, "test-model").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Invalid streaming completion event")
+        );
+        assert!(err.to_string().contains("{bad json"));
     }
 }

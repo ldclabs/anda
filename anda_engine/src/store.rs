@@ -252,3 +252,110 @@ impl Store {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn vector_store_delegates_to_implemented_and_placeholder_backends() {
+        let implemented = VectorStore::new(Arc::new(MockImplemented));
+        assert!(
+            implemented
+                .top_n(Path::from("ns"), "query".to_string(), 3)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            implemented
+                .top_n_ids(Path::from("ns"), "query".to_string(), 3)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let missing = VectorStore::not_implemented();
+        assert!(
+            missing
+                .top_n(Path::from("ns"), "query".to_string(), 3)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("not implemented")
+        );
+        assert!(
+            missing
+                .top_n_ids(Path::from("ns"), "query".to_string(), 3)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("not implemented")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn store_applies_namespace_to_crud_list_and_rename_operations() {
+        let store = Store::new(Arc::new(InMemory::new()));
+        let namespace = Path::from("agent/root");
+        let docs = Path::from("docs");
+        let first = Path::from("docs/first.txt");
+        let second = Path::from("docs/second.txt");
+        let renamed = Path::from("docs/renamed.txt");
+
+        store
+            .store_put(
+                &namespace,
+                &first,
+                PutMode::Overwrite,
+                Bytes::from_static(b"first"),
+            )
+            .await
+            .unwrap();
+        store
+            .store_put(
+                &namespace,
+                &second,
+                PutMode::Overwrite,
+                Bytes::from_static(b"second"),
+            )
+            .await
+            .unwrap();
+
+        let (data, meta) = store.store_get(&namespace, &first).await.unwrap();
+        assert_eq!(data, Bytes::from_static(b"first"));
+        assert_eq!(meta.location, Path::from("agent/root/docs/first.txt"));
+
+        let listed = store
+            .store_list(&namespace, Some(&docs), &Path::default())
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(
+            listed
+                .iter()
+                .all(|meta| meta.location.as_ref().starts_with("agent/root/docs/"))
+        );
+
+        let listed_after_offset = store
+            .store_list(&namespace, Some(&docs), &first)
+            .await
+            .unwrap();
+        assert_eq!(listed_after_offset.len(), 1);
+        assert_eq!(
+            listed_after_offset[0].location,
+            Path::from("agent/root/docs/second.txt")
+        );
+
+        store
+            .store_rename_if_not_exists(&namespace, &second, &renamed)
+            .await
+            .unwrap();
+        let (data, _) = store.store_get(&namespace, &renamed).await.unwrap();
+        assert_eq!(data, Bytes::from_static(b"second"));
+
+        store.store_delete(&namespace, &renamed).await.unwrap();
+        assert!(store.store_get(&namespace, &renamed).await.is_err());
+    }
+}

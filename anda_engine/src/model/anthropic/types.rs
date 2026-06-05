@@ -1947,6 +1947,231 @@ mod tests {
     }
 
     #[test]
+    fn converts_remaining_content_part_and_content_block_edges() {
+        let text = ContentBlock::text("helper text");
+        assert!(matches!(
+            text,
+            ContentBlock::Text { text, .. } if text == "helper text"
+        ));
+
+        let url_image = ContentBlock::image("url", "image/png", "https://example.com/pic.png");
+        assert!(matches!(
+            url_image,
+            ContentBlock::Image {
+                source: ImageSource::Url { url },
+                ..
+            } if url == "https://example.com/pic.png"
+        ));
+
+        let base64_image = ContentBlock::image("base64", "image/jpeg", "abcd");
+        assert!(matches!(
+            base64_image,
+            ContentBlock::Image {
+                source: ImageSource::Base64 { media_type, data },
+                ..
+            } if media_type == "image/jpeg" && data == "abcd"
+        ));
+
+        let doc_url_block: ContentBlock = ContentPart::FileData {
+            file_uri: "https://example.com/report.pdf".to_string(),
+            mime_type: Some("application/pdf".to_string()),
+        }
+        .into();
+        assert!(matches!(
+            doc_url_block,
+            ContentBlock::Document {
+                source: DocumentSource::Url { url },
+                ..
+            } if url == "https://example.com/report.pdf"
+        ));
+
+        let text_doc_block: ContentBlock = ContentPart::InlineData {
+            mime_type: "text/plain".to_string(),
+            data: ByteBufB64(b"plain document".to_vec()),
+        }
+        .into();
+        assert!(matches!(
+            text_doc_block,
+            ContentBlock::Document {
+                source: DocumentSource::Text { media_type, data },
+                ..
+            } if media_type == "text/plain" && data == "plain document"
+        ));
+
+        let binary_doc_block: ContentBlock = ContentPart::InlineData {
+            mime_type: "application/octet-stream".to_string(),
+            data: ByteBufB64(vec![0xff, 0xfe]),
+        }
+        .into();
+        assert!(matches!(
+            binary_doc_block,
+            ContentBlock::Document {
+                source: DocumentSource::Base64 { media_type, data },
+                ..
+            } if media_type == "application/octet-stream"
+                && data == ByteBufB64(vec![0xff, 0xfe]).to_base64()
+        ));
+
+        let tool_call_block: ContentBlock = ContentPart::ToolCall {
+            name: "lookup".to_string(),
+            args: json!({"query": "anda"}),
+            call_id: None,
+        }
+        .into();
+        assert!(matches!(
+            tool_call_block,
+            ContentBlock::ToolUse { id, name, input, .. }
+                if id.is_empty() && name == "lookup" && input == json!({"query": "anda"})
+        ));
+
+        let text_tool_result: ContentBlock = ContentPart::ToolOutput {
+            name: "lookup".to_string(),
+            output: json!("ok"),
+            is_error: Some(false),
+            call_id: None,
+            remote_id: None,
+        }
+        .into();
+        assert!(matches!(
+            text_tool_result,
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content: Some(ToolResultContent::Text(content)),
+                is_error: Some(false),
+                ..
+            } if tool_use_id.is_empty() && content == "ok"
+        ));
+
+        let json_tool_result: ContentBlock = ContentPart::ToolOutput {
+            name: "lookup".to_string(),
+            output: json!({"ok": true}),
+            is_error: None,
+            call_id: Some("toolu_2".to_string()),
+            remote_id: None,
+        }
+        .into();
+        assert!(matches!(
+            json_tool_result,
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content: Some(ToolResultContent::Text(content)),
+                is_error: None,
+                ..
+            } if tool_use_id == "toolu_2" && content == "{\"ok\":true}"
+        ));
+
+        let action_block: ContentBlock = ContentPart::Action {
+            name: "handoff".to_string(),
+            payload: json!({"to": "worker"}),
+            recipients: None,
+            signature: None,
+        }
+        .into();
+        assert!(matches!(action_block, ContentBlock::Text { .. }));
+
+        let valid_doc_block = ContentBlock::Document {
+            source: DocumentSource::Base64 {
+                media_type: "application/pdf".to_string(),
+                data: ByteBufB64(b"pdf".to_vec()).to_base64(),
+            },
+            cache_control: None,
+            citations: None,
+            context: None,
+            title: None,
+        };
+        assert!(matches!(
+            ContentPart::from(valid_doc_block),
+            ContentPart::InlineData { mime_type, data }
+                if mime_type == "application/pdf" && data == ByteBufB64(b"pdf".to_vec())
+        ));
+
+        assert!(matches!(
+            ContentPart::from(ContentBlock::Document {
+                source: DocumentSource::Text {
+                    media_type: "text/plain".to_string(),
+                    data: "doc text".to_string(),
+                },
+                cache_control: None,
+                citations: None,
+                context: None,
+                title: None,
+            }),
+            ContentPart::Text { text } if text == "doc text"
+        ));
+
+        assert!(matches!(
+            ContentPart::from(ContentBlock::Document {
+                source: DocumentSource::Content {
+                    content: DocumentSourceContent::Text("doc text".to_string())
+                },
+                cache_control: None,
+                citations: None,
+                context: None,
+                title: None,
+            }),
+            ContentPart::Any(value)
+                if value["source"]["type"] == "content"
+                    && value["source"]["content"] == "doc text"
+        ));
+
+        assert!(matches!(
+            ContentPart::from(ContentBlock::ToolUse {
+                id: String::new(),
+                name: "lookup".to_string(),
+                input: json!({}),
+                cache_control: None,
+                caller: None,
+            }),
+            ContentPart::ToolCall { call_id: None, .. }
+        ));
+
+        assert!(matches!(
+            ContentPart::from(ContentBlock::ToolResult {
+                tool_use_id: String::new(),
+                content: Some(ToolResultContent::Text("ok".to_string())),
+                cache_control: None,
+                is_error: Some(false),
+            }),
+            ContentPart::ToolOutput {
+                output: Value::String(output),
+                call_id: None,
+                is_error: Some(false),
+                ..
+            } if output == "ok"
+        ));
+
+        assert!(matches!(
+            ContentPart::from(ContentBlock::ToolResult {
+                tool_use_id: "toolu_3".to_string(),
+                content: None,
+                cache_control: None,
+                is_error: None,
+            }),
+            ContentPart::ToolOutput {
+                output: Value::Null,
+                call_id: Some(call_id),
+                ..
+            } if call_id == "toolu_3"
+        ));
+
+        for block in [
+            ContentBlock::SearchResult {
+                content: vec![ContentBlock::text("hit")],
+                source: "local".to_string(),
+                title: "Hit".to_string(),
+                cache_control: None,
+                citations: None,
+            },
+            ContentBlock::RedactedThinking {
+                data: "cipher".to_string(),
+            },
+            ContentBlock::Any(json!({"type": "future"})),
+        ] {
+            assert!(matches!(ContentPart::from(block), ContentPart::Any(_)));
+        }
+    }
+
+    #[test]
     fn converts_non_remote_file_data_to_text_block() {
         let file_part = ContentPart::FileData {
             file_uri: "file:///tmp/report.pdf".to_string(),
@@ -2324,5 +2549,433 @@ mod tests {
                 ..
             } if call_id == "toolu_1" && values[0]["type"] == "text"
         ));
+    }
+
+    #[test]
+    fn deserializes_extended_content_block_variants_and_converts_to_any_parts() {
+        let blocks: Vec<ContentBlock> = serde_json::from_value(json!([
+            {
+                "type": "image",
+                "source": {"type": "url", "url": "https://example.com/image.png"},
+                "cache_control": {"type": "ephemeral", "ttl": "5m"}
+            },
+            {
+                "type": "document",
+                "source": {"type": "content", "content": [{"type": "text", "text": "doc"}]},
+                "citations": {"enabled": true},
+                "context": "ctx",
+                "title": "Doc"
+            },
+            {
+                "type": "search_result",
+                "content": [{"type": "text", "text": "hit"}],
+                "source": "local",
+                "title": "Hit",
+                "citations": {"enabled": false}
+            },
+            {"type": "redacted_thinking", "data": "cipher"},
+            {
+                "type": "web_search_tool_result",
+                "tool_use_id": "srv_1",
+                "content": [{
+                    "type": "web_search_result",
+                    "encrypted_content": "enc",
+                    "title": "Example",
+                    "url": "https://example.com",
+                    "page_age": "1d"
+                }],
+                "caller": {"type": "code_execution_20250825", "tool_id": "code_1"}
+            },
+            {
+                "type": "web_search_tool_result",
+                "tool_use_id": "srv_2",
+                "content": {"type": "error", "error_code": "rate_limited"}
+            },
+            {
+                "type": "web_fetch_tool_result",
+                "tool_use_id": "fetch_1",
+                "content": {
+                    "type": "web_fetch_result",
+                    "content": {"type": "text", "text": "page"},
+                    "url": "https://example.com",
+                    "retrieved_at": "2026-05-16T00:00:00Z"
+                },
+                "caller": {"type": "code_execution_20260120", "tool_id": "code_2"}
+            },
+            {
+                "type": "web_fetch_tool_result",
+                "tool_use_id": "fetch_2",
+                "content": {"type": "error", "error_code": "not_found"}
+            },
+            {"type": "code_execution_tool_result", "tool_use_id": "code_1", "content": {"stdout": "ok"}},
+            {"type": "bash_code_execution_tool_result", "tool_use_id": "bash_1", "content": {"exit_code": 0}},
+            {"type": "text_editor_code_execution_tool_result", "tool_use_id": "edit_1", "content": {"diff": "@@"}},
+            {"type": "tool_search_tool_result", "tool_use_id": "search_1", "content": {"tools": []}},
+            {"type": "container_upload", "file_id": "file_1"}
+        ]))
+        .unwrap();
+
+        assert!(matches!(blocks[0], ContentBlock::Image { .. }));
+        assert!(matches!(blocks[1], ContentBlock::Document { .. }));
+        assert!(matches!(blocks[2], ContentBlock::SearchResult { .. }));
+        assert!(matches!(blocks[3], ContentBlock::RedactedThinking { .. }));
+        assert!(matches!(
+            &blocks[4],
+            ContentBlock::WebSearchToolResult {
+                content: WebSearchToolResultContent::Results(results),
+                caller: Some(ToolCaller::CodeExecution20250825 { .. }),
+                ..
+            } if results.len() == 1
+        ));
+        assert!(matches!(
+            &blocks[5],
+            ContentBlock::WebSearchToolResult {
+                content: WebSearchToolResultContent::Error(error),
+                ..
+            } if error.error_code == "rate_limited"
+        ));
+        assert!(matches!(
+            &blocks[6],
+            ContentBlock::WebFetchToolResult {
+                content: WebFetchToolResultContent::Result(result),
+                caller: Some(ToolCaller::CodeExecution20260120 { .. }),
+                ..
+            } if result.url == "https://example.com"
+        ));
+        assert!(matches!(
+            &blocks[7],
+            ContentBlock::WebFetchToolResult {
+                content: WebFetchToolResultContent::Error(error),
+                ..
+            } if error.error_code == "not_found"
+        ));
+        assert!(matches!(
+            blocks[8],
+            ContentBlock::CodeExecutionToolResult { .. }
+        ));
+        assert!(matches!(
+            blocks[9],
+            ContentBlock::BashCodeExecutionToolResult { .. }
+        ));
+        assert!(matches!(
+            blocks[10],
+            ContentBlock::TextEditorCodeExecutionToolResult { .. }
+        ));
+        assert!(matches!(
+            blocks[11],
+            ContentBlock::ToolSearchToolResult { .. }
+        ));
+        assert!(matches!(blocks[12], ContentBlock::ContainerUpload { .. }));
+
+        for block in blocks.into_iter().skip(1) {
+            let part: ContentPart = block.into();
+            assert!(matches!(part, ContentPart::Any(_)));
+        }
+    }
+
+    #[test]
+    fn deserializes_content_block_delta_variants_and_fallbacks() {
+        let delta: ContentBlockDelta =
+            serde_json::from_value(json!({"type": "text_delta"})).unwrap();
+        assert!(matches!(delta, ContentBlockDelta::TextDelta { text } if text.is_empty()));
+
+        let delta: ContentBlockDelta =
+            serde_json::from_value(json!({"type": "input_json_delta", "partial_json": "{\"a\""}))
+                .unwrap();
+        assert!(matches!(
+            delta,
+            ContentBlockDelta::InputJsonDelta { partial_json } if partial_json == "{\"a\""
+        ));
+
+        let delta: ContentBlockDelta =
+            serde_json::from_value(json!({"type": "thinking_delta", "thinking": "plan"})).unwrap();
+        assert!(matches!(
+            delta,
+            ContentBlockDelta::ThinkingDelta { thinking } if thinking == "plan"
+        ));
+
+        let delta: ContentBlockDelta =
+            serde_json::from_value(json!({"type": "signature_delta", "signature": "sig"})).unwrap();
+        assert!(matches!(
+            delta,
+            ContentBlockDelta::SignatureDelta { signature } if signature == "sig"
+        ));
+
+        let delta: ContentBlockDelta = serde_json::from_value(json!({
+            "type": "citations_delta",
+            "citation": {
+                "type": "web_search_result_location",
+                "cited_text": "quote",
+                "encrypted_index": "enc",
+                "title": "Title",
+                "url": "https://example.com"
+            }
+        }))
+        .unwrap();
+        assert!(matches!(
+            delta,
+            ContentBlockDelta::CitationsDelta {
+                citation: TextCitation::WebSearchResultLocation { .. }
+            }
+        ));
+
+        let malformed: ContentBlockDelta =
+            serde_json::from_value(json!({"type": "citations_delta"})).unwrap();
+        assert!(matches!(malformed, ContentBlockDelta::Any(_)));
+
+        let unknown: ContentBlockDelta =
+            serde_json::from_value(json!({"type": "future_delta", "value": 1})).unwrap();
+        assert!(matches!(unknown, ContentBlockDelta::Any(_)));
+
+        let scalar: ContentBlockDelta = serde_json::from_value(json!(42)).unwrap();
+        assert!(matches!(scalar, ContentBlockDelta::Any(_)));
+    }
+
+    #[test]
+    fn deserializes_stream_events_and_content_block_collection_fallbacks() {
+        let response: CreateMessageResponse = serde_json::from_value(json!({
+            "id": "msg_null",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-opus-4-6",
+            "content": null,
+            "stop_reason": "refusal",
+            "stop_sequence": null,
+            "usage": {}
+        }))
+        .unwrap();
+        assert!(response.content.is_empty());
+
+        let response: CreateMessageResponse = serde_json::from_value(json!({
+            "id": "msg_scalar",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-opus-4-6",
+            "content": {"provider": "raw"},
+            "stop_reason": "end_turn",
+            "stop_sequence": null,
+            "usage": {}
+        }))
+        .unwrap();
+        assert!(matches!(
+            response.content.as_slice(),
+            [ContentBlock::Any(_)]
+        ));
+
+        let event: StreamEvent = serde_json::from_value(json!({
+            "type": "message_start",
+            "message": {
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "content": "hello",
+                "model": "claude-opus-4-6",
+                "stop_reason": null,
+                "stop_sequence": null,
+                "usage": {"input_tokens": 1}
+            }
+        }))
+        .unwrap();
+        assert!(matches!(
+            event,
+            StreamEvent::MessageStart {
+                message: MessageStartContent { .. }
+            }
+        ));
+
+        let event: StreamEvent = serde_json::from_value(json!({
+            "type": "content_block_start",
+            "content_block": {"type": "text", "text": "hi"}
+        }))
+        .unwrap();
+        assert!(matches!(
+            event,
+            StreamEvent::ContentBlockStart {
+                index: 0,
+                content_block: ContentBlock::Text { .. }
+            }
+        ));
+
+        let event: StreamEvent = serde_json::from_value(json!({
+            "type": "content_block_delta",
+            "index": 2,
+            "delta": {"type": "text_delta", "text": "!"}
+        }))
+        .unwrap();
+        assert!(matches!(
+            event,
+            StreamEvent::ContentBlockDelta {
+                index: 2,
+                delta: ContentBlockDelta::TextDelta { .. }
+            }
+        ));
+
+        let event: StreamEvent =
+            serde_json::from_value(json!({"type": "content_block_stop"})).unwrap();
+        assert!(matches!(event, StreamEvent::ContentBlockStop { index: 0 }));
+
+        let event: StreamEvent = serde_json::from_value(json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": "max_tokens", "stop_sequence": null},
+            "usage": {"output_tokens": 5}
+        }))
+        .unwrap();
+        assert!(matches!(
+            event,
+            StreamEvent::MessageDelta {
+                delta: MessageDeltaContent {
+                    stop_reason: Some(StopReason::MaxTokens),
+                    ..
+                },
+                usage: Some(_)
+            }
+        ));
+
+        assert!(matches!(
+            serde_json::from_value::<StreamEvent>(json!({"type": "message_stop"})).unwrap(),
+            StreamEvent::MessageStop
+        ));
+        assert!(matches!(
+            serde_json::from_value::<StreamEvent>(json!({"type": "ping"})).unwrap(),
+            StreamEvent::Ping
+        ));
+        assert!(matches!(
+            serde_json::from_value::<StreamEvent>(json!({
+                "type": "error",
+                "error": {"type": "overloaded_error", "message": "try later"}
+            }))
+            .unwrap(),
+            StreamEvent::Error { .. }
+        ));
+
+        let malformed: StreamEvent =
+            serde_json::from_value(json!({"type": "message_start"})).unwrap();
+        assert!(matches!(malformed, StreamEvent::Any(_)));
+
+        let unknown: StreamEvent =
+            serde_json::from_value(json!({"type": "future_event", "value": true})).unwrap();
+        assert!(matches!(unknown, StreamEvent::Any(_)));
+
+        let scalar: StreamEvent = serde_json::from_value(json!("event")).unwrap();
+        assert!(matches!(scalar, StreamEvent::Any(_)));
+    }
+
+    #[test]
+    fn serializes_stop_usage_tool_choice_and_request_option_variants() {
+        let stop_reasons = [
+            ("end_turn", StopReason::EndTurn),
+            ("stop", StopReason::EndTurn),
+            ("max_tokens", StopReason::MaxTokens),
+            ("length", StopReason::MaxTokens),
+            ("stop_sequence", StopReason::StopSequence),
+            ("tool_use", StopReason::ToolUse),
+            ("tool_calls", StopReason::ToolUse),
+            ("pause_turn", StopReason::PauseTurn),
+            ("refusal", StopReason::Refusal),
+            ("custom", StopReason::Other("custom".into())),
+        ];
+        for (raw, expected) in stop_reasons {
+            let reason: StopReason = serde_json::from_value(json!(raw)).unwrap();
+            assert_eq!(reason, expected);
+        }
+        assert_eq!(
+            serde_json::to_value(StopReason::Other("custom".into())).unwrap(),
+            json!("custom")
+        );
+        for (reason, raw) in [
+            (StopReason::EndTurn, "end_turn"),
+            (StopReason::MaxTokens, "max_tokens"),
+            (StopReason::StopSequence, "stop_sequence"),
+            (StopReason::ToolUse, "tool_use"),
+            (StopReason::PauseTurn, "pause_turn"),
+            (StopReason::Refusal, "refusal"),
+        ] {
+            assert_eq!(serde_json::to_value(reason).unwrap(), json!(raw));
+        }
+
+        let service_tiers = [
+            ("standard", UsageServiceTier::Standard),
+            ("priority", UsageServiceTier::Priority),
+            ("batch", UsageServiceTier::Batch),
+            ("default", UsageServiceTier::Other("default".into())),
+        ];
+        for (raw, expected) in service_tiers {
+            let tier: UsageServiceTier = serde_json::from_value(json!(raw)).unwrap();
+            assert_eq!(tier, expected);
+            assert_eq!(serde_json::to_value(tier).unwrap(), json!(raw));
+        }
+
+        assert_eq!(
+            serde_json::to_value(ToolChoice::auto()).unwrap()["type"],
+            "auto"
+        );
+        assert_eq!(
+            serde_json::to_value(ToolChoice::any()).unwrap()["type"],
+            "any"
+        );
+        assert_eq!(
+            serde_json::to_value(ToolChoice::tool("lookup")).unwrap()["name"],
+            "lookup"
+        );
+        assert_eq!(
+            serde_json::to_value(ToolChoice::None).unwrap()["type"],
+            "none"
+        );
+
+        let req = CreateMessageParams {
+            max_tokens: 128,
+            messages: vec![serde_json::to_value(Message::new_text(Role::User, "hi")).unwrap()],
+            model: "claude-opus-4-6".into(),
+            system: Some(SystemPrompt::from("system")),
+            cache_control: Some(CacheControlEphemeral {
+                r#type: CacheControlType::Ephemeral,
+                ttl: Some(CacheControlTtl::OneHour),
+            }),
+            container: Some("container_1".into()),
+            inference_geo: Some("us".into()),
+            service_tier: Some(RequestServiceTier::StandardOnly),
+            temperature: Some(0.2),
+            stop_sequences: Some(vec!["END".into()]),
+            stream: Some(false),
+            top_k: Some(20),
+            top_p: Some(0.9),
+            tools: Some(vec![Tool {
+                name: "web_search".into(),
+                description: Some("Search".into()),
+                input_schema: None,
+                r#type: Some("web_search_20250305".into()),
+                allowed_callers: Some(vec!["direct".into()]),
+                cache_control: None,
+                defer_loading: Some(true),
+                eager_input_streaming: Some(false),
+                input_examples: Some(vec![json!({"query": "anda"})]),
+                strict: Some(true),
+            }]),
+            tool_choice: Some(ToolChoice::any()),
+            thinking: Some(Thinking {
+                budget_tokens: 1024,
+                r#type: ThinkingType::Enabled,
+                display: Some(ThinkingDisplay::Summarized),
+            }),
+            metadata: Some(Metadata {
+                user_id: Some("user_1".into()),
+                fields: [("tenant".into(), "test".into())].into(),
+            }),
+            output_config: Some(OutputConfig {
+                effort: Some(OutputEffort::Low),
+                format: Some(JsonOutputFormat {
+                    schema: json!({"type": "object"}),
+                    r#type: JsonOutputFormatType::JsonSchema,
+                }),
+            }),
+        };
+
+        let value = serde_json::to_value(req).unwrap();
+        assert_eq!(value["system"], "system");
+        assert_eq!(value["cache_control"]["ttl"], "1h");
+        assert_eq!(value["service_tier"], "standard_only");
+        assert_eq!(value["metadata"]["user_id"], "user_1");
+        assert_eq!(value["tools"][0]["type"], "web_search_20250305");
+        assert_eq!(value["thinking"]["budget_tokens"], 1024);
     }
 }

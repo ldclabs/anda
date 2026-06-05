@@ -831,4 +831,165 @@ mod tests {
         assert_eq!(cached_version.version, version.version);
         assert_eq!(ctx.store_gets.load(Ordering::SeqCst), 0);
     }
+
+    #[test]
+    fn cache_store_init_loads_existing_value_and_skips_initializer() {
+        let ctx = TestCacheStore::default();
+        let stored_version = UpdateVersion {
+            e_tag: Some("etag-existing".to_string()),
+            version: Some("7".to_string()),
+        };
+        let data = deterministic_cbor_into_vec(&"stored".to_string()).unwrap();
+        ctx.put_serialized("message", data, stored_version.clone());
+
+        block_on(ctx.cache_store_init("message", async {
+            Err::<String, BoxError>("initializer should not run".into())
+        }))
+        .unwrap();
+
+        let (value, version) = block_on(ctx.cache_store_get::<String>("message")).unwrap();
+        assert_eq!(value, "stored");
+        assert_eq!(version.e_tag, stored_version.e_tag);
+        assert_eq!(version.version, stored_version.version);
+        assert_eq!(ctx.store_gets.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn cache_store_init_creates_missing_value_and_delete_clears_layers() {
+        let ctx = TestCacheStore::default();
+
+        block_on(ctx.cache_store_init("message", async {
+            Ok::<_, BoxError>("created".to_string())
+        }))
+        .unwrap();
+        assert!(ctx.cache_contains("message"));
+        assert!(ctx.store.lock().unwrap().contains_key("message"));
+
+        let (value, _) = block_on(ctx.cache_store_get::<String>("message")).unwrap();
+        assert_eq!(value, "created");
+
+        block_on(ctx.cache_store_delete("message")).unwrap();
+        assert!(!ctx.cache_contains("message"));
+        assert!(!ctx.store.lock().unwrap().contains_key("message"));
+    }
+
+    #[test]
+    fn cache_store_set_update_enforces_expected_version() {
+        let ctx = TestCacheStore::default();
+
+        let version = block_on(ctx.cache_store_set("answer", 1_u32, None)).unwrap();
+        let updated = block_on(ctx.cache_store_set("answer", 2_u32, Some(version))).unwrap();
+        let (value, cached_version) = block_on(ctx.cache_store_get::<u32>("answer")).unwrap();
+        assert_eq!(value, 2);
+        assert_eq!(cached_version.version, updated.version);
+
+        let err = block_on(ctx.cache_store_set(
+            "answer",
+            3_u32,
+            Some(UpdateVersion {
+                e_tag: Some("wrong".to_string()),
+                version: Some("wrong".to_string()),
+            }),
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("version mismatch"));
+    }
+
+    #[test]
+    fn cache_and_store_mock_helpers_cover_absent_existing_and_error_paths() {
+        let ctx = TestCacheStore::default();
+
+        let ttl = CacheExpiry::TTL(Duration::from_secs(5));
+        block_on(ctx.cache_set("ttl", ("one".to_string(), Some(ttl.clone()))));
+        assert!(ctx.cache_contains("ttl"));
+
+        let existing = block_on(ctx.cache_set_if_not_exists(
+            "ttl",
+            (
+                "two".to_string(),
+                Some(CacheExpiry::TTI(Duration::from_secs(9))),
+            ),
+        ));
+        assert!(!existing);
+
+        let inserted = block_on(ctx.cache_set_if_not_exists(
+            "tti",
+            (
+                "three".to_string(),
+                Some(CacheExpiry::TTI(Duration::from_secs(9))),
+            ),
+        ));
+        assert!(inserted);
+
+        let mut seen = ctx
+            .cache_raw_iter()
+            .map(|(key, value)| (key.to_string(), value.1.clone()))
+            .collect::<Vec<_>>();
+        seen.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(seen.len(), 2);
+        let ttl_expiry = seen
+            .iter()
+            .find(|(key, _)| key == "ttl")
+            .and_then(|(_, expiry)| expiry.as_ref())
+            .unwrap();
+        let tti_expiry = seen
+            .iter()
+            .find(|(key, _)| key == "tti")
+            .and_then(|(_, expiry)| expiry.as_ref())
+            .unwrap();
+        match ttl_expiry {
+            CacheExpiry::TTL(duration) => assert_eq!(*duration, Duration::from_secs(5)),
+            CacheExpiry::TTI(_) => panic!("expected ttl"),
+        }
+        match tti_expiry {
+            CacheExpiry::TTI(duration) => assert_eq!(*duration, Duration::from_secs(9)),
+            CacheExpiry::TTL(_) => panic!("expected tti"),
+        }
+
+        let value =
+            block_on(ctx.cache_get_with("lazy", async { Ok::<_, BoxError>((99_u32, None)) }))
+                .unwrap();
+        assert_eq!(value, 99);
+        let cached =
+            block_on(ctx.cache_get_with("lazy", async { Ok::<_, BoxError>((100_u32, None)) }))
+                .unwrap();
+        assert_eq!(cached, 99);
+
+        let first =
+            block_on(ctx.store_put(&Path::from("created"), PutMode::Create, Bytes::from("a")))
+                .unwrap();
+        assert!(first.version.is_some());
+        let err =
+            block_on(ctx.store_put(&Path::from("created"), PutMode::Create, Bytes::from("b")))
+                .unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+
+        block_on(ctx.store_rename_if_not_exists(&Path::from("created"), &Path::from("renamed")))
+            .unwrap();
+        assert!(ctx.store.lock().unwrap().contains_key("renamed"));
+        let err = block_on(
+            ctx.store_rename_if_not_exists(&Path::from("missing"), &Path::from("renamed")),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+        let err = block_on(
+            ctx.store_rename_if_not_exists(&Path::from("missing"), &Path::from("new-destination")),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not found"));
+
+        let listed =
+            block_on(ctx.store_list(Some(&Path::from("r")), &Path::from("renamed"))).unwrap();
+        assert!(listed.is_empty());
+    }
+
+    #[test]
+    fn derivation_path_with_prefixes_current_path() {
+        let path = Path::from("agent/main");
+        let derivation_path = derivation_path_with(&path, vec![b"child".to_vec()]);
+        assert_eq!(
+            derivation_path,
+            vec![b"agent/main".to_vec(), b"child".to_vec()]
+        );
+    }
 }

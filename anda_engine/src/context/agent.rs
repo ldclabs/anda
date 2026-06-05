@@ -1705,18 +1705,30 @@ impl Stream for CompletionStream {
 #[cfg(test)]
 mod tests {
     use anda_core::{
-        Agent, AgentOutput, BoxError, CancellationToken, CompletionRequest, FunctionDefinition,
-        Resource, Tool, ToolCall, ToolOutput, Usage,
+        Agent, AgentContext as _, AgentInput, AgentOutput, BaseContext as _, BoxError,
+        CacheFeatures as _, CacheStoreFeatures as _, CancellationToken, CanisterCaller as _,
+        CompletionFeatures as _, CompletionRequest, ContentPart, Function, FunctionDefinition,
+        HttpFeatures as _, Json, KeysFeatures as _, Message, ModelEffort, Path, PutMode, Resource,
+        StateFeatures as _, StoreFeatures as _, Tool, ToolCall, ToolInput, ToolOutput, Usage,
     };
+    use bytes::Bytes;
+    use candid::Principal;
     use ciborium::from_reader;
     use futures_util::StreamExt;
     use ic_cose_types::to_cbor_bytes;
     use serde::Deserialize;
     use serde_json::json;
-    use std::sync::{Arc, Mutex};
+    use std::{
+        collections::{BTreeMap, HashMap},
+        sync::{Arc, Mutex},
+    };
 
-    use super::{AgentCtx, CompletionRunner};
+    use super::{
+        AgentCtx, CompletionRunner, DYNAMIC_REMOTE_ENGINES, REMOTE_AGENT_PREFIX,
+        REMOTE_TOOL_PREFIX, SUB_AGENT_PREFIX,
+    };
     use crate::context::base::BaseCtx;
+    use crate::context::engine::{AgentInfo, EngineCard, RemoteEngines};
     use crate::{
         engine::EngineBuilder,
         model::{CompletionFeaturesDyn, Model},
@@ -2025,6 +2037,50 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Debug)]
+    struct RecordingCompleter {
+        name: String,
+        requests: Arc<Mutex<Vec<CompletionRequest>>>,
+    }
+
+    impl CompletionFeaturesDyn for RecordingCompleter {
+        fn model_name(&self) -> String {
+            self.name.clone()
+        }
+
+        fn completion(
+            &self,
+            req: CompletionRequest,
+        ) -> anda_core::BoxPinFut<Result<AgentOutput, BoxError>> {
+            self.requests.lock().unwrap().push(req.clone());
+            let content = if req.prompt.is_empty() {
+                req.content
+                    .iter()
+                    .map(|part| match part {
+                        ContentPart::Text { text } | ContentPart::Reasoning { text } => {
+                            text.clone()
+                        }
+                        _ => serde_json::to_string(part).unwrap_or_default(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n\n")
+            } else {
+                req.prompt
+            };
+
+            Box::pin(futures::future::ready(Ok(AgentOutput {
+                content,
+                usage: Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cached_tokens: 0,
+                    requests: 1,
+                },
+                ..Default::default()
+            })))
+        }
+    }
+
     // ── Helper tool ──
 
     struct EchoTool;
@@ -2156,7 +2212,613 @@ mod tests {
         }
     }
 
+    struct FailAgent;
+
+    impl Agent<AgentCtx> for FailAgent {
+        fn name(&self) -> String {
+            "fail_agent".to_string()
+        }
+
+        fn description(&self) -> String {
+            "Always fails".to_string()
+        }
+
+        async fn run(
+            &self,
+            _ctx: AgentCtx,
+            _prompt: String,
+            _resources: Vec<Resource>,
+        ) -> Result<AgentOutput, BoxError> {
+            Err("agent execution failed".into())
+        }
+    }
+
+    fn function(name: &str, description: &str, tags: &[&str]) -> Function {
+        Function {
+            definition: FunctionDefinition {
+                name: name.to_string(),
+                description: description.to_string(),
+                parameters: json!({"type": "object"}),
+                ..Default::default()
+            },
+            supported_resource_tags: tags.iter().map(|tag| tag.to_string()).collect(),
+        }
+    }
+
+    fn resource(id: u64, tags: &[&str]) -> Resource {
+        Resource {
+            _id: id,
+            name: format!("resource-{id}"),
+            tags: tags.iter().map(|tag| tag.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn dynamic_remote_engines() -> RemoteEngines {
+        let mut engines = BTreeMap::new();
+        engines.insert(
+            "dyn".to_string(),
+            EngineCard {
+                id: Principal::self_authenticating([9; 32]),
+                info: AgentInfo {
+                    handle: "Dynamic".to_string(),
+                    endpoint: "https://dynamic.example".to_string(),
+                    ..Default::default()
+                },
+                agents: vec![function("chat", "Chat remotely", &["md"])],
+                tools: vec![function("lookup", "Lookup remotely", &["text"])],
+            },
+        );
+        RemoteEngines { engines }
+    }
+
     // ── Tests ──
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn agent_context_definitions_dynamic_resources_and_missing_runs() {
+        let model = Model::with_completer(Arc::new(EchoCompleter));
+        let ctx = EngineBuilder::new()
+            .with_model(model)
+            .register_tool(Arc::new(EchoTool))
+            .unwrap()
+            .register_agent(Arc::new(EchoAgent), None)
+            .unwrap()
+            .mock_ctx();
+
+        let empty: Vec<String> = Vec::new();
+        assert!(ctx.tool_definitions(Some(&empty)).is_empty());
+        assert!(ctx.agent_definitions(Some(&empty)).is_empty());
+        assert!(
+            ctx.remote_tool_definitions(None, Some(&empty))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            ctx.remote_agent_definitions(None, Some(&empty))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(ctx.definitions(Some(&empty)).await.is_empty());
+
+        ctx.root
+            .cache_store_set(DYNAMIC_REMOTE_ENGINES, dynamic_remote_engines(), None)
+            .await
+            .unwrap();
+
+        let definitions = ctx.definitions(None).await;
+        assert!(definitions.iter().any(|d| d.name == "echo_tool"));
+        assert!(definitions.iter().any(|d| d.name == "echo_agent"));
+        assert!(
+            definitions
+                .iter()
+                .any(|d| d.name == format!("{REMOTE_TOOL_PREFIX}dyn_lookup"))
+        );
+        assert!(
+            definitions
+                .iter()
+                .any(|d| d.name == format!("{REMOTE_AGENT_PREFIX}dyn_chat"))
+        );
+
+        let mut resources = vec![resource(1, &["text"]), resource(2, &["md"])];
+        let selected = ctx
+            .select_tool_resources(&format!("{REMOTE_TOOL_PREFIX}dyn_lookup"), &mut resources)
+            .await;
+        assert_eq!(
+            selected
+                .iter()
+                .map(|resource| resource._id)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert_eq!(
+            resources
+                .iter()
+                .map(|resource| resource._id)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+
+        let selected = ctx
+            .select_agent_resources(&format!("{REMOTE_AGENT_PREFIX}dyn_chat"), &mut resources)
+            .await;
+        assert_eq!(
+            selected
+                .iter()
+                .map(|resource| resource._id)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+        assert!(resources.is_empty());
+
+        let tool_err = ctx
+            .tool_call(ToolInput {
+                name: format!("{REMOTE_TOOL_PREFIX}dyn_lookup"),
+                args: json!({}),
+                resources: Vec::new(),
+                meta: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            tool_err
+                .to_string()
+                .contains("remote engine endpoint https://dynamic.example not found")
+        );
+
+        let agent_err = ctx
+            .clone()
+            .agent_run(AgentInput {
+                name: format!("{REMOTE_AGENT_PREFIX}dyn_chat"),
+                prompt: "hello".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            agent_err
+                .to_string()
+                .contains("remote engine endpoint https://dynamic.example not found")
+        );
+
+        let agent_err = ctx
+            .clone()
+            .agent_run(AgentInput {
+                name: format!("{REMOTE_AGENT_PREFIX}missing"),
+                prompt: "hello".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(agent_err.to_string().contains("agent missing not found"));
+
+        let agent_err = ctx
+            .clone()
+            .agent_run(AgentInput {
+                name: format!("{SUB_AGENT_PREFIX}missing"),
+                prompt: "hello".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(agent_err.to_string().contains("agent missing not found"));
+
+        let agent_err = ctx
+            .agent_run(AgentInput {
+                name: "missing_agent".to_string(),
+                prompt: "hello".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            agent_err
+                .to_string()
+                .contains("agent missing_agent not found")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn agent_context_trait_forwarders_cover_base_store_cache_keys_and_http() {
+        let model = Model::with_completer(Arc::new(EchoCompleter));
+        let ctx = EngineBuilder::new().with_model(model).mock_ctx();
+
+        assert_eq!(ctx.model_name(), "echo");
+        assert_eq!(ctx.engine_name(), "Mocker");
+        assert_eq!(*ctx.engine_id(), Principal::anonymous());
+        assert_eq!(*ctx.caller(), Principal::anonymous());
+        assert!(ctx.meta().user.is_none());
+        assert!(!ctx.cancellation_token().is_cancelled());
+        assert!(ctx.time_elapsed() < std::time::Duration::from_secs(60));
+
+        let caller = Principal::self_authenticating([4; 32]);
+        let called_by = ctx.with_caller(caller);
+        assert_eq!(*called_by.caller(), caller);
+
+        let path = Path::from("agent_ctx_file");
+        let renamed = Path::from("agent_ctx_file_renamed");
+        ctx.store_put(&path, PutMode::Overwrite, Bytes::from_static(b"data"))
+            .await
+            .unwrap();
+        let (stored, meta) = ctx.store_get(&path).await.unwrap();
+        assert_eq!(stored, Bytes::from_static(b"data"));
+        assert_eq!(meta.location, path);
+        ctx.store_rename_if_not_exists(&path, &renamed)
+            .await
+            .unwrap();
+        let listed = ctx.store_list(None, &Path::from("")).await.unwrap();
+        assert!(listed.iter().any(|meta| meta.location == renamed));
+        ctx.store_delete(&renamed).await.unwrap();
+        assert!(ctx.store_get(&renamed).await.is_err());
+
+        assert!(
+            ctx.cache_get_with("missing_path", async {
+                Ok::<_, BoxError>(("created".to_string(), None))
+            })
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("cache path")
+        );
+
+        let cache_ctx = ctx.child("tools_search", "Tools Search").unwrap();
+        assert!(!cache_ctx.cache_contains("number"));
+        cache_ctx.cache_set("number", (42_u64, None)).await;
+        assert_eq!(cache_ctx.cache_get::<u64>("number").await.unwrap(), 42);
+        let initialized: String = cache_ctx
+            .cache_get_with("initialized", async {
+                Ok::<_, BoxError>(("created".to_string(), None))
+            })
+            .await
+            .unwrap();
+        assert_eq!(initialized, "created");
+        let cache_keys = cache_ctx
+            .cache_raw_iter()
+            .map(|(key, _)| key.as_str().to_string())
+            .collect::<Vec<_>>();
+        assert!(cache_keys.contains(&"number".to_string()));
+        assert!(cache_ctx.cache_delete("number").await);
+        assert!(!cache_ctx.cache_contains("number"));
+
+        assert!(ctx.a256gcm_key(Vec::new()).await.is_err());
+        assert!(ctx.ed25519_sign_message(Vec::new(), b"msg").await.is_err());
+        assert!(
+            ctx.ed25519_verify(Vec::new(), b"msg", &[0; 64])
+                .await
+                .is_err()
+        );
+        assert!(ctx.ed25519_public_key(Vec::new()).await.is_err());
+        assert!(
+            ctx.secp256k1_sign_message_bip340(Vec::new(), b"msg")
+                .await
+                .is_err()
+        );
+        assert!(
+            ctx.secp256k1_verify_bip340(Vec::new(), b"msg", &[0; 64])
+                .await
+                .is_err()
+        );
+        assert!(
+            ctx.secp256k1_sign_message_ecdsa(Vec::new(), b"msg")
+                .await
+                .is_err()
+        );
+        assert!(
+            ctx.secp256k1_sign_digest_ecdsa(Vec::new(), &[0; 32])
+                .await
+                .is_err()
+        );
+        assert!(
+            ctx.secp256k1_verify_ecdsa(Vec::new(), &[0; 32], &[0; 64])
+                .await
+                .is_err()
+        );
+        assert!(ctx.secp256k1_public_key(Vec::new()).await.is_err());
+
+        assert!(
+            ctx.canister_query::<_, ()>(&Principal::anonymous(), "status", ())
+                .await
+                .is_err()
+        );
+        assert!(
+            ctx.canister_update::<_, ()>(&Principal::anonymous(), "update", ())
+                .await
+                .is_err()
+        );
+        assert!(
+            ctx.https_call("https://example.test", http::Method::GET, None, None)
+                .await
+                .is_err()
+        );
+        assert!(
+            ctx.https_signed_call(
+                "https://example.test",
+                http::Method::POST,
+                [0; 32],
+                None,
+                Some(Vec::new()),
+            )
+            .await
+            .is_err()
+        );
+        let rpc: Result<Json, BoxError> = ctx
+            .https_signed_rpc("https://example.test", "method", &())
+            .await;
+        assert!(rpc.is_err());
+
+        let err = ctx
+            .remote_tool_call(
+                "https://missing.example",
+                ToolInput {
+                    name: "lookup".to_string(),
+                    args: json!({}),
+                    resources: Vec::new(),
+                    meta: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("remote engine endpoint https://missing.example not found")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_accessors_mutators_and_implicit_context_are_observable() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let model = Model::with_completer(Arc::new(RecordingCompleter {
+            name: "recording".to_string(),
+            requests: requests.clone(),
+        }))
+        .with_labels(vec!["alt".to_string()]);
+        let ctx = EngineBuilder::new().with_model(model).mock_ctx();
+        let mut runner = ctx.completion_iter(CompletionRequest::default(), Vec::new());
+
+        assert!(runner.is_idle());
+        assert_eq!(runner.ctx().engine_name(), "Mocker");
+        assert_eq!(runner.req().prompt, "");
+        assert_eq!(runner.model().model_name(), "recording");
+        assert_eq!(runner.total_usage().requests, 0);
+        assert_eq!(runner.current_usage().requests, 0);
+        assert!(runner.tools_usage().is_empty());
+        assert!(runner.last_output().is_none());
+
+        runner.append_chat_history(vec![Message {
+            role: "system".to_string(),
+            content: vec![ContentPart::Text {
+                text: "preloaded".to_string(),
+            }],
+            ..Default::default()
+        }]);
+        assert_eq!(runner.chat_history().len(), 1);
+
+        runner.follow_up_content(vec![ContentPart::Text {
+            text: "follow".to_string(),
+        }]);
+        runner.steer_content(vec![ContentPart::Text {
+            text: "steer".to_string(),
+        }]);
+        assert!(!runner.is_idle());
+        runner.implicit_context(Message {
+            role: "system".to_string(),
+            content: vec![ContentPart::Text {
+                text: "implicit".to_string(),
+            }],
+            ..Default::default()
+        });
+        runner.set_model(Some("alt".to_string()));
+        runner.set_effort(Some(ModelEffort::Low));
+        runner.set_tools(vec![FunctionDefinition {
+            name: "forced_tool".to_string(),
+            ..Default::default()
+        }]);
+
+        let output = runner.next().await.unwrap().unwrap();
+        assert_eq!(output.content, "follow\n\nsteer");
+        assert_eq!(output.model, Some("recording".to_string()));
+        assert_eq!(runner.current_usage().requests, 1);
+        assert_eq!(output.usage.requests, 1);
+        assert_eq!(runner.total_usage().requests, 0);
+        assert!(runner.last_output().is_none());
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].model.as_deref(), Some("alt"));
+        assert_eq!(requests[0].effort, Some(ModelEffort::Low));
+        assert_eq!(requests[0].tools[0].name, "forced_tool");
+        assert_eq!(requests[0].chat_history.len(), 1);
+        assert_eq!(
+            requests[0].chat_history[0].text().as_deref(),
+            Some("implicit")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_records_missing_tool_and_failed_agent_as_tool_outputs() {
+        let model = Model::with_completer(Arc::new(ToolCallCompleter {
+            tool_calls: vec![ToolCall {
+                name: "missing_tool".to_string(),
+                args: json!({}),
+                call_id: Some("missing_tool_call".into()),
+                result: None,
+                remote_id: None,
+            }],
+        }));
+        let ctx = EngineBuilder::new().with_model(model).mock_ctx();
+        let req = CompletionRequest {
+            prompt: "call missing".to_string(),
+            ..Default::default()
+        };
+        let mut runner = ctx.completion_iter(req, Vec::new());
+        let step = runner.next().await.unwrap().unwrap();
+        assert_eq!(step.tool_calls.len(), 1);
+        assert!(step.tool_calls[0].result.is_none());
+        let output = runner.next().await.unwrap().unwrap();
+        let result = output.tool_calls[0].result.as_ref().unwrap();
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            result
+                .output
+                .to_string()
+                .contains("tool call failed: missing_tool not found")
+        );
+
+        let model = Model::with_completer(Arc::new(AgentCallCompleter {
+            agent_name: "fail_agent".to_string(),
+        }));
+        let ctx = EngineBuilder::new()
+            .with_model(model)
+            .register_agent(Arc::new(FailAgent), None)
+            .unwrap()
+            .mock_ctx();
+        let req = CompletionRequest {
+            prompt: "call failing agent".to_string(),
+            ..Default::default()
+        };
+        let mut runner = ctx.completion_iter(req, Vec::new());
+        runner.next().await.unwrap().unwrap();
+        let output = runner.next().await.unwrap().unwrap();
+        let result = output.tool_calls[0].result.as_ref().unwrap();
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            result
+                .output
+                .to_string()
+                .contains("agent run failed: agent execution failed")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_accumulates_nested_tool_usage() {
+        struct AccountingTool;
+
+        #[derive(Debug, Deserialize)]
+        struct AccountingArgs {}
+
+        impl Tool<BaseCtx> for AccountingTool {
+            type Args = AccountingArgs;
+            type Output = String;
+
+            fn name(&self) -> String {
+                "accounting_tool".to_string()
+            }
+
+            fn description(&self) -> String {
+                "Returns nested tool usage".to_string()
+            }
+
+            fn definition(&self) -> FunctionDefinition {
+                FunctionDefinition {
+                    name: "accounting_tool".to_string(),
+                    description: "Returns nested tool usage".to_string(),
+                    parameters: json!({"type": "object"}),
+                    strict: Some(true),
+                }
+            }
+
+            async fn call(
+                &self,
+                _ctx: BaseCtx,
+                _args: Self::Args,
+                _resources: Vec<Resource>,
+            ) -> Result<ToolOutput<String>, BoxError> {
+                Ok(ToolOutput {
+                    output: "accounted".to_string(),
+                    usage: Usage {
+                        input_tokens: 7,
+                        output_tokens: 11,
+                        cached_tokens: 3,
+                        requests: 4,
+                    },
+                    tools_usage: HashMap::from([(
+                        "nested_tool".to_string(),
+                        Usage {
+                            input_tokens: 2,
+                            output_tokens: 3,
+                            cached_tokens: 1,
+                            requests: 2,
+                        },
+                    )]),
+                    ..Default::default()
+                })
+            }
+        }
+
+        let model = Model::with_completer(Arc::new(ToolCallCompleter {
+            tool_calls: vec![ToolCall {
+                name: "accounting_tool".to_string(),
+                args: json!({}),
+                call_id: Some("accounting_call".into()),
+                result: None,
+                remote_id: None,
+            }],
+        }));
+        let ctx = EngineBuilder::new()
+            .with_model(model)
+            .register_tool(Arc::new(AccountingTool))
+            .unwrap()
+            .mock_ctx();
+
+        let req = CompletionRequest {
+            prompt: "account".to_string(),
+            ..Default::default()
+        };
+        let mut runner = ctx.completion_iter(req, Vec::new());
+        runner.next().await.unwrap().unwrap();
+        let output = runner.next().await.unwrap().unwrap();
+
+        assert_eq!(output.tools_usage["accounting_tool"].requests, 1);
+        assert_eq!(output.tools_usage["accounting_tool"].input_tokens, 7);
+        assert_eq!(output.tools_usage["nested_tool"].requests, 2);
+        assert_eq!(output.tools_usage["nested_tool"].cached_tokens, 1);
+        assert!(output.usage.input_tokens >= 20);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_finalize_reports_already_finalized() {
+        let model = Model::with_completer(Arc::new(EchoCompleter));
+        let ctx = EngineBuilder::new().with_model(model).mock_ctx();
+        let req = CompletionRequest {
+            prompt: "done".to_string(),
+            ..Default::default()
+        };
+        let mut runner = ctx.completion_iter(req, Vec::new());
+        runner.next().await.unwrap().unwrap();
+
+        let err = runner.finalize(None).await.unwrap_err();
+        assert!(err.to_string().contains("completion already finalized"));
+    }
+
+    #[test]
+    fn runner_prunes_contextless_raw_history_items() {
+        let mut raw_history = vec![
+            json!(null),
+            json!(""),
+            json!({"role": "assistant", "id": "meta-only", "status": "ok"}),
+            json!({"role": "assistant", "content": []}),
+            json!({
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}},
+                    {"text": "kept text"}
+                ],
+                "tool_calls": [{"id": "call_1"}],
+                "function_call": {"name": "lookup"}
+            }),
+            json!({"type": "function_call", "call_id": "call_1"}),
+            json!(42),
+        ];
+
+        CompletionRunner::prune_unanswered_tool_calls_from_raw_history(&mut raw_history, 0);
+
+        assert_eq!(raw_history.len(), 2);
+        assert_eq!(raw_history[0]["content"], json!([{"text": "kept text"}]));
+        assert!(raw_history[0].get("tool_calls").is_none());
+        assert!(raw_history[0].get("function_call").is_none());
+        assert_eq!(raw_history[1], json!(42));
+    }
 
     // ── CompletionRunner basic tests ──
 

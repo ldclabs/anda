@@ -627,12 +627,12 @@ impl EngineBuilder {
             .tools
             .set
             .keys()
-            .map(|p| Path::from(format!("T:{}", p)))
+            .map(|p| Path::from(format!("t:{}", p)))
             .chain(
                 self.agents
                     .set
                     .keys()
-                    .map(|p| Path::from(format!("A:{}", p))),
+                    .map(|p| Path::from(format!("a:{}", p))),
             )
             .collect();
         names.insert(Path::from(SYSTEM_PATH));
@@ -705,12 +705,12 @@ impl EngineBuilder {
             .tools
             .set
             .keys()
-            .map(|p| Path::from(format!("T:{}", p)))
+            .map(|p| Path::from(format!("t:{}", p)))
             .chain(
                 self.agents
                     .set
                     .keys()
-                    .map(|p| Path::from(format!("A:{}", p))),
+                    .map(|p| Path::from(format!("a:{}", p))),
             )
             .collect();
         names.insert(Path::from(SYSTEM_PATH));
@@ -778,12 +778,12 @@ impl EngineBuilder {
             .tools
             .set
             .keys()
-            .map(|p| Path::from(format!("T:{}", p)))
+            .map(|p| Path::from(format!("t:{}", p)))
             .chain(
                 self.agents
                     .set
                     .keys()
-                    .map(|p| Path::from(format!("A:{}", p))),
+                    .map(|p| Path::from(format!("a:{}", p))),
             )
             .collect();
         names.insert(Path::from(SYSTEM_PATH));
@@ -874,5 +874,544 @@ impl EngineRef {
     /// dropped.
     pub fn get(&self) -> Option<Arc<Engine>> {
         self.inner.get().and_then(Weak::upgrade)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ANONYMOUS;
+    use anda_core::FunctionDefinition;
+    use serde_json::json;
+    use std::future::Future;
+
+    struct EchoAgent;
+
+    impl Agent<AgentCtx> for EchoAgent {
+        fn name(&self) -> String {
+            "echo_agent".to_string()
+        }
+
+        fn description(&self) -> String {
+            "Echoes the prompt".to_string()
+        }
+
+        fn supported_resource_tags(&self) -> Vec<String> {
+            vec!["text".to_string()]
+        }
+
+        fn run(
+            &self,
+            _ctx: AgentCtx,
+            prompt: String,
+            resources: Vec<Resource>,
+        ) -> impl Future<Output = Result<AgentOutput, BoxError>> + Send {
+            async move {
+                Ok(AgentOutput {
+                    content: format!("{prompt}:{}", resources.len()),
+                    raw_history: vec![json!({"provider": "raw"})],
+                    ..Default::default()
+                })
+            }
+        }
+    }
+
+    struct DependentAgent;
+
+    impl Agent<AgentCtx> for DependentAgent {
+        fn name(&self) -> String {
+            "dependent_agent".to_string()
+        }
+
+        fn description(&self) -> String {
+            "Requires a missing tool".to_string()
+        }
+
+        fn tool_dependencies(&self) -> Vec<String> {
+            vec!["missing_tool".to_string()]
+        }
+
+        fn run(
+            &self,
+            _ctx: AgentCtx,
+            _prompt: String,
+            _resources: Vec<Resource>,
+        ) -> impl Future<Output = Result<AgentOutput, BoxError>> + Send {
+            async { Ok(AgentOutput::default()) }
+        }
+    }
+
+    struct EchoTool;
+
+    impl Tool<BaseCtx> for EchoTool {
+        type Args = Json;
+        type Output = Json;
+
+        fn name(&self) -> String {
+            "echo_tool".to_string()
+        }
+
+        fn description(&self) -> String {
+            "Echoes JSON args".to_string()
+        }
+
+        fn definition(&self) -> FunctionDefinition {
+            FunctionDefinition {
+                name: self.name(),
+                description: self.description(),
+                parameters: json!({"type": "object"}),
+                strict: Some(false),
+            }
+        }
+
+        fn supported_resource_tags(&self) -> Vec<String> {
+            vec!["text".to_string()]
+        }
+
+        fn call(
+            &self,
+            _ctx: BaseCtx,
+            args: Self::Args,
+            resources: Vec<Resource>,
+        ) -> impl Future<Output = Result<ToolOutput<Self::Output>, BoxError>> + Send {
+            async move {
+                Ok(ToolOutput {
+                    output: json!({
+                        "args": args,
+                        "resources": resources.len(),
+                    }),
+                    ..Default::default()
+                })
+            }
+        }
+    }
+
+    fn public_management() -> Arc<BaseManagement> {
+        Arc::new(BaseManagement {
+            controller: Principal::management_canister(),
+            managers: BTreeSet::new(),
+            visibility: Visibility::Public,
+        })
+    }
+
+    fn protected_management() -> Arc<BaseManagement> {
+        Arc::new(BaseManagement {
+            controller: Principal::management_canister(),
+            managers: BTreeSet::new(),
+            visibility: Visibility::Protected,
+        })
+    }
+
+    fn info() -> AgentInfo {
+        AgentInfo {
+            handle: "echo".to_string(),
+            name: "Echo Engine".to_string(),
+            description: "Test engine".to_string(),
+            endpoint: "https://example.com/engine".to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn resource(id: u64, tags: &[&str]) -> Resource {
+        Resource {
+            _id: id,
+            name: format!("resource-{id}"),
+            tags: tags.iter().map(|tag| tag.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn expect_box_err<T>(result: Result<T, BoxError>, context: &str) -> BoxError {
+        match result {
+            Ok(_) => panic!("{context} should fail"),
+            Err(err) => err,
+        }
+    }
+
+    async fn test_engine() -> Engine {
+        Engine::builder()
+            .with_info(info())
+            .with_management(public_management())
+            .register_tool(Arc::new(EchoTool))
+            .unwrap()
+            .register_agent(Arc::new(EchoAgent), Some("pro".to_string()))
+            .unwrap()
+            .export_tools(vec!["echo_tool".to_string()])
+            .build("echo_agent".to_string())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn engine_builder_builds_runs_exports_and_validates_inputs() {
+        let mut engine = test_engine().await;
+        assert_eq!(engine.id(), Principal::anonymous());
+        assert_eq!(engine.info().handle, "echo");
+        engine.info_mut().description = "Updated".to_string();
+        assert_eq!(engine.info().description, "Updated");
+        assert_eq!(engine.default_agent(), "echo_agent");
+        assert!(engine.models().get_model().is_none());
+
+        let info = engine.information();
+        assert_eq!(info.info.handle, "echo");
+        assert_eq!(info.agents.len(), 1);
+        assert_eq!(info.agents[0].definition.name, "echo_agent");
+        assert_eq!(info.tools.len(), 1);
+        assert_eq!(info.tools[0].definition.name, "echo_tool");
+
+        let agent_ctx = engine
+            .ctx_with(ANONYMOUS, "echo_agent", "pro", RequestMeta::default())
+            .unwrap();
+        assert_eq!(agent_ctx.base.agent, "echo_agent");
+        assert!(
+            engine
+                .ctx_with(ANONYMOUS, "missing", "pro", RequestMeta::default())
+                .is_err()
+        );
+
+        let tool_ctx = engine
+            .base_ctx_with(ANONYMOUS, "echo_agent", "echo_tool", RequestMeta::default())
+            .unwrap();
+        assert_eq!(tool_ctx.path.as_ref(), "t:echo_tool");
+        assert!(
+            engine
+                .base_ctx_with(ANONYMOUS, "echo_agent", "missing", RequestMeta::default())
+                .is_err()
+        );
+
+        let output = engine
+            .agent_run(
+                ANONYMOUS,
+                AgentInput {
+                    prompt: "hello".to_string(),
+                    resources: vec![resource(1, &["text"]), resource(2, &["image"])],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.content, "hello:2");
+        assert!(output.raw_history.is_empty());
+
+        let output = engine
+            .agent_run(
+                ANONYMOUS,
+                AgentInput {
+                    name: "ECHO_AGENT".to_string(),
+                    prompt: "named".to_string(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.content, "named:0");
+
+        let output = engine
+            .tool_call(
+                ANONYMOUS,
+                ToolInput {
+                    name: "echo_tool".to_string(),
+                    args: json!({"k": "v"}),
+                    resources: vec![resource(3, &["text"]), resource(4, &["image"])],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.output["args"], json!({"k": "v"}));
+        assert_eq!(output.output["resources"], 2);
+
+        let err = expect_box_err(
+            engine
+                .agent_run(
+                    ANONYMOUS,
+                    AgentInput {
+                        name: "echo_agent".to_string(),
+                        prompt: "hello".to_string(),
+                        meta: Some(RequestMeta {
+                            engine: Some(Principal::management_canister()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .await,
+            "agent_run with wrong engine id",
+        );
+        assert!(err.to_string().contains("invalid engine ID"));
+
+        let err = expect_box_err(
+            engine
+                .agent_run(
+                    ANONYMOUS,
+                    AgentInput {
+                        name: "echo_agent".to_string(),
+                        prompt: "hello".to_string(),
+                        meta: Some(RequestMeta {
+                            user: Some(" bad ".to_string()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .await,
+            "agent_run with invalid user",
+        );
+        assert!(err.to_string().contains("invalid user name"));
+
+        let err = expect_box_err(
+            engine
+                .tool_call(
+                    ANONYMOUS,
+                    ToolInput {
+                        name: "echo_tool".to_string(),
+                        args: json!({}),
+                        meta: Some(RequestMeta {
+                            engine: Some(Principal::management_canister()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .await,
+            "tool_call with wrong engine id",
+        );
+        assert!(err.to_string().contains("invalid engine ID"));
+
+        let err = expect_box_err(
+            engine
+                .tool_call(
+                    ANONYMOUS,
+                    ToolInput {
+                        name: "echo_tool".to_string(),
+                        args: json!({}),
+                        meta: Some(RequestMeta {
+                            user: Some(" bad ".to_string()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .await,
+            "tool_call with invalid user",
+        );
+        assert!(err.to_string().contains("invalid user name"));
+    }
+
+    #[tokio::test]
+    async fn engine_reports_unexported_and_protected_permission_errors() {
+        let unexported = Engine::builder()
+            .with_info(info())
+            .with_management(public_management())
+            .register_tool(Arc::new(EchoTool))
+            .unwrap()
+            .register_agent(Arc::new(EchoAgent), None)
+            .unwrap()
+            .build("echo_agent".to_string())
+            .await
+            .unwrap();
+        let err = expect_box_err(
+            unexported
+                .tool_call(
+                    ANONYMOUS,
+                    ToolInput {
+                        name: "echo_tool".to_string(),
+                        args: json!({}),
+                        ..Default::default()
+                    },
+                )
+                .await,
+            "unexported tool call",
+        );
+        assert!(err.to_string().contains("tool echo_tool not found"));
+
+        let protected = Engine::builder()
+            .with_info(info())
+            .with_management(protected_management())
+            .register_tool(Arc::new(EchoTool))
+            .unwrap()
+            .register_agent(Arc::new(EchoAgent), None)
+            .unwrap()
+            .export_tools(vec!["echo_tool".to_string()])
+            .build("echo_agent".to_string())
+            .await
+            .unwrap();
+        let non_manager = Principal::self_authenticating([8; 32]);
+        let err = expect_box_err(
+            protected
+                .agent_run(
+                    non_manager,
+                    AgentInput {
+                        prompt: "blocked".to_string(),
+                        ..Default::default()
+                    },
+                )
+                .await,
+            "protected agent run",
+        );
+        assert!(err.to_string().contains("permission"));
+
+        let err = expect_box_err(
+            protected
+                .tool_call(
+                    non_manager,
+                    ToolInput {
+                        name: "echo_tool".to_string(),
+                        args: json!({}),
+                        ..Default::default()
+                    },
+                )
+                .await,
+            "protected tool call",
+        );
+        assert!(err.to_string().contains("permission"));
+    }
+
+    #[tokio::test]
+    async fn engine_builder_registers_sets_and_echo_engine_info_agent_runs() {
+        let echo_info = info();
+        let echo_info_agent = Arc::new(EchoEngineInfo::new(echo_info.clone()));
+        assert_eq!(echo_info_agent.name(), "echo");
+        assert_eq!(echo_info_agent.description(), "Test engine");
+        let output = echo_info_agent
+            .run(EngineBuilder::new().mock_ctx(), String::new(), Vec::new())
+            .await
+            .unwrap();
+        let parsed: AgentInfo = serde_json::from_str(&output.content).unwrap();
+        assert_eq!(parsed.handle, echo_info.handle);
+
+        let mut tools = ToolSet::new();
+        tools.add(Arc::new(EchoTool)).unwrap();
+        let mut agents = AgentSet::new();
+        agents.add(echo_info_agent, None).unwrap();
+
+        let engine = Engine::builder()
+            .with_info(info())
+            .with_management(public_management())
+            .register_tools(tools)
+            .unwrap()
+            .register_agents(agents)
+            .unwrap()
+            .build("echo".to_string())
+            .await
+            .unwrap();
+
+        assert_eq!(engine.default_agent(), "echo");
+        assert!(
+            engine
+                .information()
+                .agents
+                .iter()
+                .any(|agent| agent.definition.name == "echo")
+        );
+    }
+
+    #[tokio::test]
+    async fn engine_builder_reports_configuration_errors_and_empty_engine_works() {
+        let err = expect_box_err(
+            Engine::builder().register_agent(Arc::new(DependentAgent), None),
+            "dependent agent registration",
+        );
+        assert!(
+            err.to_string()
+                .contains("dependent tool missing_tool not found")
+        );
+
+        let mut duplicate_tools = ToolSet::new();
+        duplicate_tools.add(Arc::new(EchoTool)).unwrap();
+        let err = expect_box_err(
+            Engine::builder()
+                .register_tool(Arc::new(EchoTool))
+                .unwrap()
+                .register_tools(duplicate_tools),
+            "duplicate tools registration",
+        );
+        assert!(err.to_string().contains("tool echo_tool already exists"));
+
+        let mut duplicate_agents = AgentSet::new();
+        duplicate_agents.add(Arc::new(EchoAgent), None).unwrap();
+        let err = expect_box_err(
+            Engine::builder()
+                .register_agent(Arc::new(EchoAgent), None)
+                .unwrap()
+                .register_agents(duplicate_agents),
+            "duplicate agents registration",
+        );
+        assert!(err.to_string().contains("agent echo_agent already exists"));
+
+        let err = expect_box_err(
+            Engine::builder()
+                .register_remote_engine(RemoteEngineArgs {
+                    endpoint: "https://remote.example".to_string(),
+                    agents: Vec::new(),
+                    tools: Vec::new(),
+                    handle: Some("remote".to_string()),
+                })
+                .unwrap()
+                .register_remote_engine(RemoteEngineArgs {
+                    endpoint: "https://remote.example".to_string(),
+                    agents: Vec::new(),
+                    tools: Vec::new(),
+                    handle: Some("remote2".to_string()),
+                }),
+            "duplicate remote engine registration",
+        );
+        assert!(err.to_string().contains("remote engine"));
+
+        let err = expect_box_err(
+            Engine::builder().register_remote_engine(RemoteEngineArgs {
+                endpoint: "https://remote.example".to_string(),
+                agents: Vec::new(),
+                tools: Vec::new(),
+                handle: Some("bad handle".to_string()),
+            }),
+            "invalid remote engine handle",
+        );
+        assert!(err.to_string().contains("invalid engine handle"));
+
+        let err = expect_box_err(
+            Engine::builder().build("missing".to_string()).await,
+            "missing default agent",
+        );
+        assert!(err.to_string().contains("default agent missing not found"));
+
+        let engine = Engine::builder()
+            .with_cancellation_token(CancellationToken::new())
+            .with_web3_client(Arc::new(Web3SDK::Web3(Web3Client::not_implemented())))
+            .with_model(Model::mock_implemented())
+            .with_models(Arc::new(Models::default()))
+            .with_store(Store::new(Arc::new(InMemory::new())))
+            .with_hooks(Arc::new(Hooks::new()))
+            .export_agents(vec!["tools_search".to_string()])
+            .export_tools(vec!["missing_tool".to_string()])
+            .empty()
+            .await
+            .unwrap();
+        assert_eq!(engine.default_agent(), "");
+        assert!(
+            engine
+                .information()
+                .agents
+                .iter()
+                .any(|f| f.definition.name == "tools_search")
+        );
+    }
+
+    #[tokio::test]
+    async fn engine_cancellation_close_and_ref_behaviour() {
+        let engine = Arc::new(test_engine().await);
+        assert!(!engine.is_cancelled());
+        let child = engine.cancellation_token();
+        assert!(!child.is_cancelled());
+        engine.cancel();
+        assert!(engine.is_cancelled());
+        engine.close().await.unwrap();
+
+        let engine_ref = EngineRef::new();
+        assert!(engine_ref.get().is_none());
+        engine_ref.bind(Arc::downgrade(&engine));
+        assert!(engine_ref.get().is_some());
+        drop(engine);
+        assert!(engine_ref.get().is_none());
     }
 }

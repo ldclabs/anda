@@ -213,7 +213,10 @@ mod tests {
     use super::*;
     use crate::engine::EngineBuilder;
     use serde_json::json;
-    use std::path::{Path, PathBuf};
+    use std::{
+        path::{Path, PathBuf},
+        sync::Arc,
+    };
 
     struct TestTempDir(PathBuf);
 
@@ -251,6 +254,90 @@ mod tests {
 
     fn read_tool(workspace: &Path) -> ReadFileTool {
         ReadFileTool::new(workspace.to_path_buf())
+    }
+
+    struct RewritingReadHook;
+
+    #[async_trait::async_trait]
+    impl ToolHook<ReadFileArgs, ReadFileOutput> for RewritingReadHook {
+        async fn before_tool_call(
+            &self,
+            _ctx: &BaseCtx,
+            mut args: ReadFileArgs,
+        ) -> Result<ReadFileArgs, BoxError> {
+            args.path = "hook.txt".to_string();
+            args.offset = 1;
+            args.limit = 1;
+            Ok(args)
+        }
+
+        async fn after_tool_call(
+            &self,
+            _ctx: &BaseCtx,
+            mut output: ToolOutput<ReadFileOutput>,
+        ) -> Result<ToolOutput<ReadFileOutput>, BoxError> {
+            output.output.content.push_str("\nhooked");
+            Ok(output)
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_hooks_and_mime_detection_are_covered() {
+        let temp_dir = TestTempDir::new().await;
+        let workspace = temp_dir.path().join("workspace");
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+        tokio::fs::write(workspace.join("hook.txt"), "zero\none\ntwo\n")
+            .await
+            .unwrap();
+        tokio::fs::write(
+            workspace.join("tiny.png"),
+            [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a],
+        )
+        .await
+        .unwrap();
+
+        let tool = read_tool(&workspace).with_description("custom read".to_string());
+        assert_eq!(tool.name(), ReadFileTool::NAME);
+        assert_eq!(tool.description(), "custom read");
+        let definition = tool.definition();
+        assert_eq!(definition.name, ReadFileTool::NAME);
+        assert_eq!(definition.strict, Some(true));
+        assert_eq!(
+            definition.parameters["required"],
+            json!(["path", "offset", "limit"])
+        );
+
+        let image = tool
+            .call(
+                mock_ctx(),
+                ReadFileArgs {
+                    path: "tiny.png".to_string(),
+                    offset: 0,
+                    limit: 0,
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(image.output.encoding, BASE64_ENCODING);
+        assert_eq!(image.output.mime_type.as_deref(), Some("image/png"));
+
+        let ctx = mock_ctx();
+        ctx.set_state(ReadFileHook::new(Arc::new(RewritingReadHook)));
+        let hooked = tool
+            .call(
+                ctx,
+                ReadFileArgs {
+                    path: "ignored.txt".to_string(),
+                    offset: 0,
+                    limit: 0,
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(hooked.output.content, "one\nhooked");
+        assert_eq!(hooked.output.total_lines, Some(3));
     }
 
     #[tokio::test]

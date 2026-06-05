@@ -32,6 +32,8 @@ reqwest = { workspace = true }
 schemars = { workspace = true }
 
 [dev-dependencies]
+axum = { workspace = true }
+tokio = { workspace = true }
 
 [lib]
 doctest = false

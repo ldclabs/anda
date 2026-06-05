@@ -1137,6 +1137,153 @@ mod tests {
         );
     }
 
+    #[test]
+    fn runtime_builders_and_low_level_output_helpers_cover_edge_paths() {
+        let temp_dir = PathBuf::from("/tmp/anda-native-custom-temp");
+        let runtime = NativeRuntime::new(PathBuf::from("/workspace"))
+            .temp_dir(temp_dir.clone())
+            .insecure()
+            .background_progress_interval(Duration::from_millis(7))
+            .auto_background_after(Duration::from_millis(9));
+
+        assert_eq!(runtime.temp_dir, temp_dir);
+        assert!(runtime.insecure);
+        assert_eq!(
+            runtime.background_progress_interval,
+            Duration::from_millis(7)
+        );
+        assert_eq!(runtime.auto_background_after, Duration::from_millis(9));
+
+        assert_eq!(complete_utf8_prefix_len(&[]), 0);
+        assert_eq!(complete_utf8_prefix_len("😀".as_bytes()), 4);
+        assert_eq!(complete_utf8_prefix_len(&[0xf0, 0x9f]), 0);
+        assert_eq!(complete_utf8_prefix_len(&[0x80, 0x80]), 2);
+        assert_eq!(utf8_sequence_len(0xf0), 4);
+        assert_eq!(utf8_sequence_len(0xff), 1);
+        assert!(has_rewrite_control("\x1b[2J"));
+        assert!(!has_rewrite_control("\x1b[31mred"));
+        assert_eq!(byte_index_for_char_column("a中b", 2), "a中".len());
+        assert_eq!(csi_params("?25;0;12h"), vec![25, 0, 12]);
+        assert_eq!(csi_param_or(&[0], 0, 1), 1);
+
+        let mut stderr = b"first".to_vec();
+        append_output_read_error(&mut stderr, "second".to_string());
+        assert_eq!(String::from_utf8(stderr).unwrap(), "first\nsecond");
+
+        let output =
+            output_bytes_to_exec_output(Some(7), "/workspace", b"out".to_vec(), b"err".to_vec());
+        assert_eq!(output.process_id, Some(7));
+        assert_eq!(output.workspace.as_deref(), Some("/workspace"));
+        assert_eq!(output.stdout.as_deref(), Some("out"));
+        assert_eq!(output.stderr.as_deref(), Some("err"));
+    }
+
+    #[test]
+    fn terminal_state_handles_cursor_motion_clears_screen_and_osc_sequences() {
+        let mut terminal = TerminalProgressState::default();
+
+        assert_eq!(
+            terminal
+                .render("abc\x1b[2GZ\x1b[1Kx\x1b[3G!\x1b]0;title\x07")
+                .as_deref(),
+            Some("x !")
+        );
+        assert_eq!(terminal.render("\x1b[2Jfresh").as_deref(), Some("fresh"));
+
+        let mut terminal = TerminalProgressState::default();
+        terminal.apply_text("ab\ncd", ProgressMode::Rewrite);
+        terminal.set_cursor_position(1, 2);
+        terminal.move_cursor_right_by(5);
+        terminal.write_char('Z');
+        terminal.move_cursor_down_by(3);
+        terminal.write_char('x');
+        terminal.move_cursor_up_by(2);
+        terminal.clear_line();
+
+        assert_eq!(terminal.lines[0], "abZ");
+        assert!(terminal.lines.len() >= 4);
+        assert_eq!(terminal.lines[3], "x");
+        assert!(terminal.dirty_rows.contains(&0));
+        assert!(terminal.dirty_rows.contains(&3));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn output_reader_and_finalize_helpers_report_read_join_and_wait_errors() {
+        let empty_reader =
+            spawn_output_reader::<tokio::io::Empty>(None, Arc::new(TokioMutex::new(Vec::new())));
+        assert!(output_reader_error(empty_reader, "stdout").await.is_none());
+
+        let read_error =
+            tokio::spawn(async { Err::<(), std::io::Error>(std::io::Error::other("read failed")) });
+        assert!(
+            output_reader_error(read_error, "stderr")
+                .await
+                .unwrap()
+                .contains("Failed to read background stderr")
+        );
+
+        let join_error = tokio::spawn(async {
+            panic!("join failed");
+            #[allow(unreachable_code)]
+            Ok::<(), std::io::Error>(())
+        });
+        assert!(
+            output_reader_error(join_error, "stdout")
+                .await
+                .unwrap()
+                .contains("Failed to join background stdout reader")
+        );
+
+        let stdout = Arc::new(TokioMutex::new(b"stdout".to_vec()));
+        let stderr = Arc::new(TokioMutex::new(b"stderr".to_vec()));
+        let ok_reader = tokio::spawn(async { Ok::<(), std::io::Error>(()) });
+        let ok_reader_2 = tokio::spawn(async { Ok::<(), std::io::Error>(()) });
+        let output = finalize_process_output(
+            Some(99),
+            "/workspace",
+            Err(std::io::Error::other("wait failed")),
+            stdout,
+            stderr,
+            ok_reader,
+            ok_reader_2,
+            Path::new("/tmp"),
+        )
+        .await;
+        assert_eq!(output.process_id, Some(99));
+        assert_eq!(output.workspace.as_deref(), Some("/workspace"));
+        assert_eq!(output.stdout.as_deref(), Some("stdout"));
+        assert!(
+            output
+                .stderr
+                .as_deref()
+                .is_some_and(|stderr| stderr.contains("wait failed") && stderr.contains("stderr"))
+        );
+
+        let stdout = Arc::new(TokioMutex::new(Vec::new()));
+        let stderr = Arc::new(TokioMutex::new(Vec::new()));
+        let read_error = tokio::spawn(async {
+            Err::<(), std::io::Error>(std::io::Error::other("stdout failed"))
+        });
+        let ok_reader = tokio::spawn(async { Ok::<(), std::io::Error>(()) });
+        let output = finalize_process_output(
+            Some(100),
+            "/workspace",
+            Ok(ExitStatus::default()),
+            stdout,
+            stderr,
+            read_error,
+            ok_reader,
+            Path::new("/tmp"),
+        )
+        .await;
+        assert!(
+            output
+                .stderr
+                .as_deref()
+                .is_some_and(|stderr| stderr.contains("stdout failed"))
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn execute_runs_foreground_command_with_envs_and_workspace() {
         let ctx = EngineBuilder::new().mock_ctx();

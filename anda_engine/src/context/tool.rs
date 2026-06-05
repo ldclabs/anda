@@ -925,4 +925,180 @@ mod tests {
         let names: Vec<&str> = output.tools.iter().map(|tool| tool.name.as_str()).collect();
         assert_eq!(names, vec!["echo_agent"]);
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tools_search_and_select_report_invalid_or_empty_inputs() {
+        let _search = ToolsSearch::default();
+        let _select = ToolsSelect::default();
+        let engine = build_engine(
+            EngineBuilder::new()
+                .register_tool(Arc::new(EchoTool))
+                .unwrap()
+                .register_agent(Arc::new(EchoAgent), None)
+                .unwrap(),
+        )
+        .await;
+        let ctx = engine
+            .ctx_with(
+                Principal::anonymous(),
+                "echo_agent",
+                "echo_agent",
+                Default::default(),
+            )
+            .unwrap();
+
+        let output = ToolsSearch::new()
+            .run(ctx.clone(), "not json".to_string(), Vec::new())
+            .await
+            .unwrap();
+        assert!(output.content.contains("Invalid input"));
+
+        let output = run_search(
+            ctx.clone(),
+            ToolsSearchArgs {
+                query: "   ".to_string(),
+                limit: 4,
+            },
+        )
+        .await;
+        assert!(output.tools.is_empty());
+        assert!(output.total_tools > 0);
+
+        let output = ToolsSelect::new()
+            .run(ctx.clone(), "not json".to_string(), Vec::new())
+            .await
+            .unwrap();
+        assert!(output.content.contains("Invalid input"));
+
+        let output = ToolsSelect::new()
+            .run(
+                ctx,
+                serde_json::to_string(&ToolsSelectArgs::default()).unwrap(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert!(output.content.contains("either `tools` or `query`"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tools_select_query_covers_empty_candidates_short_queries_and_selector_success() {
+        let models = Arc::new(Models::default());
+        models.set_model(Model::not_implemented());
+        models.set(
+            TOOLS_SELECT_NAME.to_string(),
+            Model::with_completer(Arc::new(SelectorCompleter {
+                content: "```json\n{\"tools\":[\"help_tool\"]}\n```".to_string(),
+            })),
+        );
+        let engine = build_engine(
+            EngineBuilder::new()
+                .with_models(models)
+                .register_tool(Arc::new(EchoTool))
+                .unwrap()
+                .register_tool(Arc::new(HelpTool))
+                .unwrap()
+                .register_agent(Arc::new(EchoAgent), None)
+                .unwrap(),
+        )
+        .await;
+        let ctx = engine
+            .ctx_with(
+                Principal::anonymous(),
+                "echo_agent",
+                TOOLS_SELECT_NAME,
+                Default::default(),
+            )
+            .unwrap();
+        let selector = ToolsSelect::new();
+
+        let selected = selector
+            .select_requested_definitions_by_query(
+                &ctx,
+                Vec::new(),
+                &ToolsSelectArgs {
+                    query: "echo".to_string(),
+                    limit: 0,
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(selected.is_empty());
+
+        let definitions = vec![EchoTool.definition(), HelpTool.definition()];
+        let selected = selector
+            .select_requested_definitions_by_query(
+                &ctx,
+                definitions.clone(),
+                &ToolsSelectArgs {
+                    query: "he".to_string(),
+                    limit: 1,
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert_eq!(selected[0].name, "help_tool");
+
+        let selected = selector
+            .select_requested_definitions_by_query(
+                &ctx,
+                definitions,
+                &ToolsSelectArgs {
+                    query: "echo support".to_string(),
+                    limit: 2,
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert_eq!(selected[0].name, "help_tool");
+    }
+
+    #[test]
+    fn selector_json_candidate_parsing_ranking_and_deduping_are_stable() {
+        assert_eq!(
+            parse_selector_tool_names("```JSON\n[\"echo_tool\", \"help_tool\"]\n```"),
+            vec!["echo_tool", "help_tool"]
+        );
+        assert_eq!(
+            parse_selector_tool_names("prefix {\"tools\":[\"echo_tool\"]} suffix"),
+            vec!["echo_tool"]
+        );
+        assert!(parse_selector_tool_names("not json").is_empty());
+
+        let candidates = json_candidates("prefix [\"echo_tool\"] suffix");
+        assert!(candidates.contains(&"[\"echo_tool\"]".to_string()));
+
+        let definitions = vec![
+            FunctionDefinition {
+                name: "alpha".to_string(),
+                description: "first".to_string(),
+                ..Default::default()
+            },
+            FunctionDefinition {
+                name: "my_echo_tool".to_string(),
+                description: "second".to_string(),
+                ..Default::default()
+            },
+        ];
+        assert_eq!(
+            rank_search_items(&definitions, "alpha", &[], false)[0],
+            "alpha"
+        );
+        assert_eq!(
+            rank_search_items(&definitions, "echo", &[], false),
+            vec!["my_echo_tool"]
+        );
+
+        let selected = select_requested_definitions(
+            vec![EchoTool.definition()],
+            &[
+                String::new(),
+                "echo_tool".to_string(),
+                "echo_tool".to_string(),
+                "missing".to_string(),
+            ],
+        );
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].name, "echo_tool");
+    }
 }

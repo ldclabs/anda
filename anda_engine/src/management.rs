@@ -77,3 +77,66 @@ impl Management for BaseManagement {
         Ok(self.visibility)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn principal(seed: u8) -> Principal {
+        Principal::self_authenticating([seed; 32])
+    }
+
+    #[test]
+    fn base_management_checks_controller_managers_visibility_and_anonymous_access() {
+        let controller = principal(1);
+        let manager = principal(2);
+        let user = principal(3);
+        let mut managers = BTreeSet::new();
+        managers.insert(manager);
+
+        let policy = BaseManagement {
+            controller,
+            managers,
+            visibility: Visibility::Private,
+        };
+        assert!(policy.is_controller(&controller));
+        assert!(!policy.is_controller(&manager));
+        assert!(policy.is_manager(&controller));
+        assert!(policy.is_manager(&manager));
+        assert!(!policy.is_manager(&user));
+        assert_eq!(
+            policy.check_visibility(&controller).unwrap() as u8,
+            Visibility::Private as u8
+        );
+        assert!(policy.check_visibility(&manager).is_ok());
+        let Err(err) = policy.check_visibility(&user) else {
+            panic!("expected private visibility error");
+        };
+        assert!(err.to_string().contains("not allowed"));
+        let Err(err) = policy.check_visibility(&ANONYMOUS_PRINCIPAL) else {
+            panic!("expected anonymous visibility error");
+        };
+        assert!(err.to_string().contains("anonymous"));
+
+        let protected = BaseManagement {
+            controller,
+            managers: BTreeSet::new(),
+            visibility: Visibility::Protected,
+        };
+        assert_eq!(
+            protected.check_visibility(&user).unwrap() as u8,
+            Visibility::Protected as u8
+        );
+        assert!(protected.check_visibility(&ANONYMOUS_PRINCIPAL).is_err());
+
+        let public = BaseManagement {
+            controller,
+            managers: BTreeSet::new(),
+            visibility: Visibility::Public,
+        };
+        assert_eq!(
+            public.check_visibility(&ANONYMOUS_PRINCIPAL).unwrap() as u8,
+            Visibility::Public as u8
+        );
+    }
+}

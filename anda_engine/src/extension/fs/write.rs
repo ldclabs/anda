@@ -240,7 +240,10 @@ mod tests {
         extension::fs::{commit_atomic_replace, write_temp_file_for_atomic_replace},
     };
     use serde_json::json;
-    use std::path::{Path, PathBuf};
+    use std::{
+        path::{Path, PathBuf},
+        sync::Arc,
+    };
 
     struct TestTempDir(PathBuf);
 
@@ -278,6 +281,90 @@ mod tests {
 
     fn write_tool(workspace: &Path) -> WriteFileTool {
         WriteFileTool::new(workspace.to_path_buf())
+    }
+
+    struct RewritingWriteHook;
+
+    #[async_trait::async_trait]
+    impl ToolHook<WriteFileArgs, WriteFileOutput> for RewritingWriteHook {
+        async fn before_tool_call(
+            &self,
+            _ctx: &BaseCtx,
+            mut args: WriteFileArgs,
+        ) -> Result<WriteFileArgs, BoxError> {
+            args.path = "hook.txt".to_string();
+            args.content = "hooked".to_string();
+            args.encoding = UTF8_ENCODING.to_string();
+            Ok(args)
+        }
+
+        async fn after_tool_call(
+            &self,
+            _ctx: &BaseCtx,
+            mut output: ToolOutput<WriteFileOutput>,
+        ) -> Result<ToolOutput<WriteFileOutput>, BoxError> {
+            output.output.size += 10;
+            Ok(output)
+        }
+    }
+
+    #[tokio::test]
+    async fn defaults_metadata_invalid_base64_and_hooks_are_covered() {
+        let temp_dir = TestTempDir::new().await;
+        let workspace = temp_dir.path().join("workspace");
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+
+        let default_args = WriteFileArgs::default();
+        assert_eq!(default_args.path, "");
+        assert_eq!(default_args.content, "");
+        assert_eq!(default_args.encoding, UTF8_ENCODING);
+
+        let tool = write_tool(&workspace).with_description("custom write".to_string());
+        assert_eq!(tool.name(), WriteFileTool::NAME);
+        assert_eq!(tool.description(), "custom write");
+        let definition = tool.definition();
+        assert_eq!(definition.name, WriteFileTool::NAME);
+        assert_eq!(definition.strict, Some(true));
+        assert_eq!(
+            definition.parameters["required"],
+            json!(["path", "content", "encoding"])
+        );
+
+        let err = tool
+            .call(
+                mock_ctx(),
+                WriteFileArgs {
+                    path: "bad.bin".to_string(),
+                    content: "not base64%%".to_string(),
+                    encoding: BASE64_ENCODING.to_string(),
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Failed to decode base64 content"));
+
+        let ctx = mock_ctx();
+        ctx.set_state(WriteFileHook::new(Arc::new(RewritingWriteHook)));
+        let hooked = tool
+            .call(
+                ctx,
+                WriteFileArgs {
+                    path: "ignored.txt".to_string(),
+                    content: "ignored".to_string(),
+                    encoding: UTF8_ENCODING.to_string(),
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(hooked.output.size, 16);
+        assert_eq!(
+            tokio::fs::read_to_string(workspace.join("hook.txt"))
+                .await
+                .unwrap(),
+            "hooked"
+        );
     }
 
     #[tokio::test]

@@ -27,6 +27,8 @@ ic_tee_gateway_sdk = { workspace = true }
 reqwest = { workspace = true }
 
 [dev-dependencies]
+axum = { workspace = true }
+tokio = { workspace = true }
 
 [lib]
 test = false

@@ -252,3 +252,156 @@ where
         Ok(res)
     }
 }
+
+#[cfg(test)]
+#[allow(deprecated)]
+mod tests {
+    use super::*;
+    use anda_core::{CompletionFeatures, ToolCall};
+    use serde_json::json;
+
+    use crate::engine::EngineBuilder;
+
+    #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq)]
+    struct Contact {
+        name: String,
+        phone: String,
+    }
+
+    #[derive(Clone)]
+    struct MockCompletion {
+        output: AgentOutput,
+    }
+
+    impl CompletionFeatures for MockCompletion {
+        async fn completion(
+            &self,
+            req: CompletionRequest,
+            resources: Vec<Resource>,
+        ) -> Result<AgentOutput, BoxError> {
+            assert!(req.instructions.contains("extract structured data"));
+            assert_eq!(req.prompt, "Ada, 555-0100");
+            assert_eq!(req.tools.len(), 1);
+            assert!(req.tool_choice_required);
+            assert_eq!(req.max_output_tokens, Some(64));
+            assert!(resources.is_empty());
+            Ok(self.output.clone())
+        }
+
+        fn model_name(&self) -> String {
+            "mock-model".to_string()
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn submit_tool_schema_submit_and_call_round_trip_typed_payload() {
+        let tool = SubmitTool::<Contact>::new();
+        assert_eq!(tool.name(), "submit_contact");
+        assert_eq!(
+            tool.description(),
+            "Submit the structured data you extracted from the provided text."
+        );
+        let definition = tool.definition();
+        assert_eq!(definition.name, "submit_contact");
+        assert_eq!(definition.strict, Some(true));
+        assert_eq!(definition.parameters["type"], "object");
+
+        let contact = Contact {
+            name: "Ada".to_string(),
+            phone: "555-0100".to_string(),
+        };
+        assert_eq!(
+            tool.submit(json!({"name": "Ada", "phone": "555-0100"}))
+                .unwrap(),
+            contact
+        );
+        assert!(tool.submit(json!({"name": "Ada"})).is_err());
+
+        let ctx = EngineBuilder::new().mock_ctx().base;
+        let output = tool.call(ctx, contact.clone(), Vec::new()).await.unwrap();
+        assert_eq!(output.output, contact);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn extractor_extracts_first_tool_call_and_reports_failure_modes() {
+        let extractor = Extractor::<Contact>::new(Some(64), None);
+        assert_eq!(extractor.name(), "contact_extractor");
+        assert_eq!(
+            extractor.description(),
+            "Extract structured data from text using LLMs."
+        );
+
+        let ctx = MockCompletion {
+            output: AgentOutput {
+                tool_calls: vec![ToolCall {
+                    name: "submit_contact".to_string(),
+                    args: json!({"name": "Ada", "phone": "555-0100"}),
+                    call_id: Some("call-1".to_string()),
+                    result: None,
+                    remote_id: None,
+                }],
+                ..Default::default()
+            },
+        };
+        let (contact, output) = extractor
+            .extract(&ctx, "Ada, 555-0100".to_string())
+            .await
+            .unwrap();
+        assert_eq!(
+            contact,
+            Contact {
+                name: "Ada".to_string(),
+                phone: "555-0100".to_string()
+            }
+        );
+        assert_eq!(output.tool_calls.len(), 1);
+
+        let failed = MockCompletion {
+            output: AgentOutput {
+                failed_reason: Some("model failed".to_string()),
+                ..Default::default()
+            },
+        };
+        assert!(
+            extractor
+                .extract(&failed, "Ada, 555-0100".to_string())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("model failed")
+        );
+
+        let missing_tool = MockCompletion {
+            output: AgentOutput::default(),
+        };
+        assert!(
+            extractor
+                .extract(&missing_tool, "Ada, 555-0100".to_string())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("no tool_calls")
+        );
+
+        let invalid_args = MockCompletion {
+            output: AgentOutput {
+                tool_calls: vec![ToolCall {
+                    name: "submit_contact".to_string(),
+                    args: json!({"name": "Ada"}),
+                    call_id: None,
+                    result: None,
+                    remote_id: None,
+                }],
+                ..Default::default()
+            },
+        };
+        assert!(
+            extractor
+                .extract(&invalid_args, "Ada, 555-0100".to_string())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("invalid args")
+        );
+    }
+}

@@ -459,6 +459,97 @@ impl CompletionFeaturesDyn for CompletionModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anda_core::FunctionDefinition;
+    use axum::{Router, body::Bytes, extract::State, response::IntoResponse, routing::any};
+    use http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
+    use serde_json::Value;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct MockResponse {
+        status: StatusCode,
+        headers: HeaderMap,
+        body: Vec<u8>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct RecordedRequest {
+        method: Method,
+        uri: Uri,
+        headers: HeaderMap,
+        body: Vec<u8>,
+    }
+
+    type MockState = Arc<Mutex<(MockResponse, Option<RecordedRequest>)>>;
+
+    async fn mock_handler(
+        State(state): State<MockState>,
+        method: Method,
+        uri: Uri,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> impl IntoResponse {
+        let mut state = state.lock().unwrap();
+        state.1 = Some(RecordedRequest {
+            method,
+            uri,
+            headers,
+            body: body.to_vec(),
+        });
+        let mut response = (state.0.status, state.0.body.clone()).into_response();
+        for (name, value) in state.0.headers.iter() {
+            response.headers_mut().insert(name, value.clone());
+        }
+        response
+    }
+
+    async fn spawn_mock_server(
+        status: StatusCode,
+        headers: HeaderMap,
+        body: impl Into<Vec<u8>>,
+    ) -> (String, MockState) {
+        let state = Arc::new(Mutex::new((
+            MockResponse {
+                status,
+                headers,
+                body: body.into(),
+            },
+            None,
+        )));
+        let app = Router::new()
+            .fallback(any(mock_handler))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), state)
+    }
+
+    fn no_proxy_client() -> reqwest::Client {
+        reqwest::Client::builder().no_proxy().build().unwrap()
+    }
+
+    fn recorded(state: &MockState) -> RecordedRequest {
+        state.lock().unwrap().1.clone().unwrap()
+    }
+
+    fn sse_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        headers
+    }
+
+    async fn complete(
+        model: &CompletionModel,
+        req: CompletionRequest,
+    ) -> Result<AgentOutput, BoxError> {
+        CompletionFeaturesDyn::completion(model, req).await
+    }
 
     #[test]
     fn completion_model_applies_default_effort() {
@@ -474,6 +565,366 @@ mod tests {
         assert_eq!(
             thinking_config.thinking_level,
             Some(types::ThinkingLevel::High)
+        );
+    }
+
+    #[test]
+    fn client_defaults_effort_mapping_and_default_request_are_covered() {
+        assert_eq!(
+            types::ThinkingLevel::from(ModelEffort::Minimal),
+            types::ThinkingLevel::Minimal
+        );
+        assert_eq!(
+            types::ThinkingLevel::from(ModelEffort::Low),
+            types::ThinkingLevel::Low
+        );
+        assert_eq!(
+            types::ThinkingLevel::from(ModelEffort::Medium),
+            types::ThinkingLevel::Medium
+        );
+        assert_eq!(
+            types::ThinkingLevel::from(ModelEffort::High),
+            types::ThinkingLevel::High
+        );
+        assert_eq!(
+            types::ThinkingLevel::from(ModelEffort::Max),
+            types::ThinkingLevel::High
+        );
+
+        let default_client = Client::new("test-key", None);
+        assert_eq!(default_client.endpoint, API_BASE_URL);
+        let empty_endpoint_client = Client::new("test-key", Some(String::new()));
+        assert_eq!(empty_endpoint_client.endpoint, API_BASE_URL);
+
+        let default_model = empty_endpoint_client.completion_model("");
+        assert_eq!(default_model.model, DEFAULT_COMPLETION_MODEL);
+        assert_eq!(
+            CompletionFeatures::model_name(&default_model),
+            DEFAULT_COMPLETION_MODEL
+        );
+        assert_eq!(
+            CompletionFeaturesDyn::model_name(&default_model),
+            DEFAULT_COMPLETION_MODEL
+        );
+
+        let no_effort = default_model.clone().with_effort(None);
+        assert!(
+            no_effort
+                .default_request
+                .generation_config
+                .thinking_config
+                .is_none()
+        );
+
+        let mut custom_request = types::GenerateContentRequest::default();
+        custom_request.stream = true;
+        custom_request.generation_config.temperature = Some(0.25);
+        let custom_model = default_model
+            .with_stream(false)
+            .with_default_request(custom_request);
+        assert!(custom_model.default_request.stream);
+        assert_eq!(
+            custom_model.default_request.generation_config.temperature,
+            Some(0.25)
+        );
+    }
+
+    #[test]
+    fn stream_chunk_aggregation_covers_metadata_replacements_and_errors() {
+        assert_eq!(
+            response_from_stream_chunks(Vec::new())
+                .unwrap_err()
+                .to_string(),
+            "No streamed Gemini response"
+        );
+
+        let chunks = vec![
+            serde_json::from_value::<types::GenerateContentResponse>(json!({
+                "candidates": [{
+                    "index": 0,
+                    "content": {
+                        "parts": [
+                            {"text": "plain"},
+                            {"thought": true, "text": "think"}
+                        ]
+                    }
+                }]
+            }))
+            .unwrap(),
+            serde_json::from_value::<types::GenerateContentResponse>(json!({
+                "promptFeedback": {"blockReason": "OTHER"},
+                "modelStatus": {"modelStage": "PREVIEW"},
+                "candidates": [{
+                    "index": 0,
+                    "content": {
+                        "role": "model",
+                        "parts": [
+                            {
+                                "thought": true,
+                                "thoughtSignature": "sig-1",
+                                "text": " more"
+                            },
+                            {"functionCall": {"name": "lookup", "args": {"q": "anda"}}}
+                        ]
+                    },
+                    "finishReason": "MAX_TOKENS",
+                    "citationMetadata": {
+                        "citationSources": [{"uri": "https://example.com"}]
+                    },
+                    "tokenCount": 9,
+                    "groundingAttributions": [{
+                        "sourceId": {"groundingPassage": {"passageId": "p1"}}
+                    }],
+                    "groundingMetadata": {
+                        "webSearchQueries": ["anda coverage"]
+                    },
+                    "avgLogprobs": -0.5,
+                    "logprobsResult": {"logProbabilitySum": -1.0},
+                    "urlContextMetadata": {
+                        "urlMetadata": [{
+                            "retrievedUrl": "https://example.com",
+                            "urlRetrievalStatus": "URL_RETRIEVAL_STATUS_SUCCESS"
+                        }]
+                    },
+                    "finishMessage": "cut short"
+                }]
+            }))
+            .unwrap(),
+            serde_json::from_value::<types::GenerateContentResponse>(json!({
+                "candidates": [{
+                    "index": 1,
+                    "content": {
+                        "role": "model",
+                        "parts": [{"text": "second candidate"}]
+                    },
+                    "finishReason": "STOP"
+                }]
+            }))
+            .unwrap(),
+        ];
+
+        let response = response_from_stream_chunks(chunks).unwrap();
+        assert_eq!(
+            response.prompt_feedback.unwrap().block_reason,
+            Some(types::BlockReason::Other)
+        );
+        assert_eq!(
+            response.model_status.unwrap().model_stage,
+            Some(types::ModelStage::Preview)
+        );
+        assert_eq!(response.candidates.len(), 2);
+
+        let first = &response.candidates[0];
+        assert_eq!(first.content.role, Some(types::Role::Model));
+        assert!(matches!(
+            &first.content.parts[1],
+            types::Part {
+                thought: Some(true),
+                thought_signature: Some(signature),
+                data: types::PartKind::Text(text),
+            } if signature == "sig-1" && text == "think more"
+        ));
+        assert!(matches!(
+            &first.content.parts[2].data,
+            types::PartKind::FunctionCall { name, args, .. }
+                if name == "lookup" && args.as_ref() == Some(&json!({"q": "anda"}))
+        ));
+        assert_eq!(first.finish_reason, Some(types::FinishReason::MaxTokens));
+        assert_eq!(first.token_count, Some(9));
+        assert_eq!(first.finish_message.as_deref(), Some("cut short"));
+        assert_eq!(first.avg_logprobs, Some(-0.5));
+        assert!(first.citation_metadata.is_some());
+        assert_eq!(first.grounding_attributions.len(), 1);
+        assert!(first.grounding_metadata.is_some());
+        assert!(first.logprobs_result.is_some());
+        assert!(first.url_context_metadata.is_some());
+    }
+
+    #[tokio::test]
+    async fn completion_model_posts_request_and_parses_non_stream_response() {
+        let body = serde_json::to_vec(&json!({
+            "candidates": [{
+                "index": 0,
+                "content": {
+                    "role": "model",
+                    "parts": [{"text": "hello from gemini"}]
+                },
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 7,
+                "cachedContentTokenCount": 2,
+                "candidatesTokenCount": 3
+            },
+            "modelVersion": "gemini-test",
+            "responseId": "resp_1"
+        }))
+        .unwrap();
+        let (endpoint, state) = spawn_mock_server(StatusCode::OK, HeaderMap::new(), body).await;
+        let model = Client::new("test-key", Some(endpoint))
+            .with_client(no_proxy_client())
+            .completion_model("gemini-test")
+            .with_stream(false);
+
+        let output = complete(
+            &model,
+            CompletionRequest {
+                instructions: "system rules".into(),
+                prompt: "say hello".into(),
+                temperature: Some(0.4),
+                max_output_tokens: Some(128),
+                output_schema: Some(json!({"type": "object"})),
+                stop: Some(vec!["END".into()]),
+                effort: Some(ModelEffort::Low),
+                tools: vec![FunctionDefinition {
+                    name: "lookup".into(),
+                    description: "Lookup docs".into(),
+                    parameters: json!({"type": "object"}),
+                    strict: Some(false),
+                }],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(output.content, "hello from gemini");
+        assert_eq!(output.model.as_deref(), Some("gemini-test"));
+        assert_eq!(output.usage.input_tokens, 7);
+        assert_eq!(output.usage.cached_tokens, 2);
+        assert_eq!(output.usage.output_tokens, 3);
+
+        let req = recorded(&state);
+        assert_eq!(req.method, Method::POST);
+        assert_eq!(req.uri.path(), "/gemini-test:generateContent");
+        assert_eq!(req.headers.get("x-goog-api-key").unwrap(), "test-key");
+        assert_ne!(
+            req.headers.get(ACCEPT).and_then(|v| v.to_str().ok()),
+            Some("text/event-stream")
+        );
+        let sent: Value = serde_json::from_slice(&req.body).unwrap();
+        assert_eq!(sent["systemInstruction"]["role"], "model");
+        assert_eq!(sent["contents"][0]["role"], "user");
+        assert_eq!(sent["generationConfig"]["temperature"], 0.4);
+        assert_eq!(sent["generationConfig"]["maxOutputTokens"], 128);
+        assert_eq!(
+            sent["generationConfig"]["responseMimeType"],
+            "application/json"
+        );
+        assert_eq!(
+            sent["generationConfig"]["responseSchema"],
+            json!({"type": "object"})
+        );
+        assert_eq!(sent["generationConfig"]["stopSequences"], json!(["END"]));
+        assert_eq!(
+            sent["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "LOW"
+        );
+        assert_eq!(
+            sent["tools"][0]["functionDeclarations"][0]["name"],
+            "lookup"
+        );
+        assert!(sent.get("toolConfig").is_some());
+    }
+
+    #[tokio::test]
+    async fn completion_model_reports_http_and_invalid_json_errors() {
+        let (endpoint, _) = spawn_mock_server(
+            StatusCode::SERVICE_UNAVAILABLE,
+            HeaderMap::new(),
+            "unavailable",
+        )
+        .await;
+        let model = Client::new("test-key", Some(endpoint))
+            .with_client(no_proxy_client())
+            .completion_model("gemini-test")
+            .with_stream(false);
+        let err = complete(
+            &model,
+            CompletionRequest {
+                prompt: "hello".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("Completion failed"));
+        assert!(err.to_string().contains("unavailable"));
+
+        let (endpoint, _) = spawn_mock_server(StatusCode::OK, HeaderMap::new(), "not json").await;
+        let model = Client::new("test-key", Some(endpoint))
+            .with_client(no_proxy_client())
+            .completion_model("gemini-test")
+            .with_stream(false);
+        let err = complete(
+            &model,
+            CompletionRequest {
+                prompt: "hello".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("Invalid completion response"));
+        assert!(err.to_string().contains("not json"));
+    }
+
+    #[tokio::test]
+    async fn completion_model_streams_sse_chunks() {
+        let chunks = [
+            json!({
+                "candidates": [{
+                    "index": 0,
+                    "content": {
+                        "role": "model",
+                        "parts": [{"text": "Hel"}]
+                    }
+                }],
+                "usageMetadata": {"promptTokenCount": 4},
+                "modelVersion": "gemini-stream"
+            }),
+            json!({
+                "candidates": [{
+                    "index": 0,
+                    "content": {"parts": [{"text": "lo"}]},
+                    "finishReason": "STOP"
+                }],
+                "usageMetadata": {
+                    "promptTokenCount": 4,
+                    "candidatesTokenCount": 2
+                },
+                "responseId": "resp_stream"
+            }),
+        ]
+        .into_iter()
+        .map(|chunk| format!("data: {chunk}\n\n"))
+        .collect::<String>();
+
+        let (endpoint, state) =
+            spawn_mock_server(StatusCode::OK, sse_headers(), chunks.into_bytes()).await;
+        let model = Client::new("test-key", Some(endpoint))
+            .with_client(no_proxy_client())
+            .completion_model("gemini-stream")
+            .with_stream(true);
+        let output = complete(
+            &model,
+            CompletionRequest {
+                prompt: "stream".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(output.content, "Hello");
+        assert_eq!(output.usage.input_tokens, 4);
+        assert_eq!(output.usage.output_tokens, 2);
+        let req = recorded(&state);
+        assert_eq!(req.uri.path(), "/gemini-stream:streamGenerateContent");
+        assert_eq!(req.uri.query(), Some("alt=sse"));
+        assert_eq!(
+            req.headers.get(ACCEPT).and_then(|v| v.to_str().ok()),
+            Some("text/event-stream")
         );
     }
 

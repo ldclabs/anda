@@ -611,7 +611,96 @@ impl CompletionFeaturesDyn for CompletionModel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anda_core::ContentPart;
+    use anda_core::{ContentPart, FunctionDefinition};
+    use axum::{Router, body::Bytes, extract::State, response::IntoResponse, routing::any};
+    use http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct MockResponse {
+        status: StatusCode,
+        headers: HeaderMap,
+        body: Vec<u8>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct RecordedRequest {
+        method: Method,
+        uri: Uri,
+        headers: HeaderMap,
+        body: Vec<u8>,
+    }
+
+    type MockState = Arc<Mutex<(MockResponse, Option<RecordedRequest>)>>;
+
+    async fn mock_handler(
+        State(state): State<MockState>,
+        method: Method,
+        uri: Uri,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> impl IntoResponse {
+        let mut state = state.lock().unwrap();
+        state.1 = Some(RecordedRequest {
+            method,
+            uri,
+            headers,
+            body: body.to_vec(),
+        });
+        let mut response = (state.0.status, state.0.body.clone()).into_response();
+        for (name, value) in state.0.headers.iter() {
+            response.headers_mut().insert(name, value.clone());
+        }
+        response
+    }
+
+    async fn spawn_mock_server(
+        status: StatusCode,
+        headers: HeaderMap,
+        body: impl Into<Vec<u8>>,
+    ) -> (String, MockState) {
+        let state = Arc::new(Mutex::new((
+            MockResponse {
+                status,
+                headers,
+                body: body.into(),
+            },
+            None,
+        )));
+        let app = Router::new()
+            .fallback(any(mock_handler))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), state)
+    }
+
+    fn no_proxy_client() -> reqwest::Client {
+        reqwest::Client::builder().no_proxy().build().unwrap()
+    }
+
+    fn recorded(state: &MockState) -> RecordedRequest {
+        state.lock().unwrap().1.clone().unwrap()
+    }
+
+    fn sse_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        headers
+    }
+
+    async fn complete(
+        model: &CompletionModel,
+        req: CompletionRequest,
+    ) -> Result<AgentOutput, BoxError> {
+        CompletionFeaturesDyn::completion(model, req).await
+    }
 
     #[test]
     fn completion_model_applies_default_effort() {
@@ -623,6 +712,413 @@ mod tests {
             model.default_request.output_config.unwrap().effort,
             Some(types::OutputEffort::Max)
         );
+    }
+
+    #[test]
+    fn client_defaults_effort_mapping_and_default_request_are_covered() {
+        assert_eq!(
+            types::OutputEffort::from(ModelEffort::Minimal),
+            types::OutputEffort::Low
+        );
+        assert_eq!(
+            types::OutputEffort::from(ModelEffort::Low),
+            types::OutputEffort::Medium
+        );
+        assert_eq!(
+            types::OutputEffort::from(ModelEffort::Medium),
+            types::OutputEffort::High
+        );
+        assert_eq!(
+            types::OutputEffort::from(ModelEffort::High),
+            types::OutputEffort::XHigh
+        );
+        assert_eq!(
+            types::OutputEffort::from(ModelEffort::Max),
+            types::OutputEffort::Max
+        );
+
+        let default_client = Client::new("test-key", None);
+        assert_eq!(default_client.endpoint, API_BASE_URL);
+        assert_eq!(default_client.api_version, API_VERSION);
+        assert!(!default_client.bearer_auth);
+
+        let empty_endpoint_client = Client::new("test-key", Some(String::new()));
+        assert_eq!(empty_endpoint_client.endpoint, API_BASE_URL);
+
+        let default_model = empty_endpoint_client.completion_model("");
+        assert_eq!(default_model.model, DEFAULT_COMPLETION_MODEL);
+        assert_eq!(
+            CompletionFeatures::model_name(&default_model),
+            DEFAULT_COMPLETION_MODEL
+        );
+        assert_eq!(
+            CompletionFeaturesDyn::model_name(&default_model),
+            DEFAULT_COMPLETION_MODEL
+        );
+
+        let no_effort = default_model.clone().with_effort(None);
+        assert!(no_effort.default_request.output_config.is_none());
+
+        let custom_request = types::CreateMessageParams {
+            max_tokens: 17,
+            stream: Some(true),
+            temperature: Some(0.2),
+            ..Default::default()
+        };
+        let custom_model = default_model
+            .with_stream(false)
+            .with_default_request(custom_request);
+        assert_eq!(custom_model.default_request.max_tokens, 17);
+        assert_eq!(custom_model.default_request.stream, Some(true));
+        assert_eq!(custom_model.default_request.temperature, Some(0.2));
+    }
+
+    #[test]
+    fn stream_event_aggregation_covers_usage_merges_and_errors() {
+        assert_eq!(
+            response_from_stream_events(Vec::new())
+                .unwrap_err()
+                .to_string(),
+            "No streamed Anthropic message"
+        );
+
+        let stream_error = response_from_stream_events(vec![
+            serde_json::from_value::<types::StreamEvent>(json!({
+                "type": "error",
+                "error": {"type": "overloaded_error", "message": "try later"}
+            }))
+            .unwrap(),
+        ])
+        .unwrap_err();
+        assert!(stream_error.to_string().contains("overloaded_error"));
+        assert!(stream_error.to_string().contains("try later"));
+
+        let events = vec![
+            serde_json::from_value::<types::StreamEvent>(json!({
+                "type": "message_start",
+                "message": {
+                    "id": "msg_usage",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": "claude-usage",
+                    "stop_reason": null,
+                    "stop_sequence": null,
+                    "usage": {"input_tokens": 1, "output_tokens": 0}
+                }
+            }))
+            .unwrap(),
+            serde_json::from_value::<types::StreamEvent>(json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "plan "}
+            }))
+            .unwrap(),
+            serde_json::from_value::<types::StreamEvent>(json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "signature_delta", "signature": "sig"}
+            }))
+            .unwrap(),
+            serde_json::from_value::<types::StreamEvent>(json!({
+                "type": "content_block_start",
+                "index": 1,
+                "content_block": {"type": "text", "text": "answer"}
+            }))
+            .unwrap(),
+            serde_json::from_value::<types::StreamEvent>(json!({
+                "type": "content_block_delta",
+                "index": 1,
+                "delta": {
+                    "type": "citations_delta",
+                    "citation": {
+                        "type": "char_location",
+                        "cited_text": "answer",
+                        "document_index": 0,
+                        "document_title": "Doc",
+                        "start_char_index": 0,
+                        "end_char_index": 6
+                    }
+                }
+            }))
+            .unwrap(),
+            serde_json::from_value::<types::StreamEvent>(json!({
+                "type": "content_block_start",
+                "index": 2,
+                "content_block": {
+                    "type": "server_tool_use",
+                    "id": "srv_1",
+                    "name": "web_search",
+                    "input": {}
+                }
+            }))
+            .unwrap(),
+            serde_json::from_value::<types::StreamEvent>(json!({
+                "type": "content_block_delta",
+                "index": 2,
+                "delta": {"type": "input_json_delta", "partial_json": "{\"query\":\"anda\"}"}
+            }))
+            .unwrap(),
+            serde_json::from_value::<types::StreamEvent>(json!({
+                "type": "content_block_stop",
+                "index": 2
+            }))
+            .unwrap(),
+            serde_json::from_value::<types::StreamEvent>(json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": "stop_sequence", "stop_sequence": "END"},
+                "usage": {
+                    "input_tokens": 11,
+                    "cache_creation": {
+                        "ephemeral_1h_input_tokens": 3,
+                        "ephemeral_5m_input_tokens": 4
+                    },
+                    "cache_creation_input_tokens": 5,
+                    "cache_read_input_tokens": 6,
+                    "inference_geo": "us",
+                    "output_tokens": 7,
+                    "server_tool_use": {
+                        "web_fetch_requests": 1,
+                        "web_search_requests": 2
+                    },
+                    "service_tier": "priority"
+                }
+            }))
+            .unwrap(),
+            serde_json::from_value::<types::StreamEvent>(json!({"type": "ping"})).unwrap(),
+            serde_json::from_value::<types::StreamEvent>(json!({"type": "message_stop"})).unwrap(),
+        ];
+
+        let response = response_from_stream_events(events).unwrap();
+        assert_eq!(response.stop_reason, Some(types::StopReason::StopSequence));
+        assert_eq!(response.stop_sequence.as_deref(), Some("END"));
+        assert_eq!(response.usage.input_tokens, 11);
+        assert_eq!(
+            response
+                .usage
+                .cache_creation
+                .as_ref()
+                .unwrap()
+                .ephemeral_1h_input_tokens,
+            3
+        );
+        assert_eq!(response.usage.cache_creation_input_tokens, 5);
+        assert_eq!(response.usage.cache_read_input_tokens, 6);
+        assert_eq!(response.usage.inference_geo.as_deref(), Some("us"));
+        assert_eq!(response.usage.output_tokens, 7);
+        assert_eq!(
+            response
+                .usage
+                .server_tool_use
+                .as_ref()
+                .unwrap()
+                .web_search_requests,
+            2
+        );
+        assert_eq!(
+            response.usage.service_tier,
+            Some(types::UsageServiceTier::Priority)
+        );
+        assert!(matches!(
+            &response.content[0],
+            types::ContentBlock::Thinking { thinking, signature }
+                if thinking == "plan " && signature == "sig"
+        ));
+        assert!(matches!(
+            &response.content[1],
+            types::ContentBlock::Text { citations: Some(citations), .. }
+                if citations.len() == 1
+        ));
+        assert!(matches!(
+            &response.content[2],
+            types::ContentBlock::ServerToolUse { input, .. }
+                if input == &json!({"query": "anda"})
+        ));
+    }
+
+    #[tokio::test]
+    async fn completion_model_posts_request_and_parses_non_stream_response() {
+        let body = serde_json::to_vec(&json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-test",
+            "content": [{"type": "text", "text": "hello from claude"}],
+            "stop_reason": "end_turn",
+            "stop_sequence": null,
+            "usage": {
+                "input_tokens": 6,
+                "cache_read_input_tokens": 2,
+                "output_tokens": 3
+            }
+        }))
+        .unwrap();
+        let (endpoint, state) = spawn_mock_server(StatusCode::OK, HeaderMap::new(), body).await;
+        let model = Client::new("test-key", Some(endpoint))
+            .with_api_version("2024-01-01".to_string())
+            .with_client(no_proxy_client())
+            .completion_model("claude-test")
+            .with_stream(false);
+
+        let output = complete(
+            &model,
+            CompletionRequest {
+                instructions: "system rules".into(),
+                prompt: "say hello".into(),
+                temperature: Some(0.3),
+                max_output_tokens: Some(256),
+                stop: Some(vec!["END".into()]),
+                effort: Some(ModelEffort::High),
+                tool_choice_required: true,
+                tools: vec![FunctionDefinition {
+                    name: "lookup".into(),
+                    description: "Lookup docs".into(),
+                    parameters: json!({"type": "object"}),
+                    strict: Some(false),
+                }],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(output.content, "hello from claude");
+        assert_eq!(output.model.as_deref(), Some("claude-test"));
+        assert_eq!(output.usage.input_tokens, 8);
+        assert_eq!(output.usage.cached_tokens, 2);
+        assert_eq!(output.usage.output_tokens, 3);
+
+        let req = recorded(&state);
+        assert_eq!(req.method, Method::POST);
+        assert_eq!(req.uri.path(), "/messages");
+        assert_eq!(req.headers.get("x-api-key").unwrap(), "test-key");
+        assert_eq!(req.headers.get("anthropic-version").unwrap(), "2024-01-01");
+        assert_ne!(
+            req.headers.get(ACCEPT).and_then(|v| v.to_str().ok()),
+            Some("text/event-stream")
+        );
+        let sent: Value = serde_json::from_slice(&req.body).unwrap();
+        assert_eq!(sent["model"], "claude-test");
+        assert_eq!(sent["system"], "system rules");
+        assert_eq!(sent["messages"][0]["role"], "user");
+        assert_eq!(sent["max_tokens"], 256);
+        assert_eq!(sent["temperature"], 0.3);
+        assert_eq!(sent["stop_sequences"], json!(["END"]));
+        assert_eq!(sent["tools"][0]["name"], "lookup");
+        assert_eq!(sent["tool_choice"]["type"], "any");
+        assert_eq!(sent["output_config"]["effort"], "xhigh");
+    }
+
+    #[tokio::test]
+    async fn completion_model_reports_http_and_invalid_json_errors_with_bearer_auth() {
+        let (endpoint, state) =
+            spawn_mock_server(StatusCode::BAD_REQUEST, HeaderMap::new(), "bad request").await;
+        let model = Client::new("test-key", Some(endpoint))
+            .with_bearer_auth(true)
+            .with_client(no_proxy_client())
+            .completion_model("claude-test")
+            .with_stream(false);
+        let err = complete(
+            &model,
+            CompletionRequest {
+                prompt: "hello".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("Completion failed"));
+        assert!(err.to_string().contains("bad request"));
+        let req = recorded(&state);
+        assert_eq!(
+            req.headers.get(http::header::AUTHORIZATION).unwrap(),
+            "Bearer test-key"
+        );
+        assert!(req.headers.get("x-api-key").is_none());
+
+        let (endpoint, _) = spawn_mock_server(StatusCode::OK, HeaderMap::new(), "not json").await;
+        let model = Client::new("test-key", Some(endpoint))
+            .with_client(no_proxy_client())
+            .completion_model("claude-test")
+            .with_stream(false);
+        let err = complete(
+            &model,
+            CompletionRequest {
+                prompt: "hello".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("Completion error"));
+        assert!(err.to_string().contains("not json"));
+    }
+
+    #[tokio::test]
+    async fn completion_model_streams_sse_events() {
+        let events = [
+            json!({
+                "type": "message_start",
+                "message": {
+                    "id": "msg_stream_1",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": "claude-stream",
+                    "stop_reason": null,
+                    "stop_sequence": null,
+                    "usage": {"input_tokens": 3, "output_tokens": 0}
+                }
+            }),
+            json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""}
+            }),
+            json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "Hi"}
+            }),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn", "stop_sequence": null},
+                "usage": {"output_tokens": 2}
+            }),
+            json!({"type": "message_stop"}),
+        ]
+        .into_iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect::<String>();
+
+        let (endpoint, state) =
+            spawn_mock_server(StatusCode::OK, sse_headers(), events.into_bytes()).await;
+        let model = Client::new("test-key", Some(endpoint))
+            .with_client(no_proxy_client())
+            .completion_model("claude-stream")
+            .with_stream(true);
+        let output = complete(
+            &model,
+            CompletionRequest {
+                prompt: "stream".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(output.content, "Hi");
+        assert_eq!(output.usage.input_tokens, 3);
+        assert_eq!(output.usage.output_tokens, 2);
+        let req = recorded(&state);
+        assert_eq!(req.uri.path(), "/messages");
+        assert_eq!(
+            req.headers.get(ACCEPT).and_then(|v| v.to_str().ok()),
+            Some("text/event-stream")
+        );
+        let sent: Value = serde_json::from_slice(&req.body).unwrap();
+        assert_eq!(sent["stream"], true);
     }
 
     #[test]

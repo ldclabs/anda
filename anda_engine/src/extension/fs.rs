@@ -590,3 +590,269 @@ pub(crate) fn normalize_relative_path(path: &Path) -> String {
         value
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anda_core::RequestMeta;
+    use serde_json::json;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("anda-fs-{name}-{:016x}", rand::random::<u64>()))
+    }
+
+    #[test]
+    fn workspace_helpers_normalize_dedupe_and_report_empty_sets() {
+        let first = PathBuf::from("/tmp/one");
+        let second = PathBuf::from("/tmp/two");
+        let third = PathBuf::from("/tmp/three");
+        let fourth = PathBuf::from("/tmp/four");
+
+        assert_eq!(
+            normalize_workspaces(vec![
+                PathBuf::new(),
+                first.clone(),
+                first.clone(),
+                second.clone()
+            ]),
+            vec![first.clone(), second.clone()]
+        );
+        assert_eq!(format_workspaces(&[]), "<none>");
+        assert_eq!(
+            workspace_access_error("Path", "requested_path", "file.txt", &[], Vec::new())
+                .to_string(),
+            "Path is not accessible from any configured workspace (requested_path: file.txt, workspaces: [<none>])"
+        );
+
+        let mut meta = RequestMeta::default();
+        meta.extra.insert(
+            "workspace".to_string(),
+            json!([first, "", second.clone(), second]),
+        );
+        meta.extra
+            .insert("workspaces".to_string(), json!(third.clone()));
+
+        let workspaces = tool_workspaces(&meta, &[third, fourth.clone()]);
+        assert_eq!(
+            workspaces,
+            vec![
+                PathBuf::from("/tmp/one"),
+                PathBuf::from("/tmp/two"),
+                PathBuf::from("/tmp/three"),
+                fourth
+            ]
+        );
+    }
+
+    #[test]
+    fn file_metadata_guards_reject_non_regular_large_and_hardlinked_files() {
+        let root = temp_dir("metadata");
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("file.txt");
+        std::fs::write(&file, b"abcd").unwrap();
+
+        let file_meta = std::fs::metadata(&file).unwrap();
+        ensure_file_size_within_limit(&file_meta, &file, 4).unwrap();
+        assert!(
+            ensure_file_size_within_limit(&file_meta, &file, 3)
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds maximum")
+        );
+
+        let dir_meta = std::fs::symlink_metadata(&root).unwrap();
+        assert!(
+            ensure_regular_file(&dir_meta, &root, "hard links blocked")
+                .unwrap_err()
+                .to_string()
+                .contains("Path does not point to a regular file")
+                || ensure_regular_file(&dir_meta, &root, "hard links blocked")
+                    .unwrap_err()
+                    .to_string()
+                    .contains("hard links blocked")
+        );
+
+        #[cfg(unix)]
+        {
+            let link = root.join("link.txt");
+            std::fs::hard_link(&file, &link).unwrap();
+            let linked_meta = std::fs::metadata(&file).unwrap();
+            assert!(has_multiple_hard_links(&linked_meta));
+            assert!(
+                ensure_regular_file(&linked_meta, &file, "hard links blocked")
+                    .unwrap_err()
+                    .to_string()
+                    .contains("hard links blocked")
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolve_helpers_cover_parent_paths_missing_tails_and_errors() {
+        let root = temp_dir("resolve");
+        tokio::fs::create_dir_all(root.join("dir")).await.unwrap();
+        tokio::fs::write(root.join("dir/file.txt"), b"ok")
+            .await
+            .unwrap();
+
+        let parent_read = resolve_read_path(&root, "dir/../dir/file.txt")
+            .await
+            .unwrap();
+        assert_eq!(
+            parent_read,
+            tokio::fs::canonicalize(root.join("dir/file.txt"))
+                .await
+                .unwrap()
+        );
+
+        let canonical_root = tokio::fs::canonicalize(&root).await.unwrap();
+        let write_path = resolve_write_path(&root, "new/nested/file.txt")
+            .await
+            .unwrap();
+        assert_eq!(write_path, canonical_root.join("new/nested/file.txt"));
+
+        let selected = resolve_write_path_in_workspaces(
+            &[root.join("missing"), root.clone()],
+            "new/nested/file.txt",
+        )
+        .await
+        .unwrap();
+        assert_eq!(selected.workspace, root);
+        assert!(selected.path.ends_with("new/nested/file.txt"));
+
+        let read_err = resolve_read_path_in_workspaces(&[], "missing.txt")
+            .await
+            .unwrap_err();
+        assert!(read_err.to_string().contains("workspaces: [<none>]"));
+
+        let missing_workspace = resolve_workspace_path(Path::new("/definitely/missing/anda"))
+            .await
+            .unwrap_err();
+        assert!(
+            missing_workspace
+                .to_string()
+                .contains("Failed to resolve workspace path")
+        );
+
+        assert!(path_contains_parent_reference(Path::new("a/../b")));
+        assert!(!path_contains_parent_reference(Path::new("a/b")));
+        assert!(
+            ensure_path_in_workspace_namespace(
+                Path::new("/tmp/work"),
+                Path::new("/tmp/work"),
+                Path::new("/tmp/other/file.txt"),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("outside the workspace")
+        );
+
+        let _ = tokio::fs::remove_dir_all(selected.workspace).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn atomic_write_helpers_commit_cleanup_and_path_formatting() {
+        let root = temp_dir("atomic");
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let target = root.join("file.txt");
+
+        atomic_write_file(&target, b"first", None).await.unwrap();
+        assert_eq!(tokio::fs::read(&target).await.unwrap(), b"first");
+
+        let permissions = tokio::fs::metadata(&target).await.unwrap().permissions();
+        atomic_write_file(&target, b"second", Some(&permissions))
+            .await
+            .unwrap();
+        assert_eq!(tokio::fs::read(&target).await.unwrap(), b"second");
+
+        let temp = write_temp_file_for_atomic_replace(&target, b"third", None)
+            .await
+            .unwrap();
+        assert!(
+            temp.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains(".anda-tmp-")
+        );
+        commit_atomic_replace(&temp, &target).await.unwrap();
+        assert_eq!(tokio::fs::read(&target).await.unwrap(), b"third");
+
+        let missing_temp = root.join("missing-temp");
+        assert!(
+            commit_atomic_replace(&missing_temp, &target)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("Failed to atomically replace file")
+        );
+        assert!(
+            atomic_write_file(&root, b"cannot replace a directory", None)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("Failed to atomically replace file")
+        );
+        assert!(
+            write_temp_file_for_atomic_replace(&root.join("missing/file.txt"), b"bad", None)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("Failed to create temporary file")
+        );
+        assert!(
+            write_temp_file_for_atomic_replace(Path::new(""), b"bad", None)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("Failed to determine")
+        );
+
+        let (ancestor, missing) = nearest_existing_ancestor(&root.join("a/b/c.txt"))
+            .await
+            .unwrap();
+        assert_eq!(ancestor, root);
+        assert_eq!(missing.len(), 3);
+        assert!(
+            nearest_existing_ancestor(Path::new(""))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("outside the workspace")
+        );
+        assert_eq!(normalize_relative_path(Path::new("")), ".");
+        assert_eq!(normalize_relative_path(Path::new("a/b")), "a/b");
+        assert_eq!(default_write_encoding(), UTF8_ENCODING);
+
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn deterministic_error_branches_for_read_and_metadata_guards() {
+        let root = temp_dir("fs-errors");
+        tokio::fs::create_dir_all(&root).await.unwrap();
+
+        let err = resolve_read_path(&root, "missing/../missing.txt")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Failed to resolve file path"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let link = root.join("link");
+            symlink(root.join("missing-target"), &link).unwrap();
+            let meta = std::fs::symlink_metadata(&link).unwrap();
+            assert!(
+                ensure_regular_file(&meta, &link, "hard links blocked")
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Path does not point to a regular file")
+            );
+        }
+
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+}
