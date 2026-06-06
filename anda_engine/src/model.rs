@@ -17,9 +17,12 @@ use arc_swap::ArcSwap;
 use futures_util::StreamExt;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::future::Future;
 use std::time::Duration;
 use std::{
     collections::{BTreeSet, HashMap, hash_map::Entry},
+    error::Error,
+    fmt,
     sync::Arc,
 };
 
@@ -33,6 +36,8 @@ pub use reqwest::Proxy;
 use crate::APP_USER_AGENT;
 
 pub use anda_core::ModelEffort;
+
+const MODEL_REQUEST_MAX_RETRIES: usize = 1;
 
 /// Serializable configuration for constructing a model adapter.
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
@@ -302,6 +307,10 @@ impl Models {
 /// Object-safe completion provider interface.
 pub trait CompletionFeaturesDyn: Send + Sync + 'static {
     /// Performs a completion request and returns the agent-facing output.
+    ///
+    /// Built-in adapters wrap exhausted transient provider failures in
+    /// [`ModelError`]. Use [`is_retryable_box_error`] to decide whether an upper
+    /// layer should schedule a delayed retry.
     fn completion(&self, req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>>;
 
     /// Returns the provider model name used for diagnostics and usage reports.
@@ -427,6 +436,289 @@ impl Model {
     }
 }
 
+/// Error returned by built-in model adapters when the caller can inspect retry
+/// semantics after the SDK-level retry has already been attempted.
+#[derive(Debug)]
+pub struct ModelError {
+    message: String,
+    retryable: bool,
+    status: Option<http::StatusCode>,
+    retry_after: Option<Duration>,
+    source: Option<BoxError>,
+}
+
+impl ModelError {
+    /// Creates a non-retryable model error.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: false,
+            status: None,
+            retry_after: None,
+            source: None,
+        }
+    }
+
+    /// Marks whether this error should be considered retryable by the caller.
+    pub fn with_retryable(mut self, retryable: bool) -> Self {
+        self.retryable = retryable;
+        self
+    }
+
+    /// Attaches the upstream HTTP status, if the provider returned one.
+    pub fn with_status(mut self, status: http::StatusCode) -> Self {
+        self.status = Some(status);
+        self
+    }
+
+    /// Attaches a suggested retry delay from the upstream response.
+    pub fn with_retry_after(mut self, retry_after: Option<Duration>) -> Self {
+        self.retry_after = retry_after;
+        self
+    }
+
+    /// Attaches the lower-level transport/read error.
+    pub fn with_source(mut self, source: BoxError) -> Self {
+        self.source = Some(source);
+        self
+    }
+
+    /// Returns true when the upper layer may choose a delayed retry.
+    pub fn is_retryable(&self) -> bool {
+        self.retryable
+    }
+
+    /// Returns the upstream HTTP status, when present.
+    pub fn status(&self) -> Option<http::StatusCode> {
+        self.status
+    }
+
+    /// Returns the upstream retry delay, when present.
+    pub fn retry_after(&self) -> Option<Duration> {
+        self.retry_after
+    }
+}
+
+impl fmt::Display for ModelError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl Error for ModelError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.source
+            .as_deref()
+            .map(|source| source as &(dyn Error + 'static))
+    }
+}
+
+/// Returns true if the error chain carries a retryable model error signal.
+pub fn is_retryable_model_error(error: &(dyn Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if let Some(error) = error.downcast_ref::<ModelError>()
+            && error.is_retryable()
+        {
+            return true;
+        }
+        if let Some(error) = error.downcast_ref::<reqwest::Error>()
+            && is_retryable_reqwest_error(error)
+        {
+            return true;
+        }
+        current = error.source();
+    }
+    false
+}
+
+/// Convenience wrapper for callers that keep completion errors as [`BoxError`].
+pub fn is_retryable_box_error(error: &BoxError) -> bool {
+    is_retryable_model_error(error.as_ref() as &(dyn Error + 'static))
+}
+
+/// Returns the first [`ModelError`] HTTP status found in the error chain.
+pub fn model_error_status(error: &(dyn Error + 'static)) -> Option<http::StatusCode> {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if let Some(error) = error.downcast_ref::<ModelError>()
+            && error.status().is_some()
+        {
+            return error.status();
+        }
+        current = error.source();
+    }
+    None
+}
+
+/// Returns the first upstream retry delay found in the error chain.
+pub fn model_error_retry_after(error: &(dyn Error + 'static)) -> Option<Duration> {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if let Some(error) = error.downcast_ref::<ModelError>()
+            && error.retry_after().is_some()
+        {
+            return error.retry_after();
+        }
+        current = error.source();
+    }
+    None
+}
+
+/// Statuses that are transient enough for one immediate SDK retry and for an
+/// upper-layer delayed retry after the SDK retry has been exhausted.
+pub fn is_retryable_status(status: http::StatusCode) -> bool {
+    matches!(
+        status,
+        http::StatusCode::REQUEST_TIMEOUT
+            | http::StatusCode::TOO_MANY_REQUESTS
+            | http::StatusCode::INTERNAL_SERVER_ERROR
+            | http::StatusCode::BAD_GATEWAY
+            | http::StatusCode::SERVICE_UNAVAILABLE
+            | http::StatusCode::GATEWAY_TIMEOUT
+    ) || status.as_u16() == 529
+}
+
+pub(crate) fn is_retryable_reqwest_error(err: &reqwest::Error) -> bool {
+    err.is_timeout()
+        || err.is_connect()
+        || err.is_body()
+        || err.status().is_some_and(is_retryable_status)
+}
+
+pub(crate) fn completion_transport_error(
+    model: &str,
+    action: &str,
+    err: reqwest::Error,
+) -> BoxError {
+    let retryable = is_retryable_reqwest_error(&err);
+    let message = format!("{action}, model: {model}, error: {err}");
+    Box::new(
+        ModelError::new(message)
+            .with_retryable(retryable)
+            .with_source(Box::new(err)),
+    )
+}
+
+pub(crate) async fn read_completion_response_bytes(
+    response: reqwest::Response,
+    model: &str,
+) -> Result<bytes::Bytes, BoxError> {
+    response
+        .bytes()
+        .await
+        .map_err(|err| completion_transport_error(model, "Failed to read completion response", err))
+}
+
+pub(crate) async fn execute_completion_request_with_retry<T, BuildRequest, HandleResponse, Fut>(
+    model: &str,
+    build_request: BuildRequest,
+    handle_response: HandleResponse,
+) -> Result<T, BoxError>
+where
+    BuildRequest: Fn() -> reqwest::RequestBuilder,
+    HandleResponse: Fn(reqwest::Response) -> Fut,
+    Fut: Future<Output = Result<T, BoxError>>,
+{
+    for attempt in 0..=MODEL_REQUEST_MAX_RETRIES {
+        let response = match build_request().send().await {
+            Ok(response) => response,
+            Err(err) => {
+                let retryable = is_retryable_reqwest_error(&err);
+                let message = format!(
+                    "Failed to send completion request, model: {}, error: {}",
+                    model, err
+                );
+                if retryable && attempt < MODEL_REQUEST_MAX_RETRIES {
+                    log_completion_retry(model, attempt + 1, &message);
+                    continue;
+                }
+
+                return Err(Box::new(
+                    ModelError::new(message)
+                        .with_retryable(retryable)
+                        .with_source(Box::new(err)),
+                ));
+            }
+        };
+
+        let status = response.status();
+        if status.is_success() {
+            match handle_response(response).await {
+                Ok(output) => return Ok(output),
+                Err(err) if is_retryable_box_error(&err) && attempt < MODEL_REQUEST_MAX_RETRIES => {
+                    log_completion_retry(model, attempt + 1, &err.to_string());
+                    continue;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        let retryable = is_retryable_status(status);
+        let retry_after = retry_after_duration(response.headers());
+        let body = match response.text().await {
+            Ok(body) => body,
+            Err(err) => {
+                let retryable = retryable || is_retryable_reqwest_error(&err);
+                let message = format!(
+                    "Completion failed, model: {}, status: {}; failed to read error body: {}",
+                    model, status, err
+                );
+                if retryable && attempt < MODEL_REQUEST_MAX_RETRIES {
+                    log_completion_retry(model, attempt + 1, &message);
+                    continue;
+                }
+
+                return Err(Box::new(
+                    ModelError::new(message)
+                        .with_retryable(retryable)
+                        .with_status(status)
+                        .with_retry_after(retry_after)
+                        .with_source(Box::new(err)),
+                ));
+            }
+        };
+        let message = format!(
+            "Completion failed, model: {}, status: {}, body: {}",
+            model, status, body
+        );
+
+        if retryable && attempt < MODEL_REQUEST_MAX_RETRIES {
+            log_completion_retry(model, attempt + 1, &message);
+            continue;
+        }
+
+        return Err(Box::new(
+            ModelError::new(message)
+                .with_retryable(retryable)
+                .with_status(status)
+                .with_retry_after(retry_after),
+        ));
+    }
+
+    unreachable!("completion retry loop always returns before exhausting attempts")
+}
+
+fn retry_after_duration(headers: &http::HeaderMap) -> Option<Duration> {
+    let seconds = headers
+        .get(http::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .parse::<u64>()
+        .ok()?;
+    Some(Duration::from_secs(seconds))
+}
+
+fn log_completion_retry(model: &str, retry: usize, reason: &str) {
+    log::warn!(
+        "Retrying completion request, model: {}, retry: {}/{}, error: {}",
+        model,
+        retry,
+        MODEL_REQUEST_MAX_RETRIES,
+        reason
+    );
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct AnyHost;
 
@@ -464,13 +756,7 @@ pub fn request_client_builder() -> reqwest::ClientBuilder {
                     }
 
                     match req_rep.status() {
-                        Some(
-                            http::StatusCode::REQUEST_TIMEOUT
-                            | http::StatusCode::TOO_MANY_REQUESTS
-                            | http::StatusCode::BAD_GATEWAY
-                            | http::StatusCode::SERVICE_UNAVAILABLE
-                            | http::StatusCode::GATEWAY_TIMEOUT,
-                        ) => req_rep.retryable(),
+                        Some(status) if is_retryable_status(status) => req_rep.retryable(),
                         _ => req_rep.success(),
                     }
                 }),
@@ -505,10 +791,7 @@ where
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|err| {
-            format!(
-                "Failed to read streaming completion response, model: {}, error: {}",
-                model, err
-            )
+            completion_transport_error(model, "Failed to read streaming completion response", err)
         })?;
         pending.extend_from_slice(&chunk);
 
@@ -591,6 +874,10 @@ where
 mod tests {
     use super::*;
     use anda_core::FunctionDefinition;
+    use axum::{Router, body::Bytes, extract::State, response::IntoResponse, routing::any};
+    use http::{HeaderMap, HeaderValue, Method, StatusCode};
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
 
     #[derive(Clone)]
     struct TestCompleter {
@@ -613,6 +900,47 @@ mod tests {
 
     fn http_client() -> reqwest::Client {
         reqwest::Client::builder().no_proxy().build().unwrap()
+    }
+
+    #[derive(Clone)]
+    struct MockHttpResponse {
+        status: StatusCode,
+        headers: HeaderMap,
+        body: Vec<u8>,
+    }
+
+    type RetryState = Arc<Mutex<(VecDeque<MockHttpResponse>, usize)>>;
+
+    async fn retry_mock_handler(
+        State(state): State<RetryState>,
+        _method: Method,
+        _body: Bytes,
+    ) -> impl IntoResponse {
+        let mut state = state.lock().unwrap();
+        state.1 += 1;
+        let mock = state.0.pop_front().expect("mock response should exist");
+        let mut response = (mock.status, mock.body).into_response();
+        for (name, value) in mock.headers.iter() {
+            response.headers_mut().insert(name, value.clone());
+        }
+        response
+    }
+
+    async fn spawn_retry_mock_server(responses: Vec<MockHttpResponse>) -> (String, RetryState) {
+        let state = Arc::new(Mutex::new((responses.into(), 0)));
+        let app = Router::new()
+            .fallback(any(retry_mock_handler))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), state)
+    }
+
+    fn retry_count(state: &RetryState) -> usize {
+        state.lock().unwrap().1
     }
 
     fn model_config(family: &str, model: &str) -> ModelConfig {
@@ -914,6 +1242,9 @@ mod tests {
     fn request_client_builder_and_sse_line_parser_cover_success_and_error_paths() {
         let _client = request_client_builder().no_proxy().build().unwrap();
         assert!(AnyHost == "anything");
+        assert!(is_retryable_status(StatusCode::TOO_MANY_REQUESTS));
+        assert!(is_retryable_status(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(!is_retryable_status(StatusCode::BAD_REQUEST));
 
         let mut data = String::new();
         let mut events = Vec::<serde_json::Value>::new();
@@ -942,5 +1273,88 @@ mod tests {
                 .contains("Invalid streaming completion event")
         );
         assert!(err.to_string().contains("{bad json"));
+    }
+
+    #[tokio::test]
+    async fn completion_request_retry_once_and_exposes_retry_signal() {
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::RETRY_AFTER, HeaderValue::from_static("60"));
+        let (endpoint, state) = spawn_retry_mock_server(vec![
+            MockHttpResponse {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                headers,
+                body: b"rate limited".to_vec(),
+            },
+            MockHttpResponse {
+                status: StatusCode::OK,
+                headers: HeaderMap::new(),
+                body: b"ok".to_vec(),
+            },
+        ])
+        .await;
+        let client = http_client();
+
+        let body = execute_completion_request_with_retry(
+            "retry-test",
+            || client.post(&endpoint),
+            |response| async { read_completion_response_bytes(response, "retry-test").await },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(&body[..], b"ok");
+        assert_eq!(retry_count(&state), 2);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::RETRY_AFTER, HeaderValue::from_static("45"));
+        let (endpoint, state) = spawn_retry_mock_server(vec![
+            MockHttpResponse {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                headers: headers.clone(),
+                body: b"first limit".to_vec(),
+            },
+            MockHttpResponse {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                headers,
+                body: b"still limited".to_vec(),
+            },
+        ])
+        .await;
+        let err = execute_completion_request_with_retry(
+            "retry-test",
+            || client.post(&endpoint),
+            |response| async { read_completion_response_bytes(response, "retry-test").await },
+        )
+        .await
+        .unwrap_err();
+        let err_ref = err.as_ref() as &(dyn Error + 'static);
+
+        assert_eq!(retry_count(&state), 2);
+        assert!(is_retryable_box_error(&err));
+        assert_eq!(
+            model_error_status(err_ref),
+            Some(StatusCode::TOO_MANY_REQUESTS)
+        );
+        assert_eq!(
+            model_error_retry_after(err_ref),
+            Some(Duration::from_secs(45))
+        );
+
+        let (endpoint, state) = spawn_retry_mock_server(vec![MockHttpResponse {
+            status: StatusCode::BAD_REQUEST,
+            headers: HeaderMap::new(),
+            body: b"bad request".to_vec(),
+        }])
+        .await;
+        let err = execute_completion_request_with_retry(
+            "retry-test",
+            || client.post(&endpoint),
+            |response| async { read_completion_response_bytes(response, "retry-test").await },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(retry_count(&state), 1);
+        assert!(!is_retryable_box_error(&err));
     }
 }

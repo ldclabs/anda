@@ -23,8 +23,10 @@ pub struct ToolsSearchArgs {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ToolsOutput {
-    /// Matching callable names and descriptions.
-    pub tools: Vec<FunctionDefinition>, // tool 只要出现在上下文即可能被调用，不一定要求在请求的 tools 列表中，所以这里返回完整定义，防止大模型瞎编请求参数。
+    /// Matching callable definitions returned as tool-output context.
+    ///
+    /// These definitions are not dynamically inserted into [`CompletionRequest::tools`].
+    pub tools: Vec<FunctionDefinition>,
     /// Total number of callables to the current model turn.
     #[serde(default)]
     pub total_tools: usize,
@@ -78,7 +80,7 @@ impl Agent<AgentCtx> for ToolsSearch {
     }
 
     fn description(&self) -> String {
-        "Search callable tools and agents by keyword, and return their names and descriptions"
+        "Search callable tools and agents by keyword. Returns full callable schemas in this tool output; after a schema is returned, call that tool/agent directly instead of searching again."
             .to_string()
     }
 
@@ -91,7 +93,7 @@ impl Agent<AgentCtx> for ToolsSearch {
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Search terms for callable tools/agents, or `*` to list every available callable name.",
+                        "description": "Search terms for callable tools/agents, or `*` to list every available callable name. Do not repeat the same search after the needed schema is returned.",
                     },
                     "limit": {
                         "type": "integer",
@@ -141,13 +143,13 @@ impl Agent<AgentCtx> for ToolsSearch {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ToolsSelectArgs {
-    /// Callable names to load into the next reasoning request.
+    /// Callable names whose schemas should be returned for direct calls.
     #[serde(default)]
     pub tools: Vec<String>,
     /// Natural-language intent used to select tools when exact names are unknown.
     #[serde(default)]
     pub query: String,
-    /// Maximum number of resolved definitions to load. Defaults to `5`, and is capped at `16` to prevent overloading the next model turn.
+    /// Maximum number of resolved definitions to return. Defaults to `5`, and is capped at `16` to prevent overloading the next model turn.
     #[serde(default)]
     pub limit: usize,
 }
@@ -158,7 +160,7 @@ struct ToolsSelectNamesOutput {
     tools: Vec<String>,
 }
 
-/// Loads a subset of callable definitions for the next reasoning turn.
+/// Returns a subset of callable definitions for direct use in the next reasoning turn.
 /// The "tools_select" tool has been registered as a built-in agent with label "flash".
 pub struct ToolsSelect {
     tokenizer: TokenizerChain,
@@ -253,7 +255,7 @@ impl Agent<AgentCtx> for ToolsSelect {
     }
 
     fn description(&self) -> String {
-        "Load callable tools or agents for the next model turn. Use exact names via `tools`, or provide `query` for intent-based selection when you do not know the exact callable names".to_string()
+        "Select callable tools or agents and return full schemas in this tool output for direct tool calls. Use exact names via `tools`; use `query` only when exact names are unknown. Do not call tools_select again for the same returned tools.".to_string()
     }
 
     fn definition(&self) -> FunctionDefinition {
@@ -268,15 +270,15 @@ impl Agent<AgentCtx> for ToolsSelect {
                         "items": {
                             "type": "string"
                         },
-                        "description": "Callable names to load."
+                        "description": "Exact callable names to select. After these schemas are returned in this tool output, call the selected tools/agents directly."
                     },
                     "query": {
                         "type": "string",
-                        "description": "Natural-language intent for loading relevant callables when exact names are unknown."
+                        "description": "Natural-language intent for selecting relevant callables when exact names are unknown. Prefer `tools` when exact names are known."
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Maximum number of resolved callables to inject into the next turn. Defaults to `5`, and is capped at `16`."
+                        "description": "Maximum number of resolved callables to return. Defaults to `5`, and is capped at `16`."
                     }
                 },
                 "required": ["tools", "query", "limit"],

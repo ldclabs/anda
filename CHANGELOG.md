@@ -2,6 +2,13 @@
 
 All notable changes to the Anda project will be documented in this file.
 
+## [0.12.31] — 2026-06-06
+
+### Changed — anda_engine v0.12.31
+
+- **Model completion retry and retry metadata** — Added a shared `ModelError` type and provider request helper that retry transient completion failures once across OpenAI-compatible, Anthropic, and Gemini adapters. Retryable HTTP statuses now include request timeout, rate limiting, 5xx gateway/server failures, and provider-specific `529`; exhausted retryable failures expose retryability, HTTP status, and `Retry-After` metadata for upper-layer delayed retry decisions. Streaming response read failures now use the same retryable transport error path, and Anthropic stream `overloaded_error` / `rate_limit_error` events are marked retryable.
+- **Tool discovery wording clarified** — Updated `tools_search` and `tools_select` descriptions to make schema discovery explicit: returned callable schemas live in tool-output context and should be called directly instead of being dynamically inserted into subsequent `CompletionRequest::tools`. Added regression coverage that selected tool schemas remain available as context without expanding the request tool list.
+
 ## [0.12.30] — 2026-06-04
 
 ### Changed — anda_core v0.12.7

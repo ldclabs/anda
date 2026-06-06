@@ -13,7 +13,10 @@ use reqwest::header::ACCEPT;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
-use super::{CompletionFeaturesDyn, ModelEffort, read_sse_json_events, request_client_builder};
+use super::{
+    CompletionFeaturesDyn, ModelEffort, ModelError, execute_completion_request_with_retry,
+    read_completion_response_bytes, read_sse_json_events, request_client_builder,
+};
 use crate::{rfc3339_datetime, unix_ms};
 
 pub mod types;
@@ -377,11 +380,17 @@ fn response_from_stream_events(
                 }
             }
             types::StreamEvent::Error { error } => {
-                return Err(format!(
-                    "Completion stream failed, type: {}, message: {}",
-                    error.r#type, error.message
-                )
-                .into());
+                let retryable = matches!(
+                    error.r#type.as_str(),
+                    "overloaded_error" | "rate_limit_error"
+                );
+                return Err(Box::new(
+                    ModelError::new(format!(
+                        "Completion stream failed, type: {}, message: {}",
+                        error.r#type, error.message
+                    ))
+                    .with_retryable(retryable),
+                ));
             }
             types::StreamEvent::MessageStop
             | types::StreamEvent::Ping
@@ -512,98 +521,81 @@ impl CompletionFeaturesDyn for CompletionModel {
                 log::debug!(request = val; "Completion request");
             }
 
-            let mut request = client.post("/messages").json(&r);
-            if r.stream == Some(true) {
-                request = request.header(ACCEPT, "text/event-stream");
-            }
-            let response = request.send().await.map_err(|err| {
-                format!(
-                    "Failed to send completion request, model: {}, error: {}",
-                    model, err
-                )
-            })?;
+            let (res, assistant_raw_message) = execute_completion_request_with_retry(
+                &model,
+                || {
+                    let mut request = client.post("/messages").json(&r);
+                    if r.stream == Some(true) {
+                        request = request.header(ACCEPT, "text/event-stream");
+                    }
+                    request
+                },
+                |response| async {
+                    let mut assistant_raw_message = None;
+                    let res = if r.stream == Some(true) {
+                        let events = read_sse_json_events(response, &model).await?;
+                        response_from_stream_events(events)?
+                    } else {
+                        let data = read_completion_response_bytes(response, &model).await?;
 
-            r.system = None; // avoid logging tedious instructions
-            if response.status().is_success() {
-                let mut assistant_raw_message = None;
-                let res = if r.stream == Some(true) {
-                    let events = read_sse_json_events(response, &model).await?;
-                    response_from_stream_events(events)?
-                } else {
-                    let data = response.bytes().await.map_err(|err| {
-                        format!(
-                            "Failed to read completion response, model: {}, error: {}",
-                            model, err
-                        )
-                    })?;
+                        let raw_response = match serde_json::from_slice::<Value>(&data) {
+                            Ok(value) => value,
+                            Err(err) => {
+                                return Err(format!(
+                                    "Completion error, model: {}, error: {}, body: {}",
+                                    model,
+                                    err,
+                                    String::from_utf8_lossy(&data)
+                                )
+                                .into());
+                            }
+                        };
+                        assistant_raw_message = types::assistant_raw_history_message(&raw_response);
 
-                    let raw_response = match serde_json::from_slice::<Value>(&data) {
-                        Ok(value) => value,
-                        Err(err) => {
-                            return Err(format!(
-                                "Completion error, model: {}, error: {}, body: {}",
-                                model,
-                                err,
-                                String::from_utf8_lossy(&data)
-                            )
-                            .into());
+                        match serde_json::from_value::<types::CreateMessageResponse>(
+                            raw_response.clone(),
+                        ) {
+                            Ok(res) => res,
+                            Err(err) => {
+                                return Err(format!(
+                                    "Completion error, model: {}, error: {}, body: {}",
+                                    model,
+                                    err,
+                                    String::from_utf8_lossy(&data)
+                                )
+                                .into());
+                            }
                         }
                     };
-                    assistant_raw_message = types::assistant_raw_history_message(&raw_response);
+                    Ok((res, assistant_raw_message))
+                },
+            )
+            .await?;
 
-                    match serde_json::from_value::<types::CreateMessageResponse>(
-                        raw_response.clone(),
-                    ) {
-                        Ok(res) => res,
-                        Err(err) => {
-                            return Err(format!(
-                                "Completion error, model: {}, error: {}, body: {}",
-                                model,
-                                err,
-                                String::from_utf8_lossy(&data)
-                            )
-                            .into());
-                        }
-                    }
-                };
-
-                if log_enabled!(Debug) {
-                    log::debug!(
-                        model = model,
-                        request:serde = r,
-                        response:serde = res;
-                        "Completion response");
-                } else if res.maybe_failed() {
-                    log::warn!(
-                        model = model,
-                        request:serde = r,
-                        response:serde = res;
-                        "Completion maybe failed");
-                }
-                if skip_raw > 0 {
-                    r.messages.drain(0..skip_raw);
-                }
-
-                res.try_into_with_raw(
-                    r.messages.into_iter().map(|v| json!(v)).collect(),
-                    chat_history,
-                    assistant_raw_message,
-                )
-            } else {
-                let status = response.status();
-                let msg = response.text().await.map_err(|err| {
-                    format!(
-                        "Failed to read no-success response, model: {}, error: {}",
-                        model, err
-                    )
-                })?;
-                log::error!(
+            let mut logged_request = r.clone();
+            logged_request.system = None;
+            if log_enabled!(Debug) {
+                log::debug!(
                     model = model,
-                    request:serde = r;
-                    "Completion request failed: {status}, body: {msg}",
-                );
-                Err(format!("Completion failed, model: {}, error: {}", model, msg).into())
+                    request:serde = logged_request,
+                    response:serde = res;
+                    "Completion response");
+            } else if res.maybe_failed() {
+                log::warn!(
+                    model = model,
+                    request:serde = logged_request,
+                    response:serde = res;
+                    "Completion maybe failed");
             }
+            if skip_raw > 0 {
+                r.messages.drain(0..skip_raw);
+            }
+
+            res.try_into_with_raw(
+                r.messages.into_iter().map(|v| json!(v)).collect(),
+                chat_history,
+                assistant_raw_message,
+            )
         })
     }
 }

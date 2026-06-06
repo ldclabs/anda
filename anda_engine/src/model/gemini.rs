@@ -13,7 +13,10 @@ use reqwest::header::ACCEPT;
 use serde_json::json;
 use std::collections::BTreeMap;
 
-use super::{CompletionFeaturesDyn, ModelEffort, read_sse_json_events, request_client_builder};
+use super::{
+    CompletionFeaturesDyn, ModelEffort, execute_completion_request_with_retry,
+    read_completion_response_bytes, read_sse_json_events, request_client_builder,
+};
 use crate::{rfc3339_datetime, unix_ms};
 
 pub mod types;
@@ -378,80 +381,64 @@ impl CompletionFeaturesDyn for CompletionModel {
             } else {
                 format!("/{}:generateContent", model)
             };
-            let mut request = client.post(&path).json(&r);
-            if r.stream {
-                request = request.header(ACCEPT, "text/event-stream");
-            }
-            let response = request.send().await.map_err(|err| {
-                format!(
-                    "Failed to send completion request, model: {}, error: {}",
-                    model, err
-                )
-            })?;
-
-            r.system_instruction = None; // avoid logging tedious instructions
-            if response.status().is_success() {
-                let res = if r.stream {
-                    let chunks = read_sse_json_events(response, &model).await?;
-                    response_from_stream_chunks(chunks)?
-                } else {
-                    let data = response.bytes().await.map_err(|err| {
-                        format!(
-                            "Failed to read completion response, model: {}, error: {}",
-                            model, err
-                        )
-                    })?;
-
-                    match serde_json::from_slice::<types::GenerateContentResponse>(&data) {
-                        Ok(res) => res,
-                        Err(err) => {
-                            return Err(format!(
-                                "Invalid completion response, model: {}, error: {}, body: {}",
-                                model,
-                                err,
-                                String::from_utf8_lossy(&data)
-                            )
-                            .into());
-                        }
+            let res = execute_completion_request_with_retry(
+                &model,
+                || {
+                    let mut request = client.post(&path).json(&r);
+                    if r.stream {
+                        request = request.header(ACCEPT, "text/event-stream");
                     }
-                };
+                    request
+                },
+                |response| async {
+                    let res = if r.stream {
+                        let chunks = read_sse_json_events(response, &model).await?;
+                        response_from_stream_chunks(chunks)?
+                    } else {
+                        let data = read_completion_response_bytes(response, &model).await?;
 
-                if log_enabled!(Debug) {
-                    log::debug!(
-                        model = model,
-                        request:serde = r,
-                        response:serde = res;
-                        "Completion response");
-                } else if res.maybe_failed() {
-                    log::warn!(
-                        model = model,
-                        request:serde = r,
-                        response:serde = res;
-                        "Completion maybe failed");
-                }
+                        match serde_json::from_slice::<types::GenerateContentResponse>(&data) {
+                            Ok(res) => res,
+                            Err(err) => {
+                                return Err(format!(
+                                    "Invalid completion response, model: {}, error: {}, body: {}",
+                                    model,
+                                    err,
+                                    String::from_utf8_lossy(&data)
+                                )
+                                .into());
+                            }
+                        }
+                    };
+                    Ok(res)
+                },
+            )
+            .await?;
 
-                if skip_raw > 0 {
-                    r.contents.drain(0..skip_raw);
-                }
-
-                res.try_into(
-                    r.contents.into_iter().map(|v| json!(v)).collect(),
-                    chat_history,
-                )
-            } else {
-                let status = response.status();
-                let msg = response.text().await?;
-                log::error!(
+            let mut logged_request = r.clone();
+            logged_request.system_instruction = None;
+            if log_enabled!(Debug) {
+                log::debug!(
                     model = model,
-                    request:serde = r;
-                    "Completion request failed: {status}, body: {msg}",
-                );
-                Err(format!(
-                    "Completion failed, model: {}, error: {}, body: {}",
-                    model, status, msg
-                )
-                .into())
+                    request:serde = logged_request,
+                    response:serde = res;
+                    "Completion response");
+            } else if res.maybe_failed() {
+                log::warn!(
+                    model = model,
+                    request:serde = logged_request,
+                    response:serde = res;
+                    "Completion maybe failed");
             }
+
+            if skip_raw > 0 {
+                r.contents.drain(0..skip_raw);
+            }
+
+            res.try_into(
+                r.contents.into_iter().map(|v| json!(v)).collect(),
+                chat_history,
+            )
         })
     }
 }
@@ -616,9 +603,14 @@ mod tests {
                 .is_none()
         );
 
-        let mut custom_request = types::GenerateContentRequest::default();
-        custom_request.stream = true;
-        custom_request.generation_config.temperature = Some(0.25);
+        let custom_request = types::GenerateContentRequest {
+            stream: true,
+            generation_config: types::GenerationConfig {
+                temperature: Some(0.25),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         let custom_model = default_model
             .with_stream(false)
             .with_default_request(custom_request);

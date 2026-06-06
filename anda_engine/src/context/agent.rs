@@ -1858,6 +1858,58 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Debug)]
+    struct DiscoveryCompleter {
+        requests: Arc<Mutex<Vec<CompletionRequest>>>,
+    }
+
+    impl CompletionFeaturesDyn for DiscoveryCompleter {
+        fn model_name(&self) -> String {
+            "discovery".to_string()
+        }
+
+        fn completion(
+            &self,
+            req: CompletionRequest,
+        ) -> anda_core::BoxPinFut<Result<AgentOutput, BoxError>> {
+            self.requests.lock().unwrap().push(req.clone());
+
+            if req.role.as_deref() == Some("tool") {
+                return Box::pin(futures::future::ready(Ok(AgentOutput {
+                    content: "selected tool schemas stay in context".to_string(),
+                    usage: Usage {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                        cached_tokens: 0,
+                        requests: 1,
+                    },
+                    ..Default::default()
+                })));
+            }
+
+            Box::pin(futures::future::ready(Ok(AgentOutput {
+                tool_calls: vec![ToolCall {
+                    name: "tools_select".to_string(),
+                    args: json!({
+                        "tools": ["echo_tool"],
+                        "query": "",
+                        "limit": 0
+                    }),
+                    call_id: Some("select_echo_tool".into()),
+                    result: None,
+                    remote_id: None,
+                }],
+                usage: Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cached_tokens: 0,
+                    requests: 1,
+                },
+                ..Default::default()
+            })))
+        }
+    }
+
     /// Completer that returns agent calls.
     #[derive(Clone, Debug)]
     struct AgentCallCompleter {
@@ -2688,6 +2740,47 @@ mod tests {
                 .to_string()
                 .contains("agent run failed: agent execution failed")
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_keeps_discovered_tool_schemas_out_of_request_tools() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let model = Model::with_completer(Arc::new(DiscoveryCompleter {
+            requests: requests.clone(),
+        }));
+        let ctx = EngineBuilder::new()
+            .with_model(model)
+            .register_tool(Arc::new(EchoTool))
+            .unwrap()
+            .mock_ctx();
+        let initial_tools = ctx.definitions(Some(&["tools_select".to_string()])).await;
+        let req = CompletionRequest {
+            prompt: "select echo tool".to_string(),
+            tools: initial_tools,
+            ..Default::default()
+        };
+        let mut runner = ctx.completion_iter(req, Vec::new());
+
+        let first = runner.next().await.unwrap().unwrap();
+        assert_eq!(first.tool_calls[0].name, "tools_select");
+
+        let second = runner.next().await.unwrap().unwrap();
+        assert_eq!(second.content, "selected tool schemas stay in context");
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let next_tool_names = requests[1]
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(next_tool_names.contains(&"tools_select"));
+        assert!(!next_tool_names.contains(&"echo_tool"));
+        assert!(requests[1].content.iter().any(|part| matches!(
+            part,
+            ContentPart::ToolOutput { name, output, .. }
+                if name == "tools_select" && output["tools"][0]["name"] == "echo_tool"
+        )));
     }
 
     #[tokio::test(flavor = "current_thread")]
