@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 use super::{
     CompletionFeaturesDyn, ModelEffort, execute_completion_request_with_retry,
     read_completion_response_bytes, read_sse_json_events, request_client_builder,
+    streaming_completion_request,
 };
 use crate::{rfc3339_datetime, unix_ms};
 
@@ -386,7 +387,7 @@ impl CompletionFeaturesDyn for CompletionModel {
                 || {
                     let mut request = client.post(&path).json(&r);
                     if r.stream {
-                        request = request.header(ACCEPT, "text/event-stream");
+                        request = streaming_completion_request(request);
                     }
                     request
                 },
@@ -917,6 +918,12 @@ mod tests {
         assert_eq!(
             req.headers.get(ACCEPT).and_then(|v| v.to_str().ok()),
             Some("text/event-stream")
+        );
+        assert_eq!(
+            req.headers
+                .get(http::header::ACCEPT_ENCODING)
+                .and_then(|v| v.to_str().ok()),
+            Some("identity")
         );
     }
 

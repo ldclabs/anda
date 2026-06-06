@@ -14,7 +14,6 @@
 
 use anda_core::{AgentOutput, BoxError, BoxPinFut, CONTENT_TYPE_JSON, CompletionRequest, ToolCall};
 use arc_swap::ArcSwap;
-use futures_util::StreamExt;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
@@ -784,36 +783,50 @@ pub(crate) async fn read_sse_json_events<T>(
 where
     T: DeserializeOwned,
 {
-    let mut stream = response.bytes_stream();
-    let mut pending = Vec::new();
+    let body = response.bytes().await.map_err(|err| {
+        completion_transport_error(model, "Failed to read streaming completion response", err)
+    })?;
+
+    parse_streaming_json_events(&body, model)
+}
+
+fn parse_streaming_json_events<T>(body: &[u8], model: &str) -> Result<Vec<T>, BoxError>
+where
+    T: DeserializeOwned,
+{
+    let body = std::str::from_utf8(body).map_err(|err| {
+        format!(
+            "Invalid UTF-8 in streaming completion response, model: {}, error: {}",
+            model, err
+        )
+    })?;
+    let body = body.strip_prefix('\u{feff}').unwrap_or(body);
+
+    if !looks_like_sse(body) {
+        return parse_json_event_payload(body, model);
+    }
+
     let mut data = String::new();
     let mut events = Vec::new();
 
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|err| {
-            completion_transport_error(model, "Failed to read streaming completion response", err)
-        })?;
-        pending.extend_from_slice(&chunk);
-
-        while let Some(pos) = pending.iter().position(|byte| *byte == b'\n') {
-            let mut line = pending.drain(..=pos).collect::<Vec<_>>();
-            if line.last() == Some(&b'\n') {
-                line.pop();
-            }
-            if line.last() == Some(&b'\r') {
-                line.pop();
-            }
-            handle_sse_line(&line, &mut data, &mut events, model)?;
-        }
-    }
-
-    if !pending.is_empty() {
-        let line = std::mem::take(&mut pending);
-        handle_sse_line(&line, &mut data, &mut events, model)?;
+    for line in body.lines() {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        handle_sse_text_line(line, &mut data, &mut events, model)?;
     }
     flush_sse_data(&mut data, &mut events, model)?;
 
     Ok(events)
+}
+
+fn looks_like_sse(body: &str) -> bool {
+    body.lines().any(|line| {
+        let line = line.strip_prefix('\u{feff}').unwrap_or(line);
+        line.starts_with("data:")
+            || line.starts_with("event:")
+            || line.starts_with("id:")
+            || line.starts_with("retry:")
+            || line.starts_with(':')
+    })
 }
 
 fn handle_sse_line<T>(
@@ -825,23 +838,36 @@ fn handle_sse_line<T>(
 where
     T: DeserializeOwned,
 {
-    if line.is_empty() {
-        return flush_sse_data(data, events, model);
-    }
-    if line.starts_with(b":") {
-        return Ok(());
-    }
-
-    let Some(value) = line.strip_prefix(b"data:") else {
-        return Ok(());
-    };
-    let value = value.strip_prefix(b" ").unwrap_or(value);
-    let value = std::str::from_utf8(value).map_err(|err| {
+    let line = std::str::from_utf8(line).map_err(|err| {
         format!(
             "Invalid UTF-8 in streaming completion response, model: {}, error: {}",
             model, err
         )
     })?;
+    let line = line.strip_prefix('\u{feff}').unwrap_or(line);
+    handle_sse_text_line(line, data, events, model)
+}
+
+fn handle_sse_text_line<T>(
+    line: &str,
+    data: &mut String,
+    events: &mut Vec<T>,
+    model: &str,
+) -> Result<(), BoxError>
+where
+    T: DeserializeOwned,
+{
+    if line.is_empty() {
+        return flush_sse_data(data, events, model);
+    }
+    if line.starts_with(':') {
+        return Ok(());
+    }
+
+    let Some(value) = line.strip_prefix("data:") else {
+        return Ok(());
+    };
+    let value = value.strip_prefix(' ').unwrap_or(value);
     if !data.is_empty() {
         data.push('\n');
     }
@@ -868,6 +894,65 @@ where
     events.push(event);
     data.clear();
     Ok(())
+}
+
+fn parse_json_event_payload<T>(body: &str, model: &str) -> Result<Vec<T>, BoxError>
+where
+    T: DeserializeOwned,
+{
+    let value = body.trim().strip_prefix('\u{feff}').unwrap_or(body.trim());
+    if value.is_empty() || value == "[DONE]" {
+        return Ok(Vec::new());
+    }
+
+    if value.starts_with('[')
+        && let Ok(events) = serde_json::from_str::<Vec<T>>(value)
+    {
+        return Ok(events);
+    }
+
+    match serde_json::from_str::<T>(value) {
+        Ok(event) => return Ok(vec![event]),
+        Err(single_err) => match serde_json::from_str::<Vec<T>>(value) {
+            Ok(events) => return Ok(events),
+            Err(array_err) => {
+                let mut events = Vec::new();
+                let mut saw_line = false;
+                for line in value.lines() {
+                    let line = line.trim();
+                    if line.is_empty() || line == "[DONE]" {
+                        continue;
+                    }
+                    saw_line = true;
+                    let event = serde_json::from_str::<T>(line).map_err(|line_err| {
+                        format!(
+                            "Invalid streaming completion event, model: {}, error: {}, body: {}",
+                            model, line_err, line
+                        )
+                    })?;
+                    events.push(event);
+                }
+
+                if saw_line {
+                    return Ok(events);
+                }
+
+                Err(format!(
+                    "Invalid streaming completion event, model: {}, error: {}; array error: {}, body: {}",
+                    model, single_err, array_err, value
+                )
+                .into())
+            }
+        },
+    }
+}
+
+pub(crate) fn streaming_completion_request(
+    request: reqwest::RequestBuilder,
+) -> reqwest::RequestBuilder {
+    request
+        .header(reqwest::header::ACCEPT, "text/event-stream")
+        .header(reqwest::header::ACCEPT_ENCODING, "identity")
 }
 
 #[cfg(test)]
@@ -1273,6 +1358,34 @@ mod tests {
                 .contains("Invalid streaming completion event")
         );
         assert!(err.to_string().contains("{bad json"));
+    }
+
+    #[test]
+    fn streaming_json_event_parser_accepts_bom_sse_ndjson_and_arrays() {
+        let events = parse_streaming_json_events::<serde_json::Value>(
+            b"\xef\xbb\xbfdata: {\"a\":1}\n\ndata: [DONE]\n\n",
+            "test-model",
+        )
+        .unwrap();
+        assert_eq!(events, vec![serde_json::json!({"a": 1})]);
+
+        let events = parse_streaming_json_events::<serde_json::Value>(
+            b"{\"a\":1}\n{\"b\":2}\n[DONE]\n",
+            "test-model",
+        )
+        .unwrap();
+        assert_eq!(
+            events,
+            vec![serde_json::json!({"a": 1}), serde_json::json!({"b": 2})]
+        );
+
+        let events =
+            parse_streaming_json_events::<serde_json::Value>(br#"[{"a":1},{"b":2}]"#, "test-model")
+                .unwrap();
+        assert_eq!(
+            events,
+            vec![serde_json::json!({"a": 1}), serde_json::json!({"b": 2})]
+        );
     }
 
     #[tokio::test]

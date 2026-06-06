@@ -21,6 +21,7 @@ pub mod types;
 use super::{
     CompletionFeaturesDyn, ModelEffort, execute_completion_request_with_retry,
     read_completion_response_bytes, read_sse_json_events, request_client_builder,
+    streaming_completion_request,
 };
 use crate::{rfc3339_datetime, unix_ms};
 
@@ -1711,7 +1712,7 @@ impl CompletionFeaturesDyn for CompletionModel {
                 || {
                     let mut request = client.post("/chat/completions").json(&r);
                     if r.stream == Some(true) {
-                        request = request.header(ACCEPT, "text/event-stream");
+                        request = streaming_completion_request(request);
                     }
                     request
                 },
@@ -1944,7 +1945,7 @@ impl CompletionFeaturesDyn for CompletionModelV2 {
                 || {
                     let mut request = client.post("/responses").json(&r);
                     if r.stream == Some(true) {
-                        request = request.header(ACCEPT, "text/event-stream");
+                        request = streaming_completion_request(request);
                     }
                     request
                 },
@@ -2506,6 +2507,12 @@ mod tests {
             req.headers.get(ACCEPT).and_then(|v| v.to_str().ok()),
             Some("text/event-stream")
         );
+        assert_eq!(
+            req.headers
+                .get(http::header::ACCEPT_ENCODING)
+                .and_then(|v| v.to_str().ok()),
+            Some("identity")
+        );
         let sent: Json = serde_json::from_slice(&req.body).unwrap();
         assert_eq!(sent["stream"], true);
     }
@@ -2651,6 +2658,12 @@ mod tests {
         assert_eq!(
             req.headers.get(ACCEPT).and_then(|v| v.to_str().ok()),
             Some("text/event-stream")
+        );
+        assert_eq!(
+            req.headers
+                .get(http::header::ACCEPT_ENCODING)
+                .and_then(|v| v.to_str().ok()),
+            Some("identity")
         );
         let sent: Json = serde_json::from_slice(&req.body).unwrap();
         assert_eq!(sent["stream"], true);

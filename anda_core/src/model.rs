@@ -1108,7 +1108,10 @@ pub fn text_from_bytes_with_encoding<'a>(
     }
 
     let (text, _, had_errors) = encoding.decode(data);
-    if had_errors || !looks_like_text(&text) {
+    // `Encoding::decode` sniffs UTF-16 BOMs even when the requested fallback is
+    // a legacy code page. A BOM-only non-empty byte slice decodes to an empty
+    // string and should not become an empty prompt document.
+    if had_errors || (!data.is_empty() && text.is_empty()) || !looks_like_text(&text) {
         return None;
     }
 
@@ -1462,6 +1465,14 @@ mod tests {
 
         assert!(text_from_bytes_with_encoding(&gbk, Some(UTF_8)).is_none());
         assert!(text_from_bytes_with_encoding(&[0x81, 0x30], Some(encoding_rs::GBK)).is_none());
+        assert!(
+            resource_text_from_bytes_with_encoding(
+                &[0xff, 0xfe],
+                None,
+                Some(encoding_rs::WINDOWS_1252),
+            )
+            .is_none()
+        );
     }
 
     #[test]
