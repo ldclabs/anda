@@ -3,7 +3,7 @@ name = "anda_engine"
 description = "Agents engine for Anda -- an AI agent framework built with Rust, powered by ICP and TEEs."
 repository = "https://github.com/ldclabs/anda/tree/main/anda_engine"
 publish = true
-version = "0.12.31"
+version = "0.12.32"
 edition.workspace = true
 keywords.workspace = true
 categories.workspace = true
@@ -55,6 +55,9 @@ glob = { workspace = true }
 [dev-dependencies]
 axum = { workspace = true }
 dotenv = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Globalization"] }
 
 [lib]
 doctest = false

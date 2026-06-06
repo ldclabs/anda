@@ -4,8 +4,9 @@ use serde_json::json;
 use std::path::PathBuf;
 
 use super::{
-    MAX_FILE_SIZE_BYTES, atomic_write_file, ensure_file_size_within_limit, ensure_regular_file,
-    format_workspaces, normalize_workspaces, resolve_write_path_in_workspaces, tool_workspaces,
+    FileTextEncodeError, MAX_FILE_SIZE_BYTES, atomic_write_file, decode_file_text,
+    encode_file_text, ensure_file_size_within_limit, ensure_regular_file, format_workspaces,
+    normalize_workspaces, resolve_write_path_in_workspaces, tool_workspaces,
 };
 use crate::{
     context::BaseCtx,
@@ -15,7 +16,7 @@ use crate::{
 /// Arguments for filesystem edit operations.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct EditFileArgs {
-    /// Relative or absolute path to a UTF-8 file inside the workspace.
+    /// Relative or absolute path to a text file inside the workspace.
     pub path: String,
     /// The old string to replace.
     pub old_string: String,
@@ -33,7 +34,7 @@ pub struct EditFileOutput {
     pub replacements: usize,
     /// Number of matches of the old string found in the file.
     pub total_matches: usize,
-    /// Number of bytes in the resulting UTF-8 file.
+    /// Number of bytes in the resulting text file.
     pub size: u64,
 }
 
@@ -63,7 +64,7 @@ impl EditFileTool {
     {
         let workspaces = normalize_workspaces(workspaces);
         let description = format!(
-            "Atomically edit UTF-8 files in the workspace directories ({}) by replacing strings",
+            "Atomically edit text files in the workspace directories ({}) by replacing strings",
             format_workspaces(&workspaces)
         );
         Self {
@@ -99,15 +100,15 @@ impl Tool<BaseCtx> for EditFileTool {
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Path to the UTF-8 file. Relative paths resolve from the configured workspaces in priority order; absolute paths must be inside one configured workspace."
+                        "description": "Path to the text file. Relative paths resolve from the configured workspaces in priority order; absolute paths must be inside one configured workspace."
                     },
                     "old_string": {
                         "type": "string",
-                        "description": "Old UTF-8 string to replace."
+                        "description": "Old decoded text string to replace."
                     },
                     "new_string": {
                         "type": "string",
-                        "description": "Replacement UTF-8 string."
+                        "description": "Replacement decoded text string."
                     },
                     "limit": {
                         "type": "integer",
@@ -186,14 +187,17 @@ impl Tool<BaseCtx> for EditFileTool {
                 resolved_path.display()
             )
         })?;
-        let text = String::from_utf8(data).map_err(|_| {
+        let original_size = data.len() as u64;
+        let decoded = decode_file_text(data).map_err(|_| {
             format!(
-                "Editing non-UTF-8 files is not supported (workspace: {}, requested_path: {}, resolved_path: {})",
+                "Editing binary or unsupported-encoding files is not supported (workspace: {}, requested_path: {}, resolved_path: {})",
                 workspace_display,
                 args.path,
                 resolved_path.display()
             )
         })?;
+        let encoding = decoded.encoding;
+        let text = decoded.text;
         let total_matches = text.match_indices(&args.old_string).count();
 
         let replacements = if args.limit == 0 {
@@ -206,7 +210,7 @@ impl Tool<BaseCtx> for EditFileTool {
             EditFileOutput {
                 replacements,
                 total_matches,
-                size: text.len() as u64,
+                size: original_size,
             }
         } else {
             let updated = if args.limit == 0 {
@@ -214,13 +218,24 @@ impl Tool<BaseCtx> for EditFileTool {
             } else {
                 text.replacen(&args.old_string, &args.new_string, args.limit)
             };
-            let size = updated.len() as u64;
-            atomic_write_file(
-                &resolved_path,
-                updated.as_bytes(),
-                Some(&meta.permissions()),
-            )
-            .await?;
+            let updated_bytes = encode_file_text(&updated, &encoding).map_err(|err| match err {
+                FileTextEncodeError::UnsupportedEncoding => format!(
+                    "Unsupported text encoding while editing file (workspace: {}, requested_path: {}, resolved_path: {}, encoding: {})",
+                    workspace_display,
+                    args.path,
+                    resolved_path.display(),
+                    encoding
+                ),
+                FileTextEncodeError::UnmappableCharacters => format!(
+                    "Failed to encode edited file (workspace: {}, requested_path: {}, resolved_path: {}, encoding: {}): {err}",
+                    workspace_display,
+                    args.path,
+                    resolved_path.display(),
+                    encoding
+                ),
+            })?;
+            let size = updated_bytes.len() as u64;
+            atomic_write_file(&resolved_path, &updated_bytes, Some(&meta.permissions())).await?;
             EditFileOutput {
                 replacements,
                 total_matches,
@@ -594,7 +609,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("Editing non-UTF-8 files is not supported")
+                .contains("Editing binary or unsupported-encoding files is not supported")
         );
     }
 

@@ -2,6 +2,17 @@
 
 All notable changes to the Anda project will be documented in this file.
 
+## [0.12.32] — 2026-06-06
+
+### Changed — anda_core v0.12.8
+
+- **Legacy text decoding support** — Added shared text encoding helpers that keep UTF-8 as the preferred path while allowing platform-local legacy text fallback on Windows. Resource-to-text conversion now uses MIME-aware fallback decoding for text-like resource blobs without treating binary media as text.
+
+### Changed — anda_engine v0.12.32
+
+- **Filesystem, shell, and skill tools handle platform-local text encodings** — File reads, writes, shell output previews/progress, and `SKILL.md` loading now decode or encode supported text encodings such as GBK when needed, preserving UTF-8 behavior by default and keeping binary/unsupported data on the base64 or error paths. Shell progress streaming now preserves multibyte character boundaries for both UTF-8 and common legacy multibyte encodings.
+- **Windows-compatible agent and tool context paths** — Agent/tool child context paths now avoid colon separators on Windows while preserving existing colon-based namespaces on Unix-like systems, keeping existing deployments stable and making Windows storage paths valid.
+
 ## [0.12.31] — 2026-06-06
 
 ### Changed — anda_engine v0.12.31

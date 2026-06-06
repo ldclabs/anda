@@ -5,9 +5,9 @@ use serde_json::json;
 use std::path::PathBuf;
 
 use super::{
-    BASE64_ENCODING, MAX_FILE_SIZE_BYTES, UTF8_ENCODING, ensure_file_size_within_limit,
-    ensure_regular_file, format_workspaces, normalize_workspaces, resolve_read_path_in_workspaces,
-    tool_workspaces,
+    BASE64_ENCODING, MAX_FILE_SIZE_BYTES, UTF8_ENCODING, decode_file_text,
+    ensure_file_size_within_limit, ensure_regular_file, format_workspaces, normalize_workspaces,
+    resolve_read_path_in_workspaces, tool_workspaces,
 };
 use crate::{
     context::BaseCtx,
@@ -19,10 +19,10 @@ use crate::{
 pub struct ReadFileArgs {
     /// Relative or absolute path to a file inside the workspace.
     pub path: String,
-    /// Zero-based line offset for UTF-8 text output.
+    /// Zero-based line offset for text output.
     #[serde(default)]
     pub offset: usize,
-    /// Maximum number of UTF-8 lines to return. `0` means all remaining lines.
+    /// Maximum number of text lines to return. `0` means all remaining lines.
     #[serde(default)]
     pub limit: usize,
 }
@@ -30,7 +30,7 @@ pub struct ReadFileArgs {
 /// Normalized result returned by a filesystem read operation.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ReadFileOutput {
-    /// File content as UTF-8 text or base64-encoded bytes for non-UTF-8 files.
+    /// File content as decoded text or base64-encoded bytes for unsupported/binary files.
     pub content: String,
     /// The encoding of the file content.
     pub encoding: String,
@@ -39,7 +39,7 @@ pub struct ReadFileOutput {
     /// The MIME type of the file content.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mime_type: Option<String>,
-    /// The number of lines in the file content, if the content is UTF-8 text.
+    /// The number of lines in the file content, if the content is decoded text.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_lines: Option<usize>,
 }
@@ -110,11 +110,11 @@ impl Tool<BaseCtx> for ReadFileTool {
                     },
                     "offset": {
                         "type": "integer",
-                        "description": "Zero-based line offset for UTF-8 text output (default: 0)"
+                        "description": "Zero-based line offset for decoded text output (default: 0)"
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Maximum number of UTF-8 text lines to return (default: 0, all remaining lines)"
+                        "description": "Maximum number of decoded text lines to return (default: 0, all remaining lines)"
                     }
                 },
                 "required": ["path", "offset", "limit"],
@@ -178,8 +178,10 @@ impl Tool<BaseCtx> for ReadFileTool {
         if let Some(kind) = infer2::get(&data) {
             output.mime_type = Some(kind.mime_type().to_string());
         }
-        match String::from_utf8(data) {
-            Ok(text) => {
+        match decode_file_text(data) {
+            Ok(decoded) => {
+                output.encoding = decoded.encoding;
+                let text = decoded.text;
                 let all_lines = text.lines();
                 output.total_lines = Some(all_lines.clone().count());
                 if args.offset == 0 && args.limit == 0 {
@@ -194,8 +196,8 @@ impl Tool<BaseCtx> for ReadFileTool {
                         .join("\n");
                 }
             }
-            Err(v) => {
-                output.content = ByteBufB64(v.into_bytes()).to_base64();
+            Err(bytes) => {
+                output.content = ByteBufB64(bytes).to_base64();
                 output.encoding = BASE64_ENCODING.to_string();
             }
         }

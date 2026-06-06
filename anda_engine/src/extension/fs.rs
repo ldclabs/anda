@@ -1,6 +1,11 @@
-use anda_core::{BoxError, RequestMeta};
+use anda_core::{
+    BoxError, RequestMeta, platform_text_encoding, text_encoding_for_label, text_encoding_label,
+    text_from_bytes_with_encoding,
+};
+use encoding_rs::Encoding;
 use std::{
     ffi::OsString,
+    fmt,
     fs::{Metadata, Permissions},
     path::{Component, Path, PathBuf},
 };
@@ -20,6 +25,31 @@ pub(crate) const MAX_FILE_SIZE_BYTES: u64 = 10 * 1024 * 1024;
 
 pub(crate) const UTF8_ENCODING: &str = "utf8";
 pub(crate) const BASE64_ENCODING: &str = "base64";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DecodedFileText {
+    pub(crate) text: String,
+    pub(crate) encoding: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FileTextEncodeError {
+    UnsupportedEncoding,
+    UnmappableCharacters,
+}
+
+impl fmt::Display for FileTextEncodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedEncoding => f.write_str("unsupported text encoding"),
+            Self::UnmappableCharacters => f.write_str(
+                "content contains characters not representable in the requested encoding",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for FileTextEncodeError {}
 
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedFilePath {
@@ -341,6 +371,60 @@ pub(crate) fn default_write_encoding() -> String {
     UTF8_ENCODING.to_string()
 }
 
+pub(crate) fn decode_file_text(bytes: Vec<u8>) -> Result<DecodedFileText, Vec<u8>> {
+    decode_file_text_with_fallback(bytes, platform_text_encoding())
+}
+
+fn decode_file_text_with_fallback(
+    bytes: Vec<u8>,
+    fallback_encoding: Option<&'static Encoding>,
+) -> Result<DecodedFileText, Vec<u8>> {
+    if let Ok(text) = std::str::from_utf8(&bytes) {
+        return Ok(DecodedFileText {
+            text: text.to_string(),
+            encoding: UTF8_ENCODING.to_string(),
+        });
+    }
+
+    let Some(encoding) = fallback_encoding else {
+        return Err(bytes);
+    };
+    if encoding.name() == "UTF-8" {
+        return Err(bytes);
+    }
+
+    let text = match text_from_bytes_with_encoding(&bytes, Some(encoding)) {
+        Some(text) => text.into_owned(),
+        None => return Err(bytes),
+    };
+    if !is_text_like(&text) {
+        return Err(bytes);
+    }
+
+    Ok(DecodedFileText {
+        text,
+        encoding: text_encoding_label(encoding),
+    })
+}
+
+pub(crate) fn encode_file_text(
+    content: &str,
+    encoding_label: &str,
+) -> Result<Vec<u8>, FileTextEncodeError> {
+    let encoding =
+        text_encoding_for_label(encoding_label).ok_or(FileTextEncodeError::UnsupportedEncoding)?;
+    let (bytes, _, had_errors) = encoding.encode(content);
+    if had_errors {
+        return Err(FileTextEncodeError::UnmappableCharacters);
+    }
+    Ok(bytes.into_owned())
+}
+
+fn is_text_like(text: &str) -> bool {
+    text.chars()
+        .all(|ch| matches!(ch, '\n' | '\r' | '\t' | '\u{000c}') || !ch.is_control())
+}
+
 /// Returns true when a file has multiple hard links.
 ///
 /// Multiple links can allow path-based workspace guards to be bypassed by
@@ -641,6 +725,49 @@ mod tests {
                 PathBuf::from("/tmp/three"),
                 fourth
             ]
+        );
+    }
+
+    #[test]
+    fn file_text_encoding_decodes_legacy_text_and_rejects_binary() {
+        let gbk = vec![0xd6, 0xd0, 0xce, 0xc4, b'.', b't', b'x', b't', b'\n'];
+
+        let decoded = decode_file_text_with_fallback(gbk.clone(), Some(encoding_rs::GBK)).unwrap();
+        assert_eq!(
+            decoded,
+            DecodedFileText {
+                text: "中文.txt\n".to_string(),
+                encoding: "gbk".to_string(),
+            }
+        );
+
+        let utf8 = decode_file_text_with_fallback(
+            "中文.txt\n".as_bytes().to_vec(),
+            Some(encoding_rs::GBK),
+        )
+        .unwrap();
+        assert_eq!(utf8.text, "中文.txt\n");
+        assert_eq!(utf8.encoding, UTF8_ENCODING);
+
+        let binary = vec![0xff, 0x00, 0x81, 0x7f];
+        assert_eq!(
+            decode_file_text_with_fallback(binary.clone(), Some(encoding_rs::GBK)).unwrap_err(),
+            binary
+        );
+    }
+
+    #[test]
+    fn file_text_encoding_encodes_legacy_text() {
+        let gbk = vec![0xd6, 0xd0, 0xce, 0xc4, b'.', b't', b'x', b't', b'\n'];
+
+        assert_eq!(encode_file_text("中文.txt\n", "gbk").unwrap(), gbk);
+        assert_eq!(
+            encode_file_text("hello", "utf-8").unwrap(),
+            b"hello".to_vec()
+        );
+        assert_eq!(
+            encode_file_text("hello", "not-an-encoding").unwrap_err(),
+            FileTextEncodeError::UnsupportedEncoding
         );
     }
 

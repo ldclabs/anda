@@ -14,7 +14,10 @@ use tokio::{
     sync::Mutex as TokioMutex,
 };
 
-use super::{ExecArgs, ExecOutput, Executor, SHELL_AUTO_BACKGROUND_SECS, ShellToolHook};
+use super::{
+    ExecArgs, ExecOutput, Executor, SHELL_AUTO_BACKGROUND_SECS, ShellToolHook,
+    complete_shell_output_prefix_len, decode_shell_output,
+};
 use crate::{
     context::BaseCtx,
     hook::{DynToolJsonHook, ToolBackgroundHook, ToolHook},
@@ -342,13 +345,13 @@ impl ProgressStreamState {
         }
 
         let unread = &output[self.sent_len..];
-        let readable_len = complete_utf8_prefix_len(unread);
+        let readable_len = complete_shell_output_prefix_len(unread);
         if readable_len == 0 {
             return None;
         }
 
         self.sent_len += readable_len;
-        let text = String::from_utf8_lossy(&unread[..readable_len]);
+        let text = decode_shell_output(&unread[..readable_len]);
         self.terminal.render(&text)
     }
 }
@@ -717,51 +720,6 @@ async fn collect_progress_output(
     }
 }
 
-fn complete_utf8_prefix_len(bytes: &[u8]) -> usize {
-    if bytes.is_empty() {
-        return 0;
-    }
-
-    let mut continuation_start = bytes.len();
-    while continuation_start > 0 && is_utf8_continuation_byte(bytes[continuation_start - 1]) {
-        continuation_start -= 1;
-    }
-
-    if continuation_start == 0 {
-        return bytes.len();
-    }
-
-    let lead_index = if continuation_start == bytes.len() {
-        bytes.len() - 1
-    } else {
-        continuation_start - 1
-    };
-    let required_len = utf8_sequence_len(bytes[lead_index]);
-    if required_len > 1 && bytes.len() - lead_index < required_len {
-        lead_index
-    } else {
-        bytes.len()
-    }
-}
-
-fn is_utf8_continuation_byte(byte: u8) -> bool {
-    byte & 0b1100_0000 == 0b1000_0000
-}
-
-fn utf8_sequence_len(byte: u8) -> usize {
-    if byte & 0b1000_0000 == 0 {
-        1
-    } else if byte & 0b1110_0000 == 0b1100_0000 {
-        2
-    } else if byte & 0b1111_0000 == 0b1110_0000 {
-        3
-    } else if byte & 0b1111_1000 == 0b1111_0000 {
-        4
-    } else {
-        1
-    }
-}
-
 fn has_rewrite_control(text: &str) -> bool {
     if text.contains(['\r', '\x08']) {
         return true;
@@ -863,8 +821,8 @@ fn output_bytes_to_exec_output(
     output_chunks_to_exec_output(
         process_id,
         workspace,
-        String::from_utf8_lossy(&stdout).to_string(),
-        String::from_utf8_lossy(&stderr).to_string(),
+        decode_shell_output(&stdout),
+        decode_shell_output(&stderr),
     )
 }
 
@@ -1154,12 +1112,9 @@ mod tests {
         );
         assert_eq!(runtime.auto_background_after, Duration::from_millis(9));
 
-        assert_eq!(complete_utf8_prefix_len(&[]), 0);
-        assert_eq!(complete_utf8_prefix_len("😀".as_bytes()), 4);
-        assert_eq!(complete_utf8_prefix_len(&[0xf0, 0x9f]), 0);
-        assert_eq!(complete_utf8_prefix_len(&[0x80, 0x80]), 2);
-        assert_eq!(utf8_sequence_len(0xf0), 4);
-        assert_eq!(utf8_sequence_len(0xff), 1);
+        assert_eq!(complete_shell_output_prefix_len(&[]), 0);
+        assert_eq!(complete_shell_output_prefix_len("😀".as_bytes()), 4);
+        assert_eq!(complete_shell_output_prefix_len(&[0xf0, 0x9f]), 0);
         assert!(has_rewrite_control("\x1b[2J"));
         assert!(!has_rewrite_control("\x1b[31mred"));
         assert_eq!(byte_index_for_char_column("a中b", 2), "a中".len());
@@ -1454,7 +1409,7 @@ mod tests {
         let hook = ShellToolHook::new(Arc::new(TestHook::new(sender)));
         ctx.base.set_state(hook);
         let runtime = NativeRuntime::new(workspace.path().to_path_buf())
-            .auto_background_after(Duration::from_millis(500))
+            .auto_background_after(Duration::from_millis(100))
             .background_progress_interval(Duration::from_millis(100));
         let input = ExecArgs {
             command: background_progress_command(&runtime),

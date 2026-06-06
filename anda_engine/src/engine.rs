@@ -66,7 +66,10 @@ use structured_logger::unix_ms;
 use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
 
 use crate::{
-    context::{AgentCtx, BaseCtx, ToolsSearch, ToolsSelect, Web3Client, Web3SDK},
+    context::{
+        AgentCtx, BaseCtx, ToolsSearch, ToolsSelect, Web3Client, Web3SDK, agent_context_path,
+        tool_context_path,
+    },
     hook::{Hook, Hooks},
     management::{BaseManagement, Management, SYSTEM_PATH, Visibility},
     model::{Model, Models},
@@ -627,12 +630,12 @@ impl EngineBuilder {
             .tools
             .set
             .keys()
-            .map(|p| Path::from(format!("t:{}", p)))
+            .map(|p| Path::from(tool_context_path(p)))
             .chain(
                 self.agents
                     .set
                     .keys()
-                    .map(|p| Path::from(format!("a:{}", p))),
+                    .map(|p| Path::from(agent_context_path(p))),
             )
             .collect();
         names.insert(Path::from(SYSTEM_PATH));
@@ -705,12 +708,12 @@ impl EngineBuilder {
             .tools
             .set
             .keys()
-            .map(|p| Path::from(format!("t:{}", p)))
+            .map(|p| Path::from(tool_context_path(p)))
             .chain(
                 self.agents
                     .set
                     .keys()
-                    .map(|p| Path::from(format!("a:{}", p))),
+                    .map(|p| Path::from(agent_context_path(p))),
             )
             .collect();
         names.insert(Path::from(SYSTEM_PATH));
@@ -778,12 +781,12 @@ impl EngineBuilder {
             .tools
             .set
             .keys()
-            .map(|p| Path::from(format!("t:{}", p)))
+            .map(|p| Path::from(tool_context_path(p)))
             .chain(
                 self.agents
                     .set
                     .keys()
-                    .map(|p| Path::from(format!("a:{}", p))),
+                    .map(|p| Path::from(agent_context_path(p))),
             )
             .collect();
         names.insert(Path::from(SYSTEM_PATH));
@@ -1072,7 +1075,12 @@ mod tests {
         let tool_ctx = engine
             .base_ctx_with(ANONYMOUS, "echo_agent", "echo_tool", RequestMeta::default())
             .unwrap();
-        assert_eq!(tool_ctx.path.as_ref(), "t:echo_tool");
+        let expected_tool_path = if cfg!(windows) {
+            "t_echo_tool"
+        } else {
+            "t:echo_tool"
+        };
+        assert_eq!(tool_ctx.path.as_ref(), expected_tool_path);
         assert!(
             engine
                 .base_ctx_with(ANONYMOUS, "echo_agent", "missing", RequestMeta::default())

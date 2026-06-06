@@ -11,8 +11,11 @@
 //! small allowlist of host environment variables plus explicit configured keys;
 //! arbitrary process environment variables are not forwarded.
 
+#[cfg(target_os = "windows")]
+use anda_core::windows_code_page_encoding;
 use anda_core::{BoxError, FunctionDefinition, Resource, Tool, ToolOutput};
 use async_trait::async_trait;
+use encoding_rs::{Encoding, UTF_8};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
@@ -187,7 +190,7 @@ impl ExecOutput {
             if output.status.success() || !output.stdout.is_empty() {
                 let stdout = format_output_preview(
                     "stdout",
-                    String::from_utf8_lossy(&output.stdout).to_string(),
+                    decode_shell_output(&output.stdout),
                     &raw_output,
                 );
                 rt.stdout = Some(stdout);
@@ -196,7 +199,7 @@ impl ExecOutput {
             if !output.stderr.is_empty() {
                 let stderr = format_output_preview(
                     "stderr",
-                    String::from_utf8_lossy(&output.stderr).to_string(),
+                    decode_shell_output(&output.stderr),
                     &raw_output,
                 );
                 rt.stderr = Some(stderr);
@@ -356,7 +359,7 @@ impl Tool<BaseCtx> for ShellTool {
     fn definition(&self) -> FunctionDefinition {
         let env_keys_description = self.env_keys_parameter_description();
         let background_description = format!(
-            "Whether to run the command in the background immediately (non-blocking). If false, native commands still running after {SHELL_AUTO_BACKGROUND_SECS} seconds are moved to the background automatically instead of returning a timeout error. New stdout/stderr output is pushed through background progress hooks as line-based progress: plain output is emitted as complete lines, UTF-8 split boundaries are preserved, and terminal-style rewritten progress regions are normalized to their latest changed visible lines. The final output is pushed through background end hooks when the task completes."
+            "Whether to run the command in the background immediately (non-blocking). If false, native commands still running after {SHELL_AUTO_BACKGROUND_SECS} seconds are moved to the background automatically instead of returning a timeout error. New stdout/stderr output is pushed through background progress hooks as line-based progress: plain output is emitted as complete lines, multibyte character split boundaries are preserved, and terminal-style rewritten progress regions are normalized to their latest changed visible lines. The final output is pushed through background end hooks when the task completes."
         );
 
         FunctionDefinition {
@@ -542,6 +545,145 @@ fn format_output_preview(
         "\n... [{stream_name} truncated at {cutoff} bytes{detail}]"
     ));
     text
+}
+
+pub(crate) fn decode_shell_output(bytes: &[u8]) -> String {
+    decode_shell_output_with_encoding(bytes, shell_output_encoding())
+}
+
+fn decode_shell_output_with_encoding(bytes: &[u8], fallback_encoding: &'static Encoding) -> String {
+    if bytes.is_empty() {
+        return String::new();
+    }
+
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return text.to_string();
+    }
+
+    let (text, _, _) = fallback_encoding.decode(bytes);
+    text.into_owned()
+}
+
+pub(crate) fn complete_shell_output_prefix_len(bytes: &[u8]) -> usize {
+    complete_shell_output_prefix_len_with_encoding(bytes, shell_output_encoding())
+}
+
+fn complete_shell_output_prefix_len_with_encoding(
+    bytes: &[u8],
+    encoding: &'static Encoding,
+) -> usize {
+    match encoding.name() {
+        "UTF-8" => complete_utf8_prefix_len(bytes),
+        "GBK" | "Big5" | "Shift_JIS" | "EUC-KR" => {
+            complete_legacy_multibyte_prefix_len(bytes, encoding)
+        }
+        _ => bytes.len(),
+    }
+}
+
+fn complete_utf8_prefix_len(bytes: &[u8]) -> usize {
+    if bytes.is_empty() {
+        return 0;
+    }
+
+    let mut continuation_start = bytes.len();
+    while continuation_start > 0 && is_utf8_continuation_byte(bytes[continuation_start - 1]) {
+        continuation_start -= 1;
+    }
+
+    if continuation_start == 0 {
+        return bytes.len();
+    }
+
+    let lead_index = if continuation_start == bytes.len() {
+        bytes.len() - 1
+    } else {
+        continuation_start - 1
+    };
+    let required_len = utf8_sequence_len(bytes[lead_index]);
+    if required_len > 1 && bytes.len() - lead_index < required_len {
+        lead_index
+    } else {
+        bytes.len()
+    }
+}
+
+fn is_utf8_continuation_byte(byte: u8) -> bool {
+    byte & 0b1100_0000 == 0b1000_0000
+}
+
+fn utf8_sequence_len(byte: u8) -> usize {
+    if byte & 0b1000_0000 == 0 {
+        1
+    } else if byte & 0b1110_0000 == 0b1100_0000 {
+        2
+    } else if byte & 0b1111_0000 == 0b1110_0000 {
+        3
+    } else if byte & 0b1111_1000 == 0b1111_0000 {
+        4
+    } else {
+        1
+    }
+}
+
+fn complete_legacy_multibyte_prefix_len(bytes: &[u8], encoding: &'static Encoding) -> usize {
+    let mut len = 0;
+    while len < bytes.len() {
+        let byte = bytes[len];
+        if legacy_multibyte_lead_byte(encoding, byte) {
+            let Some(&trail) = bytes.get(len + 1) else {
+                break;
+            };
+            if legacy_multibyte_trail_byte(encoding, trail) {
+                len += 2;
+            } else {
+                len += 1;
+            }
+        } else {
+            len += 1;
+        }
+    }
+    len
+}
+
+fn legacy_multibyte_lead_byte(encoding: &'static Encoding, byte: u8) -> bool {
+    match encoding.name() {
+        "GBK" | "Big5" | "EUC-KR" => (0x81..=0xfe).contains(&byte),
+        "Shift_JIS" => (0x81..=0x9f).contains(&byte) || (0xe0..=0xfc).contains(&byte),
+        _ => false,
+    }
+}
+
+fn legacy_multibyte_trail_byte(encoding: &'static Encoding, byte: u8) -> bool {
+    match encoding.name() {
+        "GBK" => (0x40..=0x7e).contains(&byte) || (0x80..=0xfe).contains(&byte),
+        "Big5" => (0x40..=0x7e).contains(&byte) || (0xa1..=0xfe).contains(&byte),
+        "EUC-KR" => {
+            (0x41..=0x5a).contains(&byte)
+                || (0x61..=0x7a).contains(&byte)
+                || (0x81..=0xfe).contains(&byte)
+        }
+        "Shift_JIS" => (0x40..=0x7e).contains(&byte) || (0x80..=0xfc).contains(&byte),
+        _ => false,
+    }
+}
+
+fn shell_output_encoding() -> &'static Encoding {
+    #[cfg(target_os = "windows")]
+    {
+        windows_code_page_encoding(windows_shell_code_page()).unwrap_or(UTF_8)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        UTF_8
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_shell_code_page() -> u32 {
+    // `cmd.exe` built-ins such as `dir` emit bytes using the OEM code page
+    // when stdout is piped. On Chinese Windows this is typically CP936 (GBK).
+    unsafe { windows_sys::Win32::Globalization::GetOEMCP() }
 }
 
 async fn persist_raw_output(
@@ -776,6 +918,32 @@ mod tests {
         assert_eq!(result.raw_output_path, None);
         assert_eq!(result.stdout.as_deref(), Some("ok\n"));
         assert_eq!(result.stderr.as_deref(), Some("warn\n"));
+    }
+
+    #[test]
+    fn shell_output_decoder_handles_gbk_and_preserves_utf8() {
+        let gbk = [0xd6, 0xd0, 0xce, 0xc4, b'.', b't', b'x', b't', b'\n'];
+
+        assert_eq!(
+            decode_shell_output_with_encoding(&gbk, encoding_rs::GBK),
+            "中文.txt\n"
+        );
+        assert_eq!(
+            decode_shell_output_with_encoding("中文.txt\n".as_bytes(), encoding_rs::GBK),
+            "中文.txt\n"
+        );
+        assert_eq!(
+            complete_shell_output_prefix_len_with_encoding(&gbk[..1], encoding_rs::GBK),
+            0
+        );
+        assert_eq!(
+            complete_shell_output_prefix_len_with_encoding(&gbk[..3], encoding_rs::GBK),
+            2
+        );
+        assert_eq!(
+            complete_shell_output_prefix_len_with_encoding(&gbk, encoding_rs::GBK),
+            gbk.len()
+        );
     }
 
     #[test]

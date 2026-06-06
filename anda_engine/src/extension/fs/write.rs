@@ -5,8 +5,9 @@ use serde_json::json;
 use std::{path::PathBuf, str::FromStr};
 
 use super::{
-    BASE64_ENCODING, UTF8_ENCODING, atomic_write_file, default_write_encoding, ensure_regular_file,
-    format_workspaces, normalize_workspaces, resolve_write_path_in_workspaces, tool_workspaces,
+    BASE64_ENCODING, FileTextEncodeError, atomic_write_file, default_write_encoding,
+    encode_file_text, ensure_regular_file, format_workspaces, normalize_workspaces,
+    resolve_write_path_in_workspaces, tool_workspaces,
 };
 use crate::{
     context::BaseCtx,
@@ -18,9 +19,9 @@ use crate::{
 pub struct WriteFileArgs {
     /// Relative or absolute path to a file inside the workspace.
     pub path: String,
-    /// File content encoded as UTF-8 text or base64, depending on `encoding`.
+    /// File content encoded as text or base64, depending on `encoding`.
     pub content: String,
-    /// Content encoding. Supported values are `utf8` and `base64`.
+    /// Content encoding. Supported values are `utf8`, `base64`, and text encodings such as `gbk`.
     #[serde(default = "default_write_encoding")]
     pub encoding: String,
 }
@@ -108,11 +109,11 @@ impl Tool<BaseCtx> for WriteFileTool {
                     },
                     "content": {
                         "type": "string",
-                        "description": "Content to write to the file. If encoding is 'base64', this should be base64-encoded data."
+                        "description": "Content to write to the file. If encoding is 'base64', this should be base64-encoded data; otherwise it is text encoded with the requested encoding."
                     },
                     "encoding": {
                         "type": "string",
-                        "description": "Encoding of the content. Can be 'utf8' or 'base64'. Defaults to 'utf8'."
+                        "description": "Encoding of the content. Can be 'utf8', 'base64', or a supported text encoding such as 'gbk'. Defaults to 'utf8'."
                     }
                 },
                 "required": ["path", "content", "encoding"],
@@ -209,7 +210,6 @@ fn decode_content(
     resolved_path: &std::path::Path,
 ) -> Result<Vec<u8>, BoxError> {
     match encoding {
-        UTF8_ENCODING => Ok(content.into_bytes()),
         BASE64_ENCODING => ByteBufB64::from_str(&content)
             .map(|decoded| decoded.0)
             .map_err(|err| {
@@ -222,13 +222,23 @@ fn decode_content(
                 )
                 .into()
             }),
-        other => Err(format!(
-            "Unsupported encoding {other:?}. Expected 'utf8' or 'base64' (workspace: {}, requested_path: {}, resolved_path: {})",
-            workspace,
-            requested_path,
-            resolved_path.display()
-        )
-        .into()),
+        text_encoding => encode_file_text(&content, text_encoding).map_err(|err| match err {
+            FileTextEncodeError::UnsupportedEncoding => format!(
+                "Unsupported encoding {text_encoding:?}. Expected 'utf8', 'base64', or a supported text encoding such as 'gbk' (workspace: {}, requested_path: {}, resolved_path: {})",
+                workspace,
+                requested_path,
+                resolved_path.display()
+            )
+            .into(),
+            FileTextEncodeError::UnmappableCharacters => format!(
+                "Failed to encode text content (workspace: {}, requested_path: {}, resolved_path: {}, encoding: {}): {err}",
+                workspace,
+                requested_path,
+                resolved_path.display(),
+                text_encoding
+            )
+            .into(),
+        }),
     }
 }
 
@@ -237,7 +247,7 @@ mod tests {
     use super::*;
     use crate::{
         engine::EngineBuilder,
-        extension::fs::{commit_atomic_replace, write_temp_file_for_atomic_replace},
+        extension::fs::{UTF8_ENCODING, commit_atomic_replace, write_temp_file_for_atomic_replace},
     };
     use serde_json::json;
     use std::{
@@ -508,6 +518,33 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(written, binary);
+    }
+
+    #[tokio::test]
+    async fn writes_legacy_text_encoding_content() {
+        let temp_dir = TestTempDir::new().await;
+        let workspace = temp_dir.path().join("workspace");
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+
+        let result = write_tool(&workspace)
+            .call(
+                mock_ctx(),
+                WriteFileArgs {
+                    path: "notes.txt".to_string(),
+                    content: "中文.txt\n".to_string(),
+                    encoding: "gbk".to_string(),
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.output.size, 9);
+        let written = tokio::fs::read(workspace.join("notes.txt")).await.unwrap();
+        assert_eq!(
+            written,
+            vec![0xd6, 0xd0, 0xce, 0xc4, b'.', b't', b'x', b't', b'\n']
+        );
     }
 
     #[tokio::test]

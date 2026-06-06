@@ -194,9 +194,9 @@ impl SkillManager {
         let data = tokio::fs::read(path)
             .await
             .map_err(|err| format!("Failed to read file (path: {}): {err}", path.display()))?;
-        String::from_utf8(data).map_err(|_| {
+        types::decode_skill_md_bytes(data).map_err(|_| {
             format!(
-                "Only UTF-8 skill files are supported by skills_manager (path: {})",
+                "Only UTF-8 or supported text-encoded skill files are supported by skills_manager (path: {})",
                 path.display()
             )
             .into()
@@ -230,7 +230,9 @@ impl SkillManager {
                     let dir_name_matches = base_dir.file_name() == Some(OsStr::new(name));
                     let frontmatter_name_matches = if dir_name_matches {
                         true
-                    } else if let Ok(content) = tokio::fs::read_to_string(&path).await {
+                    } else if let Ok(content) =
+                        self.read_text_file(&path, MAX_SKILL_FILE_BYTES).await
+                    {
                         parse_skill_md(base_dir.clone(), &content)
                             .map(|skill| skill.frontmatter.name == name)
                             .unwrap_or(false)
@@ -637,6 +639,67 @@ Beta instructions.
     }
 
     #[tokio::test]
+    async fn load_and_read_platform_encoded_skill_file_when_available() {
+        let Some(encoding) =
+            anda_core::platform_text_encoding().filter(|encoding| encoding.name() != "UTF-8")
+        else {
+            return;
+        };
+        let Some(marker) = [
+            "中文",
+            "café",
+            "日本語",
+            "한국어",
+            "тест",
+            "γειά",
+            "שלום",
+            "مرحبا",
+        ]
+        .into_iter()
+        .find(|candidate| {
+            let (bytes, _, had_errors) = encoding.encode(candidate);
+            !had_errors && std::str::from_utf8(&bytes).is_err()
+        }) else {
+            return;
+        };
+
+        let tmp =
+            std::env::temp_dir().join(format!("anda-skills-legacy-{:016x}", rand::random::<u64>()));
+        tokio::fs::create_dir_all(tmp.join("legacy-skill"))
+            .await
+            .unwrap();
+        let body = format!("Legacy encoded skill marker: {marker}");
+        let content = skill_md(
+            "legacy-skill",
+            "Legacy encoded skill for testing.",
+            &body,
+            None,
+        );
+        let (encoded, _, had_errors) = encoding.encode(&content);
+        assert!(!had_errors);
+        assert!(std::str::from_utf8(encoded.as_ref()).is_err());
+        tokio::fs::write(tmp.join("legacy-skill/SKILL.md"), encoded.as_ref())
+            .await
+            .unwrap();
+
+        let mgr = SkillManager::new(tmp.clone());
+        mgr.load().await.unwrap();
+
+        assert!(mgr.contains_lowercase("skill_legacy_skill"));
+        let agent = mgr.get_lowercase("skill_legacy_skill").unwrap();
+        assert!(agent.instructions.contains(&body));
+
+        let output = mgr
+            .call_raw(mock_ctx(), json!({ "name": "legacy-skill" }), Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(output.output["name"], json!("legacy-skill"));
+        assert!(output.output["content"].as_str().unwrap().contains(&body));
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    #[tokio::test]
     async fn load_and_read_from_multiple_dirs() {
         let root =
             std::env::temp_dir().join(format!("anda-skills-multi-{:016x}", rand::random::<u64>()));
@@ -878,14 +941,18 @@ Beta instructions.
         tokio::fs::create_dir_all(root.join("binary"))
             .await
             .unwrap();
-        tokio::fs::write(root.join("binary/SKILL.md"), vec![0xFF, 0xFE])
+        tokio::fs::write(root.join("binary/SKILL.md"), vec![0x81, 0x00])
             .await
             .unwrap();
         let binary = mgr
             .call_raw(mock_ctx(), json!({"name": "binary"}), Vec::new())
             .await
             .unwrap_err();
-        assert!(binary.to_string().contains("Only UTF-8 skill files"));
+        assert!(
+            binary
+                .to_string()
+                .contains("Only UTF-8 or supported text-encoded skill files")
+        );
 
         tokio::fs::create_dir_all(root.join("large")).await.unwrap();
         tokio::fs::write(

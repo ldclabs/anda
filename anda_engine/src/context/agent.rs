@@ -57,6 +57,25 @@ pub static REMOTE_AGENT_PREFIX: &str = "RA_";
 pub static REMOTE_TOOL_PREFIX: &str = "RT_";
 pub static SUB_AGENT_PREFIX: &str = "SA_";
 
+pub(crate) fn agent_context_path(agent_name: &str) -> String {
+    component_context_path("a", agent_name)
+}
+
+pub(crate) fn tool_context_path(tool_name: &str) -> String {
+    component_context_path("t", tool_name)
+}
+
+fn component_context_path(prefix: &str, name: &str) -> String {
+    let name = name.to_ascii_lowercase();
+    if cfg!(windows) {
+        format!("{prefix}_{name}")
+    } else {
+        // Preserve the existing namespace on Unix-like systems so deployed
+        // stores and key-derivation paths keep resolving to the same place.
+        format!("{prefix}:{name}")
+    }
+}
+
 /// Context for agent operations, providing access to models, tools, and other agents.
 #[derive(Clone)]
 pub struct AgentCtx {
@@ -109,9 +128,7 @@ impl AgentCtx {
     /// * `agent_name` - Name of the agent to create context for.
     pub fn child(&self, agent_name: &str, agent_label: &str) -> Result<Self, BoxError> {
         Ok(Self {
-            base: self
-                .base
-                .child(format!("A:{}", agent_name.to_ascii_lowercase()))?,
+            base: self.base.child(agent_context_path(agent_name))?,
             label: agent_label.to_string(),
             root: self.root.clone(),
             models: self.models.clone(),
@@ -126,8 +143,7 @@ impl AgentCtx {
     /// # Arguments
     /// * `tool_name` - Name of the tool to create context for.
     pub fn child_base(&self, tool_name: &str) -> Result<BaseCtx, BoxError> {
-        self.base
-            .child(format!("T:{}", tool_name.to_ascii_lowercase()))
+        self.base.child(tool_context_path(tool_name))
     }
 
     /// Creates a child context with caller and meta information.
@@ -147,7 +163,7 @@ impl AgentCtx {
             base: self.base.child_with(
                 caller,
                 agent_name.to_string(),
-                format!("A:{}", agent_name.to_ascii_lowercase()),
+                agent_context_path(agent_name),
                 meta,
             )?,
             label: agent_label.to_string(),
@@ -175,7 +191,7 @@ impl AgentCtx {
         self.base.child_with(
             caller,
             agent_name.to_string(),
-            format!("T:{}", tool_name.to_ascii_lowercase()),
+            tool_context_path(tool_name),
             meta,
         )
     }
@@ -1708,8 +1724,9 @@ mod tests {
         Agent, AgentContext as _, AgentInput, AgentOutput, BaseContext as _, BoxError,
         CacheFeatures as _, CacheStoreFeatures as _, CancellationToken, CanisterCaller as _,
         CompletionFeatures as _, CompletionRequest, ContentPart, Function, FunctionDefinition,
-        HttpFeatures as _, Json, KeysFeatures as _, Message, ModelEffort, Path, PutMode, Resource,
-        StateFeatures as _, StoreFeatures as _, Tool, ToolCall, ToolInput, ToolOutput, Usage,
+        HttpFeatures as _, Json, KeysFeatures as _, Message, ModelEffort, Path, PutMode,
+        RequestMeta, Resource, StateFeatures as _, StoreFeatures as _, Tool, ToolCall, ToolInput,
+        ToolOutput, Usage,
     };
     use bytes::Bytes;
     use candid::Principal;
@@ -1749,6 +1766,44 @@ mod tests {
         let data = to_cbor_bytes(&json);
         let val: serde_json::Value = from_reader(&data[..]).unwrap();
         assert_eq!(json, val);
+    }
+
+    #[test]
+    fn child_context_paths_are_platform_compatible() {
+        let ctx = EngineBuilder::new().mock_ctx();
+        let caller = Principal::self_authenticating([4; 32]);
+        let expected_agent = if cfg!(windows) {
+            "a_echo_agent"
+        } else {
+            "a:echo_agent"
+        };
+        let expected_tool = if cfg!(windows) {
+            "t_echo_tool"
+        } else {
+            "t:echo_tool"
+        };
+
+        let agent = ctx.child("Echo_Agent", "Echo Agent").unwrap();
+        let tool = ctx.child_base("Echo_Tool").unwrap();
+        let agent_with = ctx
+            .child_with(caller, "Echo_Agent", "Echo Agent", RequestMeta::default())
+            .unwrap();
+        let tool_with = ctx
+            .child_base_with(caller, "Echo_Agent", "Echo_Tool", RequestMeta::default())
+            .unwrap();
+
+        assert_eq!(agent.base.path.as_ref(), expected_agent);
+        assert_eq!(tool.path.as_ref(), expected_tool);
+        assert_eq!(agent_with.base.path.as_ref(), expected_agent);
+        assert_eq!(tool_with.path.as_ref(), expected_tool);
+        for path in [
+            agent.base.path.as_ref(),
+            tool.path.as_ref(),
+            agent_with.base.path.as_ref(),
+            tool_with.path.as_ref(),
+        ] {
+            assert_eq!(path.contains(':'), !cfg!(windows));
+        }
     }
 
     // ── Helper completers ──

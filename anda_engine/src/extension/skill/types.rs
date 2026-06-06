@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::subagent::SubAgent;
+use crate::{extension::fs::decode_file_text, subagent::SubAgent};
 
 // ---------------------------------------------------------------------------
 // SKILL.md frontmatter — Agent Skills specification
@@ -236,10 +236,11 @@ pub async fn load_skills_from_dir(dir: &Path) -> Result<BTreeMap<String, Skill>,
     let mut skills = BTreeMap::new();
 
     for path in files {
-        if let Some(base_dir) = path.parent()
-            && let Ok(content) = tokio::fs::read_to_string(&path).await
-        {
-            match parse_skill_md(base_dir.to_path_buf(), &content) {
+        let Some(base_dir) = path.parent() else {
+            continue;
+        };
+        match read_skill_md_text(&path).await {
+            Ok(content) => match parse_skill_md(base_dir.to_path_buf(), &content) {
                 Ok(skill) => {
                     if skills.contains_key(&skill.agent_name) {
                         log::warn!(
@@ -251,14 +252,32 @@ pub async fn load_skills_from_dir(dir: &Path) -> Result<BTreeMap<String, Skill>,
                         skills.insert(skill.agent_name.clone(), skill);
                     }
                 }
-                Err(err) => {
-                    log::error!("skipping {}: {err}", path.display());
-                }
+                Err(err) => log::error!("skipping {}: {err}", path.display()),
+            },
+            Err(err) => {
+                log::error!("skipping {}: {err}", path.display());
             }
         }
     }
 
     Ok(skills)
+}
+
+async fn read_skill_md_text(path: &Path) -> Result<String, BoxError> {
+    let bytes = tokio::fs::read(path)
+        .await
+        .map_err(|err| format!("Failed to read skill file {}: {err}", path.display()))?;
+    decode_skill_md_bytes(bytes).map_err(|_| {
+        format!(
+            "Only UTF-8 or supported text-encoded skill files are supported (path: {})",
+            path.display()
+        )
+        .into()
+    })
+}
+
+pub(crate) fn decode_skill_md_bytes(bytes: Vec<u8>) -> Result<String, Vec<u8>> {
+    decode_file_text(bytes).map(|decoded| decoded.text)
 }
 
 // ---------------------------------------------------------------------------
