@@ -912,9 +912,9 @@ where
     }
 
     match serde_json::from_str::<T>(value) {
-        Ok(event) => return Ok(vec![event]),
+        Ok(event) => Ok(vec![event]),
         Err(single_err) => match serde_json::from_str::<Vec<T>>(value) {
-            Ok(events) => return Ok(events),
+            Ok(events) => Ok(events),
             Err(array_err) => {
                 let mut events = Vec::new();
                 let mut saw_line = false;

@@ -589,7 +589,7 @@ mod tests {
         let temp_dir = TestTempDir::new().await;
         let workspace = temp_dir.path().join("workspace");
         tokio::fs::create_dir_all(&workspace).await.unwrap();
-        tokio::fs::write(workspace.join("payload.bin"), [0x66, 0x6f, 0x80, 0x6f])
+        tokio::fs::write(workspace.join("payload.bin"), [0x66, 0x00, 0x80, 0x6f])
             .await
             .unwrap();
 

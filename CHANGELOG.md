@@ -14,6 +14,11 @@ All notable changes to the Anda project will be documented in this file.
 - **Streaming completion responses are more robust** — OpenAI-compatible, Anthropic, and Gemini streaming requests now ask providers for identity-encoded event streams and the shared parser accepts BOM-prefixed SSE, NDJSON, plain JSON event payloads, and JSON arrays. This avoids provider/proxy response-shape surprises while preserving existing SSE handling.
 - **Windows-compatible agent and tool context paths** — Agent/tool child context paths now avoid colon separators on Windows while preserving existing colon-based namespaces on Unix-like systems, keeping existing deployments stable and making Windows storage paths valid.
 
+### Fixed — anda_engine v0.12.32
+
+- **Native shell final progress flush** — Background shell tasks now emit any final complete stdout/stderr progress lines before the background-end hook, so short-lived commands do not lose their last progress update when they exit before the next progress interval.
+- **Portable skill output paths** — `skills_manager` now normalizes relative `SKILL.md` paths with `/` separators on Windows, matching the existing API output shape on Unix-like systems.
+
 ### Fixed — anda_core v0.12.8
 
 - **BOM-only resource text is filtered out** — Legacy text decoding now rejects non-empty byte slices that decode to an empty string, preventing Windows fallback decoding from turning BOM-only binary or empty-looking resources into empty prompt documents.

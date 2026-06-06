@@ -28,7 +28,7 @@ use std::{
 
 use crate::{
     context::BaseCtx,
-    extension::fs::{ensure_file_size_within_limit, ensure_regular_file},
+    extension::fs::{ensure_file_size_within_limit, ensure_regular_file, normalize_relative_path},
     subagent::{SubAgent, SubAgentSet},
 };
 
@@ -264,7 +264,7 @@ impl SkillManager {
     fn display_path(&self, path: &Path) -> String {
         for skills_dir in &self.skills_dirs {
             if let Ok(stripped) = path.strip_prefix(skills_dir) {
-                return stripped.display().to_string();
+                return normalize_relative_path(stripped);
             }
         }
 
@@ -273,7 +273,7 @@ impl SkillManager {
                 if let Ok(root) = std::fs::canonicalize(skills_dir)
                     && let Ok(stripped) = canonical_path.strip_prefix(&root)
                 {
-                    return stripped.display().to_string();
+                    return normalize_relative_path(stripped);
                 }
             }
         }

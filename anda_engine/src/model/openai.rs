@@ -11,7 +11,6 @@ use anda_core::{
     Message, Usage as ModelUsage, inline_data_from_data_url, part_to_data_url,
 };
 use log::{Level::Debug, log_enabled};
-use reqwest::header::ACCEPT;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, json};
 use std::collections::{BTreeMap, HashMap};
@@ -2005,6 +2004,7 @@ mod tests {
     use super::*;
     use axum::{Router, body::Bytes, extract::State, response::IntoResponse, routing::any};
     use http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
+    use reqwest::header::ACCEPT;
     use serde_json::{Map, json};
     use std::sync::{Arc, Mutex};
 

@@ -255,7 +255,7 @@ impl NativeRuntime {
                     }
                 };
 
-                let exec_output = finalize_process_output(
+                let (final_progress, exec_output) = finalize_process_output_with_final_progress(
                     pid,
                     &workspace_str,
                     status,
@@ -264,8 +264,21 @@ impl NativeRuntime {
                     stdout_reader,
                     stderr_reader,
                     &temp_dir,
+                    &mut stdout_progress,
+                    &mut stderr_progress,
                 )
                 .await;
+
+                if let Some(exec_output) = final_progress {
+                    emit_background_progress(
+                        &ctx,
+                        &task_id,
+                        exec_output,
+                        json_hook.as_ref(),
+                        hook.as_ref(),
+                    )
+                    .await;
+                }
 
                 emit_background_end(
                     &ctx,
@@ -660,8 +673,43 @@ async fn finalize_process_output(
     stderr_reader: OutputReaderHandle,
     temp_dir: &Path,
 ) -> ExecOutput {
+    finalize_process_output_with_final_progress(
+        process_id,
+        workspace,
+        status,
+        stdout,
+        stderr,
+        stdout_reader,
+        stderr_reader,
+        temp_dir,
+        &mut ProgressStreamState::default(),
+        &mut ProgressStreamState::default(),
+    )
+    .await
+    .1
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finalize_process_output_with_final_progress(
+    process_id: Option<u32>,
+    workspace: &str,
+    status: std::io::Result<ExitStatus>,
+    stdout: OutputBuffer,
+    stderr: OutputBuffer,
+    stdout_reader: OutputReaderHandle,
+    stderr_reader: OutputReaderHandle,
+    temp_dir: &Path,
+    stdout_progress: &mut ProgressStreamState,
+    stderr_progress: &mut ProgressStreamState,
+) -> (Option<ExecOutput>, ExecOutput) {
     let stdout_read_error = output_reader_error(stdout_reader, "stdout").await;
     let stderr_read_error = output_reader_error(stderr_reader, "stderr").await;
+    let final_progress =
+        collect_progress_output(&stdout, &stderr, stdout_progress, stderr_progress)
+            .await
+            .map(|(stdout_chunk, stderr_chunk)| {
+                output_chunks_to_exec_output(process_id, workspace, stdout_chunk, stderr_chunk)
+            });
     let stdout_bytes = std::mem::take(&mut *stdout.lock().await);
     let mut stderr_bytes = std::mem::take(&mut *stderr.lock().await);
     if let Some(err) = stdout_read_error {
@@ -684,7 +732,7 @@ async fn finalize_process_output(
             )
             .await;
             exec_output.workspace = Some(workspace.to_string());
-            exec_output
+            (final_progress, exec_output)
         }
         Err(err) => {
             let mut error = format!("Failed to execute process: {err}").into_bytes();
@@ -692,7 +740,10 @@ async fn finalize_process_output(
                 error.push(b'\n');
                 error.extend_from_slice(&stderr_bytes);
             }
-            output_bytes_to_exec_output(process_id, workspace, stdout_bytes, error)
+            (
+                final_progress,
+                output_bytes_to_exec_output(process_id, workspace, stdout_bytes, error),
+            )
         }
     }
 }
@@ -979,19 +1030,36 @@ mod tests {
         }
     }
 
+    fn windows_ping_delay_command() -> String {
+        let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+        let system_root = system_root.trim_end_matches(['\\', '/']);
+        format!(r"{system_root}\System32\ping.exe 127.0.0.1 -n 2 > nul")
+    }
+
     fn background_command(runtime: &NativeRuntime) -> String {
         match runtime.shell() {
-            "cmd.exe" => {
-                "ping 127.0.0.1 -n 2 > nul & <nul set /p =bg-out & echo bg-err 1>&2".to_string()
-            }
+            "cmd.exe" => format!(
+                "{} & <nul set /p =bg-out & echo bg-err 1>&2",
+                windows_ping_delay_command()
+            ),
             _ => "sleep 0.2; printf '%s' 'bg-out'; printf '%s' 'bg-err' >&2".to_string(),
         }
     }
 
     fn background_progress_command(runtime: &NativeRuntime) -> String {
         match runtime.shell() {
-            "cmd.exe" => "echo progress-out & echo progress-err 1>&2 & ping 127.0.0.1 -n 2 > nul & <nul set /p =done".to_string(),
+            "cmd.exe" => format!(
+                "echo progress-out & echo progress-err 1>&2 & {} & <nul set /p =done",
+                windows_ping_delay_command()
+            ),
             _ => "printf '%s\n' 'progress-out'; printf '%s\n' 'progress-err' >&2; sleep 0.5; printf '%s' 'done'".to_string(),
+        }
+    }
+
+    fn short_background_progress_command(runtime: &NativeRuntime) -> String {
+        match runtime.shell() {
+            "cmd.exe" => "echo progress-out & echo progress-err 1>&2".to_string(),
+            _ => "printf '%s\n' 'progress-out'; printf '%s\n' 'progress-err' >&2".to_string(),
         }
     }
 
@@ -1111,6 +1179,8 @@ mod tests {
             Duration::from_millis(7)
         );
         assert_eq!(runtime.auto_background_after, Duration::from_millis(9));
+        assert!(!windows_ping_delay_command().starts_with('"'));
+        assert!(windows_ping_delay_command().contains(r"\System32\ping.exe"));
 
         assert_eq!(complete_shell_output_prefix_len(&[]), 0);
         assert_eq!(complete_shell_output_prefix_len("😀".as_bytes()), 4);
@@ -1392,6 +1462,80 @@ mod tests {
                 .stdout
                 .as_deref()
                 .is_some_and(|stdout| stdout.contains("progress-out") && stdout.contains("done"))
+        );
+        assert!(
+            hook_output
+                .stderr
+                .as_deref()
+                .is_some_and(|stderr| stderr.contains("progress-err"))
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn execute_flushes_final_background_progress_before_end() {
+        let ctx = EngineBuilder::new().mock_ctx();
+        let workspace = TestTempDir::new("anda-native-final-progress").await;
+        let (progress_sender, mut progress_receiver) = mpsc::unbounded_channel();
+        let (end_sender, end_receiver) = oneshot::channel();
+        let hook = ShellToolHook::new(Arc::new(ProgressHook::new(progress_sender, end_sender)));
+        ctx.base.set_state(hook);
+        let runtime = NativeRuntime::new(workspace.path().to_path_buf())
+            .background_progress_interval(Duration::from_secs(60));
+        let input = ExecArgs {
+            command: short_background_progress_command(&runtime),
+            background: true,
+            ..Default::default()
+        };
+
+        let output = runtime
+            .execute(ctx.base, input.clone(), HashMap::new())
+            .await
+            .unwrap();
+
+        let (
+            progress_task_id,
+            ToolOutput {
+                output: progress_output,
+                ..
+            },
+        ) = tokio::time::timeout(Duration::from_secs(5), progress_receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(progress_output.process_id, output.process_id);
+        assert!(progress_output.exit_status.is_none());
+        assert!(
+            progress_output
+                .stdout
+                .as_deref()
+                .is_some_and(|stdout| stdout.contains("progress-out"))
+        );
+        assert!(
+            progress_output
+                .stderr
+                .as_deref()
+                .is_some_and(|stderr| stderr.contains("progress-err"))
+        );
+
+        let (
+            end_task_id,
+            ToolOutput {
+                output: hook_output,
+                ..
+            },
+        ) = tokio::time::timeout(Duration::from_secs(5), end_receiver)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(end_task_id, progress_task_id);
+        assert_eq!(hook_output.process_id, output.process_id);
+        assert!(
+            hook_output
+                .stdout
+                .as_deref()
+                .is_some_and(|stdout| stdout.contains("progress-out"))
         );
         assert!(
             hook_output

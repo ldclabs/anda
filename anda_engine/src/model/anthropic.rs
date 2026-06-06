@@ -9,7 +9,6 @@ use anda_core::{
     AgentOutput, BoxError, BoxPinFut, CompletionFeatures, CompletionRequest, Message, Resource,
 };
 use log::{Level::Debug, log_enabled};
-use reqwest::header::ACCEPT;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
@@ -607,6 +606,7 @@ mod tests {
     use anda_core::{ContentPart, FunctionDefinition};
     use axum::{Router, body::Bytes, extract::State, response::IntoResponse, routing::any};
     use http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
+    use reqwest::header::ACCEPT;
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone)]
