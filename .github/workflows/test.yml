@@ -6,13 +6,28 @@ on:
     branches: ["main"]
 jobs:
   test:
-    runs-on: ubuntu-latest
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
-      - name: Run tests
+      - name: Install protobuf compiler (Linux)
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends -o Acquire::Retries=3 protobuf-compiler
-          rustup update --no-self-update stable
-          cargo clippy --all-targets --all-features
-          cargo test --workspace -- --nocapture
+      - name: Install protobuf compiler (Windows)
+        if: runner.os == 'Windows'
+        run: choco install protoc -y --no-progress
+      - name: Install protobuf compiler (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+      - name: Install Rust stable
+        run: rustup update --no-self-update stable
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features
+      - name: Run tests
+        run: cargo test --workspace -- --nocapture
