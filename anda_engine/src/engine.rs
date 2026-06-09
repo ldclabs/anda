@@ -1075,12 +1075,7 @@ mod tests {
         let tool_ctx = engine
             .base_ctx_with(ANONYMOUS, "echo_agent", "echo_tool", RequestMeta::default())
             .unwrap();
-        let expected_tool_path = if cfg!(windows) {
-            "t_echo_tool"
-        } else {
-            "t:echo_tool"
-        };
-        assert_eq!(tool_ctx.path.as_ref(), expected_tool_path);
+        assert_eq!(tool_ctx.path.as_ref(), "t_echo_tool");
         assert!(
             engine
                 .base_ctx_with(ANONYMOUS, "echo_agent", "missing", RequestMeta::default())

@@ -20,15 +20,3 @@ pub mod note;
 pub mod shell;
 pub mod skill;
 pub mod todo;
-
-#[deprecated(
-    since = "0.12.0",
-    note = "The `google` extension is deprecated and will be removed in a future release."
-)]
-pub mod google;
-
-#[deprecated(
-    since = "0.12.0",
-    note = "The `extractor` extension is deprecated and will be removed in a future release."
-)]
-pub mod extractor;

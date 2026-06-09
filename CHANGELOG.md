@@ -10,6 +10,10 @@ All notable changes to the Anda project will be documented in this file.
 
 - **Note tool operation API** — Replaced substring-based `action=add|replace|remove` writes with stable-id `op=read|set|upsert|delete` and `items` parameters. Notes now persist in the `notes_v2` store, writes return compact summary counts, and read/load operations return structured note items with usage summaries.
 
+- **Deprecated extension cleanup** — Removed the deprecated `google` and `extractor` extension modules from `anda_engine`, eliminating the legacy Google Custom Search tool and generic extractor helper that were previously marked deprecated.
+
+- **Unified child context paths** — Agent and tool child context paths now consistently use underscore-separated names such as `a_echo_agent` and `t_echo_tool` on every platform.
+
 ## [0.12.33] — 2026-06-09
 
 ### Changed — anda_engine v0.12.33

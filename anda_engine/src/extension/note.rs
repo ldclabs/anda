@@ -27,7 +27,7 @@ const NOTE_OP_READ: &str = "read";
 const NOTE_OP_SET: &str = "set";
 const NOTE_OP_UPSERT: &str = "upsert";
 const NOTE_OP_DELETE: &str = "delete";
-const NOTE_STORE_PATH: &str = "notes_v2";
+const LEGACY_NOTE_STORE_PATH: &str = "notes";
 const NOTE_CHAR_LIMIT: usize = 16384;
 const NOTE_ENTRY_DELIMITER: &str = "\n---\n";
 
@@ -86,6 +86,11 @@ pub struct NoteOutput {
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 struct NoteStore {
     items: Vec<NoteItem>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+struct LegacyNoteStore {
+    notes: Vec<String>,
 }
 
 impl NoteStore {
@@ -213,13 +218,25 @@ impl NoteTool {
     }
 
     fn store_path(agent: &str) -> Path {
-        Path::from(format!("{NOTE_STORE_PATH}_{agent}"))
+        Path::from(agent)
+    }
+
+    fn legacy_store_path(agent: &str) -> Path {
+        Path::from(format!("{LEGACY_NOTE_STORE_PATH}:{agent}"))
     }
 
     async fn load_store(ctx: &BaseCtx) -> Result<NoteStore, BoxError> {
         match ctx.store_get(&Self::store_path(&ctx.agent)).await {
             Ok((data, _)) => Ok(from_reader(&data[..])?),
             Err(err) if is_missing_store_object(err.as_ref()) => Ok(NoteStore::default()),
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn load_legacy_store(ctx: &BaseCtx) -> Result<LegacyNoteStore, BoxError> {
+        match ctx.store_get(&Self::legacy_store_path(&ctx.agent)).await {
+            Ok((data, _)) => Ok(from_reader(&data[..])?),
+            Err(err) if is_missing_store_object(err.as_ref()) => Ok(LegacyNoteStore::default()),
             Err(err) => Err(err),
         }
     }
@@ -243,6 +260,16 @@ pub async fn load_notes(ctx: &AgentCtx) -> Option<NoteOutput> {
         .await
         .ok()
         .map(|store| store.output(true, true, None))
+}
+
+/// Loads notes from the pre-v2 note store without mutating the current store.
+pub async fn load_notes_from_legacy(ctx: &AgentCtx) -> Option<NoteOutput> {
+    let mut base_ctx = ctx.child_base(NoteTool::NAME).ok()?;
+    base_ctx.path = "t:note".into();
+    NoteTool::load_legacy_store(&base_ctx)
+        .await
+        .ok()
+        .map(legacy_store_output)
 }
 
 impl Tool<BaseCtx> for NoteTool {
@@ -385,6 +412,27 @@ fn normalize_op(op: Option<&str>) -> Option<String> {
     op.map(|value| value.trim().to_ascii_lowercase())
         .filter(|value| !value.is_empty())
         .or_else(|| Some(NOTE_OP_READ.to_string()))
+}
+
+fn legacy_store_output(store: LegacyNoteStore) -> NoteOutput {
+    let items = store
+        .notes
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, content)| {
+            let content = content.trim();
+            if content.is_empty() {
+                return None;
+            }
+
+            Some(NoteItem {
+                id: format!("legacy_{}", index + 1),
+                content: content.to_string(),
+            })
+        })
+        .collect();
+
+    NoteStore { items }.output(true, true, None)
 }
 
 fn normalize_note_items(items: Vec<NoteItemInput>) -> Result<Vec<NoteItem>, String> {
@@ -791,6 +839,41 @@ mod tests {
         assert!(loaded.success);
         assert_eq!(loaded.items, vec![item("hook", "hook inserted note")]);
         assert_eq!(loaded.summary.limit, None);
+    }
+
+    #[tokio::test]
+    async fn load_notes_from_legacy_reads_old_store_without_touching_v2() {
+        let agent = agent_ctx("legacy");
+        let mut ctx = agent.child_base(NoteTool::NAME).unwrap();
+        ctx.path = "t:note".into();
+        let legacy = LegacyNoteStore {
+            notes: vec![
+                "remember old release process".to_string(),
+                "prefer concise persisted notes".to_string(),
+            ],
+        };
+        ctx.store_put(
+            &NoteTool::legacy_store_path(&ctx.agent),
+            PutMode::Overwrite,
+            deterministic_cbor_into_vec(&legacy).unwrap().into(),
+        )
+        .await
+        .unwrap();
+
+        let loaded = load_notes_from_legacy(&agent).await.unwrap();
+        assert!(loaded.success);
+        assert_eq!(
+            loaded.items,
+            vec![
+                item("legacy_1", "remember old release process"),
+                item("legacy_2", "prefer concise persisted notes"),
+            ]
+        );
+        assert_eq!(loaded.summary.total, 2);
+        assert_eq!(loaded.summary.limit, None);
+
+        let current = load_notes(&agent).await.unwrap();
+        assert!(current.items.is_empty());
     }
 
     #[test]

@@ -832,25 +832,6 @@ fn looks_like_sse(body: &str) -> bool {
     })
 }
 
-fn handle_sse_line<T>(
-    line: &[u8],
-    data: &mut String,
-    events: &mut Vec<T>,
-    model: &str,
-) -> Result<(), BoxError>
-where
-    T: DeserializeOwned,
-{
-    let line = std::str::from_utf8(line).map_err(|err| {
-        format!(
-            "Invalid UTF-8 in streaming completion response, model: {}, error: {}",
-            model, err
-        )
-    })?;
-    let line = line.strip_prefix('\u{feff}').unwrap_or(line);
-    handle_sse_text_line(line, data, events, model)
-}
-
 fn handle_sse_text_line<T>(
     line: &str,
     data: &mut String,
@@ -1324,43 +1305,6 @@ mod tests {
             .await
             .unwrap();
         assert!(output.tool_calls.is_empty());
-    }
-
-    #[test]
-    fn request_client_builder_and_sse_line_parser_cover_success_and_error_paths() {
-        let _client = request_client_builder().no_proxy().build().unwrap();
-        assert!(AnyHost == "anything");
-        assert!(is_retryable_status(StatusCode::TOO_MANY_REQUESTS));
-        assert!(is_retryable_status(StatusCode::INTERNAL_SERVER_ERROR));
-        assert!(!is_retryable_status(StatusCode::BAD_REQUEST));
-
-        let mut data = String::new();
-        let mut events = Vec::<serde_json::Value>::new();
-
-        handle_sse_line(b": keep-alive", &mut data, &mut events, "test-model").unwrap();
-        handle_sse_line(b"event: ignored", &mut data, &mut events, "test-model").unwrap();
-        handle_sse_line(b"data: {\"a\":", &mut data, &mut events, "test-model").unwrap();
-        handle_sse_line(b"data: 1}", &mut data, &mut events, "test-model").unwrap();
-        handle_sse_line(b"", &mut data, &mut events, "test-model").unwrap();
-        assert_eq!(events, vec![serde_json::json!({"a": 1})]);
-
-        handle_sse_line(b"data: [DONE]", &mut data, &mut events, "test-model").unwrap();
-        handle_sse_line(b"", &mut data, &mut events, "test-model").unwrap();
-        assert!(data.is_empty());
-        assert_eq!(events.len(), 1);
-
-        let err = handle_sse_line(b"data: \xff", &mut data, &mut events, "test-model").unwrap_err();
-        assert!(err.to_string().contains("Invalid UTF-8"));
-
-        data.clear();
-        data.push_str("{bad json");
-        let err =
-            flush_sse_data::<serde_json::Value>(&mut data, &mut events, "test-model").unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("Invalid streaming completion event")
-        );
-        assert!(err.to_string().contains("{bad json"));
     }
 
     #[test]

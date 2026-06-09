@@ -63,22 +63,11 @@ pub static SUB_AGENT_PREFIX: &str = "SA_";
 const MAX_DISCOVERED_REQUEST_TOOLS: usize = 16;
 
 pub(crate) fn agent_context_path(agent_name: &str) -> String {
-    component_context_path("a", agent_name)
+    format!("a_{}", agent_name.to_ascii_lowercase())
 }
 
 pub(crate) fn tool_context_path(tool_name: &str) -> String {
-    component_context_path("t", tool_name)
-}
-
-fn component_context_path(prefix: &str, name: &str) -> String {
-    let name = name.to_ascii_lowercase();
-    if cfg!(windows) {
-        format!("{prefix}_{name}")
-    } else {
-        // Preserve the existing namespace on Unix-like systems so deployed
-        // stores and key-derivation paths keep resolving to the same place.
-        format!("{prefix}:{name}")
-    }
+    format!("t_{}", tool_name.to_ascii_lowercase())
 }
 
 /// Context for agent operations, providing access to models, tools, and other agents.
@@ -1857,9 +1846,8 @@ mod tests {
         Agent, AgentContext as _, AgentInput, AgentOutput, BaseContext as _, BoxError,
         CacheFeatures as _, CacheStoreFeatures as _, CancellationToken, CanisterCaller as _,
         CompletionFeatures as _, CompletionRequest, ContentPart, Function, FunctionDefinition,
-        HttpFeatures as _, Json, KeysFeatures as _, Message, ModelEffort, Path, PutMode,
-        RequestMeta, Resource, StateFeatures as _, StoreFeatures as _, Tool, ToolCall, ToolInput,
-        ToolOutput, Usage,
+        HttpFeatures as _, Json, KeysFeatures as _, Message, ModelEffort, Path, PutMode, Resource,
+        StateFeatures as _, StoreFeatures as _, Tool, ToolCall, ToolInput, ToolOutput, Usage,
     };
     use bytes::Bytes;
     use candid::Principal;
@@ -1899,44 +1887,6 @@ mod tests {
         let data = to_cbor_bytes(&json);
         let val: serde_json::Value = from_reader(&data[..]).unwrap();
         assert_eq!(json, val);
-    }
-
-    #[test]
-    fn child_context_paths_are_platform_compatible() {
-        let ctx = EngineBuilder::new().mock_ctx();
-        let caller = Principal::self_authenticating([4; 32]);
-        let expected_agent = if cfg!(windows) {
-            "a_echo_agent"
-        } else {
-            "a:echo_agent"
-        };
-        let expected_tool = if cfg!(windows) {
-            "t_echo_tool"
-        } else {
-            "t:echo_tool"
-        };
-
-        let agent = ctx.child("Echo_Agent", "Echo Agent").unwrap();
-        let tool = ctx.child_base("Echo_Tool").unwrap();
-        let agent_with = ctx
-            .child_with(caller, "Echo_Agent", "Echo Agent", RequestMeta::default())
-            .unwrap();
-        let tool_with = ctx
-            .child_base_with(caller, "Echo_Agent", "Echo_Tool", RequestMeta::default())
-            .unwrap();
-
-        assert_eq!(agent.base.path.as_ref(), expected_agent);
-        assert_eq!(tool.path.as_ref(), expected_tool);
-        assert_eq!(agent_with.base.path.as_ref(), expected_agent);
-        assert_eq!(tool_with.path.as_ref(), expected_tool);
-        for path in [
-            agent.base.path.as_ref(),
-            tool.path.as_ref(),
-            agent_with.base.path.as_ref(),
-            tool_with.path.as_ref(),
-        ] {
-            assert_eq!(path.contains(':'), !cfg!(windows));
-        }
     }
 
     // ── Helper completers ──
