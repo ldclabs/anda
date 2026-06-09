@@ -16,198 +16,156 @@ use ic_auth_types::deterministic_cbor_into_vec;
 use object_store::Error as ObjectStoreError;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::{
     context::{AgentCtx, BaseCtx},
     hook::{DynToolHook, ToolHook},
 };
 
-const NOTE_ACTION_READ: &str = "read";
-const NOTE_ACTION_ADD: &str = "add";
-const NOTE_ACTION_REPLACE: &str = "replace";
-const NOTE_ACTION_REMOVE: &str = "remove";
-const NOTE_STORE_PATH: &str = "notes";
+const NOTE_OP_READ: &str = "read";
+const NOTE_OP_SET: &str = "set";
+const NOTE_OP_UPSERT: &str = "upsert";
+const NOTE_OP_DELETE: &str = "delete";
+const NOTE_STORE_PATH: &str = "notes_v2";
 const NOTE_CHAR_LIMIT: usize = 16384;
-const NOTE_MATCH_PREVIEW_LIMIT: usize = 120;
-const NOTE_EMPTY_CONTENT: &str = "content cannot be empty";
-const NOTE_EMPTY_OLD_TEXT: &str = "old_text cannot be empty";
 const NOTE_ENTRY_DELIMITER: &str = "\n---\n";
 
-static VALID_ACTIONS: &[&str] = &[
-    NOTE_ACTION_READ,
-    NOTE_ACTION_ADD,
-    NOTE_ACTION_REPLACE,
-    NOTE_ACTION_REMOVE,
-];
+static VALID_OPS: &[&str] = &[NOTE_OP_READ, NOTE_OP_SET, NOTE_OP_UPSERT, NOTE_OP_DELETE];
 
 /// Arguments accepted by the note tool.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct NoteArgs {
-    /// Action to perform. Omit or use `read` to retrieve current notes.
+    /// Operation to perform: read, set, upsert, or delete.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub action: Option<String>,
-    /// Note content for `add` and `replace`.
+    pub op: Option<String>,
+    /// Items for set/upsert/delete. Omit or null for read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub items: Option<Vec<NoteItemInput>>,
+}
+
+/// Input item accepted by the note tool.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct NoteItemInput {
+    /// Stable short id used for future updates/deletes.
+    #[serde(default)]
+    pub id: String,
+    /// Note content for set/upsert. Use null for delete.
+    #[serde(default)]
     pub content: Option<String>,
-    /// Unique substring used to identify a note for `replace` and `remove`.
+}
+
+/// Normalized persistent note item.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct NoteItem {
+    pub id: String,
+    pub content: String,
+}
+
+/// Compact note store usage summary.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct NoteSummary {
+    pub total: usize,
+    pub chars: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub old_text: Option<String>,
+    pub limit: Option<usize>,
 }
 
 /// Output returned by the note tool.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct NoteOutput {
     pub success: bool,
-    pub notes: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub usage: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
+    pub summary: NoteSummary,
+    /// Full note list. Present only for read operations and `load_notes`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<NoteItem>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub matches: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 struct NoteStore {
-    notes: Vec<String>,
+    items: Vec<NoteItem>,
 }
 
 impl NoteStore {
-    fn usage(&self, char_limit: usize) -> String {
-        let current = self.char_count();
-        let pct = ((current * 100) / char_limit).min(100);
-        format!("{pct}% - {current}/{char_limit} chars")
+    fn set(&mut self, items: Vec<NoteItemInput>, char_limit: usize) -> Result<bool, String> {
+        let next = normalize_note_items(items)?;
+        validate_note_size(&next, char_limit)?;
+
+        let changed = self.items != next;
+        self.items = next;
+        Ok(changed)
     }
 
-    fn char_count(&self) -> usize {
-        joined_len(&self.notes)
-    }
-
-    fn success_output(&self, message: Option<String>, char_limit: Option<usize>) -> NoteOutput {
-        NoteOutput {
-            success: true,
-            notes: self.notes.clone(),
-            usage: char_limit.map(|limit| self.usage(limit)),
-            message,
-            error: None,
-            matches: None,
-        }
-    }
-
-    fn failure_output(
-        &self,
-        error: String,
-        matches: Option<Vec<String>>,
-        char_limit: Option<usize>,
-    ) -> NoteOutput {
-        NoteOutput {
-            success: false,
-            notes: self.notes.clone(),
-            usage: char_limit.map(|limit| self.usage(limit)),
-            message: None,
-            error: Some(error),
-            matches,
-        }
-    }
-
-    fn add(&mut self, content: String, char_limit: usize) -> NoteOutput {
-        let content = content.trim();
-        if content.is_empty() {
-            return self.failure_output(NOTE_EMPTY_CONTENT.to_string(), None, Some(char_limit));
+    fn upsert(&mut self, items: Vec<NoteItemInput>, char_limit: usize) -> Result<bool, String> {
+        let updates = normalize_note_items(items)?;
+        if updates.is_empty() {
+            return Ok(false);
         }
 
-        if self.notes.iter().any(|entry| entry == content) {
-            return self.success_output(
-                Some("Entry already exists (no duplicate added).".into()),
-                Some(char_limit),
-            );
-        }
-
-        let mut next = self.notes.clone();
-        next.push(content.to_string());
-        if let Err(error) = validate_note_size(&next) {
-            return self.failure_output(error, None, Some(char_limit));
-        }
-
-        self.notes = next;
-        self.success_output(Some("Entry added.".into()), Some(char_limit))
-    }
-
-    fn replace(&mut self, old_text: String, content: String, char_limit: usize) -> NoteOutput {
-        let old_text = old_text.trim();
-        if old_text.is_empty() {
-            return self.failure_output(NOTE_EMPTY_OLD_TEXT.to_string(), None, Some(char_limit));
-        }
-
-        let content = content.trim();
-        if content.is_empty() {
-            return self.failure_output(NOTE_EMPTY_CONTENT.to_string(), None, Some(char_limit));
-        }
-
-        let matches = self.find_matches(old_text);
-        let Some(index) = resolve_single_match(&matches) else {
-            if matches.is_empty() {
-                return self.failure_output(
-                    format!("No entry matched {:?}.", old_text),
-                    None,
-                    Some(char_limit),
-                );
-            }
-
-            return self.failure_output(
-                format!("Multiple entries matched {:?}. Be more specific.", old_text),
-                Some(preview_matches(&matches)),
-                Some(char_limit),
-            );
-        };
-
-        let mut next = self.notes.clone();
-        next[index] = content.to_string();
-        if let Err(error) = validate_note_size(&next) {
-            return self.failure_output(error, None, Some(char_limit));
-        }
-
-        self.notes = next;
-        self.success_output(Some("Entry replaced.".into()), Some(char_limit))
-    }
-
-    fn remove(&mut self, old_text: String, char_limit: usize) -> NoteOutput {
-        let old_text = old_text.trim();
-        if old_text.is_empty() {
-            return self.failure_output(NOTE_EMPTY_OLD_TEXT.to_string(), None, Some(char_limit));
-        }
-
-        let matches = self.find_matches(old_text);
-        let Some(index) = resolve_single_match(&matches) else {
-            if matches.is_empty() {
-                return self.failure_output(
-                    format!("No entry matched {:?}.", old_text),
-                    None,
-                    Some(char_limit),
-                );
-            }
-
-            return self.failure_output(
-                format!("Multiple entries matched {:?}. Be more specific.", old_text),
-                Some(preview_matches(&matches)),
-                Some(char_limit),
-            );
-        };
-
-        self.notes.remove(index);
-        self.success_output(Some("Entry removed.".into()), Some(char_limit))
-    }
-
-    fn find_matches(&self, needle: &str) -> Vec<(usize, String)> {
-        self.notes
+        let mut next = self.items.clone();
+        let mut index_by_id: HashMap<String, usize> = next
             .iter()
             .enumerate()
-            .filter(|(_, entry)| entry.contains(needle))
-            .map(|(index, entry)| (index, entry.clone()))
-            .collect()
+            .map(|(index, item)| (item.id.clone(), index))
+            .collect();
+
+        for item in updates {
+            if let Some(index) = index_by_id.get(&item.id).copied() {
+                next[index] = item;
+            } else {
+                index_by_id.insert(item.id.clone(), next.len());
+                next.push(item);
+            }
+        }
+
+        validate_note_size(&next, char_limit)?;
+        let changed = self.items != next;
+        self.items = next;
+        Ok(changed)
+    }
+
+    fn delete(&mut self, items: Vec<NoteItemInput>) -> Result<bool, String> {
+        let ids = normalize_note_ids(items)?;
+        if ids.is_empty() {
+            return Ok(false);
+        }
+
+        let ids: HashSet<String> = ids.into_iter().collect();
+        let old_len = self.items.len();
+        self.items.retain(|item| !ids.contains(&item.id));
+        Ok(self.items.len() != old_len)
+    }
+
+    fn output(&self, success: bool, include_items: bool, char_limit: Option<usize>) -> NoteOutput {
+        NoteOutput {
+            success,
+            summary: self.summary(char_limit),
+            items: if include_items {
+                self.items.clone()
+            } else {
+                Vec::new()
+            },
+            error: None,
+        }
+    }
+
+    fn error_output(&self, error: String, char_limit: Option<usize>) -> NoteOutput {
+        NoteOutput {
+            success: false,
+            summary: self.summary(char_limit),
+            items: Vec::new(),
+            error: Some(error),
+        }
+    }
+
+    fn summary(&self, char_limit: Option<usize>) -> NoteSummary {
+        NoteSummary {
+            total: self.items.len(),
+            chars: joined_len(&self.items),
+            limit: char_limit,
+        }
     }
 }
 
@@ -235,18 +193,10 @@ impl NoteTool {
         Self {
             char_limit: NOTE_CHAR_LIMIT,
             description: concat!(
-                "Manage persistent notes for the current agent only. ",
-                "These notes are stored durably and are isolated by agent, ",
-                "so other agents cannot read them. ",
-                "Call with no parameters or action=read to read the current notes.\n\n",
-                "Writing:\n",
-                "- action=add with content: append a new note\n",
-                "- action=replace with old_text and content: replace one matching note\n",
-                "- action=remove with old_text: remove one matching note\n\n",
-                "Use short unique substrings for old_text. ",
-                "Exact duplicate notes are ignored. ",
-                "The store is bounded to prevent unbounded growth.\n\n",
-                "Always returns the full current note list and usage."
+                "Persistent notes for the current agent only. Use op=upsert ",
+                "with stable short ids to add or update only changed notes; ",
+                "op=delete removes by id; op=set replaces all notes; op=read ",
+                "returns the full list. Writes return only summary counts."
             )
             .to_string(),
         }
@@ -263,7 +213,7 @@ impl NoteTool {
     }
 
     fn store_path(agent: &str) -> Path {
-        Path::from(format!("{NOTE_STORE_PATH}:{agent}"))
+        Path::from(format!("{NOTE_STORE_PATH}_{agent}"))
     }
 
     async fn load_store(ctx: &BaseCtx) -> Result<NoteStore, BoxError> {
@@ -292,7 +242,7 @@ pub async fn load_notes(ctx: &AgentCtx) -> Option<NoteOutput> {
     NoteTool::load_store(&base_ctx)
         .await
         .ok()
-        .map(|store| store.success_output(None, None))
+        .map(|store| store.output(true, true, None))
 }
 
 impl Tool<BaseCtx> for NoteTool {
@@ -314,28 +264,39 @@ impl Tool<BaseCtx> for NoteTool {
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "action": {
+                    "op": {
                         "type": ["string", "null"],
                         "enum": [
-                            NOTE_ACTION_READ,
-                            NOTE_ACTION_ADD,
-                            NOTE_ACTION_REPLACE,
-                            NOTE_ACTION_REMOVE,
+                            NOTE_OP_READ,
+                            NOTE_OP_SET,
+                            NOTE_OP_UPSERT,
+                            NOTE_OP_DELETE,
                             null
                         ],
-                        "description": "Action to perform. Use null or read to return the current notes.",
-                        "default": NOTE_ACTION_READ
+                        "description": "read: return notes. set: replace all. upsert: add/update changed ids. delete: remove ids.",
+                        "default": NOTE_OP_READ
                     },
-                    "content": {
-                        "type": ["string", "null"],
-                        "description": "Note content for add and replace."
-                    },
-                    "old_text": {
-                        "type": ["string", "null"],
-                        "description": "Unique substring identifying the note to replace or remove."
+                    "items": {
+                        "type": ["array", "null"],
+                        "description": "Items for set/upsert/delete. Use null for read. Delete only needs id with content=null.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {
+                                    "type": "string",
+                                    "description": "Stable short note id"
+                                },
+                                "content": {
+                                    "type": ["string", "null"],
+                                    "description": "Note content for set/upsert; null for delete"
+                                }
+                            },
+                            "required": ["id", "content"],
+                            "additionalProperties": false
+                        }
                     }
                 },
-                "required": ["action", "content", "old_text"],
+                "required": ["op", "items"],
                 "additionalProperties": false
             }),
             strict: Some(true),
@@ -356,71 +317,60 @@ impl Tool<BaseCtx> for NoteTool {
         };
 
         let mut store = Self::load_store(&ctx).await?;
-        let action = args
-            .action
-            .as_deref()
-            .map(|value| value.trim().to_ascii_lowercase())
-            .unwrap_or_else(|| NOTE_ACTION_READ.to_string());
+        let op = normalize_op(args.op.as_deref());
+        let items = args.items;
 
-        let output = match action.as_str() {
-            NOTE_ACTION_READ => store.success_output(None, Some(self.char_limit)),
-            NOTE_ACTION_ADD => match args.content {
-                Some(content) => {
-                    let output = store.add(content, self.char_limit);
-                    if output.success {
-                        Self::save_store(&ctx, &store).await?;
-                    }
-                    output
-                }
-                None => store.failure_output(
-                    "content is required for add".into(),
-                    None,
-                    Some(self.char_limit),
+        let (output, changed) = match op.as_deref() {
+            Some(NOTE_OP_READ) => (store.output(true, true, Some(self.char_limit)), false),
+            Some(NOTE_OP_SET) => match items {
+                Some(items) => match store.set(items, self.char_limit) {
+                    Ok(changed) => (store.output(true, false, Some(self.char_limit)), changed),
+                    Err(error) => (store.error_output(error, Some(self.char_limit)), false),
+                },
+                None => (
+                    store.error_output("items are required for set".into(), Some(self.char_limit)),
+                    false,
                 ),
             },
-            NOTE_ACTION_REPLACE => match (args.old_text, args.content) {
-                (Some(old_text), Some(content)) => {
-                    let output = store.replace(old_text, content, self.char_limit);
-                    if output.success {
-                        Self::save_store(&ctx, &store).await?;
-                    }
-                    output
-                }
-                (None, _) => store.failure_output(
-                    "old_text is required for replace".into(),
-                    None,
-                    Some(self.char_limit),
-                ),
-                (_, None) => store.failure_output(
-                    "content is required for replace".into(),
-                    None,
-                    Some(self.char_limit),
+            Some(NOTE_OP_UPSERT) => match items {
+                Some(items) => match store.upsert(items, self.char_limit) {
+                    Ok(changed) => (store.output(true, false, Some(self.char_limit)), changed),
+                    Err(error) => (store.error_output(error, Some(self.char_limit)), false),
+                },
+                None => (
+                    store.error_output(
+                        "items are required for upsert".into(),
+                        Some(self.char_limit),
+                    ),
+                    false,
                 ),
             },
-            NOTE_ACTION_REMOVE => match args.old_text {
-                Some(old_text) => {
-                    let output = store.remove(old_text, self.char_limit);
-                    if output.success {
-                        Self::save_store(&ctx, &store).await?;
-                    }
-                    output
-                }
-                None => store.failure_output(
-                    "old_text is required for remove".into(),
-                    None,
-                    Some(self.char_limit),
+            Some(NOTE_OP_DELETE) => match items {
+                Some(items) => match store.delete(items) {
+                    Ok(changed) => (store.output(true, false, Some(self.char_limit)), changed),
+                    Err(error) => (store.error_output(error, Some(self.char_limit)), false),
+                },
+                None => (
+                    store.error_output(
+                        "items are required for delete".into(),
+                        Some(self.char_limit),
+                    ),
+                    false,
                 ),
             },
-            _ => store.failure_output(
-                format!(
-                    "Unknown action {:?}. Use one of: {}.",
-                    action,
-                    VALID_ACTIONS.join(", ")
+            Some(op) => (
+                store.error_output(
+                    format!("Unknown op {:?}. Use one of: {}.", op, VALID_OPS.join(", ")),
+                    Some(self.char_limit),
                 ),
-                None,
-                Some(self.char_limit),
+                false,
             ),
+            None => (store.output(true, true, Some(self.char_limit)), false),
         };
+
+        if changed {
+            Self::save_store(&ctx, &store).await?;
+        }
 
         let output = ToolOutput::new(output);
         if let Some(hook) = &hook {
@@ -431,59 +381,86 @@ impl Tool<BaseCtx> for NoteTool {
     }
 }
 
-fn validate_note_size(notes: &[String]) -> Result<(), String> {
-    let current = joined_len(notes);
-    if current > NOTE_CHAR_LIMIT {
+fn normalize_op(op: Option<&str>) -> Option<String> {
+    op.map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .or_else(|| Some(NOTE_OP_READ.to_string()))
+}
+
+fn normalize_note_items(items: Vec<NoteItemInput>) -> Result<Vec<NoteItem>, String> {
+    let mut last_index: HashMap<String, usize> = HashMap::new();
+    for (index, item) in items.iter().enumerate() {
+        let id = item.id.trim();
+        if id.is_empty() {
+            return Err(format!("items[{index}].id cannot be empty"));
+        }
+        last_index.insert(id.to_string(), index);
+    }
+
+    let mut indexes: Vec<usize> = last_index.into_values().collect();
+    indexes.sort_unstable();
+
+    indexes
+        .into_iter()
+        .map(|index| {
+            let item = &items[index];
+            let id = item.id.trim();
+            let Some(content) = item.content.as_deref() else {
+                return Err(format!("items[{index}].content is required"));
+            };
+            let content = content.trim();
+            if content.is_empty() {
+                return Err(format!("items[{index}].content cannot be empty"));
+            }
+
+            Ok(NoteItem {
+                id: id.to_string(),
+                content: content.to_string(),
+            })
+        })
+        .collect()
+}
+
+fn normalize_note_ids(items: Vec<NoteItemInput>) -> Result<Vec<String>, String> {
+    let mut last_index: HashMap<String, usize> = HashMap::new();
+    for (index, item) in items.iter().enumerate() {
+        let id = item.id.trim();
+        if id.is_empty() {
+            return Err(format!("items[{index}].id cannot be empty"));
+        }
+        last_index.insert(id.to_string(), index);
+    }
+
+    let mut indexes: Vec<usize> = last_index.into_values().collect();
+    indexes.sort_unstable();
+    Ok(indexes
+        .into_iter()
+        .map(|index| items[index].id.trim().to_string())
+        .collect())
+}
+
+fn validate_note_size(items: &[NoteItem], char_limit: usize) -> Result<(), String> {
+    let current = joined_len(items);
+    if current > char_limit {
         return Err(format!(
-            "Notes use {current}/{NOTE_CHAR_LIMIT} chars. Shorten the new content or remove older notes first."
+            "Notes use {current}/{char_limit} chars. Shorten new content or delete older notes first."
         ));
     }
 
     Ok(())
 }
 
-fn joined_len(notes: &[String]) -> usize {
-    if notes.is_empty() {
-        0
-    } else {
-        notes.join(NOTE_ENTRY_DELIMITER).chars().count()
-    }
-}
-
-fn resolve_single_match(matches: &[(usize, String)]) -> Option<usize> {
-    if matches.is_empty() {
-        return None;
+fn joined_len(items: &[NoteItem]) -> usize {
+    if items.is_empty() {
+        return 0;
     }
 
-    if matches.len() == 1 {
-        return Some(matches[0].0);
-    }
-
-    let unique: HashSet<&str> = matches.iter().map(|(_, entry)| entry.as_str()).collect();
-    if unique.len() == 1 {
-        return Some(matches[0].0);
-    }
-
-    None
-}
-
-fn preview_matches(matches: &[(usize, String)]) -> Vec<String> {
-    matches
+    let delimiter_len = NOTE_ENTRY_DELIMITER.chars().count() * (items.len() - 1);
+    let item_len = items
         .iter()
-        .map(|(_, entry)| {
-            if entry.chars().count() > NOTE_MATCH_PREVIEW_LIMIT {
-                format!(
-                    "{}...",
-                    entry
-                        .chars()
-                        .take(NOTE_MATCH_PREVIEW_LIMIT)
-                        .collect::<String>()
-                )
-            } else {
-                entry.clone()
-            }
-        })
-        .collect()
+        .map(|item| item.id.chars().count() + item.content.chars().count() + 2)
+        .sum::<usize>();
+    item_len + delimiter_len
 }
 
 fn is_missing_store_object(err: &(dyn std::error::Error + 'static)) -> bool {
@@ -511,6 +488,20 @@ mod tests {
             .expect("create note tool ctx")
     }
 
+    fn input(id: &str, content: Option<&str>) -> NoteItemInput {
+        NoteItemInput {
+            id: id.to_string(),
+            content: content.map(ToString::to_string),
+        }
+    }
+
+    fn item(id: &str, content: &str) -> NoteItem {
+        NoteItem {
+            id: id.to_string(),
+            content: content.to_string(),
+        }
+    }
+
     struct MutatingHook;
 
     #[async_trait]
@@ -520,8 +511,8 @@ mod tests {
             _ctx: &BaseCtx,
             mut args: NoteArgs,
         ) -> Result<NoteArgs, BoxError> {
-            args.action = Some(NOTE_ACTION_ADD.to_string());
-            args.content = Some("hook inserted note".to_string());
+            args.op = Some(NOTE_OP_UPSERT.to_string());
+            args.items = Some(vec![input("hook", Some("hook inserted note"))]);
             Ok(args)
         }
 
@@ -530,120 +521,91 @@ mod tests {
             _ctx: &BaseCtx,
             mut output: ToolOutput<NoteOutput>,
         ) -> Result<ToolOutput<NoteOutput>, BoxError> {
-            output.output.message = Some("hook observed output".to_string());
+            output.output.summary.limit = Some(1);
             Ok(output)
         }
     }
 
     #[test]
-    fn store_add_replace_remove_match_memory_style() {
+    fn store_set_upsert_delete_by_stable_id() {
         let mut store = NoteStore::default();
 
-        let added = store.add("remember the release checklist".into(), NOTE_CHAR_LIMIT);
-        assert!(added.success);
+        assert!(
+            store
+                .set(
+                    vec![
+                        input("release", Some("remember release checklist")),
+                        input("release", Some("remember launch checklist")),
+                    ],
+                    NOTE_CHAR_LIMIT,
+                )
+                .unwrap()
+        );
         assert_eq!(
-            store.notes,
-            vec!["remember the release checklist".to_string()]
+            store.items,
+            vec![item("release", "remember launch checklist")]
         );
 
-        let duplicate = store.add("remember the release checklist".into(), NOTE_CHAR_LIMIT);
-        assert!(duplicate.success);
-        assert_eq!(store.notes.len(), 1);
-
-        let replaced = store.replace(
-            "release".into(),
-            "remember the launch checklist".into(),
-            NOTE_CHAR_LIMIT,
+        assert!(
+            store
+                .upsert(
+                    vec![
+                        input("release", Some("remember stable release tags")),
+                        input("review", Some("prefer focused review notes")),
+                    ],
+                    NOTE_CHAR_LIMIT,
+                )
+                .unwrap()
         );
-        assert!(replaced.success);
         assert_eq!(
-            store.notes,
-            vec!["remember the launch checklist".to_string()]
+            store.items,
+            vec![
+                item("release", "remember stable release tags"),
+                item("review", "prefer focused review notes"),
+            ]
         );
 
-        let removed = store.remove("launch".into(), NOTE_CHAR_LIMIT);
-        assert!(removed.success);
-        assert!(store.notes.is_empty());
+        assert!(store.delete(vec![input("release", None)]).unwrap());
+        assert_eq!(
+            store.items,
+            vec![item("review", "prefer focused review notes")]
+        );
+        assert!(!store.delete(vec![input("missing", None)]).unwrap());
     }
 
     #[test]
-    fn store_reports_ambiguous_matches() {
-        let mut store = NoteStore {
-            notes: vec![
-                "remember alpha release".to_string(),
-                "remember alpha rollout".to_string(),
-            ],
-        };
-
-        let output = store.replace("alpha".into(), "new note".into(), NOTE_CHAR_LIMIT);
-        assert!(!output.success);
-        assert_eq!(store.notes.len(), 2);
-        assert_eq!(output.matches.unwrap().len(), 2);
-    }
-
-    #[test]
-    fn store_reports_empty_missing_limit_and_preview_errors() {
+    fn store_reports_validation_and_limit_errors() {
         let mut store = NoteStore::default();
-        assert_eq!(store.usage(10), "0% - 0/10 chars");
-        assert_eq!(
-            store.add("   ".into(), NOTE_CHAR_LIMIT).error.as_deref(),
-            Some(NOTE_EMPTY_CONTENT)
-        );
-
-        store.notes = vec![
-            "alpha exact".to_string(),
-            "alpha exact".to_string(),
-            format!("alpha {}", "x".repeat(NOTE_MATCH_PREVIEW_LIMIT + 20)),
-        ];
-        let duplicate_match = store.replace("exact".into(), "changed".into(), NOTE_CHAR_LIMIT);
-        assert!(duplicate_match.success);
-        assert_eq!(store.notes[0], "changed");
 
         assert_eq!(
             store
-                .replace(" ".into(), "new".into(), NOTE_CHAR_LIMIT)
-                .error
-                .as_deref(),
-            Some(NOTE_EMPTY_OLD_TEXT)
+                .set(vec![input(" ", Some("content"))], NOTE_CHAR_LIMIT)
+                .unwrap_err(),
+            "items[0].id cannot be empty"
         );
         assert_eq!(
             store
-                .replace("alpha".into(), " ".into(), NOTE_CHAR_LIMIT)
-                .error
-                .as_deref(),
-            Some(NOTE_EMPTY_CONTENT)
+                .upsert(vec![input("alpha", None)], NOTE_CHAR_LIMIT)
+                .unwrap_err(),
+            "items[0].content is required"
         );
+        assert_eq!(
+            store
+                .upsert(vec![input("alpha", Some(" "))], NOTE_CHAR_LIMIT)
+                .unwrap_err(),
+            "items[0].content cannot be empty"
+        );
+        assert_eq!(
+            store.delete(vec![input("", None)]).unwrap_err(),
+            "items[0].id cannot be empty"
+        );
+
+        let oversized = "x".repeat(33);
         assert!(
             store
-                .replace("missing".into(), "new".into(), NOTE_CHAR_LIMIT)
-                .error
-                .unwrap()
-                .contains("No entry matched")
-        );
-
-        let ambiguous = store.remove("alpha".into(), NOTE_CHAR_LIMIT);
-        assert!(!ambiguous.success);
-        let previews = ambiguous.matches.unwrap();
-        assert_eq!(previews.len(), 2);
-        assert!(previews[1].ends_with("..."));
-
-        assert_eq!(
-            store.remove(" ".into(), NOTE_CHAR_LIMIT).error.as_deref(),
-            Some(NOTE_EMPTY_OLD_TEXT)
-        );
-        assert!(
-            store
-                .remove("missing".into(), NOTE_CHAR_LIMIT)
-                .error
-                .unwrap()
-                .contains("No entry matched")
-        );
-
-        let oversized = "x".repeat(NOTE_CHAR_LIMIT + 1);
-        assert!(
-            validate_note_size(&[oversized])
+                .set(vec![input("a", Some(&oversized))], 32)
                 .unwrap_err()
-                .contains("Shorten")
+                .contains("32")
         );
     }
 
@@ -656,11 +618,12 @@ mod tests {
             .unwrap();
 
         assert!(output.output.success);
-        assert!(output.output.notes.is_empty());
+        assert!(output.output.items.is_empty());
+        assert_eq!(output.output.summary.total, 0);
     }
 
     #[tokio::test]
-    async fn tool_persists_notes_across_calls_for_same_agent() {
+    async fn tool_persists_items_and_write_outputs_are_compact() {
         let tool = NoteTool::new();
         let ctx = note_ctx("writer");
 
@@ -668,43 +631,43 @@ mod tests {
             .call(
                 ctx.clone(),
                 NoteArgs {
-                    action: Some(NOTE_ACTION_ADD.to_string()),
-                    content: Some("remember to tag releases".to_string()),
-                    old_text: None,
+                    op: Some(NOTE_OP_UPSERT.to_string()),
+                    items: Some(vec![input("release", Some("remember to tag releases"))]),
                 },
                 Vec::new(),
             )
             .await
             .unwrap();
         assert!(first.output.success);
-        assert_eq!(
-            first.output.notes,
-            vec!["remember to tag releases".to_string()]
-        );
+        assert_eq!(first.output.summary.total, 1);
+        assert!(first.output.items.is_empty());
 
         let second = tool
             .call(ctx.clone(), NoteArgs::default(), Vec::new())
             .await
             .unwrap();
-        assert_eq!(second.output.notes, first.output.notes);
+        assert_eq!(
+            second.output.items,
+            vec![item("release", "remember to tag releases")]
+        );
 
         let third = tool
             .call(
                 ctx,
                 NoteArgs {
-                    action: Some(NOTE_ACTION_REPLACE.to_string()),
-                    content: Some("remember to tag stable releases".to_string()),
-                    old_text: Some("tag releases".to_string()),
+                    op: Some(NOTE_OP_UPSERT.to_string()),
+                    items: Some(vec![input(
+                        "release",
+                        Some("remember to tag stable releases"),
+                    )]),
                 },
                 Vec::new(),
             )
             .await
             .unwrap();
         assert!(third.output.success);
-        assert_eq!(
-            third.output.notes,
-            vec!["remember to tag stable releases".to_string()]
-        );
+        assert!(third.output.items.is_empty());
+        assert_eq!(third.output.summary.total, 1);
     }
 
     #[tokio::test]
@@ -715,40 +678,55 @@ mod tests {
             .call(
                 note_ctx("writer"),
                 NoteArgs {
-                    action: Some(NOTE_ACTION_ADD.to_string()),
-                    content: Some("writer only note".to_string()),
-                    old_text: None,
+                    op: Some(NOTE_OP_UPSERT.to_string()),
+                    items: Some(vec![input("owner", Some("writer only note"))]),
                 },
                 Vec::new(),
             )
             .await
             .unwrap();
         assert!(writer.output.success);
-        assert_eq!(writer.output.notes, vec!["writer only note".to_string()]);
+        assert_eq!(writer.output.summary.total, 1);
 
         let reviewer = tool
             .call(note_ctx("reviewer"), NoteArgs::default(), Vec::new())
             .await
             .unwrap();
         assert!(reviewer.output.success);
-        assert!(reviewer.output.notes.is_empty());
+        assert!(reviewer.output.items.is_empty());
     }
 
     #[tokio::test]
-    async fn tool_reports_validation_errors_and_unknown_actions_without_persisting() {
+    async fn tool_reports_validation_errors_and_unknown_ops_without_persisting() {
         let tool = NoteTool::default()
             .with_char_limit(32)
             .with_description("custom note description".to_string());
         assert_eq!(tool.description(), "custom note description");
         let ctx = note_ctx("validation");
 
+        let missing_items = tool
+            .call(
+                ctx.clone(),
+                NoteArgs {
+                    op: Some(NOTE_OP_UPSERT.to_string()),
+                    items: None,
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            missing_items.output.error.as_deref(),
+            Some("items are required for upsert")
+        );
+        assert_eq!(missing_items.output.summary.limit, Some(32));
+
         let missing_content = tool
             .call(
                 ctx.clone(),
                 NoteArgs {
-                    action: Some(NOTE_ACTION_ADD.to_string()),
-                    content: None,
-                    old_text: None,
+                    op: Some(NOTE_OP_SET.to_string()),
+                    items: Some(vec![input("entry", None)]),
                 },
                 Vec::new(),
             )
@@ -756,56 +734,15 @@ mod tests {
             .unwrap();
         assert_eq!(
             missing_content.output.error.as_deref(),
-            Some("content is required for add")
-        );
-        assert_eq!(
-            missing_content.output.usage.as_deref(),
-            Some("0% - 0/32 chars")
-        );
-
-        for (action, expected) in [
-            (NOTE_ACTION_REPLACE, "old_text is required for replace"),
-            (NOTE_ACTION_REMOVE, "old_text is required for remove"),
-        ] {
-            let output = tool
-                .call(
-                    ctx.clone(),
-                    NoteArgs {
-                        action: Some(action.to_string()),
-                        content: None,
-                        old_text: None,
-                    },
-                    Vec::new(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(output.output.error.as_deref(), Some(expected));
-        }
-
-        let missing_replace_content = tool
-            .call(
-                ctx.clone(),
-                NoteArgs {
-                    action: Some(NOTE_ACTION_REPLACE.to_string()),
-                    content: None,
-                    old_text: Some("entry".to_string()),
-                },
-                Vec::new(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            missing_replace_content.output.error.as_deref(),
-            Some("content is required for replace")
+            Some("items[0].content is required")
         );
 
         let unknown = tool
             .call(
                 ctx.clone(),
                 NoteArgs {
-                    action: Some("archive".to_string()),
-                    content: None,
-                    old_text: None,
+                    op: Some("archive".to_string()),
+                    items: None,
                 },
                 Vec::new(),
             )
@@ -816,14 +753,14 @@ mod tests {
                 .output
                 .error
                 .as_deref()
-                .is_some_and(|error| error.contains("Unknown action"))
+                .is_some_and(|error| error.contains("Unknown op"))
         );
 
         let read = tool
             .call(ctx, NoteArgs::default(), Vec::new())
             .await
             .unwrap();
-        assert!(read.output.notes.is_empty());
+        assert!(read.output.items.is_empty());
     }
 
     #[tokio::test]
@@ -840,24 +777,20 @@ mod tests {
             .call(
                 ctx,
                 NoteArgs {
-                    action: Some(NOTE_ACTION_READ.to_string()),
-                    content: None,
-                    old_text: None,
+                    op: Some(NOTE_OP_READ.to_string()),
+                    items: None,
                 },
                 Vec::new(),
             )
             .await
             .unwrap();
-        assert_eq!(output.output.notes, vec!["hook inserted note".to_string()]);
-        assert_eq!(
-            output.output.message.as_deref(),
-            Some("hook observed output")
-        );
+        assert!(output.output.success);
+        assert_eq!(output.output.summary.limit, Some(1));
 
         let loaded = load_notes(&agent).await.unwrap();
         assert!(loaded.success);
-        assert_eq!(loaded.notes, vec!["hook inserted note".to_string()]);
-        assert!(loaded.usage.is_none());
+        assert_eq!(loaded.items, vec![item("hook", "hook inserted note")]);
+        assert_eq!(loaded.summary.limit, None);
     }
 
     #[test]
@@ -865,27 +798,28 @@ mod tests {
         let definition = NoteTool::new().definition();
 
         assert!(
-            definition.parameters["properties"]["action"]
+            definition.parameters["properties"]["op"]
                 .get("anyOf")
                 .is_none()
         );
         assert_eq!(
-            definition.parameters["properties"]["action"]["type"],
+            definition.parameters["properties"]["op"]["type"],
             json!(["string", "null"])
         );
         assert_eq!(
-            definition.parameters["properties"]["action"]["enum"],
+            definition.parameters["properties"]["op"]["enum"],
             json!([
-                NOTE_ACTION_READ,
-                NOTE_ACTION_ADD,
-                NOTE_ACTION_REPLACE,
-                NOTE_ACTION_REMOVE,
+                NOTE_OP_READ,
+                NOTE_OP_SET,
+                NOTE_OP_UPSERT,
+                NOTE_OP_DELETE,
                 null
             ])
         );
         assert_eq!(
-            definition.parameters["required"],
-            json!(["action", "content", "old_text"])
+            definition.parameters["properties"]["items"]["items"]["required"],
+            json!(["id", "content"])
         );
+        assert_eq!(definition.parameters["required"], json!(["op", "items"]));
     }
 }
