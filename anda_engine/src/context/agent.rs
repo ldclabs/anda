@@ -38,7 +38,7 @@ use futures_util::Stream;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::json;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     future::Future,
     pin::Pin,
     sync::Arc,
@@ -46,7 +46,11 @@ use std::{
     time::Duration,
 };
 
-use super::{base::BaseCtx, engine::RemoteEngines};
+use super::{
+    base::BaseCtx,
+    engine::RemoteEngines,
+    tool::{TOOLS_SEARCH_NAME, TOOLS_SELECT_NAME, ToolsOutput},
+};
 use crate::{
     model::{Model, Models},
     subagent::{SubAgentSet, SubAgentSetManager},
@@ -56,6 +60,7 @@ pub static DYNAMIC_REMOTE_ENGINES: &str = "_engines";
 pub static REMOTE_AGENT_PREFIX: &str = "RA_";
 pub static REMOTE_TOOL_PREFIX: &str = "RT_";
 pub static SUB_AGENT_PREFIX: &str = "SA_";
+const MAX_DISCOVERED_REQUEST_TOOLS: usize = 16;
 
 pub(crate) fn agent_context_path(agent_name: &str) -> String {
     component_context_path("a", agent_name)
@@ -232,6 +237,9 @@ impl AgentCtx {
             pending_tool_call_raw_history_start: None,
             tools_usage: HashMap::new(),
             last_output: None,
+            discovered_tools: BTreeMap::new(),
+            discovery_selection_counts: BTreeMap::new(),
+            merge_discovered_tools: false,
             done: false,
             unbound: false,
             turns: 0,
@@ -1012,6 +1020,9 @@ pub struct CompletionRunner {
     pending_tool_call_raw_history_start: Option<usize>,
     tools_usage: HashMap<String, Usage>,
     last_output: Option<AgentOutput>,
+    discovered_tools: BTreeMap<String, FunctionDefinition>,
+    discovery_selection_counts: BTreeMap<String, usize>,
+    merge_discovered_tools: bool,
     done: bool,
     unbound: bool,
     turns: usize,
@@ -1145,6 +1156,23 @@ impl CompletionRunner {
         self.follow_up_message.extend(content);
     }
 
+    /// Drops the current in-flight request after a transport-level model failure.
+    ///
+    /// This keeps accumulated chat history, usage, artifacts, and queued follow-up messages, but
+    /// removes request content that was already sent to the failed completion. Long-lived callers
+    /// can use this before processing newly queued input, so stale tool results or dangling
+    /// tool-call history are not resent.
+    pub fn discard_in_flight_request(&mut self) {
+        self.req.prompt.clear();
+        self.req.content.clear();
+        self.req.documents.clear();
+        self.req.role = None;
+        self.req.tool_choice_required = false;
+        self.req.output_schema = None;
+        self.pending_tool_calls.clear();
+        self.discard_pending_tool_call_raw_history();
+    }
+
     /// Set an implicit context message that is automatically included in the next request.
     pub fn implicit_context(&mut self, message: Message) {
         self.implicit_context = Some(message);
@@ -1163,6 +1191,9 @@ impl CompletionRunner {
     /// Selects the tool definitions to use for subsequent completion turns.
     pub fn set_tools(&mut self, tools: Vec<FunctionDefinition>) {
         self.req.tools = tools;
+        self.discovered_tools.clear();
+        self.discovery_selection_counts.clear();
+        self.merge_discovered_tools = false;
     }
 
     /// Accumulate usage from an intermediate step into the runner's total usage.
@@ -1178,6 +1209,101 @@ impl CompletionRunner {
                 .or_default()
                 .accumulate(usage);
         }
+    }
+
+    fn add_discovered_tools_from_output(&mut self, tool_name: &str, output: &Json) {
+        if !tool_name.eq_ignore_ascii_case(TOOLS_SELECT_NAME)
+            && !tool_name.eq_ignore_ascii_case(TOOLS_SEARCH_NAME)
+        {
+            return;
+        }
+
+        let Ok(tools_output) = serde_json::from_value::<ToolsOutput>(output.clone()) else {
+            return;
+        };
+
+        let count_selection =
+            tool_name.eq_ignore_ascii_case(TOOLS_SELECT_NAME) && !self.merge_discovered_tools;
+        let mut added = 0;
+        for definition in tools_output.tools {
+            if definition.name.trim().is_empty() {
+                continue;
+            }
+
+            let key = definition.name.to_ascii_lowercase();
+            if count_selection {
+                let count = self
+                    .discovery_selection_counts
+                    .entry(key.clone())
+                    .and_modify(|count| *count += 1)
+                    .or_insert(1);
+                if *count >= 2 {
+                    self.merge_discovered_tools = true;
+                }
+            }
+            self.discovered_tools.entry(key).or_insert(definition);
+            added += 1;
+            if added >= MAX_DISCOVERED_REQUEST_TOOLS {
+                break;
+            }
+        }
+    }
+
+    fn merge_discovered_tools_into_request(&self, req: &mut CompletionRequest) {
+        if !self.merge_discovered_tools || self.discovered_tools.is_empty() {
+            return;
+        }
+
+        let mut seen: BTreeSet<String> = req
+            .tools
+            .iter()
+            .map(|tool| tool.name.to_ascii_lowercase())
+            .collect();
+        for (name, definition) in &self.discovered_tools {
+            if seen.insert(name.clone()) {
+                req.tools.push(definition.clone());
+            }
+        }
+    }
+
+    fn compact_discovery_tool_output_for_context(&self, tool_name: &str, output: &Json) -> Json {
+        if !self.merge_discovered_tools {
+            return output.clone();
+        }
+
+        let keep_description = if tool_name.eq_ignore_ascii_case(TOOLS_SEARCH_NAME) {
+            true
+        } else if tool_name.eq_ignore_ascii_case(TOOLS_SELECT_NAME) {
+            false
+        } else {
+            return output.clone();
+        };
+
+        let Ok(tools_output) = serde_json::from_value::<ToolsOutput>(output.clone()) else {
+            return output.clone();
+        };
+
+        let tools = tools_output
+            .tools
+            .into_iter()
+            .map(|definition| {
+                if keep_description {
+                    json!({
+                        "name": definition.name,
+                        "description": definition.description,
+                    })
+                } else {
+                    json!({
+                        "name": definition.name,
+                    })
+                }
+            })
+            .collect::<Vec<_>>();
+
+        json!({
+            "tools": tools,
+            "total_tools": tools_output.total_tools,
+        })
     }
 
     // Drains all queued steering messages into a single user turn. When steering exists, queued
@@ -1320,6 +1446,9 @@ impl CompletionRunner {
             pending_tool_call_raw_history_start: None,
             tools_usage: HashMap::new(),
             last_output: None,
+            discovered_tools: BTreeMap::new(),
+            discovery_selection_counts: BTreeMap::new(),
+            merge_discovered_tools: false,
             done: true,
             unbound: self.unbound,
             turns: self.turns,
@@ -1403,7 +1532,6 @@ impl CompletionRunner {
             // 自动执行工具/代理调用
             let tool_calls = std::mem::take(&mut self.pending_tool_calls);
             if !tool_calls.is_empty() {
-                self.pending_tool_call_raw_history_start = None;
                 pending_tool_calls = true;
                 let mut tool_call_futs: Vec<BoxPinFut<(Option<ToolCall>, Option<String>)>> =
                     Vec::new();
@@ -1528,6 +1656,9 @@ impl CompletionRunner {
                                 .or_insert(usage);
                             self.accumulate_tools_usage(&res.tools_usage);
                             self.accumulate(&res.usage);
+                            self.add_discovered_tools_from_output(&tool.name, &res.output);
+                            res.output = self
+                                .compact_discovery_tool_output_for_context(&tool.name, &res.output);
 
                             // We can not ignore some tool calls.
                             // GPT-5: An assistant message with 'tool_calls' must be followed by tool messages responding to each 'tool_call_id'.
@@ -1569,6 +1700,7 @@ impl CompletionRunner {
         if !pending_tool_calls && let Some(implicit_context) = self.implicit_context.take() {
             req.chat_history.push(implicit_context);
         }
+        self.merge_discovered_tools_into_request(&mut req);
 
         let label = req.model.as_ref().unwrap_or(&self.ctx.label);
         if let Some(model) = self.ctx.models.resolve(label) {
@@ -1596,6 +1728,7 @@ impl CompletionRunner {
         // Accumulate all raw history, including the original request history.
         let raw_history_start = self.req.raw_history.len();
         self.req.raw_history.append(&mut output.raw_history);
+        self.pending_tool_call_raw_history_start = None;
         // Accumulate all generated chat history, excluding the original request history.
         self.chat_history.append(&mut output.chat_history);
 
@@ -1929,9 +2062,63 @@ mod tests {
         ) -> anda_core::BoxPinFut<Result<AgentOutput, BoxError>> {
             self.requests.lock().unwrap().push(req.clone());
 
+            if req.role.as_deref() == Some("tool")
+                && req.content.iter().any(|part| {
+                    matches!(
+                        part,
+                        ContentPart::ToolOutput { name, .. } if name == "echo_tool"
+                    )
+                })
+            {
+                return Box::pin(futures::future::ready(Ok(AgentOutput {
+                    content: "echo tool used after discovery".to_string(),
+                    usage: Usage {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                        cached_tokens: 0,
+                        requests: 1,
+                    },
+                    ..Default::default()
+                })));
+            }
+
+            if req.role.as_deref() == Some("tool")
+                && req
+                    .tools
+                    .iter()
+                    .any(|tool| tool.name.as_str() == "echo_tool")
+            {
+                return Box::pin(futures::future::ready(Ok(AgentOutput {
+                    tool_calls: vec![ToolCall {
+                        name: "echo_tool".to_string(),
+                        args: json!({"input": "after-select"}),
+                        call_id: Some("call_echo_after_select".into()),
+                        result: None,
+                        remote_id: None,
+                    }],
+                    usage: Usage {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                        cached_tokens: 0,
+                        requests: 1,
+                    },
+                    ..Default::default()
+                })));
+            }
+
             if req.role.as_deref() == Some("tool") {
                 return Box::pin(futures::future::ready(Ok(AgentOutput {
-                    content: "selected tool schemas stay in context".to_string(),
+                    tool_calls: vec![ToolCall {
+                        name: "tools_select".to_string(),
+                        args: json!({
+                            "tools": ["echo_tool"],
+                            "query": "",
+                            "limit": 0
+                        }),
+                        call_id: Some("select_echo_tool_again".into()),
+                        result: None,
+                        remote_id: None,
+                    }],
                     usage: Usage {
                         input_tokens: 1,
                         output_tokens: 1,
@@ -2028,6 +2215,46 @@ mod tests {
             _req: CompletionRequest,
         ) -> anda_core::BoxPinFut<Result<AgentOutput, BoxError>> {
             Box::pin(futures::future::ready(Err("model error".into())))
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct ToolResultErrorCompleter;
+
+    impl CompletionFeaturesDyn for ToolResultErrorCompleter {
+        fn model_name(&self) -> String {
+            "tool_result_error".to_string()
+        }
+
+        fn completion(
+            &self,
+            req: CompletionRequest,
+        ) -> anda_core::BoxPinFut<Result<AgentOutput, BoxError>> {
+            if req.role.as_deref() == Some("tool") {
+                return Box::pin(futures::future::ready(Err("model error".into())));
+            }
+
+            Box::pin(futures::future::ready(Ok(AgentOutput {
+                tool_calls: vec![ToolCall {
+                    name: "echo_tool".to_string(),
+                    args: json!({"input": "hello"}),
+                    call_id: Some("call_1".into()),
+                    result: None,
+                    remote_id: None,
+                }],
+                raw_history: vec![json!({
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "echo_tool",
+                            "arguments": "{\"input\":\"hello\"}"
+                        }
+                    }]
+                })],
+                ..Default::default()
+            })))
         }
     }
 
@@ -2798,7 +3025,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn runner_keeps_discovered_tool_schemas_out_of_request_tools() {
+    async fn runner_injects_discovered_tool_schemas_after_repeated_selection() {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let model = Model::with_completer(Arc::new(DiscoveryCompleter {
             requests: requests.clone(),
@@ -2820,22 +3047,85 @@ mod tests {
         assert_eq!(first.tool_calls[0].name, "tools_select");
 
         let second = runner.next().await.unwrap().unwrap();
-        assert_eq!(second.content, "selected tool schemas stay in context");
+        assert_eq!(second.tool_calls[0].name, "tools_select");
+
+        let third = runner.next().await.unwrap().unwrap();
+        assert_eq!(third.tool_calls[0].name, "echo_tool");
+
+        let fourth = runner.next().await.unwrap().unwrap();
+        assert_eq!(fourth.content, "echo tool used after discovery");
 
         let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 2);
-        let next_tool_names = requests[1]
+        assert_eq!(requests.len(), 4);
+        let initial_tool_names = requests[0]
             .tools
             .iter()
             .map(|tool| tool.name.as_str())
             .collect::<Vec<_>>();
-        assert!(next_tool_names.contains(&"tools_select"));
-        assert!(!next_tool_names.contains(&"echo_tool"));
+        assert!(initial_tool_names.contains(&"tools_select"));
+        assert!(!initial_tool_names.contains(&"echo_tool"));
+
+        let first_after_select_tool_names = requests[1]
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(first_after_select_tool_names.contains(&"tools_select"));
+        assert!(!first_after_select_tool_names.contains(&"echo_tool"));
         assert!(requests[1].content.iter().any(|part| matches!(
             part,
             ContentPart::ToolOutput { name, output, .. }
                 if name == "tools_select" && output["tools"][0]["name"] == "echo_tool"
+                    && output["tools"][0].get("parameters").is_some()
         )));
+
+        let second_after_select_tool_names = requests[2]
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(second_after_select_tool_names.contains(&"tools_select"));
+        assert!(second_after_select_tool_names.contains(&"echo_tool"));
+        assert!(requests[2].content.iter().any(|part| matches!(
+            part,
+            ContentPart::ToolOutput { name, output, .. }
+                if name == "tools_select"
+                    && output["tools"][0]["name"] == "echo_tool"
+                    && output["tools"][0].get("parameters").is_none()
+                    && output["tools"][0].get("description").is_none()
+        )));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_compacts_discovery_outputs_after_schema_merge_is_enabled() {
+        let ctx = EngineBuilder::new().mock_ctx();
+        let mut runner = ctx.completion_iter(CompletionRequest::default(), Vec::new());
+        runner.merge_discovered_tools = true;
+        let full_output = json!({
+            "tools": [{
+                "name": "echo_tool",
+                "description": "Echoes input",
+                "parameters": {"type": "object"},
+                "strict": true
+            }],
+            "total_tools": 9
+        });
+
+        let search_output =
+            runner.compact_discovery_tool_output_for_context("tools_search", &full_output);
+        assert_eq!(search_output["tools"][0]["name"], "echo_tool");
+        assert_eq!(search_output["tools"][0]["description"], "Echoes input");
+        assert!(search_output["tools"][0].get("parameters").is_none());
+        assert!(search_output["tools"][0].get("strict").is_none());
+        assert_eq!(search_output["total_tools"], 9);
+
+        let select_output =
+            runner.compact_discovery_tool_output_for_context("tools_select", &full_output);
+        assert_eq!(select_output["tools"][0]["name"], "echo_tool");
+        assert!(select_output["tools"][0].get("description").is_none());
+        assert!(select_output["tools"][0].get("parameters").is_none());
+        assert!(select_output["tools"][0].get("strict").is_none());
+        assert_eq!(select_output["total_tools"], 9);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3180,6 +3470,41 @@ mod tests {
         let result = runner.next().await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("model error"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_discards_in_flight_tool_result_request_after_model_error() {
+        let model = Model::with_completer(Arc::new(ToolResultErrorCompleter));
+        let ctx = EngineBuilder::new()
+            .with_model(model)
+            .register_tool(Arc::new(EchoTool))
+            .unwrap()
+            .mock_ctx();
+
+        let mut runner = ctx.completion_iter(
+            CompletionRequest {
+                prompt: "call tool".to_string(),
+                ..Default::default()
+            },
+            Vec::new(),
+        );
+
+        let step = runner.next().await.unwrap().unwrap();
+        assert_eq!(step.tool_calls[0].name, "echo_tool");
+        assert!(runner.req.raw_history[0].get("tool_calls").is_some());
+
+        let err = runner.next().await.unwrap_err();
+        assert!(err.to_string().contains("model error"));
+        assert_eq!(runner.req.role.as_deref(), Some("tool"));
+        assert!(!runner.req.content.is_empty());
+
+        runner.discard_in_flight_request();
+
+        assert!(runner.req.content.is_empty());
+        assert!(runner.req.prompt.is_empty());
+        assert!(runner.req.role.is_none());
+        assert!(runner.req.raw_history.is_empty());
+        assert!(runner.pending_tool_calls.is_empty());
     }
 
     // ── Tool call tests ──

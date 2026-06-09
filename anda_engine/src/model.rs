@@ -765,7 +765,10 @@ pub fn request_client_builder() -> reqwest::ClientBuilder {
         .http2_keep_alive_while_idle(true)
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(300))
-        .gzip(true)
+        .no_gzip()
+        .no_brotli()
+        .no_zstd()
+        .no_deflate()
         .user_agent(APP_USER_AGENT)
         .default_headers({
             let mut headers = reqwest::header::HeaderMap::new();
@@ -1386,6 +1389,37 @@ mod tests {
             events,
             vec![serde_json::json!({"a": 1}), serde_json::json!({"b": 2})]
         );
+    }
+
+    #[tokio::test]
+    async fn streaming_reader_ignores_mislabelled_content_encoding() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        headers.insert(
+            http::header::CONTENT_ENCODING,
+            HeaderValue::from_static("gzip"),
+        );
+        let (endpoint, _) = spawn_retry_mock_server(vec![MockHttpResponse {
+            status: StatusCode::OK,
+            headers,
+            body: b"data: {\"a\":1}\n\ndata: [DONE]\n\n".to_vec(),
+        }])
+        .await;
+        let client = request_client_builder()
+            .https_only(false)
+            .no_proxy()
+            .build()
+            .unwrap();
+        let response = client.get(endpoint).send().await.unwrap();
+
+        let events = read_sse_json_events::<serde_json::Value>(response, "test-model")
+            .await
+            .unwrap();
+
+        assert_eq!(events, vec![serde_json::json!({"a": 1})]);
     }
 
     #[tokio::test]

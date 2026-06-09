@@ -2,6 +2,17 @@
 
 All notable changes to the Anda project will be documented in this file.
 
+## [0.12.33] — 2026-06-09
+
+### Changed — anda_engine v0.12.33
+
+- **Adaptive discovered-tool request merging** — `CompletionRunner` now tracks schemas returned by `tools_search` and `tools_select`, promotes repeatedly selected discovered tools into subsequent request tool definitions, and compacts repeated discovery outputs once schema merging is enabled. This lets long-running agents call tools after repeated discovery without resending full schemas in every tool-output context.
+- **Identity-encoded completion transport** — The shared model HTTP client now disables automatic response decompression so streaming readers can consume raw SSE bytes even when a provider or proxy mislabels `Content-Encoding`.
+
+### Fixed — anda_engine v0.12.33
+
+- **Failed in-flight tool-result cleanup** — Added `CompletionRunner::discard_in_flight_request()` to clear stale request content, pending tool calls, and dangling raw tool-call history after a transport-level model failure before processing newly queued input.
+
 ## [0.12.32] — 2026-06-06
 
 ### Changed — anda_core v0.12.8
