@@ -2,6 +2,12 @@
 
 All notable changes to the Anda project will be documented in this file.
 
+## [0.12.34] — 2026-06-09
+
+### Changed — anda_engine v0.12.34
+
+- **Todo tool operation API** — Replaced the `todos`/`merge` write contract with explicit `op=read|set|update` and `items` parameters. `set` replaces the list, `update` patches only changed ids, empty ids are ignored instead of materialized, and write calls now return summary counts while `read` returns the full item list. This reduces tool-call payload size during long-running work and keeps task-list updates focused on changed items.
+
 ## [0.12.33] — 2026-06-09
 
 ### Changed — anda_engine v0.12.33

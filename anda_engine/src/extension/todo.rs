@@ -13,21 +13,20 @@ use anda_core::{BoxError, FunctionDefinition, Resource, Tool, ToolOutput};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use std::{collections::HashMap, sync::Arc};
 
 use crate::{
     context::BaseCtx,
     hook::{DynToolHook, ToolHook},
 };
 
+const TODO_OP_READ: &str = "read";
+const TODO_OP_SET: &str = "set";
+const TODO_OP_UPDATE: &str = "update";
 const TODO_STATUS_PENDING: &str = "pending";
 const TODO_STATUS_IN_PROGRESS: &str = "in_progress";
 const TODO_STATUS_COMPLETED: &str = "completed";
 const TODO_STATUS_CANCELLED: &str = "cancelled";
-const TODO_EMPTY_ID: &str = "?";
 const TODO_EMPTY_CONTENT: &str = "(no description)";
 const TODO_ACTIVE_LIST_PREFIX: &str =
     "[Your active task list was preserved across context compression]";
@@ -54,8 +53,12 @@ impl TodoSession {
         Self::default()
     }
 
-    pub fn write(&self, todos: Vec<TodoItemInput>, merge: bool) -> Vec<TodoItem> {
-        self.inner.write().write(todos, merge)
+    pub fn set(&self, items: Vec<TodoItemInput>) -> Vec<TodoItem> {
+        self.inner.write().set(items)
+    }
+
+    pub fn update(&self, items: Vec<TodoItemInput>) -> Vec<TodoItem> {
+        self.inner.write().update(items)
     }
 
     pub fn snapshot(&self) -> Vec<TodoItem> {
@@ -89,61 +92,49 @@ pub struct TodoStore {
 }
 
 impl TodoStore {
-    /// Writes todos using replace or merge semantics, then returns the full list.
-    pub fn write(&mut self, todos: Vec<TodoItemInput>, merge: bool) -> Vec<TodoItem> {
-        let todos = Self::dedupe_by_id(todos);
+    /// Replaces the current list, then returns the full snapshot.
+    pub fn set(&mut self, items: Vec<TodoItemInput>) -> Vec<TodoItem> {
+        self.items = Self::dedupe_by_id(items)
+            .into_iter()
+            .filter(|item| !item.id.trim().is_empty())
+            .map(TodoItem::from_input)
+            .collect();
+        self.snapshot()
+    }
 
-        if !merge {
-            self.items = todos.into_iter().map(TodoItem::from_input).collect();
-            return self.snapshot();
-        }
-
-        let mut existing: HashMap<String, TodoItem> = self
+    /// Applies partial updates by id, then returns the full snapshot.
+    pub fn update(&mut self, items: Vec<TodoItemInput>) -> Vec<TodoItem> {
+        let items = Self::dedupe_by_id(items);
+        let mut index_by_id: HashMap<String, usize> = self
             .items
             .iter()
-            .cloned()
-            .map(|item| (item.id.clone(), item))
+            .enumerate()
+            .map(|(index, item)| (item.id.clone(), index))
             .collect();
 
-        for todo in todos {
-            let item_id = todo.id.trim().to_string();
+        for item in items {
+            let item_id = item.id.trim().to_string();
             if item_id.is_empty() {
                 continue;
             }
 
-            if let Some(item) = existing.get_mut(&item_id) {
-                if let Some(content) = todo.content.as_deref().map(str::trim)
+            if let Some(index) = index_by_id.get(&item_id).copied() {
+                let current = &mut self.items[index];
+                if let Some(content) = item.content.as_deref().map(str::trim)
                     && !content.is_empty()
                 {
-                    item.content = content.to_string();
+                    current.content = content.to_string();
                 }
 
-                if let Some(status) = todo.status.as_deref() {
-                    item.status = normalize_status(Some(status));
+                if let Some(status) = item.status.as_deref() {
+                    current.status = normalize_status(Some(status));
                 }
             } else {
-                let validated = TodoItem::from_input(todo);
-                existing.insert(validated.id.clone(), validated.clone());
+                let validated = TodoItem::from_input(item);
+                index_by_id.insert(validated.id.clone(), self.items.len());
                 self.items.push(validated);
             }
         }
-
-        let mut seen = HashSet::new();
-        self.items = self
-            .items
-            .iter()
-            .filter_map(|item| {
-                let current = existing
-                    .get(&item.id)
-                    .cloned()
-                    .unwrap_or_else(|| item.clone());
-                if seen.insert(current.id.clone()) {
-                    Some(current)
-                } else {
-                    None
-                }
-            })
-            .collect();
 
         self.snapshot()
     }
@@ -194,9 +185,9 @@ impl TodoStore {
         Some(lines.join("\n"))
     }
 
-    fn dedupe_by_id(todos: Vec<TodoItemInput>) -> Vec<TodoItemInput> {
+    fn dedupe_by_id(items: Vec<TodoItemInput>) -> Vec<TodoItemInput> {
         let mut last_index = HashMap::new();
-        for (index, item) in todos.iter().enumerate() {
+        for (index, item) in items.iter().enumerate() {
             last_index.insert(todo_dedupe_key(item), index);
         }
 
@@ -205,7 +196,7 @@ impl TodoStore {
 
         indexes
             .into_iter()
-            .map(|index| todos[index].clone())
+            .map(|index| items[index].clone())
             .collect()
     }
 }
@@ -213,12 +204,12 @@ impl TodoStore {
 /// Arguments for the todo tool.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct TodoArgs {
-    /// Task items to write. Omit to read the current list.
+    /// Operation to perform: read, set, or update.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub todos: Option<Vec<TodoItemInput>>,
-    /// Whether writes should merge into the existing list by id.
-    #[serde(default)]
-    pub merge: bool,
+    pub op: Option<String>,
+    /// Task items for set/update. Omit or null for read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub items: Option<Vec<TodoItemInput>>,
 }
 
 /// Input item accepted by the todo tool.
@@ -252,11 +243,7 @@ impl TodoItem {
         let content = input.content.as_deref().unwrap_or_default().trim();
 
         Self {
-            id: if id.is_empty() {
-                TODO_EMPTY_ID.to_string()
-            } else {
-                id.to_string()
-            },
+            id: id.to_string(),
             content: if content.is_empty() {
                 TODO_EMPTY_CONTENT.to_string()
             } else {
@@ -301,8 +288,10 @@ impl TodoSummary {
 /// Output returned by the todo tool.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct TodoOutput {
-    pub todos: Vec<TodoItem>,
     pub summary: TodoSummary,
+    /// Full task list. Present only for read operations.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<TodoItem>,
 }
 
 pub type TodoToolHook = DynToolHook<TodoArgs, TodoOutput>;
@@ -327,22 +316,11 @@ impl TodoTool {
     pub fn new() -> Self {
         Self {
             description: concat!(
-                "Manage your task list for the current session. Use for complex tasks ",
-                "with 3+ steps or when the user provides multiple tasks. ",
-                "This list is shared across the current agent and its subagents ",
-                "within the same session/context tree. ",
-                "Call with no parameters, or with todos=null in strict schemas, ",
-                "to read the current list.\n\n",
-                "Writing:\n",
-                "- Provide 'todos' array to create/update items\n",
-                "- merge=false (default): replace the entire list with a fresh plan\n",
-                "- merge=true: update existing items by id, add any new ones\n\n",
-                "Each item: {id: string, content: string, ",
-                "status: pending|in_progress|completed|cancelled}\n",
-                "List order is priority. Only ONE item in_progress at a time.\n",
-                "Mark items completed immediately when done. If something fails, ",
-                "cancel it and add a revised item.\n\n",
-                "Always returns the full current list."
+                "Session task list for complex work. Use op=set once to create ",
+                "or replace a plan; use op=update for progress with only changed ",
+                "ids; use op=read only when you need the full list again. ",
+                "Writes return counts only; reads return items. Keep one ",
+                "in_progress item, and mark work completed as soon as it is done."
             )
             .to_string(),
         }
@@ -373,19 +351,25 @@ impl Tool<BaseCtx> for TodoTool {
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "todos": {
-                        "description": "Task items to write. Use null to read current list.",
+                    "op": {
+                        "type": ["string", "null"],
+                        "enum": [TODO_OP_READ, TODO_OP_SET, TODO_OP_UPDATE, null],
+                        "description": "read: return full list. set: replace list. update: patch only changed ids.",
+                        "default": TODO_OP_READ
+                    },
+                    "items": {
+                        "description": "Items for set/update. Use null for read. For update, include only changed ids; null content/status keeps existing values.",
                         "type": ["array", "null"],
                         "items": {
                             "type": "object",
                             "properties": {
                                 "id": {
                                     "type": "string",
-                                    "description": "Unique item identifier"
+                                    "description": "Stable short id"
                                 },
                                 "content": {
                                     "type": ["string", "null"],
-                                    "description": "Task description. Use null to leave it unchanged when merge=true."
+                                    "description": "Task text; null keeps existing text on update"
                                 },
                                 "status": {
                                     "type": ["string", "null"],
@@ -396,20 +380,15 @@ impl Tool<BaseCtx> for TodoTool {
                                         TODO_STATUS_CANCELLED,
                                         null
                                     ],
-                                    "description": "Current status. Use null to keep the existing status when merge=true."
+                                    "description": "Task status; null keeps existing status on update"
                                 }
                             },
                             "required": ["id", "content", "status"],
                             "additionalProperties": false
                         }
-                    },
-                    "merge": {
-                        "type": "boolean",
-                        "description": "true: update existing items by id, add new ones. false (default): replace the entire list.",
-                        "default": false
                     }
                 },
-                "required": ["todos", "merge"],
+                "required": ["op", "items"],
                 "additionalProperties": false
             }),
             strict: Some(true),
@@ -430,15 +409,16 @@ impl Tool<BaseCtx> for TodoTool {
         };
 
         let session = todo_session(&ctx);
-        let items = if let Some(todos) = args.todos {
-            session.write(todos, args.merge)
-        } else {
-            session.snapshot()
+        let op = normalize_op(args.op.as_deref());
+        let (items, include_items) = match op {
+            TODO_OP_SET => (session.set(args.items.unwrap_or_default()), false),
+            TODO_OP_UPDATE => (session.update(args.items.unwrap_or_default()), false),
+            _ => (session.snapshot(), true),
         };
 
         let output = TodoOutput {
             summary: TodoSummary::from_items(&items),
-            todos: items,
+            items: if include_items { items } else { Vec::new() },
         };
 
         if let Some(hook) = &hook {
@@ -452,9 +432,21 @@ impl Tool<BaseCtx> for TodoTool {
 fn todo_dedupe_key(item: &TodoItemInput) -> String {
     let id = item.id.trim();
     if id.is_empty() {
-        TODO_EMPTY_ID.to_string()
+        String::new()
     } else {
         id.to_string()
+    }
+}
+
+fn normalize_op(op: Option<&str>) -> &'static str {
+    let op = op
+        .map(|value| value.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| TODO_OP_READ.to_string());
+
+    match op.as_str() {
+        TODO_OP_SET => TODO_OP_SET,
+        TODO_OP_UPDATE => TODO_OP_UPDATE,
+        _ => TODO_OP_READ,
     }
 }
 
@@ -498,63 +490,47 @@ mod tests {
     }
 
     #[test]
-    fn replace_mode_dedupes_and_normalizes_items() {
+    fn set_dedupes_normalizes_and_skips_empty_ids() {
         let mut store = TodoStore::default();
 
-        let items = store.write(
-            vec![
-                input("1", Some("draft plan"), Some(TODO_STATUS_PENDING)),
-                input("1", Some("final plan"), Some(TODO_STATUS_COMPLETED)),
-                input("", Some(""), Some("invalid")),
-            ],
-            false,
-        );
+        let items = store.set(vec![
+            input("1", Some("draft plan"), Some(TODO_STATUS_PENDING)),
+            input("1", Some("final plan"), Some(TODO_STATUS_COMPLETED)),
+            input("", Some(""), Some("invalid")),
+        ]);
 
         assert_eq!(
             items,
-            vec![
-                TodoItem {
-                    id: "1".to_string(),
-                    content: "final plan".to_string(),
-                    status: TODO_STATUS_COMPLETED.to_string(),
-                },
-                TodoItem {
-                    id: TODO_EMPTY_ID.to_string(),
-                    content: TODO_EMPTY_CONTENT.to_string(),
-                    status: TODO_STATUS_PENDING.to_string(),
-                },
-            ]
+            vec![TodoItem {
+                id: "1".to_string(),
+                content: "final plan".to_string(),
+                status: TODO_STATUS_COMPLETED.to_string(),
+            }]
         );
     }
 
     #[test]
-    fn merge_mode_updates_existing_items_and_preserves_order() {
+    fn update_patches_existing_items_and_preserves_order() {
         let mut store = TodoStore::default();
-        store.write(
-            vec![
-                input("1", Some("draft"), Some(TODO_STATUS_PENDING)),
-                input("2", Some("implement"), Some(TODO_STATUS_PENDING)),
-            ],
-            false,
-        );
+        store.set(vec![
+            input("1", Some("draft"), Some(TODO_STATUS_PENDING)),
+            input("2", Some("implement"), Some(TODO_STATUS_PENDING)),
+        ]);
 
-        let items = store.write(
-            vec![
-                input(
-                    "2",
-                    Some("implement todo tool"),
-                    Some(TODO_STATUS_IN_PROGRESS),
-                ),
-                input("3", Some("write tests"), Some(TODO_STATUS_PENDING)),
-                input("", Some("ignored"), Some(TODO_STATUS_COMPLETED)),
-                input(
-                    "3",
-                    Some("write tests thoroughly"),
-                    Some(TODO_STATUS_COMPLETED),
-                ),
-            ],
-            true,
-        );
+        let items = store.update(vec![
+            input(
+                "2",
+                Some("implement todo tool"),
+                Some(TODO_STATUS_IN_PROGRESS),
+            ),
+            input("3", Some("write tests"), Some(TODO_STATUS_PENDING)),
+            input("", Some("ignored"), Some(TODO_STATUS_COMPLETED)),
+            input(
+                "3",
+                Some("write tests thoroughly"),
+                Some(TODO_STATUS_COMPLETED),
+            ),
+        ]);
 
         assert_eq!(
             items,
@@ -581,15 +557,12 @@ mod tests {
     #[test]
     fn injection_format_only_includes_active_items() {
         let mut store = TodoStore::default();
-        store.write(
-            vec![
-                input("1", Some("plan"), Some(TODO_STATUS_PENDING)),
-                input("2", Some("build"), Some(TODO_STATUS_IN_PROGRESS)),
-                input("3", Some("done"), Some(TODO_STATUS_COMPLETED)),
-                input("4", Some("skip"), Some(TODO_STATUS_CANCELLED)),
-            ],
-            false,
-        );
+        store.set(vec![
+            input("1", Some("plan"), Some(TODO_STATUS_PENDING)),
+            input("2", Some("build"), Some(TODO_STATUS_IN_PROGRESS)),
+            input("3", Some("done"), Some(TODO_STATUS_COMPLETED)),
+            input("4", Some("skip"), Some(TODO_STATUS_CANCELLED)),
+        ]);
 
         let injected = store.format_for_injection().unwrap();
         assert!(injected.contains(TODO_ACTIVE_LIST_PREFIX));
@@ -608,32 +581,40 @@ mod tests {
             .call(
                 ctx.clone(),
                 TodoArgs {
-                    todos: Some(vec![input("1", Some("plan"), Some(TODO_STATUS_PENDING))]),
-                    merge: false,
+                    op: Some(TODO_OP_SET.to_string()),
+                    items: Some(vec![input("1", Some("plan"), Some(TODO_STATUS_PENDING))]),
                 },
                 Vec::new(),
             )
             .await
             .unwrap();
         assert_eq!(first.output.summary.total, 1);
+        assert!(first.output.items.is_empty());
         assert!(todo_session(&ctx).has_items());
 
         let second = tool
             .call(ctx.clone(), TodoArgs::default(), Vec::new())
             .await
             .unwrap();
-        assert_eq!(second.output.todos, first.output.todos);
+        assert_eq!(
+            second.output.items,
+            vec![TodoItem {
+                id: "1".to_string(),
+                content: "plan".to_string(),
+                status: TODO_STATUS_PENDING.to_string(),
+            }]
+        );
 
         let third = tool
             .call(
                 ctx.clone(),
                 TodoArgs {
-                    todos: Some(vec![TodoItemInput {
+                    op: Some(TODO_OP_UPDATE.to_string()),
+                    items: Some(vec![TodoItemInput {
                         id: "1".to_string(),
                         content: Some("plan carefully".to_string()),
                         status: None,
                     }]),
-                    merge: true,
                 },
                 Vec::new(),
             )
@@ -641,7 +622,20 @@ mod tests {
             .unwrap();
 
         assert_eq!(third.output.summary.pending, 1);
-        assert_eq!(third.output.todos[0].content, "plan carefully");
+        assert!(third.output.items.is_empty());
+
+        let fourth = tool
+            .call(
+                ctx.clone(),
+                TodoArgs {
+                    op: Some(TODO_OP_READ.to_string()),
+                    items: None,
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fourth.output.items[0].content, "plan carefully");
     }
 
     #[test]
@@ -649,20 +643,24 @@ mod tests {
         let definition = TodoTool::new().definition();
 
         assert!(
-            definition.parameters["properties"]["todos"]
+            definition.parameters["properties"]["items"]
                 .get("anyOf")
                 .is_none()
         );
         assert_eq!(
-            definition.parameters["properties"]["todos"]["type"],
+            definition.parameters["properties"]["items"]["type"],
             json!(["array", "null"])
         );
         assert_eq!(
-            definition.parameters["properties"]["todos"]["items"]["properties"]["content"]["type"],
+            definition.parameters["properties"]["op"]["enum"],
+            json!([TODO_OP_READ, TODO_OP_SET, TODO_OP_UPDATE, null])
+        );
+        assert_eq!(
+            definition.parameters["properties"]["items"]["items"]["properties"]["content"]["type"],
             json!(["string", "null"])
         );
         assert_eq!(
-            definition.parameters["properties"]["todos"]["items"]["properties"]["status"]["enum"],
+            definition.parameters["properties"]["items"]["items"]["properties"]["status"]["enum"],
             json!([
                 TODO_STATUS_PENDING,
                 TODO_STATUS_IN_PROGRESS,
@@ -671,6 +669,6 @@ mod tests {
                 null
             ])
         );
-        assert_eq!(definition.parameters["required"], json!(["todos", "merge"]));
+        assert_eq!(definition.parameters["required"], json!(["op", "items"]));
     }
 }
