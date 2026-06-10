@@ -14,6 +14,7 @@
 
 use anda_core::{AgentOutput, BoxError, BoxPinFut, CONTENT_TYPE_JSON, CompletionRequest, ToolCall};
 use arc_swap::ArcSwap;
+use futures_util::StreamExt;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
@@ -582,6 +583,7 @@ pub(crate) fn is_retryable_reqwest_error(err: &reqwest::Error) -> bool {
     err.is_timeout()
         || err.is_connect()
         || err.is_body()
+        || err.is_decode()
         || err.status().is_some_and(is_retryable_status)
 }
 
@@ -786,11 +788,25 @@ pub(crate) async fn read_sse_json_events<T>(
 where
     T: DeserializeOwned,
 {
-    let body = response.bytes().await.map_err(|err| {
-        completion_transport_error(model, "Failed to read streaming completion response", err)
-    })?;
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|err| {
+            completion_transport_error(model, "Failed to read streaming completion response", err)
+        })?;
+        body.extend_from_slice(&chunk);
+        if body_contains_sse_done(&body) {
+            return parse_streaming_json_events(&body, model);
+        }
+    }
 
     parse_streaming_json_events(&body, model)
+}
+
+fn body_contains_sse_done(body: &[u8]) -> bool {
+    body.windows(b"data: [DONE]".len())
+        .any(|window| window == b"data: [DONE]")
 }
 
 fn parse_streaming_json_events<T>(body: &[u8], model: &str) -> Result<Vec<T>, BoxError>
@@ -947,6 +963,7 @@ mod tests {
     use http::{HeaderMap, HeaderValue, Method, StatusCode};
     use std::collections::VecDeque;
     use std::sync::Mutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[derive(Clone)]
     struct TestCompleter {
@@ -1006,6 +1023,30 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         (format!("http://{addr}"), state)
+    }
+
+    async fn spawn_truncated_sse_after_done_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            let _ = socket.read(&mut request).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+                      Content-Type: text/event-stream\r\n\
+                      Content-Length: 4096\r\n\
+                      Connection: close\r\n\
+                      \r\n\
+                      data: {\"a\":1}\n\n\
+                      data: [DONE]\n\n",
+                )
+                .await
+                .unwrap();
+            let _ = socket.shutdown().await;
+        });
+        format!("http://{addr}")
     }
 
     fn retry_count(state: &RetryState) -> usize {
@@ -1364,6 +1405,54 @@ mod tests {
             .unwrap();
 
         assert_eq!(events, vec![serde_json::json!({"a": 1})]);
+    }
+
+    #[tokio::test]
+    async fn streaming_reader_returns_after_done_before_late_body_error() {
+        let endpoint = spawn_truncated_sse_after_done_server().await;
+        let client = request_client_builder()
+            .https_only(false)
+            .no_proxy()
+            .build()
+            .unwrap();
+        let response = client.get(endpoint).send().await.unwrap();
+
+        let events = read_sse_json_events::<serde_json::Value>(response, "test-model")
+            .await
+            .unwrap();
+
+        assert_eq!(events, vec![serde_json::json!({"a": 1})]);
+    }
+
+    #[tokio::test]
+    async fn custom_client_streaming_decode_errors_are_retryable() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        headers.insert(
+            http::header::CONTENT_ENCODING,
+            HeaderValue::from_static("gzip"),
+        );
+        let (endpoint, _) = spawn_retry_mock_server(vec![MockHttpResponse {
+            status: StatusCode::OK,
+            headers,
+            body: b"data: {\"a\":1}\n\ndata: [DONE]\n\n".to_vec(),
+        }])
+        .await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let response = streaming_completion_request(client.get(endpoint))
+            .send()
+            .await
+            .unwrap();
+
+        let err = read_sse_json_events::<serde_json::Value>(response, "test-model")
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("error decoding response body"));
+        assert!(is_retryable_box_error(&err));
     }
 
     #[tokio::test]

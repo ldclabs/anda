@@ -2,7 +2,7 @@
 
 All notable changes to the Anda project will be documented in this file.
 
-## [0.12.34] — 2026-06-09
+## [0.12.34] — 2026-06-10
 
 ### Changed — anda_engine v0.12.34
 
@@ -13,6 +13,11 @@ All notable changes to the Anda project will be documented in this file.
 - **Deprecated extension cleanup** — Removed the deprecated `google` and `extractor` extension modules from `anda_engine`, eliminating the legacy Google Custom Search tool and generic extractor helper that were previously marked deprecated.
 
 - **Unified child context paths** — Agent and tool child context paths now consistently use underscore-separated names such as `a_echo_agent` and `t_echo_tool` on every platform.
+
+### Fixed — anda_engine v0.12.34
+
+- **Streaming completion body read resilience** — SSE completion readers now return immediately after receiving `data: [DONE]`, preserving completed OpenAI-compatible streams even if the server or proxy closes the HTTP body with a late transport error. `reqwest` decode errors are also classified as retryable model transport failures so upper layers can apply delayed retry behavior instead of treating them as permanent completion failures.
+
 
 ## [0.12.33] — 2026-06-09
 
@@ -498,4 +503,3 @@ All notable changes to the Anda project will be documented in this file.
 - `DEFAULT_SKILL_TOOLS` expanded to include `todo`, `tools_search`, `tools_select`.
 - User name max length relaxed from 32 to 96 chars.
 - `SkillFrontmatter` gains `extra` field with `serde(flatten)` for forward compatibility.
-
