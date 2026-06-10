@@ -18,6 +18,8 @@ All notable changes to the Anda project will be documented in this file.
 
 - **Streaming completion body read resilience** — SSE completion readers now return immediately after receiving `data: [DONE]`, preserving completed OpenAI-compatible streams even if the server or proxy closes the HTTP body with a late transport error. `reqwest` decode errors are also classified as retryable model transport failures so upper layers can apply delayed retry behavior instead of treating them as permanent completion failures.
 
+- **Structured subagent tool arguments** — Subagent calls now preserve full structured argument objects, including `session`, `model`, and `effort`, instead of collapsing any object with a `prompt` field down to the prompt string. This keeps asynchronous/session subagent calls working while preserving legacy plain-string and single-`prompt` agent behavior.
+
 
 ## [0.12.33] — 2026-06-09
 

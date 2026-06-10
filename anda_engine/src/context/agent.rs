@@ -1566,11 +1566,14 @@ impl CompletionRunner {
                         || tool_name.starts_with("sa_")
                         || tool_name.starts_with("ra_")
                     {
-                        // 代理调用的 prompt 可能在 args 中的 "prompt" 字段，也可能直接在 args 的 JSON 中（如果 args 是一个字符串的话），也可能整个 args 就是 prompt（如果没有 "prompt" 字段的话）
+                        // Subagents consume structured controls such as `session`, `model`, and
+                        // `effort`, so preserve their full argument object. Plain string args and
+                        // normal agents keep the historical prompt behavior.
                         let prompt = if let Some(args) = tool.args.as_str() {
                             args.to_string()
-                        } else if let Some(args) = tool.args.get("prompt")
-                            && let Some(prompt) = args.as_str()
+                        } else if let Some(args) = tool.args.as_object()
+                            && args.len() == 1
+                            && let Some(prompt) = args.get("prompt").and_then(|v| v.as_str())
                         {
                             prompt.to_string()
                         } else {
@@ -1870,6 +1873,7 @@ mod tests {
     use crate::{
         engine::EngineBuilder,
         model::{CompletionFeaturesDyn, Model},
+        subagent::{SubAgent, SubAgentManager},
     };
 
     #[test]
@@ -3642,6 +3646,54 @@ mod tests {
         assert_eq!(
             result.output.as_str().unwrap(),
             "agent_echoed:{\"invalid_field\":42}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_preserves_structured_subagent_session_args() {
+        let model = Model::with_completer(Arc::new(ToolCallCompleter {
+            tool_calls: vec![ToolCall {
+                name: format!("{SUB_AGENT_PREFIX}echo_helper"),
+                args: json!({
+                    "prompt": "session task",
+                    "session": "AsyncJob",
+                    "model": "",
+                    "effort": null,
+                }),
+                call_id: Some("subagent_session_call".into()),
+                result: None,
+                remote_id: None,
+            }],
+        }));
+        let ctx = EngineBuilder::new().with_model(model).mock_ctx();
+        let manager: Arc<SubAgentManager> = ctx.subagents.get().unwrap();
+        manager
+            .upsert_temporary(SubAgent {
+                name: "echo_helper".to_string(),
+                description: "Echoes input.".to_string(),
+                instructions: "Echo the prompt.".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let req = CompletionRequest {
+            prompt: "call subagent".to_string(),
+            ..Default::default()
+        };
+        let mut runner = ctx.completion_iter(req, Vec::new());
+
+        let _step1 = runner.next().await.unwrap().unwrap();
+        assert!(!runner.is_done());
+
+        let output = runner.next().await.unwrap().unwrap();
+        assert_eq!(output.tool_calls.len(), 1);
+        let result = output.tool_calls[0].result.as_ref().unwrap();
+        assert_eq!(result.output["session"], json!("asyncjob"));
+        assert!(
+            result.output["content"]
+                .as_str()
+                .unwrap()
+                .contains("session mode")
         );
     }
 
