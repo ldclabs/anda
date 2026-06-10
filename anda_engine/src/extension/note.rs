@@ -262,7 +262,7 @@ pub async fn load_notes(ctx: &AgentCtx) -> Option<NoteOutput> {
         .map(|store| store.output(true, true, None))
 }
 
-/// Loads notes from the pre-v2 note store without mutating the current store.
+/// Loads notes from the pre note store without mutating the current store.
 pub async fn load_notes_from_legacy(ctx: &AgentCtx) -> Option<NoteOutput> {
     let mut base_ctx = ctx.child_base(NoteTool::NAME).ok()?;
     base_ctx.path = "t:note".into();

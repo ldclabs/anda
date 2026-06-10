@@ -2,6 +2,12 @@
 
 All notable changes to the Anda project will be documented in this file.
 
+## [0.12.35] — 2026-06-10
+
+### Fixed — anda_engine v0.12.35
+
+- **Follow-up delivery during tool execution** — `CompletionRunner` now queues follow-up messages for the next safe user turn and delivers them after pending tool-call results finish instead of waiting for a fully idle boundary. Tool outputs are preserved in chat history before the follow-up is sent, while steering messages still take priority.
+
 ## [0.12.34] — 2026-06-10
 
 ### Changed — anda_engine v0.12.34

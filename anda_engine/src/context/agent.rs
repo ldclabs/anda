@@ -1127,8 +1127,9 @@ impl CompletionRunner {
         self.steering_message.extend(content);
     }
 
-    /// Queue a follow-up message to be processed after the agent finishes.
-    /// Delivered only when agent has no more tool calls or steering messages.
+    /// Queue a follow-up message for the next safe user turn.
+    /// Delivered with the current pending tool-call results when they finish, or at the next idle
+    /// boundary when no tools are pending. Steering still takes priority.
     /// No effect if the completion has finished.
     pub fn follow_up(&mut self, message: impl Into<ContentPart>) {
         if self.done {
@@ -1137,7 +1138,7 @@ impl CompletionRunner {
         self.follow_up_message.push_back(message.into());
     }
 
-    /// Queue a follow-up message with multiple content parts to be processed after the agent finishes.
+    /// Queue a follow-up message with multiple content parts for the next safe user turn.
     pub fn follow_up_content(&mut self, content: Vec<ContentPart>) {
         if self.done {
             return;
@@ -1312,6 +1313,11 @@ impl CompletionRunner {
     fn drain_queued_message(&mut self) -> Option<Vec<ContentPart>> {
         let mut msgs: Vec<ContentPart> = self.follow_up_message.drain(..).collect();
         msgs.append(&mut self.steering_message);
+        if msgs.is_empty() { None } else { Some(msgs) }
+    }
+
+    fn drain_follow_up_message(&mut self) -> Option<Vec<ContentPart>> {
+        let msgs: Vec<ContentPart> = self.follow_up_message.drain(..).collect();
         if msgs.is_empty() { None } else { Some(msgs) }
     }
 
@@ -1677,8 +1683,28 @@ impl CompletionRunner {
                 if !tool_calls_continue.is_empty() {
                     self.req.content.append(&mut tool_calls_continue);
                 }
+                let mut follow_up_content: Vec<ContentPart> = Vec::new();
                 if !tool_call_errors.is_empty() {
-                    self.req.content.push(tool_call_errors.join("; ").into());
+                    follow_up_content.push(tool_call_errors.join("; ").into());
+                }
+                if let Some(content) = self.drain_follow_up_message() {
+                    follow_up_content.extend(content);
+                }
+
+                if !follow_up_content.is_empty() {
+                    if self.req.content.is_empty() {
+                        self.set_next_user_content(follow_up_content);
+                    } else {
+                        let msg = Message {
+                            role: "tool".to_string(),
+                            content: std::mem::take(&mut self.req.content),
+                            ..Default::default()
+                        };
+
+                        self.req.chat_history.push(msg.clone());
+                        self.set_next_user_content(follow_up_content);
+                        self.append_chat_history(vec![msg]);
+                    }
                 }
             } else if let Some(content) = self.drain_queued_message() {
                 self.set_next_user_content(content);
@@ -1992,6 +2018,65 @@ mod tests {
                 usage: Usage {
                     input_tokens: 10,
                     output_tokens: 20,
+                    cached_tokens: 0,
+                    requests: 1,
+                },
+                ..Default::default()
+            })))
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct ToolChainUntilFollowUpCompleter {
+        requests: Arc<Mutex<Vec<CompletionRequest>>>,
+    }
+
+    impl CompletionFeaturesDyn for ToolChainUntilFollowUpCompleter {
+        fn model_name(&self) -> String {
+            "tool_chain_until_follow_up".to_string()
+        }
+
+        fn completion(
+            &self,
+            req: CompletionRequest,
+        ) -> anda_core::BoxPinFut<Result<AgentOutput, BoxError>> {
+            let request_index = {
+                let mut requests = self.requests.lock().unwrap();
+                requests.push(req.clone());
+                requests.len()
+            };
+            let saw_follow_up = req.content.iter().any(|part| {
+                matches!(
+                    part,
+                    ContentPart::Text { text }
+                        if text == "follow up while tool chain is pending"
+                )
+            });
+
+            if saw_follow_up {
+                return Box::pin(futures::future::ready(Ok(AgentOutput {
+                    content: "follow_up_seen_with_tool_result".to_string(),
+                    usage: Usage {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                        cached_tokens: 0,
+                        requests: 1,
+                    },
+                    ..Default::default()
+                })));
+            }
+
+            Box::pin(futures::future::ready(Ok(AgentOutput {
+                tool_calls: vec![ToolCall {
+                    name: "echo_tool".to_string(),
+                    args: json!({"input": "chain"}),
+                    call_id: Some(format!("chain_call_{request_index}")),
+                    result: None,
+                    remote_id: None,
+                }],
+                usage: Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
                     cached_tokens: 0,
                     requests: 1,
                 },
@@ -3506,6 +3591,53 @@ mod tests {
         assert_eq!(step2.tool_calls.len(), 1);
         assert_eq!(step2.tool_calls[0].name, "echo_tool");
         assert!(step2.tool_calls[0].result.is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_appends_follow_up_after_pending_tool_calls_finish() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let model = Model::with_completer(Arc::new(ToolChainUntilFollowUpCompleter {
+            requests: requests.clone(),
+        }));
+        let ctx = EngineBuilder::new()
+            .with_model(model)
+            .register_tool(Arc::new(EchoTool))
+            .unwrap()
+            .mock_ctx();
+
+        let req = CompletionRequest {
+            prompt: "start tool chain".to_string(),
+            ..Default::default()
+        };
+
+        let mut runner = ctx.completion_iter(req, Vec::new());
+
+        let step1 = runner.next().await.unwrap().unwrap();
+        assert!(!runner.is_done());
+        assert_eq!(step1.tool_calls.len(), 1);
+
+        runner.follow_up("follow up while tool chain is pending".to_string());
+
+        let step2 = runner.next().await.unwrap().unwrap();
+        assert!(runner.is_done());
+        assert_eq!(step2.content, "follow_up_seen_with_tool_result");
+        assert_eq!(runner.turns(), 2);
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].chat_history.len(), 1);
+        assert_eq!(requests[1].chat_history[0].role, "tool");
+        assert_eq!(requests[1].chat_history[0].content.len(), 1);
+        assert!(matches!(
+            &requests[1].chat_history[0].content[0],
+            ContentPart::ToolOutput { name, .. } if name == "echo_tool"
+        ));
+        assert_eq!(requests[1].role.as_deref(), Some("user"));
+        assert_eq!(requests[1].content.len(), 1);
+        assert!(matches!(
+            &requests[1].content[0],
+            ContentPart::Text { text } if text == "follow up while tool chain is pending"
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]

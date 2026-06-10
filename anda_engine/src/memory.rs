@@ -109,10 +109,11 @@ pub struct Conversation {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub steering_messages: Option<Vec<String>>,
 
-    /// Follow-up messages processed after the agent becomes idle.
+    /// Follow-up messages queued for the agent's next safe user turn.
     ///
-    /// They are delivered only when there are no pending tool calls or steering
-    /// messages.
+    /// They are delivered with the current pending tool-call results when they
+    /// finish, or at the next idle boundary when no tools are pending. Steering
+    /// still takes priority.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub follow_up_messages: Option<Vec<String>>,
 
@@ -1340,7 +1341,7 @@ pub enum MemoryToolArgs {
     FollowUpConversation {
         /// The ID of the conversation to follow up
         _id: u64,
-        /// The follow-up message to be processed after the agent finishes, delivered only when agent has no more tool calls or steering messages.
+        /// The follow-up message to queue for the agent's next safe user turn.
         message: String,
     },
     DeleteConversation {
