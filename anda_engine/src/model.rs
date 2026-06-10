@@ -767,10 +767,6 @@ pub fn request_client_builder() -> reqwest::ClientBuilder {
         .http2_keep_alive_while_idle(true)
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(300))
-        .no_gzip()
-        .no_brotli()
-        .no_zstd()
-        .no_deflate()
         .user_agent(APP_USER_AGENT)
         .default_headers({
             let mut headers = reqwest::header::HeaderMap::new();
@@ -1382,10 +1378,6 @@ mod tests {
         headers.insert(
             http::header::CONTENT_TYPE,
             HeaderValue::from_static("text/event-stream"),
-        );
-        headers.insert(
-            http::header::CONTENT_ENCODING,
-            HeaderValue::from_static("gzip"),
         );
         let (endpoint, _) = spawn_retry_mock_server(vec![MockHttpResponse {
             status: StatusCode::OK,

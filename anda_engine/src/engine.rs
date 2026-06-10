@@ -886,7 +886,6 @@ mod tests {
     use crate::ANONYMOUS;
     use anda_core::FunctionDefinition;
     use serde_json::json;
-    use std::future::Future;
 
     struct EchoAgent;
 
@@ -903,19 +902,17 @@ mod tests {
             vec!["text".to_string()]
         }
 
-        fn run(
+        async fn run(
             &self,
             _ctx: AgentCtx,
             prompt: String,
             resources: Vec<Resource>,
-        ) -> impl Future<Output = Result<AgentOutput, BoxError>> + Send {
-            async move {
-                Ok(AgentOutput {
-                    content: format!("{prompt}:{}", resources.len()),
-                    raw_history: vec![json!({"provider": "raw"})],
-                    ..Default::default()
-                })
-            }
+        ) -> Result<AgentOutput, BoxError> {
+            Ok(AgentOutput {
+                content: format!("{prompt}:{}", resources.len()),
+                raw_history: vec![json!({"provider": "raw"})],
+                ..Default::default()
+            })
         }
     }
 
@@ -934,13 +931,13 @@ mod tests {
             vec!["missing_tool".to_string()]
         }
 
-        fn run(
+        async fn run(
             &self,
             _ctx: AgentCtx,
             _prompt: String,
             _resources: Vec<Resource>,
-        ) -> impl Future<Output = Result<AgentOutput, BoxError>> + Send {
-            async { Ok(AgentOutput::default()) }
+        ) -> Result<AgentOutput, BoxError> {
+            Ok(AgentOutput::default())
         }
     }
 
@@ -971,21 +968,19 @@ mod tests {
             vec!["text".to_string()]
         }
 
-        fn call(
+        async fn call(
             &self,
             _ctx: BaseCtx,
             args: Self::Args,
             resources: Vec<Resource>,
-        ) -> impl Future<Output = Result<ToolOutput<Self::Output>, BoxError>> + Send {
-            async move {
-                Ok(ToolOutput {
-                    output: json!({
-                        "args": args,
-                        "resources": resources.len(),
-                    }),
-                    ..Default::default()
-                })
-            }
+        ) -> Result<ToolOutput<Self::Output>, BoxError> {
+            Ok(ToolOutput {
+                output: json!({
+                    "args": args,
+                    "resources": resources.len(),
+                }),
+                ..Default::default()
+            })
         }
     }
 
