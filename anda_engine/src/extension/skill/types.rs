@@ -1,5 +1,6 @@
 use anda_core::{BoxError, Json, validate_function_name};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
+use serde_json::Value;
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -38,7 +39,9 @@ pub struct SkillFrontmatter {
     /// Space-delimited list of pre-approved tools the skill may use.
     #[serde(
         default,
+        alias = "allowed_tools",
         rename = "allowed-tools",
+        deserialize_with = "deserialize_optional_tools",
         skip_serializing_if = "Option::is_none"
     )]
     pub allowed_tools: Option<String>,
@@ -107,6 +110,49 @@ pub fn normalise_skill_agent_name(name: &str) -> String {
 // SKILL.md parsing & formatting
 // ---------------------------------------------------------------------------
 
+fn deserialize_optional_tools<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let Some(value) = Option::<Value>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+
+    match value {
+        Value::Null => Ok(None),
+        Value::String(s) => {
+            let s = s.trim().to_string();
+            if s.is_empty() { Ok(None) } else { Ok(Some(s)) }
+        }
+        Value::Array(items) => {
+            let mut tools = Vec::new();
+            for item in items {
+                match item {
+                    Value::String(s) => {
+                        let s = s.trim();
+                        if !s.is_empty() {
+                            tools.push(s.to_string());
+                        }
+                    }
+                    other => {
+                        return Err(de::Error::custom(format!(
+                            "allowed-tools entries must be strings, got {other}"
+                        )));
+                    }
+                }
+            }
+            if tools.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(tools.join(" ")))
+            }
+        }
+        other => Err(de::Error::custom(format!(
+            "allowed-tools must be a string or a list of strings, got {other}"
+        ))),
+    }
+}
+
 /// Split a `SKILL.md` into YAML frontmatter string and Markdown body.
 fn split_frontmatter(content: &str) -> Result<(&str, &str), BoxError> {
     let content = content.trim();
@@ -128,12 +174,72 @@ fn split_frontmatter(content: &str) -> Result<(&str, &str), BoxError> {
     Ok((frontmatter, body))
 }
 
+fn parse_skill_frontmatter(yaml_str: &str) -> Result<SkillFrontmatter, BoxError> {
+    match serde_saphyr::from_str(yaml_str) {
+        Ok(fm) => Ok(fm),
+        Err(strict_err) => {
+            let relaxed = relax_common_frontmatter_scalars(yaml_str);
+            if relaxed == yaml_str {
+                return Err(format!("invalid SKILL.md frontmatter: {strict_err}").into());
+            }
+
+            serde_saphyr::from_str(&relaxed).map_err(|relaxed_err| {
+                format!(
+                    "invalid SKILL.md frontmatter: {strict_err}; relaxed parser also failed: {relaxed_err}"
+                )
+                .into()
+            })
+        }
+    }
+}
+
+fn relax_common_frontmatter_scalars(yaml_str: &str) -> String {
+    let mut out = String::with_capacity(yaml_str.len());
+    for line in yaml_str.lines() {
+        if let Some((key, value)) = split_relaxable_top_level_scalar(line) {
+            out.push_str(key);
+            out.push_str(": |-\n");
+            out.push_str("  ");
+            out.push_str(value.trim());
+            out.push('\n');
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+
+    if !yaml_str.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+fn split_relaxable_top_level_scalar(line: &str) -> Option<(&str, &str)> {
+    if line.starts_with([' ', '\t']) {
+        return None;
+    }
+
+    let (key, value) = line.split_once(':')?;
+    if !matches!(
+        key,
+        "name" | "description" | "license" | "compatibility" | "allowed-tools" | "allowed_tools"
+    ) {
+        return None;
+    }
+
+    let value = value.trim_start();
+    if value.is_empty() || value.starts_with(['"', '\'', '|', '>', '[', '{']) {
+        return None;
+    }
+
+    Some((key, value))
+}
+
 /// Parse a `SKILL.md` file content into a [`Skill`].
 pub fn parse_skill_md(base_dir: PathBuf, content: &str) -> Result<Skill, BoxError> {
     let (yaml_str, body) = split_frontmatter(content)?;
 
-    let fm: SkillFrontmatter = serde_saphyr::from_str(yaml_str)
-        .map_err(|e| format!("invalid SKILL.md frontmatter: {e}"))?;
+    let fm = parse_skill_frontmatter(yaml_str)?;
 
     // Validate required fields.
     validate_skill_name(&fm.name)?;
@@ -156,7 +262,11 @@ pub fn parse_skill_md(base_dir: PathBuf, content: &str) -> Result<Skill, BoxErro
 
     // Parse allowed-tools (space-delimited) or use defaults.
     let tools = match &fm.allowed_tools {
-        Some(at) if !at.trim().is_empty() => at.split_whitespace().map(|s| s.to_string()).collect(),
+        Some(at) if !at.trim().is_empty() => at
+            .split(|c: char| c.is_whitespace() || c == ',')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect(),
         _ => Vec::new(),
     };
 
@@ -436,6 +546,68 @@ Search and download GIFs directly via the Tenor API using curl. No extra tools n
         );
         assert!(skill.frontmatter.extra.contains_key("version"));
         assert!(skill.frontmatter.extra.contains_key("prerequisites"));
+    }
+
+    #[test]
+    fn parse_skill_md_relaxes_unquoted_description_with_colon() {
+        let md = "\
+---
+name: baoyu-design
+description: Create polished design artifacts. It drives a full design process: clarifying questions, design-context gathering, and production of HTML deliverables.
+---
+
+# Design
+
+Follow the design process.
+";
+        let skill = parse_skill_md(PathBuf::from("/test_dir"), md).unwrap();
+        assert_eq!(skill.frontmatter.name, "baoyu-design");
+        assert!(
+            skill
+                .frontmatter
+                .description
+                .contains("process: clarifying questions")
+        );
+        assert!(skill.instructions.contains("# Design"));
+    }
+
+    #[test]
+    fn parse_skill_md_accepts_allowed_tools_alias_and_list() {
+        let md = "\
+---
+name: list-tools
+description: A skill with tools as a YAML list.
+allowed_tools:
+  - shell
+  - read_file
+---
+
+Use the listed tools.
+";
+        let skill = parse_skill_md(PathBuf::from("/test_dir"), md).unwrap();
+        assert_eq!(
+            skill.frontmatter.allowed_tools.as_deref(),
+            Some("shell read_file")
+        );
+        assert_eq!(
+            skill.tools,
+            vec!["shell".to_string(), "read_file".to_string()]
+        );
+
+        let md = "\
+---
+name: comma-tools
+description: A skill with comma-separated tools.
+allowed-tools: shell, read_file
+---
+
+Use the listed tools.
+";
+        let skill = parse_skill_md(PathBuf::from("/test_dir"), md).unwrap();
+        assert_eq!(
+            skill.tools,
+            vec!["shell".to_string(), "read_file".to_string()]
+        );
     }
 
     #[test]
