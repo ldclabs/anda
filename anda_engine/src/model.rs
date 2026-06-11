@@ -246,25 +246,29 @@ impl Models {
 
         let model_name = model.model_name();
         labels.push(model_name.to_ascii_lowercase());
-        let mut models = self.models.load().as_ref().clone();
-        for mut label in labels {
+        for label in labels.iter_mut() {
             label.make_ascii_lowercase();
             if label == "primary" {
                 self.model.store(Arc::new(Some(model.clone())));
             }
-
-            match models.entry(label) {
-                Entry::Vacant(e) => {
-                    e.insert(vec![model.clone()]);
-                }
-                Entry::Occupied(mut e) => {
-                    e.get_mut().retain(|m| m.model_name() != model_name);
-                    e.get_mut().push(model.clone());
-                }
-            }
         }
 
-        self.models.store(Arc::new(models));
+        // rcu keeps concurrent inserts from losing each other's labels.
+        self.models.rcu(|models| {
+            let mut models = models.as_ref().clone();
+            for label in &labels {
+                match models.entry(label.clone()) {
+                    Entry::Vacant(e) => {
+                        e.insert(vec![model.clone()]);
+                    }
+                    Entry::Occupied(mut e) => {
+                        e.get_mut().retain(|m| m.model_name() != model_name);
+                        e.get_mut().push(model.clone());
+                    }
+                }
+            }
+            models
+        });
     }
 
     /// Returns a model by lowercase label if it exists.
@@ -777,6 +781,8 @@ pub fn request_client_builder() -> reqwest::ClientBuilder {
         })
 }
 
+const SSE_DONE_MARKER: &[u8] = b"data: [DONE]";
+
 pub(crate) async fn read_sse_json_events<T>(
     response: reqwest::Response,
     model: &str,
@@ -785,6 +791,7 @@ where
     T: DeserializeOwned,
 {
     let mut body = Vec::new();
+    let mut scanned: usize = 0;
     let mut stream = response.bytes_stream();
 
     while let Some(chunk) = stream.next().await {
@@ -792,17 +799,21 @@ where
             completion_transport_error(model, "Failed to read streaming completion response", err)
         })?;
         body.extend_from_slice(&chunk);
-        if body_contains_sse_done(&body) {
+        // Only scan the unscanned tail (with marker-sized overlap), so long
+        // streams are not rescanned from the start on every chunk.
+        let start = scanned.saturating_sub(SSE_DONE_MARKER.len() - 1);
+        if body_contains_sse_done(&body[start..]) {
             return parse_streaming_json_events(&body, model);
         }
+        scanned = body.len();
     }
 
     parse_streaming_json_events(&body, model)
 }
 
 fn body_contains_sse_done(body: &[u8]) -> bool {
-    body.windows(b"data: [DONE]".len())
-        .any(|window| window == b"data: [DONE]")
+    body.windows(SSE_DONE_MARKER.len())
+        .any(|window| window == SSE_DONE_MARKER)
 }
 
 fn parse_streaming_json_events<T>(body: &[u8], model: &str) -> Result<Vec<T>, BoxError>

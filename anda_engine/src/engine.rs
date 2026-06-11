@@ -270,8 +270,9 @@ impl Engine {
     pub async fn tool_call(
         &self,
         caller: Principal,
-        input: ToolInput<Json>,
+        mut input: ToolInput<Json>,
     ) -> Result<ToolOutput<Json>, BoxError> {
+        input.name.make_ascii_lowercase();
         let meta = input.meta.unwrap_or_default();
         if meta.engine.is_some() && meta.engine != Some(self.id) {
             return Err(format!(
@@ -608,7 +609,8 @@ impl EngineBuilder {
 
     /// Exports tools by name for non-manager callers and remote discovery.
     pub fn export_tools(mut self, tools: Vec<String>) -> Self {
-        for tool in tools {
+        for mut tool in tools {
+            tool.make_ascii_lowercase();
             self.export_tools.insert(tool);
         }
         self

@@ -178,7 +178,13 @@ impl CacheService {
         let Some(cache) = self.cache(path) else {
             return;
         };
-        let data = deterministic_cbor_into_vec(&value.0).unwrap();
+        let data = match deterministic_cbor_into_vec(&value.0) {
+            Ok(data) => data,
+            Err(err) => {
+                log::error!("CacheService failed to serialize value, key: {key}, error: {err}");
+                return;
+            }
+        };
         cache
             .insert(key.to_string(), Arc::new((data.into(), value.1)))
             .await;
@@ -202,7 +208,13 @@ impl CacheService {
         let Some(cache) = self.cache(path) else {
             return false;
         };
-        let data = deterministic_cbor_into_vec(&value.0).unwrap();
+        let data = match deterministic_cbor_into_vec(&value.0) {
+            Ok(data) => data,
+            Err(err) => {
+                log::error!("CacheService failed to serialize value, key: {key}, error: {err}");
+                return false;
+            }
+        };
         let entry = cache
             .entry_by_ref(key)
             .or_optionally_insert_with(async { Some(Arc::new((data.into(), value.1))) })

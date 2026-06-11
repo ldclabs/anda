@@ -92,7 +92,7 @@ impl RemoteEngines {
             let tools: Vec<Function> = engine
                 .tools
                 .into_iter()
-                .filter(|d| args.tools.is_empty() || args.tools.contains(&d.definition.name))
+                .filter(|d| args.tools.contains(&d.definition.name))
                 .collect();
             for tool in args.tools {
                 if !tools.iter().any(|d| d.definition.name == tool) {
@@ -106,12 +106,16 @@ impl RemoteEngines {
         Ok(())
     }
 
+    fn strip_handle_prefix<'a>(name: &'a str, handle: &str) -> Option<&'a str> {
+        name.strip_prefix(handle)?.strip_prefix('_')
+    }
+
     /// Retrieves a remote tool endpoint and name from a prefixed name.
     pub fn get_tool_endpoint(&self, name: &str) -> Option<(Principal, String, String)> {
         self.engines
             .iter()
             .filter_map(|(handle, engine)| {
-                let tool_name = name.strip_prefix(&format!("{handle}_"))?;
+                let tool_name = Self::strip_handle_prefix(name, handle)?;
                 engine
                     .tools
                     .iter()
@@ -133,7 +137,7 @@ impl RemoteEngines {
         self.engines
             .iter()
             .filter_map(|(handle, engine)| {
-                let agent_name = name.strip_prefix(&format!("{handle}_"))?;
+                let agent_name = Self::strip_handle_prefix(name, handle)?;
                 engine
                     .agents
                     .iter()
@@ -235,7 +239,7 @@ impl RemoteEngines {
         resources: &mut Vec<Resource>,
     ) -> Vec<Resource> {
         for (handle, engine) in self.engines.iter() {
-            if let Some(name) = prefixed_name.strip_prefix(&format!("{handle}_")) {
+            if let Some(name) = Self::strip_handle_prefix(prefixed_name, handle) {
                 for tool in engine.tools.iter() {
                     if tool.definition.name.eq_ignore_ascii_case(name) {
                         return select_resources(resources, &tool.supported_resource_tags);
@@ -311,7 +315,7 @@ impl RemoteEngines {
         resources: &mut Vec<Resource>,
     ) -> Vec<Resource> {
         for (handle, engine) in self.engines.iter() {
-            if let Some(name) = name.strip_prefix(&format!("{handle}_")) {
+            if let Some(name) = Self::strip_handle_prefix(name, handle) {
                 for agent in engine.agents.iter() {
                     if agent.definition.name.eq_ignore_ascii_case(name) {
                         return select_resources(resources, &agent.supported_resource_tags);

@@ -1833,6 +1833,8 @@ impl CompletionFeaturesDyn for CompletionModelV2 {
         let client = self.client.clone();
         let mut r = self.default_request.clone();
         r.model = self.model.clone();
+        // The Responses API adapter always streams and never stores responses,
+        // regardless of `with_stream` or `with_default_request` overrides.
         r.stream = Some(true);
         r.additional_parameters.store = Some(false);
 

@@ -26,6 +26,7 @@ use anda_core::{
     BoxError, FunctionDefinition, HttpFeatures, Json, Resource, Tool, ToolOutput, gen_schema_for,
 };
 use encoding_rs::Encoding;
+use futures_util::StreamExt;
 use http::header;
 use ic_auth_types::ByteBufB64;
 use mime::Mime;
@@ -33,6 +34,12 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::context::BaseCtx;
+
+/// Maximum response body size accepted by [`FetchWebResourcesTool::fetch`].
+///
+/// Fetched content is buffered in memory and usually ends up in model context,
+/// so anything larger is rejected instead of exhausting engine memory.
+pub const MAX_FETCH_BODY_SIZE: usize = 20 * 1024 * 1024; // 20 MB
 
 /// Arguments for fetching resources from a URL
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
@@ -105,12 +112,31 @@ impl FetchWebResourcesTool {
             return Err(format!("Fetch failed with status: {}", response.status()).into());
         }
         let headers = response.headers().clone();
-        let body = response
-            .bytes()
-            .await
-            .map_err(|e| format!("Failed to read response body: {}", e))?;
+        if let Some(content_length) = response.content_length()
+            && content_length > MAX_FETCH_BODY_SIZE as u64
+        {
+            return Err(format!(
+                "Fetch failed: content length {} exceeds the limit of {} bytes (url: {})",
+                content_length, MAX_FETCH_BODY_SIZE, url
+            )
+            .into());
+        }
 
-        Ok((headers, body.to_vec()))
+        let mut body: Vec<u8> = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| format!("Failed to read response body: {}", e))?;
+            if body.len() + chunk.len() > MAX_FETCH_BODY_SIZE {
+                return Err(format!(
+                    "Fetch failed: response body exceeds the limit of {} bytes (url: {})",
+                    MAX_FETCH_BODY_SIZE, url
+                )
+                .into());
+            }
+            body.extend_from_slice(&chunk);
+        }
+
+        Ok((headers, body))
     }
 
     /// Fetches content from the specified URL and returns it as text (base64-url encoded if not UTF-8)

@@ -7,7 +7,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::context::{AgentCtx, REMOTE_AGENT_PREFIX, REMOTE_TOOL_PREFIX, SUB_AGENT_PREFIX};
+use crate::context::{
+    AgentCtx, REMOTE_AGENT_PREFIX, REMOTE_TOOL_PREFIX, SUB_AGENT_PREFIX,
+    strip_prefix_ignore_ascii_case,
+};
 
 pub const TOOLS_SEARCH_NAME: &str = "tools_search";
 pub const TOOLS_SELECT_NAME: &str = "tools_select";
@@ -459,22 +462,23 @@ fn rank_search_items(
 ) -> Vec<String> {
     let mut candidates: Vec<(bool, usize, String)> = Vec::new();
     for item in items {
-        let normalized_name = item
-            .name
-            .strip_prefix(SUB_AGENT_PREFIX)
-            .unwrap_or(&item.name)
-            .strip_prefix(REMOTE_AGENT_PREFIX)
-            .unwrap_or(&item.name)
-            .strip_prefix(REMOTE_TOOL_PREFIX)
-            .unwrap_or(&item.name)
-            .to_lowercase();
+        // Returned names must stay the full callable names so that definition
+        // lookups succeed; the routing prefix is only ignored for matching.
+        let normalized_name = item.name.to_lowercase();
+        let stripped_name = strip_prefix_ignore_ascii_case(&normalized_name, SUB_AGENT_PREFIX)
+            .or_else(|| strip_prefix_ignore_ascii_case(&normalized_name, REMOTE_AGENT_PREFIX))
+            .or_else(|| strip_prefix_ignore_ascii_case(&normalized_name, REMOTE_TOOL_PREFIX))
+            .unwrap_or(&normalized_name);
         let normalized_description = item.description.to_lowercase();
         let mut score = 0usize;
 
-        let exact_name_match = normalized_name == normalized_query;
+        let exact_name_match =
+            normalized_name == normalized_query || stripped_name == normalized_query;
         if exact_name_match {
             score += NAME_EXACT_MATCH_BONUS;
-        } else if normalized_name.starts_with(normalized_query) {
+        } else if normalized_name.starts_with(normalized_query)
+            || stripped_name.starts_with(normalized_query)
+        {
             score += NAME_PREFIX_MATCH_BONUS;
         } else if normalized_name.contains(normalized_query) {
             score += NAME_SUBSTRING_MATCH_BONUS;
@@ -1102,5 +1106,39 @@ mod tests {
         );
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].name, "echo_tool");
+    }
+
+    #[test]
+    fn rank_search_items_keeps_prefixed_names_resolvable() {
+        let definitions = vec![
+            FunctionDefinition {
+                name: "RT_remote_lookup".to_string(),
+                description: "Remote lookup tool".to_string(),
+                ..Default::default()
+            },
+            FunctionDefinition {
+                name: "SA_researcher".to_string(),
+                description: "Research subagent".to_string(),
+                ..Default::default()
+            },
+            FunctionDefinition {
+                name: "RA_remote_chat".to_string(),
+                description: "Remote chat agent".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        // The routing prefix is ignored for matching, and the ranked names stay
+        // resolvable through select_requested_definitions.
+        let ranked = rank_search_items(&definitions, "researcher", &[], false);
+        assert_eq!(ranked, vec!["sa_researcher"]);
+        let ranked = rank_search_items(&definitions, "remote_lookup", &[], false);
+        assert_eq!(ranked.first().map(String::as_str), Some("rt_remote_lookup"));
+        let ranked = rank_search_items(&definitions, "remote_chat", &[], false);
+        assert_eq!(ranked.first().map(String::as_str), Some("ra_remote_chat"));
+
+        let ranked = rank_search_items(&definitions, "remote_lookup", &[], false);
+        let selected = select_requested_definitions(definitions, &ranked);
+        assert_eq!(selected[0].name, "RT_remote_lookup");
     }
 }

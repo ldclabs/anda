@@ -62,6 +62,14 @@ pub static REMOTE_TOOL_PREFIX: &str = "RT_";
 pub static SUB_AGENT_PREFIX: &str = "SA_";
 const MAX_DISCOVERED_REQUEST_TOOLS: usize = 16;
 
+/// Strips a routing prefix such as `RT_`, `RA_`, or `SA_` without case
+/// sensitivity, since models occasionally echo prefixed callable names in a
+/// different case.
+pub(crate) fn strip_prefix_ignore_ascii_case<'a>(name: &'a str, prefix: &str) -> Option<&'a str> {
+    let (head, tail) = name.split_at_checked(prefix.len())?;
+    head.eq_ignore_ascii_case(prefix).then_some(tail)
+}
+
 pub(crate) fn agent_context_path(agent_name: &str) -> String {
     format!("a_{}", agent_name.to_ascii_lowercase())
 }
@@ -312,7 +320,7 @@ impl AgentContext for AgentCtx {
         prefixed_name: &str,
         resources: &mut Vec<Resource>,
     ) -> Vec<Resource> {
-        if let Some(name) = prefixed_name.strip_prefix(REMOTE_TOOL_PREFIX) {
+        if let Some(name) = strip_prefix_ignore_ascii_case(prefixed_name, REMOTE_TOOL_PREFIX) {
             let res = self.base.remote.select_tool_resources(name, resources);
             if !res.is_empty() {
                 return res;
@@ -404,7 +412,7 @@ impl AgentContext for AgentCtx {
         prefixed_name: &str,
         resources: &mut Vec<Resource>,
     ) -> Vec<Resource> {
-        if let Some(name) = prefixed_name.strip_prefix(REMOTE_AGENT_PREFIX) {
+        if let Some(name) = strip_prefix_ignore_ascii_case(prefixed_name, REMOTE_AGENT_PREFIX) {
             let res = self.base.remote.select_agent_resources(name, resources);
             if !res.is_empty() {
                 return res;
@@ -419,8 +427,11 @@ impl AgentContext for AgentCtx {
             }
         }
 
-        if let Some(prefix) = prefixed_name.strip_prefix(SUB_AGENT_PREFIX) {
-            return self.subagents.select_resources(prefix, resources);
+        if let Some(prefix) = strip_prefix_ignore_ascii_case(prefixed_name, SUB_AGENT_PREFIX) {
+            let res = self.subagents.select_resources(prefix, resources);
+            if !res.is_empty() {
+                return res;
+            }
         }
 
         self.agents.select_resources(prefixed_name, resources)
@@ -458,7 +469,7 @@ impl AgentContext for AgentCtx {
         &self,
         mut input: ToolInput<Json>,
     ) -> Result<(ToolOutput<Json>, Option<Principal>), BoxError> {
-        if let Some(name) = input.name.strip_prefix(REMOTE_TOOL_PREFIX) {
+        if let Some(name) = strip_prefix_ignore_ascii_case(&input.name, REMOTE_TOOL_PREFIX) {
             // find registered remote tool and call it
             if let Some((id, endpoint, tool_name)) = self.base.remote.get_tool_endpoint(name) {
                 input.name = tool_name;
@@ -510,7 +521,11 @@ impl AgentContext for AgentCtx {
     ) -> impl Future<Output = Result<(AgentOutput, Option<Principal>), BoxError>> + Send {
         let ctx = self;
         Box::pin(async move {
-            if let Some(name) = input.name.strip_prefix(REMOTE_AGENT_PREFIX) {
+            // Prefixed names route to remote engines or subagents first; on a
+            // miss they fall through to the local agent lookup so that local
+            // agents whose names happen to start with a routing prefix stay
+            // reachable.
+            if let Some(name) = strip_prefix_ignore_ascii_case(&input.name, REMOTE_AGENT_PREFIX) {
                 if let Some((id, endpoint, agent_name)) = ctx.base.remote.get_agent_endpoint(name) {
                     input.name = agent_name;
                     input.meta = Some(ctx.base.self_meta(id));
@@ -533,11 +548,9 @@ impl AgentContext for AgentCtx {
                         .await
                         .map(|output| (output, Some(id)));
                 }
-
-                return Err(format!("agent {} not found", name).into());
             }
 
-            if let Some(name) = input.name.strip_prefix(SUB_AGENT_PREFIX) {
+            if let Some(name) = strip_prefix_ignore_ascii_case(&input.name, SUB_AGENT_PREFIX) {
                 let name = name.to_ascii_lowercase();
                 if let Some(agent) = ctx.subagents.get_lowercase(&name) {
                     let child = ctx.child(&name, &name)?;
@@ -545,8 +558,6 @@ impl AgentContext for AgentCtx {
                         .run(child, input.prompt, input.resources)
                         .await
                         .map(|output| (output, None));
-                } else {
-                    return Err(format!("agent {} not found", name).into());
                 }
             }
 
@@ -1528,8 +1539,7 @@ impl CompletionRunner {
             let tool_calls = std::mem::take(&mut self.pending_tool_calls);
             if !tool_calls.is_empty() {
                 pending_tool_calls = true;
-                let mut tool_call_futs: Vec<BoxPinFut<(Option<ToolCall>, Option<String>)>> =
-                    Vec::new();
+                let mut tool_call_futs: Vec<BoxPinFut<ToolCall>> = Vec::new();
                 for mut tool in tool_calls.into_iter() {
                     let tool_name = tool.name.to_ascii_lowercase();
                     if self.ctx.tools.contains_lowercase(&tool_name) || tool_name.starts_with("rt_")
@@ -1549,23 +1559,20 @@ impl CompletionRunner {
                                 Ok((res, remote_id)) => {
                                     tool.remote_id = remote_id;
                                     tool.result = Some(res);
-                                    (Some(tool), None)
                                 }
                                 Err(err) => {
                                     // 工具调用失败了，但我们不能终止整个对话流程，可以让 LLM 尝试纠正错误并继续对话
-                                    {
-                                        tool.result = Some(ToolOutput {
-                                            output: json!({ "error": format!(
-                                                "tool call failed: {}",
-                                                err
-                                            )}),
-                                            is_error: Some(true),
-                                            ..Default::default()
-                                        });
-                                        (Some(tool), None)
-                                    }
+                                    tool.result = Some(ToolOutput {
+                                        output: json!({ "error": format!(
+                                            "tool call failed: {}",
+                                            err
+                                        )}),
+                                        is_error: Some(true),
+                                        ..Default::default()
+                                    });
                                 }
                             }
+                            tool
                         }));
                     } else if self.ctx.agents.contains_lowercase(&tool_name)
                         || self.ctx.subagents.contains_lowercase(&tool_name)
@@ -1602,23 +1609,20 @@ impl CompletionRunner {
                                 Ok((res, remote_id)) => {
                                     tool.remote_id = remote_id;
                                     tool.result = Some(res.into_tool_output());
-                                    (Some(tool), None)
                                 }
                                 Err(err) => {
                                     // agent 调用失败了，但我们不能终止整个对话流程，可以让 LLM 尝试纠正错误并继续对话
-                                    {
-                                        tool.result = Some(ToolOutput {
-                                            output: json!({ "error": format!(
-                                                "agent run failed: {}",
-                                                err
-                                            )}),
-                                            is_error: Some(true),
-                                            ..Default::default()
-                                        });
-                                        (Some(tool), None)
-                                    }
+                                    tool.result = Some(ToolOutput {
+                                        output: json!({ "error": format!(
+                                            "agent run failed: {}",
+                                            err
+                                        )}),
+                                        is_error: Some(true),
+                                        ..Default::default()
+                                    });
                                 }
                             }
+                            tool
                         }));
                     } else {
                         tool_call_futs.push(Box::pin(async move {
@@ -1630,21 +1634,18 @@ impl CompletionRunner {
                                 is_error: Some(true),
                                 ..Default::default()
                             });
-                            (Some(tool), None)
+                            tool
                         }));
                     }
                 }
 
                 let mut tool_calls: Vec<ToolCall> = Vec::new();
                 let mut tool_calls_continue: Vec<ContentPart> = Vec::new();
-                let mut tool_call_errors: Vec<String> = Vec::new();
                 if !tool_call_futs.is_empty() {
                     let results = futures::future::join_all(tool_call_futs).await;
 
-                    for (tool, err) in results {
-                        if let Some(mut tool) = tool
-                            && let Some(res) = &mut tool.result
-                        {
+                    for mut tool in results {
+                        if let Some(res) = &mut tool.result {
                             let mut usage = res.usage.clone();
                             // usage.requests 原值为内部调用次数，这里把它重置为 1 来表示被模型调用了一次，方便后续统计被调用的工具次数
                             usage.requests = 1;
@@ -1671,9 +1672,6 @@ impl CompletionRunner {
                             self.artifacts.append(&mut res.artifacts);
                             tool_calls.push(tool);
                         }
-                        if let Some(err) = err {
-                            tool_call_errors.push(err);
-                        }
                     }
                 }
 
@@ -1683,13 +1681,8 @@ impl CompletionRunner {
                 if !tool_calls_continue.is_empty() {
                     self.req.content.append(&mut tool_calls_continue);
                 }
-                let mut follow_up_content: Vec<ContentPart> = Vec::new();
-                if !tool_call_errors.is_empty() {
-                    follow_up_content.push(tool_call_errors.join("; ").into());
-                }
-                if let Some(content) = self.drain_follow_up_message() {
-                    follow_up_content.extend(content);
-                }
+                let follow_up_content: Vec<ContentPart> =
+                    self.drain_follow_up_message().unwrap_or_default();
 
                 if !follow_up_content.is_empty() {
                     if self.req.content.is_empty() {
@@ -2764,7 +2757,7 @@ mod tests {
             })
             .await
             .unwrap_err();
-        assert!(agent_err.to_string().contains("agent missing not found"));
+        assert!(agent_err.to_string().contains("agent ra_missing not found"));
 
         let agent_err = ctx
             .clone()
@@ -2775,7 +2768,7 @@ mod tests {
             })
             .await
             .unwrap_err();
-        assert!(agent_err.to_string().contains("agent missing not found"));
+        assert!(agent_err.to_string().contains("agent sa_missing not found"));
 
         let agent_err = ctx
             .agent_run(AgentInput {
