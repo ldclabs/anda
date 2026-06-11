@@ -89,7 +89,7 @@ impl From<String> for PromptCommand {
         let command = &stripped[..command_end];
 
         Self::Command {
-            command: command.to_lowercase().to_string(),
+            command: command.to_lowercase(),
             prompt,
         }
     }
@@ -395,13 +395,16 @@ pub enum ContentPart {
 
 impl ContentPart {
     /// Creates a content part of type `Any` with the given type tag and value.
+    ///
+    /// The type tag is only added when `val` serializes to a JSON object.
     pub fn any_from<T>(ty: &str, val: T) -> Self
     where
         T: Serialize,
     {
         let mut val = json!(val);
-        val.as_object_mut()
-            .map(|map| map.insert("type".to_string(), ty.into()));
+        if let Some(map) = val.as_object_mut() {
+            map.insert("type".to_string(), ty.into());
+        }
         ContentPart::Any(val)
     }
 
@@ -414,7 +417,7 @@ impl ContentPart {
             && let Some(t) = val.get("type").and_then(|x| x.as_str())
             && t == ty
         {
-            serde_json::from_value::<T>(val.clone()).map_err(|_| Box::new(self))
+            T::deserialize(val).map_err(|_| Box::new(self))
         } else {
             Err(Box::new(self))
         }
@@ -433,26 +436,38 @@ pub fn part_to_data_url(data: &ByteBufB64, mime_type: Option<&String>) -> String
 }
 
 /// Parses a data URL string and extracts the inline data and MIME type, if applicable.
+///
+/// When the data URL omits the media type (e.g. `data:;base64,...`), the MIME
+/// type is inferred from the decoded bytes, falling back to
+/// `application/octet-stream` for base64 payloads and `text/plain` for
+/// percent-encoded payloads.
 pub fn inline_data_from_data_url(data_url: &str) -> Option<(ByteBufB64, String)> {
     if let Some(stripped) = data_url.strip_prefix("data:") {
         let (meta, data_part) = stripped.split_once(",")?;
 
-        if meta.ends_with(";base64") {
+        if let Some(mime_part) = meta.strip_suffix(";base64") {
             if let Ok(data) = ByteBufB64::from_str(data_part) {
-                let mime_type = meta
-                    .strip_suffix(";base64")
-                    .map(|s| s.to_string())
-                    .or_else(|| infer2::get(&data).map(|t| t.mime_type().to_string()));
-                Some((
-                    data,
-                    mime_type.unwrap_or_else(|| "application/octet-stream".to_string()),
-                ))
+                let mime_type = if mime_part.is_empty() {
+                    infer2::get(&data)
+                        .map(|t| t.mime_type().to_string())
+                        .unwrap_or_else(|| "application/octet-stream".to_string())
+                } else {
+                    mime_part.to_string()
+                };
+                Some((data, mime_type))
             } else {
                 None
             }
         } else {
             let data = decode_percent_encoded_bytes(data_part)?;
-            Some((data, meta.to_string()))
+            let mime_type = if meta.is_empty() {
+                infer2::get(&data)
+                    .map(|t| t.mime_type().to_string())
+                    .unwrap_or_else(|| "text/plain".to_string())
+            } else {
+                meta.to_string()
+            };
+            Some((data, mime_type))
         }
     } else if let Ok(data) = ByteBufB64::from_str(data_url) {
         let mime_type = infer2::get(&data).map(|t| t.mime_type().to_string());
@@ -572,7 +587,9 @@ impl<'de> Deserialize<'de> for ContentPart {
                             signature,
                         },
                     }),
-                    Err(_) => Err(serde::de::Error::custom("invalid ContentPart")),
+                    Err(err) => Err(serde::de::Error::custom(format!(
+                        "invalid ContentPart: {err}"
+                    ))),
                 }
             }
             _ => Ok(ContentPart::Any(value)),
@@ -1012,6 +1029,10 @@ impl std::fmt::Display for Documents {
     }
 }
 
+/// Appends text resources to the prompt as an `<attachments>` document block.
+///
+/// Resources tagged `text` or `md` are removed from `resources` (see
+/// [`text_resource_documents`]); other resources are left untouched.
 pub fn prompt_with_resources(prompt: String, resources: &mut Vec<Resource>) -> String {
     let user_resources = text_resource_documents(resources);
     if user_resources.is_empty() {
@@ -1024,6 +1045,10 @@ pub fn prompt_with_resources(prompt: String, resources: &mut Vec<Resource>) -> S
     }
 }
 
+/// Removes resources tagged `text` or `md` and converts them into documents.
+///
+/// Removed resources whose blob cannot be decoded as text are discarded
+/// without producing a document.
 pub fn text_resource_documents(resources: &mut Vec<Resource>) -> Vec<Document> {
     let res = select_resources(resources, &["text".to_string(), "md".to_string()]);
     let mut user_resources: Vec<Document> = Vec::with_capacity(res.len());
@@ -1396,6 +1421,26 @@ mod tests {
 
         assert!(inline_data_from_data_url("data:text/plain,%GG").is_none());
         assert!(inline_data_from_data_url("not-base64%%%").is_none());
+    }
+
+    #[test]
+    fn test_inline_data_from_data_url_infers_missing_mime_type() {
+        // base64 data URL without media type: infer from magic bytes
+        let jpeg_header: ByteBufB64 = vec![0xff, 0xd8, 0xff, 0xe0].into();
+        let data_url = format!("data:;base64,{}", jpeg_header.to_base64());
+        let (decoded, mime_type) = inline_data_from_data_url(&data_url).unwrap();
+        assert_eq!(decoded, jpeg_header);
+        assert_eq!(mime_type, "image/jpeg");
+
+        // base64 data URL without media type and no recognizable magic bytes
+        let (decoded, mime_type) = inline_data_from_data_url("data:;base64,aGVsbG8=").unwrap();
+        assert_eq!(decoded, ByteBufB64::from(b"hello".to_vec()));
+        assert_eq!(mime_type, "application/octet-stream");
+
+        // percent-encoded data URL without media type defaults to text/plain
+        let (decoded, mime_type) = inline_data_from_data_url("data:,Hello%20World").unwrap();
+        assert_eq!(decoded, ByteBufB64::from(b"Hello World".to_vec()));
+        assert_eq!(mime_type, "text/plain");
     }
 
     #[test]

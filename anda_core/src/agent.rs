@@ -361,11 +361,11 @@ where
         T: Agent<C> + Send + Sync + 'static,
     {
         let name = agent.name().to_ascii_lowercase();
+        validate_function_name(&name)?;
         if self.set.contains_key(&name) {
             return Err(format!("agent {} already exists", name).into());
         }
 
-        validate_function_name(&name)?;
         let agent_dyn = AgentWrapper {
             inner: agent,
             label: label.unwrap_or_else(|| name.clone()),

@@ -510,7 +510,7 @@ pub trait CacheStoreFeatures: StoreFeatures + CacheFeatures + Send + Sync + 'sta
     /// Returns a value and its storage version, loading it into cache if needed.
     async fn cache_store_get<T>(&self, key: &str) -> Result<(T, UpdateVersion), BoxError>
     where
-        T: DeserializeOwned + Serialize + Send,
+        T: DeserializeOwned + Serialize + Send + Sync,
     {
         match self.cache_get::<CacheStoreValue<T>>(key).await {
             Ok(CacheStoreValue(val, ver)) => Ok((val, ver)),
@@ -523,9 +523,8 @@ pub trait CacheStoreFeatures: StoreFeatures + CacheFeatures + Send + Sync + 'sta
                     e_tag: meta.e_tag,
                     version: meta.version,
                 };
-                self.cache_set(key, (CacheStoreValue(val, version.clone()), None))
+                self.cache_set(key, (CacheStoreValue(&val, version.clone()), None))
                     .await;
-                let val: T = from_reader(&v[..])?;
                 Ok((val, version))
             }
         }

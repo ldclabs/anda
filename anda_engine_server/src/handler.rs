@@ -49,8 +49,8 @@ impl AppState {
             cwt.subject
                 .and_then(|s| Principal::from_text(&s).ok())
                 .unwrap_or(ANONYMOUS_PRINCIPAL)
-        } else if let Some(se) = SignedEnvelope::from_authorization(&headers)
-            .or_else(|| SignedEnvelope::from_headers(&headers))
+        } else if let Some(se) = SignedEnvelope::from_authorization(headers)
+            .or_else(|| SignedEnvelope::from_headers(headers))
         {
             match se.verify(now_ms, expect_target, expect_digest) {
                 Ok(_) => se.sender(),

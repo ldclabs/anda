@@ -25,9 +25,9 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::fmt::Display;
 
-pub static CONTENT_TYPE_CBOR: &str = "application/cbor";
-pub static CONTENT_TYPE_JSON: &str = "application/json";
-pub static CONTENT_TYPE_TEXT: &str = "text/plain";
+pub const CONTENT_TYPE_CBOR: &str = "application/cbor";
+pub const CONTENT_TYPE_JSON: &str = "application/json";
+pub const CONTENT_TYPE_TEXT: &str = "text/plain";
 
 /// Owned RPC request with a method name and CBOR-encoded parameters.
 #[derive(Clone, Debug, Deserialize, Serialize)]
