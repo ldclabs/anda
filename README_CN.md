@@ -1,50 +1,37 @@
 # `Anda`
 
-> 🤖 一个基于 Rust 构建的 AI 智能体框架，由 ICP 区块链和 TEE 环境赋能。
+> 一个基于 Rust 构建的可组合 AI 智能体运行时框架。
 
-## 🌍 说明文档翻译
+## 说明文档翻译
 
 [English readme](./README.md) | [中文说明](./README_CN.md) | [日本語の説明](./README_JA.md)
 
-## 🐼 简介
+## 简介
 
-Anda 是一个基于 Rust 构建的 AI 智能体框架，集成了 ICP 区块链并支持 TEE 环境。
-它旨在构建一个高度可组合、自主运行且具备持续记忆能力的 AI 智能体网络。
-通过连接跨行业的智能体，Anda 致力于打造一个超级 AGI 系统，推动人工智能向更高层次发展。
+Anda 是一个用于构建 AI 智能体的 Rust 框架，可以把模型、工具、记忆和其他智能体组合进同一个运行时。它关注可组合性、类型安全的扩展点、异步执行，以及可控的运行时调度。
+
+核心引擎支持开发者注册 agents 和 tools，按能力标签路由模型请求，调用本地或远程函数，隔离上下文状态，并在应用需要时接入可选的持久化和记忆层。
 
 ![Anda Diagram](./anda_diagram.webp)
 
-### ✨ 核心特性
+## 核心特性
 
-1. **可组合性**：
-   Anda 智能体专注于解决特定领域的问题，并通过灵活组合不同的智能体来应对复杂任务。当单个智能体无法独立解决问题时，它能够与其他智能体协作，形成强大的问题解决网络。这种模块化设计使得 Anda 能够灵活应对多样化的需求。
+1. **可组合的 agents 和 tools**
+   Agents 和 tools 通过稳定的 traits 与 function definitions 注册，专用组件可以组合成更大的工作流，而不需要把运行时写死成某一种应用形态。
 
-2. **简洁性**：
-   Anda 的设计理念强调简洁易用，旨在帮助开发者快速构建功能强大且高效的智能体。同时，非开发者也可以通过简单的配置创建自己的智能体，降低了技术门槛，使更多人能够参与到智能体的开发与应用中。
+2. **模型路由**
+   引擎可以通过 `primary`、`pro`、`flash`、`lite` 等能力标签路由 completion 请求，具体 provider adapter 隐藏在统一的请求和输出契约后面。
 
-3. **可信性**：
-   Anda 智能体运行在基于可信执行环境（TEEs）的去中心化可信计算环境（dTEE）中，确保了智能体的安全性、隐私性和数据完整性。这种架构为智能体的运行提供了高度可信的基础设施，保障了数据和计算过程的安全。
+3. **运行时编排**
+   `CompletionRunner` 负责迭代模型回合、执行 tool calls、调用 agents、累计 usage、汇总 artifacts、处理 steering/follow-up messages 和 cancellation。
 
-4. **自主性**：
-   Anda 智能体从 ICP 区块链获取永久身份和加密能力，并结合大语言模型的思考和决策能力，使其能够根据自身的经验和知识自主、高效地解决问题。这种自主性使智能体能够适应动态环境，并在复杂场景中做出高效决策。
+4. **隔离的执行上下文**
+   `BaseCtx` 和 `AgentCtx` 为每个 agent 或 tool 提供隔离 state、cache、object storage、HTTP 调用、signed calls、cancellation 和 child contexts。
 
-5. **永久记忆**：
-   Anda 智能体的记忆状态存储在 ICP 区块链和 dTEE 的可信存储网络中，确保其能够持续升级算法、积累知识并不断进化。这种永久记忆机制使智能体能够长久运行，甚至实现“永生”，为构建超级 AGI 系统奠定基础。
+5. **可扩展的记忆与技能**
+   可选 extensions 提供 conversation storage、基于 KIP 的 memory tools、filesystem、shell、fetch、notes、todos，以及文件驱动的 skills。
 
-### 🧠 愿景与目标
-
-Anda 的目标是通过创建和连接无数智能体，构建一个开放、安全、可信、高度协同的智能体网络，最终实现超级 AGI 系统。我们相信，Anda 将为各行各业带来革命性的变革，推动人工智能技术在更广泛的领域中落地应用，为人类社会创造更大的价值。
-
-## 🐼 关于 ICPanda DAO
-
-ICPanda DAO 是在互联网计算机协议（ICP）区块链上建立的 SNS DAO 组织，发行了 `PANDA` 代币。作为 `Anda` 框架的创造者，ICPanda DAO 致力于探索 Web3 与 AI 融合的未来。
-
-- **官方网站**: [https://panda.fans/](https://panda.fans/)
-- **永久链接**: [https://dmsg.net/PANDA](https://dmsg.net/PANDA)
-- **ICP SNS**: [https://dashboard.internetcomputer.org/sns/d7wvo-iiaaa-aaaaq-aacsq-cai](https://dashboard.internetcomputer.org/sns/d7wvo-iiaaa-aaaaq-aacsq-cai)
-- **代币**: ICP 网络上的 PANDA，[https://www.coingecko.com/en/coins/icpanda-dao](https://www.coingecko.com/en/coins/icpanda-dao)
-
-## 🔎 项目说明
+## 项目说明
 
 文档：
 - [Anda 架构设计](./docs/architecture_cn.md)
@@ -54,30 +41,33 @@ ICPanda DAO 是在互联网计算机协议（ICP）区块链上建立的 SNS DAO
 ```sh
 anda/
 ├── anda_cli/              # 与 Anda 引擎服务交互的命令行工具
-├── anda_core/             # 核心库，包含基础类型与接口
-├── anda_engine/           # 智能体运行时与管理引擎实现
-├── anda_engine_server/   # 支持多个 Anda 引擎的 HTTP 服务
-└── anda_web3_client/      # 用于在非 TEE 环境的 Rust 语言 Web3 SDK
+├── anda_core/             # 核心 traits、类型和运行时契约
+├── anda_engine/           # 智能体运行时、编排、上下文、模型和扩展
+└── anda_engine_server/    # 支持一个或多个 Anda 引擎的 HTTP 服务
 ```
 
 ### 如何使用和参与贡献
 
-#### 非开发者：
+#### 应用构建者：
 
-Anda 框架在 `anda_cli` 目录下提供了命令行工具，用于与 Anda 引擎服务交互。
+使用 `anda_cli` 和 `anda_engine_server` 运行并访问已配置的引擎。
 
 #### 开发者：
 
-- 完善 `anda_core` 和 `anda_engine` 核心引擎；
-- 使用 `anda_core` 的 trait 构建自定义智能体和工具；
-- 为 `anda_engine_server` HTTP 服务器实现做出贡献。
+- 使用 `anda_core` 的 traits 构建自定义 agents 和 tools。
+- 为 `anda_engine` 扩展可复用的运行时能力。
+- 改进模型 adapters、上下文能力、记忆集成和服务端 API。
+
+### 基于 Anda 的产品
+
+- [Anda Brain](https://github.com/ldclabs/anda-brain): 基于 Anda 框架构建的持久记忆与认知产品。
+- [Anda Bot](https://github.com/ldclabs/anda-bot): 基于 Anda 框架构建的个人 AI 助手和应用运行时。
 
 ### 关联项目
 
-- [IC-TEE](https://github.com/ldclabs/ic-tee): 🔐 Make Trusted Execution Environments (TEEs) work with the Internet Computer.
-- [IC-COSE](https://github.com/ldclabs/ic-cose): ⚙️ A decentralized COnfiguration service with Signing and Encryption on the Internet Computer.
+- [KIP](https://github.com/ldclabs/KIP): Anda memory tools 使用的 Knowledge Interaction Protocol。
 
-## 📝 License
+## License
 
 Copyright © 2026 [LDC Labs](https://github.com/ldclabs).
 

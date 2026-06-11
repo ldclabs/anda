@@ -1,185 +1,229 @@
-# Anda 架构设计
+# Anda Engine 架构
 
-## 简介
+本文基于当前 `anda_engine` 源码描述运行时架构，替换旧文档中把 ICP、TEE、IC-TEE 作为必需主路径的部署叙述。
 
-`Anda` 是一个创新的智能体开发框架，旨在构建一个高度可组合、自主性强且具有永久记忆的 AI 智能体网络。通过连接各行各业的智能体，Anda 致力于打造一个超级 AGI 系统，推动人工智能向更高层次发展。
+当前引擎的实际核心是 `Engine` 运行时：校验调用者、创建隔离上下文、调度 agents 和 tools、路由模型请求、处理模型返回的 tool calls，并把需要暴露的本地或远程函数发布出去。Web3、TEE、ICP、IC-COSE 这类能力只是可替换的后端集成，不是理解或运行 engine 的前置条件。
 
-本文介绍了 Anda 框架的系统架构和核心组件。
+预览提示：建议使用 [markdown-viewer/markdown-viewer-extension](https://github.com/markdown-viewer/markdown-viewer-extension) 预览本文档，以正确渲染内嵌 HTML 架构图和 PlantUML 时序图。
 
-**资源**:
-- [GitHub: 项目源代码](https://github.com/ldclabs/anda)
-- [扩展（Extensions）: 核心 agents & tools 的实现](https://github.com/ldclabs/anda/tree/main/anda_engine/src/extension)
-- [Anda bot（X 平台应用）](https://x.com/AndaICP)
+源码索引：
 
-## 系统架构
+- [`engine.rs`](../anda_engine/src/engine.rs)：顶层 `Engine`、`EngineBuilder`、导出 API、管理策略、hooks、challenge 签名。
+- [`context/agent.rs`](../anda_engine/src/context/agent.rs)：`AgentCtx`、本地/远程/subagent 路由、`CompletionRunner`、`CompletionStream`。
+- [`context/base.rs`](../anda_engine/src/context/base.rs)：`BaseCtx`、隔离 state、cache、store、keys、HTTP、signed RPC、cancellation。
+- [`model.rs`](../anda_engine/src/model.rs)：`Models` 标签路由、provider adapters、重试和 streaming 解析。
+- [`subagent.rs`](../anda_engine/src/subagent.rs)：可复用 subagents、后台 sessions、compaction 和 handoff。
+- [`memory.rs`](../anda_engine/src/memory.rs)：conversation/resource 存储和 KIP/Cognitive Nexus tools。
+- [`extension`](../anda_engine/src/extension.rs)：内置工具库，例如 filesystem、shell、fetch、skills、notes、todos、memory。
 
-![Anda 系统架构图](./anda_architecture.webp)
+## 运行时视图
 
-要运行完整的 Anda AI Agent 程序（下面简称为 Anda），需要3种外部资源，分别是 **LLM 服务**、**TEE 计算**和 **ICP 区块链**；以及两个内部服务，即 **Anda Engine** 和 **IC-TEE Gateway**。
+<style scoped>
+.anda-arch{font-family:Inter,Segoe UI,Arial,sans-serif;color:#18202b;background:#f7f9fb;border:1px solid #d9e2ec;border-radius:8px;padding:18px;margin:16px 0;box-shadow:0 10px 28px rgba(24,32,43,.08)}
+.anda-arch *{box-sizing:border-box}
+.anda-title{font-size:22px;font-weight:760;letter-spacing:0;margin:0 0 4px;color:#101820}
+.anda-subtitle{font-size:13px;color:#52606d;margin:0 0 16px}
+.anda-layout{display:grid;grid-template-columns:minmax(168px,.75fr) minmax(420px,2.2fr) minmax(190px,.85fr);gap:12px;align-items:stretch}
+.anda-panel{background:#ffffff;border:1px solid #d9e2ec;border-radius:8px;padding:10px}
+.anda-panel-title{font-size:12px;text-transform:uppercase;letter-spacing:.04em;font-weight:780;color:#52606d;margin-bottom:8px}
+.anda-main{display:flex;flex-direction:column;gap:10px}
+.anda-layer{border:1px solid #d9e2ec;border-left-width:5px;border-radius:8px;background:#ffffff;padding:10px}
+.anda-layer.entry{border-left-color:#3b82f6}
+.anda-layer.control{border-left-color:#64748b}
+.anda-layer.registry{border-left-color:#22a06b}
+.anda-layer.runner{border-left-color:#d97706}
+.anda-layer.context{border-left-color:#0f766e}
+.anda-layer.model{border-left-color:#b45309}
+.anda-layer.storage{border-left-color:#7c3aed}
+.anda-layer-title{font-size:14px;font-weight:780;color:#18202b;margin-bottom:8px}
+.anda-grid{display:grid;gap:8px}
+.anda-grid.two{grid-template-columns:repeat(2,minmax(0,1fr))}
+.anda-grid.three{grid-template-columns:repeat(3,minmax(0,1fr))}
+.anda-box{background:#f8fafc;border:1px solid #d9e2ec;border-radius:7px;padding:9px;min-height:58px;font-size:12px;line-height:1.35;color:#243b53}
+.anda-box strong{display:block;font-size:12.5px;color:#102a43;margin-bottom:3px}
+.anda-box small{display:block;color:#627d98}
+.anda-pill{display:inline-block;background:#edf2f7;border:1px solid #cbd5e1;border-radius:999px;padding:3px 7px;font-size:11px;color:#334155;margin:2px 3px 2px 0}
+.anda-side-list{display:flex;flex-direction:column;gap:7px}
+.anda-side-item{border:1px solid #d9e2ec;background:#f8fafc;border-radius:7px;padding:8px;font-size:12px;line-height:1.35;color:#334e68}
+.anda-note{margin-top:12px;border-top:1px solid #d9e2ec;padding-top:10px;font-size:12px;color:#52606d}
+@media (max-width:900px){.anda-layout{grid-template-columns:1fr}.anda-grid.two,.anda-grid.three{grid-template-columns:1fr}}
+</style>
+<div class="anda-arch">
+<div class="anda-title">Anda Engine Runtime Architecture</div>
+<div class="anda-subtitle">当前源码视角：agents、tools、contexts、models、memory，以及可选外部能力。</div>
+<div class="anda-layout">
+<div class="anda-panel">
+<div class="anda-panel-title">入口</div>
+<div class="anda-side-list">
+<div class="anda-side-item"><strong>宿主应用</strong><br>CLI、HTTP server、bot runtime，或嵌入式 Rust 应用调用 engine API。</div>
+<div class="anda-side-item"><strong>公开 API</strong><br><span class="anda-pill">agent_run</span><span class="anda-pill">tool_call</span><span class="anda-pill">information</span><span class="anda-pill">challenge</span></div>
+<div class="anda-side-item"><strong>远程 peers</strong><br>其他 engines 可以发现导出的函数，并通过 signed RPC 调用。</div>
+</div>
+</div>
+<div class="anda-main">
+<div class="anda-layer entry">
+<div class="anda-layer-title">Engine 边界</div>
+<div class="anda-grid three">
+<div class="anda-box"><strong>Engine</strong><small>持有 runtime state、default agent、export lists、hooks、management policy。</small></div>
+<div class="anda-box"><strong>EngineBuilder</strong><small>注册 tools、agents、models、store、remote engines、subagents、hooks。</small></div>
+<div class="anda-box"><strong>EngineCard</strong><small>把已导出的 agent/tool definitions 发布给远程发现。</small></div>
+</div>
+</div>
+<div class="anda-layer control">
+<div class="anda-layer-title">访问控制和观测</div>
+<div class="anda-grid three">
+<div class="anda-box"><strong>Management</strong><small>Private、protected、public 可见性，以及 controller/manager principals。</small></div>
+<div class="anda-box"><strong>Hooks</strong><small>on_agent_start/end 和 on_tool_start/end 可以拒绝、观测或改写输出。</small></div>
+<div class="anda-box"><strong>Cancellation</strong><small>根 token 和 child tokens 通过 contexts 与 runners 传递。</small></div>
+</div>
+</div>
+<div class="anda-layer registry">
+<div class="anda-layer-title">可调用对象注册表</div>
+<div class="anda-grid three">
+<div class="anda-box"><strong>AgentSet</strong><small>本地 agents，包括内置 `tools_search`、`tools_select`、`subagents_manager`。</small></div>
+<div class="anda-box"><strong>ToolSet</strong><small>类型化 `Tool&lt;BaseCtx&gt;`，提供 JSON function definitions 和 resource tags。</small></div>
+<div class="anda-box"><strong>RemoteEngines</strong><small>远程函数元数据，通过 `RA_` 和 `RT_` 前缀路由。</small></div>
+</div>
+</div>
+<div class="anda-layer runner">
+<div class="anda-layer-title">AgentCtx 和 CompletionRunner</div>
+<div class="anda-grid three">
+<div class="anda-box"><strong>AgentCtx</strong><small>把 BaseCtx 与 models、tools、agents、subagents、routing helpers 组合起来。</small></div>
+<div class="anda-box"><strong>CompletionRunner</strong><small>迭代模型回合，执行 tool calls，累计 usage/artifacts，生成 final output。</small></div>
+<div class="anda-box"><strong>SubAgent sessions</strong><small>`SA_` workers 支持同步调用，也支持带 progress/final hooks 的后台 session。</small></div>
+</div>
+</div>
+<div class="anda-layer context">
+<div class="anda-layer-title">BaseCtx 能力面</div>
+<div class="anda-grid three">
+<div class="anda-box"><strong>Scoped state</strong><small>caller、request meta、elapsed time、typed state extensions、depth-limited children。</small></div>
+<div class="anda-box"><strong>Store and cache</strong><small>基于 context path 的命名空间隔离 agent/tool 数据。</small></div>
+<div class="anda-box"><strong>External calls</strong><small>HTTP、signed RPC、key derivation/signing、canister calls 通过配置的 Web3SDK 提供。</small></div>
+</div>
+</div>
+<div class="anda-layer model">
+<div class="anda-layer-title">模型路由和 Provider Adapters</div>
+<div class="anda-grid three">
+<div class="anda-box"><strong>Models</strong><small>标签映射加 primary model。`pro`、`flash`、`lite` 等标签选择 provider entry。</small></div>
+<div class="anda-box"><strong>Adapters</strong><small>OpenAI-compatible、Anthropic、Gemini，以及自定义 `CompletionFeaturesDyn` providers。</small></div>
+<div class="anda-box"><strong>Reliability</strong><small>请求默认值、SSE/NDJSON 解析、一次短重试、retryable `ModelError` 信号。</small></div>
+</div>
+</div>
+<div class="anda-layer storage">
+<div class="anda-layer-title">可选 Extensions 和持久化</div>
+<div class="anda-grid three">
+<div class="anda-box"><strong>内置工具</strong><small>fetch、filesystem、shell、note、skill、todo、memory tools 和其他工具一样注册。</small></div>
+<div class="anda-box"><strong>Memory</strong><small>Conversation/resource records 存在 AndaDB；KIP commands 由 Cognitive Nexus 支撑。</small></div>
+<div class="anda-box"><strong>ObjectStore</strong><small>默认 in-memory；也可以替换为 local、cloud、IC-COSE-compatible backends。</small></div>
+</div>
+</div>
+</div>
+<div class="anda-panel">
+<div class="anda-panel-title">外部能力</div>
+<div class="anda-side-list">
+<div class="anda-side-item"><strong>Model providers</strong><br>Completion APIs 只通过已注册 model adapters 访问。</div>
+<div class="anda-side-item"><strong>Web3SDK</strong><br>可以是 TEE client、Web3 client，或 not-implemented placeholder。</div>
+<div class="anda-side-item"><strong>HTTP resources</strong><br>Fetch 和 remote-engine calls 使用 context HTTP/signed-RPC traits。</div>
+<div class="anda-side-item"><strong>Databases</strong><br>只有注册 memory tools 时才会用到 AndaDB 和 Cognitive Nexus。</div>
+</div>
+</div>
+</div>
+<div class="anda-note">关键点：engine 调度 agents 并不依赖 blockchain、TEE 或特定 storage backend。这些都只是 `Web3SDK`、`Store`、model providers、memory extensions 后面的可替换集成。</div>
+</div>
 
-### LLM 服务
+## 请求时序
 
-LLM 服务为 Anda 提供智能算力，就像一种 GPU 云服务，它是可以替换的。目前 Anda 框架内支持了 OpenAI、DeepSeek、Anthropic 和 Google Gemini，未来会支持更多的 LLM 服务，包括用 TEE GPU 运行开源的 LLMs。
-
-目前来说，DeepSeek 和 OpenAI 是性价比最高的，以极低的价格提供了令人惊叹的智能算力。为了极致的安全和隐私，使用 TEE GPU 运行 DeepSeek 将是最佳选择。
-
-### TEE 计算
-
-TEE 计算为 Anda 提供硬件级的安全隔离计算环境和身份证明。目前 Anda 框架通过 IC-TEE 支持了 AWS Nitro enclave，未来会支持 Intel SGX，NVIDIA 的 TEE GPU 等。只有运行在 TEE 中，我们才可相信并验证 Anda 还是那个 Anda，它没有被篡改，它的计算状态（如密钥等）也处于安全环境不会被窃取。
-
-### ICP 区块链
-
-ICP 区块链为 Anda 提供了必要的去中心化的身份证明、根密钥和数据存储，以及代币经济体系和 DAO 治理机制。
-
-因为 TEE 是无状态的计算环境，并且 Anda 的每次升级都会导致 TEE Attestation 指纹变化。Anda 的运行状态需要存储在 ICP 区块链上，如果程序崩溃、TEE 重启或者切换不同的 TEE，Anda 才能从中恢复状态。Anda 也需要 ICP 为其提供一种永久固定的链上身份证明，这样它才能与外界其它系统进行可信交互。
-
-### Anda Engine
-
-Anda Engine 是 Anda 的核心调度引擎。一个 Anda AI Agent 可以包含多个 agents 和 tools，它们被注册到 Engine 中，可以被 Engine 自动调度执行。我们将在下一部分详细介绍 Engine 的架构和工作原理。
-
-### IC-TEE Gateway
-
-[IC-TEE](https://github.com/ldclabs/ic-tee) 为 Anda 提供了运行在 TEE 的内部环境，它由多个组件组成。IC-TEE Gateway 是 Anda 与 TEE 即外界（包括 ICP 区块链）之间的桥梁。
-
-TEE 启动后，IC-TEE Gateway 会做如下工作：
-1. 打通 TEE 本地与宿主机的通信通道；
-2. 利用 TEE Attestation 从 ICP Identity canister 合约获取 Anda 的临时身份证明
-3. 利用临时身份证明换取永久身份证明；
-4. 用永久身份从 ICP COSE canister 合约读取加密配置文件、TLS 证书以及 Anda 的根密钥。加密配置文件和 TLS 证书需要开发者提前上传到 COSE canister，而根密钥则是首次启动时在 TEE 中生成并加密存储到 COSE canister 中，后续每次启动都会从 COSE canister 中读取并解密，永久固定，不再变化。
-5. IC-TEE Gateway 会用 TLS 证书启动一个 HTTPS 服务，让外界可以安全地与 Anda 通信。
-6. 一切都准备好了，Anda Engine 开始与 IC-TEE Gateway 通信、启动并对外提供服务。
-7. Anda Engine 启动后，IC-TEE Gateway 为其提供的核心服务包括：
-   - 从根密钥派生一系列密钥相关服务；
-   - 代理 ICP canisters 请求，所以 Anda 调用 canisters 都会用同一个永久身份，当然应用层也可以从密钥服务派生确定性的子身份与 ICP canisters 交互；
-   - 代理外界到 Anda Engine 的 HTTPs 请求。
-
-![Anda 启动时序图](./anda_sequence_diagram.webp)
-
-## Anda 引擎架构
-
-### 核心库
-
-| 库名称        | 描述                   | 文档                                               |
-| ------------- | ---------------------- | -------------------------------------------------- |
-| `anda_core`   | 定义特性、类型和接口   | [docs.rs/anda_core](https://docs.rs/anda_core)     |
-| `anda_engine` | 实现运行时、集成和工具 | [docs.rs/anda_engine](https://docs.rs/anda_engine) |
-
-### 核心组件
-
-#### [代理（Agents）](https://docs.rs/anda_core/latest/anda_core/agent/index.html)
-
-- 使用 `Agent` 特性定义 AI 代理，该特性指定了执行逻辑、依赖关系和元数据等能力。
-- 使用 `AgentSet` 管理多个代理，并通过 `DynAgent` 实现动态分发，以实现运行时的灵活性。
-- 示例用例：数据提取、文档分割、角色扮演 AI。
-
-```rust
-// 简化的 Agent 特性定义
-pub trait Agent<C: AgentContext> {
-    fn name(&self) -> String;
-
-    fn description(&self) -> String;
-
-    fn definition(&self) -> FunctionDefinition;
-
-    fn supported_resource_tags(&self) -> Vec<String>;
-
-    fn tool_dependencies(&self) -> Vec<String>;
-
-    async fn init(&self, ctx: C);
-
-    async fn run(
-        &self,
-        ctx: C,
-        prompt: String,
-        resources: Option<Vec<Resource>>,
-    ) -> Result<AgentOutput, BoxError>;
-}
+```plantuml
+@startuml
+title Anda Engine agent_run and completion loop
+skinparam backgroundColor #FFFFFF
+skinparam sequenceArrowColor #334155
+skinparam sequenceLifeLineBorderColor #CBD5E1
+skinparam sequenceParticipantBorderColor #CBD5E1
+skinparam sequenceParticipantBackgroundColor #F8FAFC
+skinparam sequenceGroupBorderColor #94A3B8
+skinparam sequenceGroupBackgroundColor #F8FAFC
+skinparam noteBackgroundColor #FFF7ED
+skinparam noteBorderColor #FDBA74
+actor Caller
+participant "Host API\n(server / CLI / app)" as Host
+participant "Engine" as Engine
+participant "Management\n+ Hooks" as Guard
+participant "AgentCtx\n+ BaseCtx" as Ctx
+participant "Agent" as Agent
+participant "CompletionRunner" as Runner
+participant "Models\nlabel router" as Models
+participant "Model adapter\nOpenAI / Anthropic / Gemini" as Model
+participant "Tool / Agent\nregistries" as Registry
+participant "Local Tool\nor Agent" as Local
+participant "Remote Engine" as Remote
+participant "SubAgent\nsession runner" as SubSession
+Caller -> Host : submit AgentInput
+Host -> Engine : agent_run(caller, input)
+Engine -> Engine : validate RequestMeta\nnormalize default agent
+Engine -> Guard : check_visibility(caller)
+Guard --> Engine : visibility accepted
+Engine -> Ctx : ctx_with(caller, agent, label, meta)
+Engine -> Guard : on_agent_start(ctx, agent)
+Engine -> Agent : run(ctx, prompt, resources)
+Agent -> Ctx : completion(req, resources)
+Ctx -> Runner : completion_iter(req, resources)
+loop until final output, failure, or cancellation
+Runner -> Models : resolve(req.model or ctx.label)
+Models --> Runner : Model
+Runner -> Model : completion(CompletionRequest)
+Model --> Runner : AgentOutput\ncontent, usage, raw_history, tool_calls
+alt model returned tool_calls
+Runner -> Registry : resolve each tool_call name\nlocal, RA_, RT_, or SA_
+par each resolved call
+alt local tool
+Runner -> Ctx : child_base(tool)
+Ctx -> Local : Tool::call(BaseCtx, args, selected resources)
+Local --> Runner : ToolOutput
+else local agent or subagent without session
+Runner -> Ctx : child(agent)
+Ctx -> Local : Agent::run(AgentCtx, prompt, resources)
+Local --> Runner : AgentOutput as ToolOutput
+else remote callable
+Runner -> Ctx : remote_tool_call or remote_agent_run
+Ctx -> Remote : https_signed_rpc(tool_call / agent_run)
+Remote --> Runner : ToolOutput or AgentOutput
+else subagent session mode
+Runner -> Local : SubAgent::run(session args)
+Local -> SubSession : claim session and spawn background runner
+Local --> Runner : ack with session id
+SubSession -> Guard : on_background_start
+SubSession -> Runner : unbound completion loop
+SubSession -> Guard : on_background_progress / on_background_end
+end
+end
+Runner -> Runner : accumulate usage, artifacts, tools_usage\nappend tool outputs to next request
+else no tool calls
+Runner -> Runner : final_output()
+end
+opt steering or follow-up queued
+Runner -> Runner : insert user content at safe boundary\nprune unanswered tool raw history if needed
+end
+end
+Runner --> Agent : AgentOutput
+Agent --> Engine : AgentOutput
+Engine -> Guard : on_agent_end(ctx, agent, output)
+Guard --> Engine : transformed output
+Engine -> Engine : clear provider raw_history
+Engine --> Host : AgentOutput
+Host --> Caller : response
+@enduml
 ```
 
-#### [工具（Tools）](https://docs.rs/anda_core/latest/anda_core/tool/index.html)
+## 组件说明
 
-- 通过 `Tool` 特性实现可重用的工具（例如 API、区块链交互）。工具强制执行类型安全的输入/输出，并自动生成 JSON 函数定义以便与 LLM 集成。
-- 使用 `ToolSet` 管理工具，并通过 `DynTool` 动态调用它们。
-
-```rust
-// 简化的 Tool 特性定义
-pub trait Tool<BaseContext> {
-    type Args: DeserializeOwned;
-    type Output: Serialize;
-
-    fn name(&self) -> String;
-
-    fn description(&self) -> String;
-
-    fn definition(&self) -> FunctionDefinition;
-
-    fn supported_resource_tags(&self) -> Vec<String>;
-
-    async fn init(&self, ctx: C);
-
-    async fn call(
-        &self,
-        ctx: C,
-        args: Self::Args,
-        resources: Option<Vec<Resource>>,
-    ) -> Result<ToolOutput<Self::Output>, BoxError>;
-}
-```
-
-#### [上下文（Context）](https://docs.rs/anda_core/latest/anda_core/context/index.html)
-
-- `BaseContext` 为代理和工具提供了基础操作和执行环境，结合了以下功能：
-  - **StateFeatures**：用户、调用者、时间和异步任务取消令牌
-  - **KeysFeatures**：Agents/Tools 隔离的加密密钥操作
-  - **StoreFeatures**：Agents/Tools 隔离的持久化存储
-  - **CacheFeatures**：具有 TTL/TTI 过期机制和 Agents/Tools 隔离的内存缓存存储
-  - **CanisterFeatures**：ICP 区块链交互
-  - **HttpFeatures**：HTTPs 请求能力
-- `AgentContext` 为代理提供了执行环境。它结合了所有 `BaseContext` 功能和 AI 特定功能：
-  - **CompletionFeatures**：为代理提供 LLM 完成能力。
-  - **EmbeddingFeatures**：为代理提供文本嵌入能力。
-  - **运行时功能**：调用工具（`tool_call`、`remote_tool_call`、`tool_definitions`）和运行代理（`agent_run`、`remote_agent_run`、`agent_definitions`）。注意，Agent 可以通过 AgentContext 调用本地或者远程的其它 Agents 和 Tools，可以是按照 Agent 编程逻辑明确调用，也可以根据大模型的建议自动调用！
-- [`BaseCtx`](https://docs.rs/anda_engine/latest/anda_engine/context/struct.BaseCtx.html) 是 `BaseContext` 的实现。
-- [`AgentCtx`](https://docs.rs/anda_engine/latest/anda_engine/context/struct.AgentCtx.html) 是 `AgentContext` 的实现。
-
-#### [模型（Models）](https://docs.rs/anda_core/latest/anda_core/model/index.html)
-
-定义 AI 交互的数据结构：
-  - `CompletionRequest`：包含聊天历史、文档和工具的 LLM 提示。
-  - `AgentOutput`：代理执行的结果。
-  - `Embedding`：文本到向量的表示。
-
-#### [引擎（Engine）](https://docs.rs/anda_engine/latest/anda_engine/engine/index.html)
-
-- `Engine` 负责协调代理和工具的执行，提供构建器模式以进行配置。
-- 使用 `EngineBuilder` 注册代理/工具并设置执行参数。
-
-```rust
-let engine = Engine::builder()
-   .with_name(my_agent_name)
-   .with_tee_client(my_tee_client)
-   .with_model(my_llm_model)
-   .register_tool(my_tool)
-   .register_agent(my_agent, None)
-   .build("default_agent")?;
-
-let output = engine.agent_run(caller, AgentInput{ prompt: "Hello".to_string(), ..Default::default() }).await?;
-```
-
-### 关键特性
-
-- **模块化**：分离代理、工具和上下文功能，实现清晰的架构。
-- **类型安全**：强类型接口减少了运行时错误。
-- **异步执行**：非阻塞 I/O 以提高资源利用率。
-- **上下文层次结构**：支持取消的隔离执行上下文。
-- **安全操作**：通过 TEE（可信执行环境）内置加密、验证调用者身份和安全存储。
-- **存储**：内存缓存、对象存储 + 向量搜索能力。
-- **可扩展性**：添加自定义代理/工具或通过新特性扩展 `BaseContext` 和 `AgentContext`。
-
-## 结论
-
-以上概述了 Anda 智能体的完整组成。虽然它可能看起来复杂，但 Anda 框架封装了这种复杂性，使开发人员能够专注于业务逻辑，并快速在 Anda 上构建安全、高效和可扩展的智能体。
-
-### 未来展望
-
-基于代币经济系统和 DAO 治理机制，Anda 代理可以在为外部世界提供服务的同时产生收入，形成一个正反馈循环，推动代理生态系统的增长。
+- `Engine` 是公开运行时边界。它对非 manager 调用者执行 exported agent/tool lists 检查，并自动导出 default agent。
+- `EngineBuilder` 默认使用 in-memory store、not-implemented Web3 client、无外部模型，并注册 discovery/subagent control agents。
+- `AgentCtx` 是主要调度面。它暴露本地 tools、本地 agents、subagents、已注册远程 engines，以及从 cache 动态加载的远程 engines。
+- `CompletionRunner` 是迭代式执行器。模型回合可以返回 tool calls；runner 执行它们，再把 tool outputs 回灌到下一轮模型请求。
+- `tools_search` 和 `tools_select` 是 agents，不是旁路机制。它们的输出可以把发现的 tool schemas 合并进后续请求，同时压缩 conversation context 中重复的 schema payload。
+- `BaseCtx` 创建命名空间隔离的 child contexts。Agent 路径使用 `a_<agent>`，tool 路径使用 `t_<tool>`，store/cache 操作都在该 path 下解析。
+- `Models` 先按 label 路由，再回落到 primary/default model。provider 真实模型名留在 adapter 配置内部。
+- `SubAgentManager` 把持久化或临时 `SubAgent` 定义转成可调用的 `SA_<name>` agents。长任务 session 通过 hooks 推送 progress 和 final output。
+- Memory 是 extension 层。Conversation/resource 存储使用 AndaDB collections，长期知识操作作为 KIP tools 暴露，并由 Cognitive Nexus 支撑。
+- Web3、TEE、ICP、IC-COSE 等集成只是 `Web3SDK`、`HttpFeatures`、`KeysFeatures`、`CanisterCaller` 或 `ObjectStore` 后面的实现选择，不是 engine 本身的必需架构层。
