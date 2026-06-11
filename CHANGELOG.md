@@ -2,6 +2,24 @@
 
 All notable changes to the Anda project will be documented in this file.
 
+## [0.12.36] — 2026-06-11
+
+### Fixed — anda_engine v0.12.36
+
+- **Bounded filesystem and shell tool output** — File reads now cap inline text and binary previews with explicit truncation markers, glob searches tolerate unreadable or dangling entries while enforcing a scan cap, and native shell execution bounds captured output, terminal-progress rendering, inherited-pipe waits, and cancellation cleanup for background processes.
+- **Subagent session robustness** — Session calls now validate structured arguments, atomically claim session IDs to avoid duplicate runners, report inactive control commands cleanly, preserve usage and artifacts across compaction, forward background usage deltas, and buffer stream steering while a completion step is in flight.
+- **Conversation and memory edge cases** — Conversation batch reads, pagination, search limits, expired-deletion loops, timestamp serialization, resource existence checks, and resource ownership checks are now hardened to avoid default-limit truncation, cursor overlap, dangling references, and cross-conversation resource reads.
+- **Model transport and response handling** — Completion retries now include a short backoff honoring capped `Retry-After` hints, shared HTTP request timeout allows long reasoning calls, SSE `[DONE]` detection is line-anchored so generated text cannot truncate streams, and OpenAI Responses `incomplete`/`failed`/`cancelled` statuses surface as failure reasons while preserving partial content.
+
+### Changed — anda_engine_server v0.12.1
+
+- **Embeddable and testable HTTP server router** — `ServerBuilder::build_router()` exposes the configured Axum router for embedding and integration tests, while engine RPC dispatch now shares CBOR/JSON decoding and result encoding paths, resolves the `default` engine consistently, and keeps request logging behavior unified.
+- **API key middleware hardening** — API key checks now compare equal-length keys in constant time and keep exempt-path configuration clone-friendly.
+
+### Fixed — anda_web3_client v0.12.1
+
+- **Signed HTTP/RPC client hardening** — The Web3 client now caches its principal at build time, centralizes HTTPS guard and signed-header construction, avoids echoing secret material in identity-load errors, and shares signed CBOR RPC request construction across async and trait-based call paths.
+
 ## [0.12.35] — 2026-06-10
 
 ### Fixed — anda_engine v0.12.35

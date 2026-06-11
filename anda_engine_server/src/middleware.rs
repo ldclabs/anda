@@ -76,32 +76,42 @@ impl HttpMiddleware for CompressionMiddleware {
 
 /// A simple API key middleware that validates `x-api-key` on every request.
 ///
+/// Keys are compared in constant time to avoid leaking the expected key
+/// through a timing side channel.
+///
 /// Use `exempt_path` to allow unauthenticated endpoints (e.g. health/info routes).
 pub struct ApiKeyMiddleware {
-    expected_key: Arc<String>,
-    exempt_paths: Arc<Vec<String>>,
+    expected_key: String,
+    exempt_paths: Vec<String>,
 }
 
 impl ApiKeyMiddleware {
     pub fn new(expected_key: impl Into<String>) -> Self {
         Self {
-            expected_key: Arc::new(expected_key.into()),
-            exempt_paths: Arc::new(Vec::new()),
+            expected_key: expected_key.into(),
+            exempt_paths: Vec::new(),
         }
     }
 
     pub fn exempt_path(mut self, path: impl Into<String>) -> Self {
-        Arc::get_mut(&mut self.exempt_paths)
-            .unwrap()
-            .push(path.into());
+        self.exempt_paths.push(path.into());
         self
     }
 }
 
+/// Compares two byte slices in constant time for equal-length inputs.
+/// Only the length may be learned from timing, never the content.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 impl HttpMiddleware for ApiKeyMiddleware {
     fn apply(&self, router: AppRouter) -> AppRouter {
-        let expected_key = self.expected_key.clone();
-        let exempt_paths = self.exempt_paths.clone();
+        let expected_key: Arc<str> = Arc::from(self.expected_key.as_str());
+        let exempt_paths: Arc<[String]> = Arc::from(self.exempt_paths.as_slice());
 
         router.layer(axum::middleware::from_fn(
             move |req: Request, next: Next| {
@@ -115,7 +125,12 @@ impl HttpMiddleware for ApiKeyMiddleware {
                     }
 
                     match req.headers().get("x-api-key") {
-                        Some(provided_key) if provided_key == expected_key.as_str() => {
+                        Some(provided_key)
+                            if constant_time_eq(
+                                provided_key.as_bytes(),
+                                expected_key.as_bytes(),
+                            ) =>
+                        {
                             next.run(req).await
                         }
                         _ => (

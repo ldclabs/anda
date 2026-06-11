@@ -179,26 +179,27 @@ impl Conversation {
     }
 
     pub fn to_changes(&self) -> Result<BTreeMap<String, Fv>, BoxError> {
+        let messages = cbor!(self.messages).map_err(|err| format!("encode messages: {err}"))?;
+        let resources = cbor!(self.resources).map_err(|err| format!("encode resources: {err}"))?;
+        let artifacts = cbor!(self.artifacts).map_err(|err| format!("encode artifacts: {err}"))?;
+        let usage = cbor!(self.usage).map_err(|err| format!("encode usage: {err}"))?;
         let mut changes = BTreeMap::from([
             (
                 "messages".to_string(),
-                Fv::array_from(cbor!(self.messages).unwrap(), &[Ft::Json])?,
+                Fv::array_from(messages, &[Ft::Json])?,
             ),
             (
                 "resources".to_string(),
-                Fv::array_from(cbor!(self.resources).unwrap(), &[Resource::field_type()])?,
+                Fv::array_from(resources, &[Resource::field_type()])?,
             ),
             (
                 "artifacts".to_string(),
-                Fv::array_from(cbor!(self.artifacts).unwrap(), &[Resource::field_type()])?,
+                Fv::array_from(artifacts, &[Resource::field_type()])?,
             ),
             ("status".to_string(), Fv::Text(self.status.to_string())),
             (
                 "usage".to_string(),
-                Fv::map_from(
-                    cbor!(self.usage).unwrap(),
-                    &BTreeMap::from([("*".into(), Ft::U64)]),
-                )?,
+                Fv::map_from(usage, &BTreeMap::from([("*".into(), Ft::U64)]))?,
             ),
             ("updated_at".to_string(), Fv::U64(self.updated_at)),
             (
@@ -317,15 +318,13 @@ impl From<Conversation> for Document {
             ("type".to_string(), "Conversation".into()),
             ("user".to_string(), conversation.user.to_string().into()),
             ("status".to_string(), conversation.status.to_string().into()),
-            (
-                "created_at".to_string(),
-                rfc3339_datetime(conversation.created_at).unwrap().into(),
-            ),
-            (
-                "updated_at".to_string(),
-                rfc3339_datetime(conversation.updated_at).unwrap().into(),
-            ),
         ]);
+        if let Some(created_at) = rfc3339_datetime(conversation.created_at) {
+            metadata.insert("created_at".to_string(), created_at.into());
+        }
+        if let Some(updated_at) = rfc3339_datetime(conversation.updated_at) {
+            metadata.insert("updated_at".to_string(), updated_at.into());
+        }
         if let Some(thread) = conversation.thread {
             metadata.insert("thread".to_string(), thread.to_string().into());
         }
@@ -526,11 +525,20 @@ impl Conversations {
         Ok(doc.is_some())
     }
 
+    /// Retrieves the user's conversations matching `ids`.
+    ///
+    /// The underlying query limit is capped at 1000 IDs per call.
     pub async fn batch_get_conversations(
         &self,
         user: &Principal,
         ids: Vec<u64>,
     ) -> Result<Vec<Conversation>, BoxError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // `limit: None` falls back to the database default (10); request the full batch instead.
+        let limit = ids.len();
         let filter = Some(Filter::And(vec![
             Box::new(Filter::Field((
                 "_id".to_string(),
@@ -547,19 +555,21 @@ impl Conversations {
             .search_as(Query {
                 search: None,
                 filter,
-                limit: None,
+                limit: Some(limit),
             })
             .await?;
         Ok(rt)
     }
 
+    /// Lists the user's conversations, newest first, with cursor-based pagination.
     pub async fn list_conversations_by_user(
         &self,
         user: &Principal,
         cursor: Option<String>,
         limit: Option<usize>,
     ) -> Result<(Vec<Conversation>, Option<String>), BoxError> {
-        let limit = limit.unwrap_or(10).min(100);
+        // 0 means "no limit" to the database, and an empty page would panic below; clamp instead.
+        let limit = limit.unwrap_or(10).clamp(1, 100);
         let cursor = match BTree::from_cursor::<u64>(&cursor)? {
             Some(cursor) => cursor,
             None => self.conversations.max_document_id() + 1,
@@ -575,7 +585,7 @@ impl Conversations {
             ))),
         ]));
 
-        let rt: Vec<Conversation> = self
+        let mut rt: Vec<Conversation> = self
             .conversations
             .search_as(Query {
                 search: None,
@@ -583,11 +593,17 @@ impl Conversations {
                 limit: Some(limit),
             })
             .await?;
+        // The page holds the newest matching conversations; the next cursor is the smallest ID,
+        // so the following page fetches strictly older ones.
         let cursor = if rt.len() >= limit {
-            BTree::to_cursor(&rt.first().unwrap()._id)
+            rt.iter()
+                .map(|conversation| conversation._id)
+                .min()
+                .and_then(|id| BTree::to_cursor(&id))
         } else {
             None
         };
+        rt.sort_by_key(|conversation| std::cmp::Reverse(conversation._id));
         Ok((rt, cursor))
     }
 
@@ -597,11 +613,12 @@ impl Conversations {
         query: String,
         limit: Option<usize>,
     ) -> Result<Vec<Conversation>, BoxError> {
+        let limit = limit.unwrap_or(10).clamp(1, 100);
         let rt = self
             .conversations
             .search_as(Query {
                 search: Some(Search {
-                    text: Some(query.to_string()),
+                    text: Some(query),
                     logical_search: true,
                     ..Default::default()
                 }),
@@ -609,31 +626,57 @@ impl Conversations {
                     "user".to_string(),
                     RangeQuery::Eq(Fv::Bytes(user.as_slice().to_vec())),
                 ))),
-                limit,
+                limit: Some(limit),
             })
             .await?;
         Ok(rt)
     }
 
+    /// Deletes all conversations created before `timestamp` (in milliseconds).
     pub async fn delete_expired_conversations(&self, timestamp: u64) -> Result<u64, BoxError> {
         let period = timestamp / 3600 / 1000;
-        let filter = Filter::Field(("period".to_string(), RangeQuery::Lt(Fv::U64(period))));
-        let ids = self
-            .conversations
-            .search_ids(Query {
-                search: None,
-                filter: Some(filter),
-                limit: None,
-            })
-            .await?;
-        let count = ids.len() as u64;
-        for id in ids {
-            let _ = self.conversations.remove(id).await;
+        let mut count = 0u64;
+        loop {
+            let ids = next_expired_batch(&self.conversations, period).await?;
+            if ids.is_empty() {
+                break;
+            }
+
+            let mut removed = 0u64;
+            for id in ids {
+                if matches!(self.conversations.remove(id).await, Ok(Some(_))) {
+                    removed += 1;
+                }
+            }
+            count += removed;
+            if removed == 0 {
+                // Nothing was removable; stop instead of spinning on undeletable documents.
+                break;
+            }
         }
-        let now_ms = unix_ms();
-        self.conversations.flush(now_ms).await?;
+
+        self.conversations.flush(unix_ms()).await?;
         Ok(count)
     }
+}
+
+/// The maximum number of expired conversations fetched per deletion batch. The database caps
+/// query limits at 1000.
+const DELETE_EXPIRED_BATCH: usize = 1000;
+
+/// Returns the next batch of conversation IDs whose `period` is older than `period`.
+async fn next_expired_batch(conversations: &Collection, period: u64) -> Result<Vec<u64>, BoxError> {
+    let ids = conversations
+        .search_ids(Query {
+            search: None,
+            filter: Some(Filter::Field((
+                "period".to_string(),
+                RangeQuery::Lt(Fv::U64(period)),
+            ))),
+            limit: Some(DELETE_EXPIRED_BATCH),
+        })
+        .await?;
+    Ok(ids)
 }
 
 #[derive(Debug, Clone)]
@@ -646,31 +689,9 @@ pub struct MemoryManagement {
 
 impl MemoryManagement {
     pub async fn connect(db: Arc<AndaDB>, nexus: Arc<CognitiveNexus>) -> Result<Self, BoxError> {
-        let mut schema = Conversation::schema()?;
-        schema.with_version(4);
-
-        let conversations = db
-            .open_or_create_collection(
-                schema,
-                CollectionConfig {
-                    name: "conversations".to_string(),
-                    description: "conversations collection".to_string(),
-                },
-                async |collection| {
-                    // set tokenizer
-                    collection.set_tokenizer(jieba_tokenizer());
-                    // create BTree indexes if not exists
-                    collection.create_btree_index_nx(&["user"]).await?;
-                    collection.create_btree_index_nx(&["thread"]).await?;
-                    collection.create_btree_index_nx(&["period"]).await?;
-                    collection
-                        .create_bm25_index_nx(&["messages", "resources", "artifacts"])
-                        .await?;
-
-                    Ok::<(), DBError>(())
-                },
-            )
-            .await?;
+        let conversations = Conversations::connect(db.clone(), "conversations".to_string())
+            .await?
+            .conversations;
 
         let schema = Resource::schema()?;
         let resources = db
@@ -711,6 +732,13 @@ impl MemoryManagement {
 
     pub fn nexus(&self) -> Arc<CognitiveNexus> {
         self.nexus.clone()
+    }
+
+    /// Views the conversations collection through the shared [`Conversations`] API.
+    fn as_conversations(&self) -> Conversations {
+        Conversations {
+            conversations: self.conversations.clone(),
+        }
     }
 
     pub fn max_conversation_id(&self) -> u64 {
@@ -797,7 +825,12 @@ impl MemoryManagement {
         for r in resources.iter() {
             let rf: ResourceRef = r.into();
             let id = if r._id > 0 {
-                r._id // TODO: check if the resource exists and has permission
+                // Stored resources carry no owner, so only existence can be verified here;
+                // rejecting unknown IDs keeps conversations free of dangling references.
+                if !self.resources.contains(r._id) {
+                    return Err(format!("resource {} does not exist", r._id).into());
+                }
+                r._id
             } else {
                 match self.resources.add_from(&rf).await {
                     Ok(id) => {
@@ -832,9 +865,7 @@ impl MemoryManagement {
         &self,
         conversation: ConversationRef<'_>,
     ) -> Result<u64, DBError> {
-        let id = self.conversations.add_from(&conversation).await?;
-        self.conversations.flush(unix_ms()).await?;
-        Ok(id)
+        self.as_conversations().add_conversation(conversation).await
     }
 
     pub async fn update_conversation(
@@ -842,19 +873,17 @@ impl MemoryManagement {
         id: u64,
         fields: BTreeMap<String, Fv>,
     ) -> Result<(), DBError> {
-        self.conversations.update(id, fields).await?;
-        self.conversations.flush(unix_ms()).await?;
-        Ok(())
+        self.as_conversations()
+            .update_conversation(id, fields)
+            .await
     }
 
     pub async fn get_conversation(&self, id: u64) -> Result<Conversation, DBError> {
-        self.conversations.get_as(id).await
+        self.as_conversations().get_conversation(id).await
     }
 
     pub async fn delete_conversation(&self, id: u64) -> Result<bool, DBError> {
-        let doc = self.conversations.remove(id).await?;
-        self.conversations.flush(unix_ms()).await?;
-        Ok(doc.is_some())
+        self.as_conversations().delete_conversation(id).await
     }
 
     pub async fn list_conversations_by_user(
@@ -863,36 +892,9 @@ impl MemoryManagement {
         cursor: Option<String>,
         limit: Option<usize>,
     ) -> Result<(Vec<Conversation>, Option<String>), BoxError> {
-        let limit = limit.unwrap_or(10).min(100);
-        let cursor = match BTree::from_cursor::<u64>(&cursor)? {
-            Some(cursor) => cursor,
-            None => self.conversations.max_document_id() + 1,
-        };
-        let filter = Some(Filter::And(vec![
-            Box::new(Filter::Field((
-                "user".to_string(),
-                RangeQuery::Eq(Fv::Bytes(user.as_slice().to_vec())),
-            ))),
-            Box::new(Filter::Field((
-                "_id".to_string(),
-                RangeQuery::Lt(Fv::U64(cursor)),
-            ))),
-        ]));
-
-        let rt: Vec<Conversation> = self
-            .conversations
-            .search_as(Query {
-                search: None,
-                filter,
-                limit: Some(limit),
-            })
-            .await?;
-        let cursor = if rt.len() >= limit {
-            BTree::to_cursor(&rt.first().unwrap()._id)
-        } else {
-            None
-        };
-        Ok((rt, cursor))
+        self.as_conversations()
+            .list_conversations_by_user(user, cursor, limit)
+            .await
     }
 
     pub async fn search_conversations(
@@ -901,52 +903,44 @@ impl MemoryManagement {
         query: String,
         limit: Option<usize>,
     ) -> Result<Vec<Conversation>, BoxError> {
-        let rt = self
-            .conversations
-            .search_as(Query {
-                search: Some(Search {
-                    text: Some(query.to_string()),
-                    logical_search: true,
-                    ..Default::default()
-                }),
-                filter: Some(Filter::Field((
-                    "user".to_string(),
-                    RangeQuery::Eq(Fv::Bytes(user.as_slice().to_vec())),
-                ))),
-                limit,
-            })
-            .await?;
-        Ok(rt)
+        self.as_conversations()
+            .search_conversations(user, query, limit)
+            .await
     }
 
+    /// Deletes all conversations created before `timestamp` (in milliseconds), together with the
+    /// resources and artifacts they reference.
     pub async fn delete_expired_conversations(&self, timestamp: u64) -> Result<u64, BoxError> {
         let period = timestamp / 3600 / 1000;
-        let filter = Filter::Field(("period".to_string(), RangeQuery::Lt(Fv::U64(period))));
-        let ids = self
-            .conversations
-            .search_ids(Query {
-                search: None,
-                filter: Some(filter),
-                limit: None,
-            })
-            .await?;
-        let count = ids.len() as u64;
-        for id in ids {
-            if let Ok(Some(doc)) = self.conversations.remove(id).await
-                && let Ok(conversation) = doc.try_into::<Conversation>()
-            {
-                for resource in conversation.resources {
-                    if resource._id > 0 {
-                        let _ = self.resources.remove(resource._id).await;
-                    }
-                }
+        let mut count = 0u64;
+        loop {
+            let ids = next_expired_batch(&self.conversations, period).await?;
+            if ids.is_empty() {
+                break;
+            }
 
-                for artifact in conversation.artifacts {
-                    if artifact._id > 0 {
-                        let _ = self.resources.remove(artifact._id).await;
+            let mut removed = 0u64;
+            for id in ids {
+                if let Ok(Some(doc)) = self.conversations.remove(id).await {
+                    removed += 1;
+                    if let Ok(conversation) = doc.try_into::<Conversation>() {
+                        for resource in conversation
+                            .resources
+                            .into_iter()
+                            .chain(conversation.artifacts)
+                        {
+                            if resource._id > 0 {
+                                let _ = self.resources.remove(resource._id).await;
+                            }
+                        }
                     }
                 }
-            };
+            }
+            count += removed;
+            if removed == 0 {
+                // Nothing was removable; stop instead of spinning on undeletable documents.
+                break;
+            }
         }
 
         let now_ms = unix_ms();
@@ -1483,6 +1477,22 @@ impl Tool<BaseCtx> for MemoryTool {
                     return Err("permission denied".into());
                 }
 
+                // Ownership is established through the conversation, so the resource must
+                // actually belong to it; otherwise any caller could read arbitrary resources
+                // by pairing them with a conversation they own.
+                if !conversation
+                    .resources
+                    .iter()
+                    .chain(conversation.artifacts.iter())
+                    .any(|resource| resource._id == _id)
+                {
+                    return Err(format!(
+                        "permission denied: resource {_id} does not belong to conversation {}",
+                        conversation._id
+                    )
+                    .into());
+                }
+
                 let mut res = self.memory.get_resource(_id).await?;
                 if res.blob.is_none()
                     && let Some(uri) = &res.uri
@@ -1621,6 +1631,8 @@ impl Tool<BaseCtx> for MemoryTool {
                 }))
             }
             MemoryToolArgs::ListPrevConversations { cursor, limit } => {
+                // Models often send "" instead of null for the first page.
+                let cursor = cursor.filter(|cursor| !cursor.is_empty());
                 let (conversations, next_cursor) = self
                     .memory
                     .list_conversations_by_user(ctx.caller(), cursor, limit)
@@ -2148,6 +2160,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pagination_batch_and_expiry_handle_limits_robustly() {
+        let conversations = test_conversations("pagination_test").await;
+        let user = principal(8);
+
+        let mut ids = Vec::new();
+        for i in 0..12u64 {
+            let item = conversation(user, &format!("topic {i}"), i + 1);
+            ids.push(
+                conversations
+                    .add_conversation(ConversationRef::from(&item))
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        // batch_get must return all requested conversations, not the database default of 10.
+        let batch = conversations
+            .batch_get_conversations(&user, ids.clone())
+            .await
+            .unwrap();
+        assert_eq!(batch.len(), 12);
+        assert!(
+            conversations
+                .batch_get_conversations(&user, Vec::new())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // limit 0 is clamped instead of panicking or returning everything.
+        let (page, _) = conversations
+            .list_conversations_by_user(&user, None, Some(0))
+            .await
+            .unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0]._id, *ids.last().unwrap());
+
+        // Pages are newest-first and the cursor walks backwards without overlap.
+        let mut seen = Vec::new();
+        let mut cursor = None;
+        loop {
+            let (page, next) = conversations
+                .list_conversations_by_user(&user, cursor, Some(5))
+                .await
+                .unwrap();
+            seen.extend(page.iter().map(|conversation| conversation._id));
+            match next {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        assert_eq!(seen.len(), 12);
+        assert!(
+            seen.windows(2).all(|pair| pair[0] > pair[1]),
+            "pages must be newest-first without duplicates: {seen:?}"
+        );
+
+        // Expired deletion must drain everything, not just the first database batch of 10.
+        let memory = test_memory().await;
+        let expiring_user = principal(9);
+        for i in 0..12u64 {
+            let item = conversation(expiring_user, &format!("expiring {i}"), i + 1);
+            memory
+                .add_conversation(ConversationRef::from(&item))
+                .await
+                .unwrap();
+        }
+        let deleted = memory
+            .delete_expired_conversations(13 * 3600 * 1000)
+            .await
+            .unwrap();
+        assert_eq!(deleted, 12);
+
+        // Referencing a resource ID that does not exist is rejected.
+        let err = memory
+            .try_add_resources(&[Resource {
+                _id: 999_999,
+                ..resource("ghost", Some(b"ghost"))
+            }])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("does not exist"));
+    }
+
+    #[tokio::test]
     async fn memory_management_resources_conversations_and_descriptions() {
         let memory = test_memory().await;
         let user = principal(4);
@@ -2432,6 +2529,35 @@ mod tests {
                 MemoryToolArgs::GetResource {
                     _id: text_id,
                     conversation: conversation_id,
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(output.output, Response::Ok { .. }));
+
+        // A resource that the conversation does not reference must be rejected even for the
+        // conversation owner.
+        let denied = memory_tool
+            .call(
+                ctx.clone(),
+                MemoryToolArgs::GetResource {
+                    _id: binary_id,
+                    conversation: conversation_id,
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(denied.to_string().contains("does not belong"));
+
+        // Models often send "" for the first page and 0 for the default limit.
+        let output = memory_tool
+            .call(
+                ctx.clone(),
+                MemoryToolArgs::ListPrevConversations {
+                    cursor: Some(String::new()),
+                    limit: Some(0),
                 },
                 Vec::new(),
             )

@@ -23,6 +23,10 @@ pub use write::*;
 
 pub(crate) const MAX_FILE_SIZE_BYTES: u64 = 10 * 1024 * 1024;
 
+/// Maximum bytes of file content returned inline in a tool response. Larger
+/// content is truncated so a single read cannot flood the model context.
+pub(crate) const MAX_INLINE_CONTENT_BYTES: usize = 256 * 1024;
+
 pub(crate) const UTF8_ENCODING: &str = "utf8";
 pub(crate) const BASE64_ENCODING: &str = "base64";
 
@@ -379,12 +383,16 @@ fn decode_file_text_with_fallback(
     bytes: Vec<u8>,
     fallback_encoding: Option<&'static Encoding>,
 ) -> Result<DecodedFileText, Vec<u8>> {
-    if let Ok(text) = std::str::from_utf8(&bytes) {
-        return Ok(DecodedFileText {
-            text: text.to_string(),
-            encoding: UTF8_ENCODING.to_string(),
-        });
-    }
+    // Take ownership on success so valid UTF-8 content is not copied.
+    let bytes = match String::from_utf8(bytes) {
+        Ok(text) => {
+            return Ok(DecodedFileText {
+                text,
+                encoding: UTF8_ENCODING.to_string(),
+            });
+        }
+        Err(err) => err.into_bytes(),
+    };
 
     let Some(encoding) = fallback_encoding else {
         return Err(bytes);
@@ -423,6 +431,26 @@ pub(crate) fn encode_file_text(
 fn is_text_like(text: &str) -> bool {
     text.chars()
         .all(|ch| matches!(ch, '\n' | '\r' | '\t' | '\u{000c}') || !ch.is_control())
+}
+
+/// Truncates `content` to at most `max_bytes`, preferring a line boundary and
+/// falling back to a character boundary. Returns true when content was cut.
+pub(crate) fn truncate_inline_text(content: &mut String, max_bytes: usize) -> bool {
+    if content.len() <= max_bytes {
+        return false;
+    }
+
+    let mut end = max_bytes;
+    while end > 0 && !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    let cut = match content[..end].rfind('\n') {
+        // Keep whole lines when possible; a single oversized line is cut at `end`.
+        Some(idx) if idx > 0 => idx + 1,
+        _ => end,
+    };
+    content.truncate(cut);
+    true
 }
 
 /// Returns true when a file has multiple hard links.
@@ -769,6 +797,27 @@ mod tests {
             encode_file_text("hello", "not-an-encoding").unwrap_err(),
             FileTextEncodeError::UnsupportedEncoding
         );
+    }
+
+    #[test]
+    fn truncate_inline_text_prefers_line_then_char_boundaries() {
+        let mut text = "short".to_string();
+        assert!(!truncate_inline_text(&mut text, 10));
+        assert_eq!(text, "short");
+
+        let mut text = "line one\nline two\nline three".to_string();
+        assert!(truncate_inline_text(&mut text, 20));
+        assert_eq!(text, "line one\nline two\n");
+
+        // A single oversized line is cut at a char boundary instead of dropped.
+        let mut text = "中文内容没有换行".to_string();
+        assert!(truncate_inline_text(&mut text, 10));
+        assert_eq!(text, "中文内");
+
+        // A leading newline does not produce an empty result.
+        let mut text = "\nabcdefghijklmnop".to_string();
+        assert!(truncate_inline_text(&mut text, 8));
+        assert_eq!(text, "\nabcdefg");
     }
 
     #[test]

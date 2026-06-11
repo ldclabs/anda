@@ -38,6 +38,8 @@ use crate::APP_USER_AGENT;
 pub use anda_core::ModelEffort;
 
 const MODEL_REQUEST_MAX_RETRIES: usize = 1;
+const MODEL_RETRY_BACKOFF: Duration = Duration::from_millis(300);
+const MODEL_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(1);
 
 /// Serializable configuration for constructing a model adapter.
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
@@ -303,8 +305,7 @@ impl Models {
         if label.is_empty() {
             return self.get_model();
         }
-        self.get(&label.to_ascii_lowercase())
-            .or_else(|| self.get_model())
+        self.get(label).or_else(|| self.get_model())
     }
 }
 
@@ -636,6 +637,7 @@ where
                 );
                 if retryable && attempt < MODEL_REQUEST_MAX_RETRIES {
                     log_completion_retry(model, attempt + 1, &message);
+                    backoff_before_retry(None).await;
                     continue;
                 }
 
@@ -653,6 +655,7 @@ where
                 Ok(output) => return Ok(output),
                 Err(err) if is_retryable_box_error(&err) && attempt < MODEL_REQUEST_MAX_RETRIES => {
                     log_completion_retry(model, attempt + 1, &err.to_string());
+                    backoff_before_retry(None).await;
                     continue;
                 }
                 Err(err) => return Err(err),
@@ -671,6 +674,7 @@ where
                 );
                 if retryable && attempt < MODEL_REQUEST_MAX_RETRIES {
                     log_completion_retry(model, attempt + 1, &message);
+                    backoff_before_retry(retry_after).await;
                     continue;
                 }
 
@@ -690,6 +694,7 @@ where
 
         if retryable && attempt < MODEL_REQUEST_MAX_RETRIES {
             log_completion_retry(model, attempt + 1, &message);
+            backoff_before_retry(retry_after).await;
             continue;
         }
 
@@ -704,14 +709,33 @@ where
     unreachable!("completion retry loop always returns before exhausting attempts")
 }
 
+/// Sleeps briefly before the single in-SDK retry so transient overload
+/// (429/5xx/connection flaps) has a chance to clear. The upstream `Retry-After`
+/// hint is honored up to a small cap; longer waits are the responsibility of
+/// upper layers, which receive the hint via [`ModelError::retry_after`].
+async fn backoff_before_retry(retry_after: Option<Duration>) {
+    let delay = retry_after
+        .unwrap_or(MODEL_RETRY_BACKOFF)
+        .min(MODEL_RETRY_MAX_BACKOFF);
+    tokio::time::sleep(delay).await;
+}
+
 fn retry_after_duration(headers: &http::HeaderMap) -> Option<Duration> {
-    let seconds = headers
+    let value = headers
         .get(http::header::RETRY_AFTER)?
         .to_str()
         .ok()?
-        .parse::<u64>()
-        .ok()?;
-    Some(Duration::from_secs(seconds))
+        .trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+
+    // HTTP-date form, e.g. "Wed, 21 Oct 2026 07:28:00 GMT", common from
+    // gateways and CDNs in front of model providers.
+    let when = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+    (when.with_timezone(&chrono::Utc) - chrono::Utc::now())
+        .to_std()
+        .ok()
 }
 
 fn log_completion_retry(model: &str, retry: usize, reason: &str) {
@@ -770,7 +794,10 @@ pub fn request_client_builder() -> reqwest::ClientBuilder {
         .http2_keep_alive_timeout(Duration::from_secs(15))
         .http2_keep_alive_while_idle(true)
         .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(300))
+        // Total request timeout, including the streamed body. Heavy reasoning
+        // completions can run for many minutes; provider SDKs default to 10
+        // minutes. Stalled connections are detected earlier by h2 keep-alive.
+        .timeout(Duration::from_secs(600))
         .user_agent(APP_USER_AGENT)
         .default_headers({
             let mut headers = reqwest::header::HeaderMap::new();
@@ -801,8 +828,8 @@ where
         body.extend_from_slice(&chunk);
         // Only scan the unscanned tail (with marker-sized overlap), so long
         // streams are not rescanned from the start on every chunk.
-        let start = scanned.saturating_sub(SSE_DONE_MARKER.len() - 1);
-        if body_contains_sse_done(&body[start..]) {
+        let start = scanned.saturating_sub(SSE_DONE_MARKER.len());
+        if body_contains_sse_done(&body, start) {
             return parse_streaming_json_events(&body, model);
         }
         scanned = body.len();
@@ -811,9 +838,18 @@ where
     parse_streaming_json_events(&body, model)
 }
 
-fn body_contains_sse_done(body: &[u8]) -> bool {
-    body.windows(SSE_DONE_MARKER.len())
-        .any(|window| window == SSE_DONE_MARKER)
+/// Returns true when a `data: [DONE]` line exists at or after `from`.
+///
+/// The marker must be anchored at the start of an SSE line (buffer start or a
+/// preceding `\n`). Generated content inside a JSON string can legitimately
+/// contain the marker text, and must not terminate the stream early.
+fn body_contains_sse_done(body: &[u8], from: usize) -> bool {
+    if from == 0 && body.starts_with(SSE_DONE_MARKER) {
+        return true;
+    }
+    body[from..]
+        .windows(SSE_DONE_MARKER.len() + 1)
+        .any(|window| window[0] == b'\n' && &window[1..] == SSE_DONE_MARKER)
 }
 
 fn parse_streaming_json_events<T>(body: &[u8], model: &str) -> Result<Vec<T>, BoxError>
@@ -1049,6 +1085,37 @@ mod tests {
                       data: {\"a\":1}\n\n\
                       data: [DONE]\n\n",
                 )
+                .await
+                .unwrap();
+            let _ = socket.shutdown().await;
+        });
+        format!("http://{addr}")
+    }
+
+    /// Sends an event whose JSON content embeds the literal `data: [DONE]`
+    /// text in an early chunk, then a second event and the real terminator
+    /// in a later chunk.
+    async fn spawn_sse_with_done_marker_in_content_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            let _ = socket.read(&mut request).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+                      Content-Type: text/event-stream\r\n\
+                      Connection: close\r\n\
+                      \r\n\
+                      data: {\"text\":\"sse ends with data: [DONE]\"}\n\n",
+                )
+                .await
+                .unwrap();
+            socket.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            socket
+                .write_all(b"data: {\"b\":2}\n\ndata: [DONE]\n\n")
                 .await
                 .unwrap();
             let _ = socket.shutdown().await;
@@ -1425,6 +1492,77 @@ mod tests {
             .unwrap();
 
         assert_eq!(events, vec![serde_json::json!({"a": 1})]);
+    }
+
+    #[test]
+    fn sse_done_detection_is_line_anchored() {
+        assert!(body_contains_sse_done(b"data: [DONE]\n\n", 0));
+        assert!(body_contains_sse_done(
+            b"data: {\"a\":1}\n\ndata: [DONE]\n\n",
+            0
+        ));
+        // The marker text inside generated JSON content must not terminate
+        // the stream.
+        assert!(!body_contains_sse_done(
+            b"data: {\"text\":\"sse ends with data: [DONE]\"}\n\n",
+            0
+        ));
+    }
+
+    #[tokio::test]
+    async fn streaming_reader_is_not_truncated_by_done_marker_in_content() {
+        let endpoint = spawn_sse_with_done_marker_in_content_server().await;
+        let client = request_client_builder()
+            .https_only(false)
+            .no_proxy()
+            .build()
+            .unwrap();
+        let response = client.get(endpoint).send().await.unwrap();
+
+        let events = read_sse_json_events::<serde_json::Value>(response, "test-model")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            events,
+            vec![
+                serde_json::json!({"text": "sse ends with data: [DONE]"}),
+                serde_json::json!({"b": 2})
+            ]
+        );
+    }
+
+    #[test]
+    fn retry_after_parses_seconds_and_http_date() {
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::RETRY_AFTER, HeaderValue::from_static("42"));
+        assert_eq!(
+            retry_after_duration(&headers),
+            Some(Duration::from_secs(42))
+        );
+
+        let when = chrono::Utc::now() + chrono::Duration::seconds(90);
+        headers.insert(
+            http::header::RETRY_AFTER,
+            HeaderValue::from_str(&when.to_rfc2822()).unwrap(),
+        );
+        let parsed = retry_after_duration(&headers).expect("http-date should parse");
+        assert!(parsed <= Duration::from_secs(90));
+        assert!(parsed >= Duration::from_secs(80));
+
+        // A date in the past yields no delay hint.
+        let when = chrono::Utc::now() - chrono::Duration::seconds(90);
+        headers.insert(
+            http::header::RETRY_AFTER,
+            HeaderValue::from_str(&when.to_rfc2822()).unwrap(),
+        );
+        assert_eq!(retry_after_duration(&headers), None);
+
+        headers.insert(
+            http::header::RETRY_AFTER,
+            HeaderValue::from_static("not-a-date"),
+        );
+        assert_eq!(retry_after_duration(&headers), None);
     }
 
     #[tokio::test]

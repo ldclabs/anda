@@ -6,7 +6,7 @@ use candid::{
 };
 use ciborium::from_reader;
 use ic_agent::identity::{AnonymousIdentity, BasicIdentity, Secp256k1Identity};
-use ic_auth_types::deterministic_cbor_into_vec;
+use ic_auth_types::{ByteBufB64, deterministic_cbor_into_vec};
 use ic_auth_verifier::envelope::SignedEnvelope;
 use ic_cose::client::CoseSDK;
 use ic_cose_types::{
@@ -35,6 +35,7 @@ pub struct Client {
     outer_http: reqwest::Client,
     root_secret: [u8; 48],
     identity: Arc<dyn Identity>,
+    principal: Principal,
     agent: Agent,
     cose_canister: Principal,
     allow_http: bool,
@@ -78,10 +79,16 @@ pub fn load_identity(id_secret_or_path: &str) -> Result<Box<dyn Identity>, BoxEr
     match identity_from_pem(id_secret_or_path) {
         Ok(identity) => Ok(identity),
         Err(_) => {
-            let id_secret = hex::decode(id_secret_or_path)?;
-            let id_secret: [u8; 32] = id_secret
-                .try_into()
-                .map_err(|_| format!("invalid id_secret: {id_secret_or_path:?}"))?;
+            // Never echo the input back: it may be a (mistyped) secret.
+            let id_secret = hex::decode(id_secret_or_path).map_err(
+                |_| "invalid id_secret: expected a PEM file path or a 32-byte hex secret",
+            )?;
+            let id_secret: [u8; 32] = id_secret.try_into().map_err(|secret: Vec<u8>| {
+                format!(
+                    "invalid id_secret length: expected 32 bytes, got {}",
+                    secret.len()
+                )
+            })?;
             Ok(identity_from_secret(id_secret))
         }
     }
@@ -147,8 +154,11 @@ impl ClientBuilder {
     pub async fn build(self) -> Result<Client, BoxError> {
         let identity = match self.identity {
             Some(identity) => identity,
-            None => Arc::new(identity_from_secret(sha3_256(&self.root_secret))),
+            None => Arc::from(identity_from_secret(sha3_256(&self.root_secret))),
         };
+        let principal = identity
+            .sender()
+            .map_err(|err| format!("failed to get the principal from identity: {err}"))?;
 
         let agent = match self.agent {
             Some(agent) => agent,
@@ -159,14 +169,9 @@ impl ClientBuilder {
                     .with_verify_query_signatures(false)
                     .build()?;
 
-                // let agent = if self.ic_host.starts_with("https://") {
-                //     agent.with_background_dynamic_routing().build()?
-                // } else {
-                //     agent.build()?
-                // };
-
                 if self.ic_host.starts_with("http://") {
-                    // ignore error
+                    // local replica: ignore the error so the client can still be
+                    // constructed when the replica is not running yet
                     let _ = agent.fetch_root_key().await;
                 }
                 agent
@@ -192,6 +197,7 @@ impl ClientBuilder {
             outer_http,
             root_secret: self.root_secret,
             identity,
+            principal,
             agent,
             cose_canister: self.cose_canister,
             allow_http: self.allow_http,
@@ -204,10 +210,9 @@ impl Client {
         ClientBuilder::default()
     }
 
+    /// Returns the principal of the client identity, resolved at build time.
     pub fn get_principal(&self) -> Principal {
-        self.identity
-            .sender()
-            .expect("Failed to get sender principal")
+        self.principal
     }
 
     pub async fn sign_envelope(
@@ -217,13 +222,69 @@ impl Client {
         let se = SignedEnvelope::sign_digest(&self.identity, message_digest.into())?;
         Ok(se)
     }
+
+    /// Ensures the URL uses HTTPS, unless `allow_http` was enabled for local tests.
+    fn check_url(&self, url: &str) -> Result<(), BoxError> {
+        if !self.allow_http && !url.starts_with("https://") {
+            return Err(format!("Invalid url {url:?}, must start with https://").into());
+        }
+        Ok(())
+    }
+
+    /// Signs `message_digest` with the client identity and merges the
+    /// authorization headers into `headers`.
+    fn sign_headers(
+        &self,
+        message_digest: [u8; 32],
+        headers: Option<http::HeaderMap>,
+    ) -> Result<http::HeaderMap, BoxError> {
+        let se = SignedEnvelope::sign_digest(&self.identity, message_digest.into())?;
+        let mut headers = headers.unwrap_or_default();
+        se.to_authorization(&mut headers)?;
+        Ok(headers)
+    }
+
+    /// Builds the signed authorization headers and CBOR body for a signed RPC
+    /// request with CBOR-encoded `params`.
+    fn signed_rpc_request(
+        &self,
+        method: &str,
+        params: Vec<u8>,
+    ) -> Result<(http::HeaderMap, Vec<u8>), BoxError> {
+        let params: ByteBufB64 = params.into();
+        let req = RPCRequestRef {
+            method,
+            params: &params,
+        };
+        let body = deterministic_cbor_into_vec(&req)?;
+        let digest: [u8; 32] = sha3_256(&body);
+        let headers = self.sign_headers(digest, None)?;
+        Ok((headers, body))
+    }
+}
+
+/// Sends an HTTP request with optional headers and body using the given client.
+async fn send_request(
+    http: reqwest::Client,
+    url: String,
+    method: http::Method,
+    headers: Option<http::HeaderMap>,
+    body: Option<Vec<u8>>,
+) -> Result<reqwest::Response, BoxError> {
+    let mut req = http.request(method, url);
+    if let Some(headers) = headers {
+        req = req.headers(headers);
+    }
+    if let Some(body) = body {
+        req = req.body(body);
+    }
+
+    req.send().await.map_err(|e| e.into())
 }
 
 impl Web3ClientFeatures for Client {
     fn get_principal(&self) -> Principal {
-        self.identity
-            .sender()
-            .expect("Failed to get sender principal")
+        self.principal
     }
 
     fn sign_envelope(
@@ -442,24 +503,17 @@ impl Web3ClientFeatures for Client {
         headers: Option<http::HeaderMap>,
         body: Option<Vec<u8>>, // default is empty
     ) -> BoxPinFut<Result<reqwest::Response, BoxError>> {
-        if !self.allow_http && !url.starts_with("https://") {
-            return Box::pin(futures::future::ready(Err(
-                "Invalid url, must start with https://".into(),
-            )));
+        if let Err(err) = self.check_url(&url) {
+            return Box::pin(futures::future::ready(Err(err)));
         }
 
-        let outer_http = self.outer_http.clone();
-        Box::pin(async move {
-            let mut req = outer_http.request(method, url);
-            if let Some(headers) = headers {
-                req = req.headers(headers);
-            }
-            if let Some(body) = body {
-                req = req.body(body);
-            }
-
-            req.send().await.map_err(|e| e.into())
-        })
+        Box::pin(send_request(
+            self.outer_http.clone(),
+            url,
+            method,
+            headers,
+            body,
+        ))
     }
 
     fn https_signed_call(
@@ -470,31 +524,21 @@ impl Web3ClientFeatures for Client {
         headers: Option<http::HeaderMap>,
         body: Option<Vec<u8>>, // default is empty
     ) -> BoxPinFut<Result<reqwest::Response, BoxError>> {
-        if !self.allow_http && !url.starts_with("https://") {
-            return Box::pin(futures::future::ready(Err(
-                "Invalid url, must start with https://".into(),
-            )));
+        if let Err(err) = self.check_url(&url) {
+            return Box::pin(futures::future::ready(Err(err)));
         }
-
-        let se = match SignedEnvelope::sign_digest(&self.identity, message_digest.into()) {
-            Ok(se) => se,
-            Err(err) => return Box::pin(futures::future::ready(Err(err.into()))),
+        let headers = match self.sign_headers(message_digest, headers) {
+            Ok(headers) => headers,
+            Err(err) => return Box::pin(futures::future::ready(Err(err))),
         };
-        let mut headers = headers.unwrap_or_default();
-        if let Err(err) = se.to_authorization(&mut headers) {
-            return Box::pin(futures::future::ready(Err(err.into())));
-        }
 
-        let outer_http = self.outer_http.clone();
-        Box::pin(async move {
-            let mut req = outer_http.request(method, url);
-            req = req.headers(headers);
-            if let Some(body) = body {
-                req = req.body(body);
-            }
-
-            req.send().await.map_err(|e| e.into())
-        })
+        Box::pin(send_request(
+            self.outer_http.clone(),
+            url,
+            method,
+            Some(headers),
+            body,
+        ))
     }
 
     fn https_signed_rpc_raw(
@@ -503,29 +547,13 @@ impl Web3ClientFeatures for Client {
         method: String,
         args: Vec<u8>,
     ) -> BoxPinFut<Result<Vec<u8>, BoxError>> {
-        if !self.allow_http && !endpoint.starts_with("https://") {
-            return Box::pin(futures::future::ready(Err(
-                "Invalid endpoint, must start with https://".into(),
-            )));
+        if let Err(err) = self.check_url(&endpoint) {
+            return Box::pin(futures::future::ready(Err(err)));
         }
-
-        let req = RPCRequestRef {
-            method: &method,
-            params: &args.into(),
+        let (headers, body) = match self.signed_rpc_request(&method, args) {
+            Ok(req) => req,
+            Err(err) => return Box::pin(futures::future::ready(Err(err))),
         };
-        let body = match deterministic_cbor_into_vec(&req) {
-            Ok(body) => body,
-            Err(err) => return Box::pin(futures::future::ready(Err(err.into()))),
-        };
-        let digest: [u8; 32] = sha3_256(&body);
-        let se = match SignedEnvelope::sign_digest(&self.identity, digest.into()) {
-            Ok(se) => se,
-            Err(err) => return Box::pin(futures::future::ready(Err(err.into()))),
-        };
-        let mut headers = http::HeaderMap::new();
-        if let Err(err) = se.to_authorization(&mut headers) {
-            return Box::pin(futures::future::ready(Err(err.into())));
-        }
 
         let outer_http = self.outer_http.clone();
         Box::pin(async move {
@@ -550,18 +578,15 @@ impl HttpFeatures for Client {
         headers: Option<http::HeaderMap>,
         body: Option<Vec<u8>>, // default is empty
     ) -> Result<reqwest::Response, BoxError> {
-        if !self.allow_http && !url.starts_with("https://") {
-            return Err("Invalid url, must start with https://".into());
-        }
-        let mut req = self.outer_http.request(method, url);
-        if let Some(headers) = headers {
-            req = req.headers(headers);
-        }
-        if let Some(body) = body {
-            req = req.body(body);
-        }
-
-        req.send().await.map_err(|e| e.into())
+        self.check_url(url)?;
+        send_request(
+            self.outer_http.clone(),
+            url.to_string(),
+            method,
+            headers,
+            body,
+        )
+        .await
     }
 
     /// Makes a signed HTTPs request with message authentication
@@ -580,21 +605,16 @@ impl HttpFeatures for Client {
         headers: Option<http::HeaderMap>,
         body: Option<Vec<u8>>, // default is empty
     ) -> Result<reqwest::Response, BoxError> {
-        if !self.allow_http && !url.starts_with("https://") {
-            return Err("Invalid url, must start with https://".into());
-        }
-
-        let se = SignedEnvelope::sign_digest(&self.identity, message_digest.into())?;
-        let mut headers = headers.unwrap_or_default();
-        se.to_authorization(&mut headers)?;
-
-        let mut req = self.outer_http.request(method, url);
-        req = req.headers(headers);
-        if let Some(body) = body {
-            req = req.body(body);
-        }
-
-        req.send().await.map_err(|e| e.into())
+        self.check_url(url)?;
+        let headers = self.sign_headers(message_digest, headers)?;
+        send_request(
+            self.outer_http.clone(),
+            url.to_string(),
+            method,
+            Some(headers),
+            body,
+        )
+        .await
     }
 
     /// Makes a signed CBOR-encoded RPC call
@@ -612,20 +632,10 @@ impl HttpFeatures for Client {
     where
         T: DeserializeOwned,
     {
-        if !self.allow_http && !endpoint.starts_with("https://") {
-            return Err("Invalid endpoint, must start with https://".into());
-        }
+        self.check_url(endpoint)?;
         let args = deterministic_cbor_into_vec(&args)?;
-        let req = RPCRequestRef {
-            method,
-            params: &args.into(),
-        };
-        let body = deterministic_cbor_into_vec(&req)?;
-        let digest: [u8; 32] = sha3_256(&body);
-        let se = SignedEnvelope::sign_digest(&self.identity, digest.into())?;
-        let mut headers = http::HeaderMap::new();
-        se.to_authorization(&mut headers)?;
-        let res = cbor_rpc(&self.outer_http, endpoint, &method, Some(headers), body).await?;
+        let (headers, body) = self.signed_rpc_request(method, args)?;
+        let res = cbor_rpc(&self.outer_http, endpoint, method, Some(headers), body).await?;
         let res = from_reader(&res[..])?;
         Ok(res)
     }

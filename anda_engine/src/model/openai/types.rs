@@ -383,6 +383,18 @@ impl CompletionResponse {
                 output.chat_history.push(msg);
             }
             output.failed_reason = failed_reason;
+
+            // A non-success terminal status (e.g. `incomplete` after
+            // `max_output_tokens` truncation) must surface as a failure even
+            // when the response carries no explicit error object, matching the
+            // finish/stop reason handling of the other adapters.
+            if output.failed_reason.is_none() && self.status.is_failure() {
+                let mut reason = json!({ "status": self.status.as_str() });
+                if let Some(details) = &self.incomplete_details {
+                    reason["incomplete_details"] = json!(details);
+                }
+                output.failed_reason = Some(reason.to_string());
+            }
         }
 
         Ok(output)
@@ -390,6 +402,7 @@ impl CompletionResponse {
 
     pub fn maybe_failed(&self) -> bool {
         self.error.is_some()
+            || self.status.is_failure()
             || self.parsed_output.is_empty()
             || self.parsed_output.iter().any(|item| {
                 if let MessageItem::Message { content, .. } = item {
@@ -2713,6 +2726,15 @@ impl ResponseStatus {
             Self::Other(value) => value.as_str(),
         }
     }
+
+    /// Returns true for explicit non-success terminal statuses.
+    ///
+    /// `in_progress`/`queued`/unknown statuses are not failures: stream
+    /// aggregation may legitimately end on an `in_progress` snapshot when a
+    /// provider omits the final `response.completed` event.
+    fn is_failure(&self) -> bool {
+        matches!(self, Self::Failed | Self::Cancelled | Self::Incomplete)
+    }
 }
 
 impl Serialize for ResponseStatus {
@@ -3597,6 +3619,66 @@ mod tests {
             response.additional_parameters.service_tier,
             Some(OpenAIServiceTier::Other(ref tier)) if tier == "economy"
         ));
+    }
+
+    #[test]
+    fn non_success_terminal_status_surfaces_as_failed_reason() {
+        fn response_with_status(status: &str) -> CompletionResponse {
+            let mut response: CompletionResponse = serde_json::from_value(json!({
+                "id": "resp_incomplete",
+                "object": "response",
+                "created_at": 1741294021,
+                "status": status,
+                "error": null,
+                "incomplete_details": if status == "incomplete" {
+                    json!({"reason": "max_output_tokens"})
+                } else {
+                    Json::Null
+                },
+                "model": "gpt-5.4",
+                "output": [{
+                    "type": "message",
+                    "id": "msg_1",
+                    "role": "assistant",
+                    "status": status,
+                    "content": [{"type": "output_text", "text": "truncated answe"}]
+                }],
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 5,
+                    "total_tokens": 15
+                },
+                "metadata": {}
+            }))
+            .unwrap();
+            response.parse_output();
+            response
+        }
+
+        for status in ["incomplete", "failed", "cancelled"] {
+            let response = response_with_status(status);
+            assert!(response.maybe_failed(), "{status} should be maybe_failed");
+            let output = response.try_into(Vec::new(), Vec::new()).unwrap();
+            let failed_reason = output
+                .failed_reason
+                .unwrap_or_else(|| panic!("{status} should set failed_reason"));
+            assert!(failed_reason.contains(status));
+            if status == "incomplete" {
+                assert!(failed_reason.contains("max_output_tokens"));
+            }
+            // Partial content is preserved alongside the failure signal.
+            assert_eq!(output.content, "truncated answe");
+        }
+
+        // Success and tolerated statuses stay non-failing.
+        for status in ["completed", "in_progress"] {
+            let response = response_with_status(status);
+            let output = response.try_into(Vec::new(), Vec::new()).unwrap();
+            assert!(
+                output.failed_reason.is_none(),
+                "{status} should not set failed_reason"
+            );
+        }
     }
 
     #[test]

@@ -16,6 +16,9 @@ use crate::{
 };
 
 const DEFAULT_LIMIT: usize = 1000;
+/// Hard cap on collected matches across all workspaces. Scanning stops here so
+/// pathological patterns (e.g. `**/*` over a huge tree) stay bounded.
+const MAX_GLOB_MATCHES: usize = 10_000;
 
 /// Arguments for filesystem glob operations.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -34,6 +37,10 @@ pub struct SearchFileOutput {
     pub paths: Vec<String>,
     /// Total matches before applying `limit`.
     pub total_matches: usize,
+    /// True when scanning stopped early at the internal match cap; `total_matches`
+    /// is a lower bound. Narrow the pattern to see the rest.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub scan_truncated: bool,
 }
 
 pub type SearchFileHook = DynToolHook<SearchFileArgs, SearchFileOutput>;
@@ -130,8 +137,9 @@ impl Tool<BaseCtx> for SearchFileTool {
         let mut paths = Vec::new();
         let mut errors = Vec::new();
         let mut searched_any_workspace = false;
+        let mut scan_truncated = false;
 
-        for workspace in &workspaces {
+        'workspaces: for workspace in &workspaces {
             let workspace_display = workspace.display().to_string();
             let (resolved_workspace, pattern, restrict_to_workspace_targets) =
                 match resolve_glob_pattern(workspace, &args.pattern).await {
@@ -153,35 +161,53 @@ impl Tool<BaseCtx> for SearchFileTool {
                     )
                 })?
             {
-                let path = entry.map_err(|err| {
-                    format!(
-                        "Failed to expand glob pattern (workspace: {}, requested_pattern: {}, expanded_pattern: {}): {err}",
-                        workspace_display,
-                        args.pattern,
-                        pattern
-                    )
-                })?;
-                let resolved_path = tokio::fs::canonicalize(&path)
-                    .await
-                    .map_err(|err| {
-                        format!(
-                            "Failed to resolve matched path (workspace: {}, requested_pattern: {}, expanded_pattern: {}, matched_path: {}): {err}",
-                            workspace_display,
-                            args.pattern,
-                            pattern,
-                            path.display()
-                        )
-                    })?;
-                if restrict_to_workspace_targets {
-                    ensure_path_in_workspace(&resolved_workspace, &resolved_path)?;
-                }
+                // Unreadable directories or entries removed mid-scan must not fail the
+                // whole search; skip them and keep matching.
+                let Ok(path) = entry else {
+                    continue;
+                };
 
-                paths.push(relative_match_path(
-                    &path,
-                    &resolved_path,
-                    workspace,
-                    &resolved_workspace,
-                )?);
+                // Canonicalizing every match is only needed to verify parent-traversal
+                // patterns; plain patterns are already confined to the workspace
+                // namespace, which also keeps dangling symlink matches listable.
+                let resolved_path = if restrict_to_workspace_targets {
+                    match tokio::fs::canonicalize(&path).await {
+                        // A match escaping the workspace (via symlinks) is skipped, not fatal.
+                        Ok(resolved) => {
+                            if ensure_path_in_workspace(&resolved_workspace, &resolved).is_err() {
+                                continue;
+                            }
+                            Some(resolved)
+                        }
+                        // Dangling symlink or removed mid-scan.
+                        Err(_) => continue,
+                    }
+                } else {
+                    None
+                };
+
+                let relative = match relative_match_path(&path, workspace, &resolved_workspace) {
+                    Some(relative) => relative,
+                    None => {
+                        let resolved = match resolved_path {
+                            Some(resolved) => resolved,
+                            None => match tokio::fs::canonicalize(&path).await {
+                                Ok(resolved) => resolved,
+                                Err(_) => continue,
+                            },
+                        };
+                        match resolved.strip_prefix(&resolved_workspace) {
+                            Ok(relative) => normalize_relative_path(relative),
+                            Err(_) => continue,
+                        }
+                    }
+                };
+
+                if paths.len() >= MAX_GLOB_MATCHES {
+                    scan_truncated = true;
+                    break 'workspaces;
+                }
+                paths.push(relative);
             }
         }
 
@@ -208,6 +234,7 @@ impl Tool<BaseCtx> for SearchFileTool {
         let output = SearchFileOutput {
             paths,
             total_matches,
+            scan_truncated,
         };
 
         if let Some(hook) = &hook {
@@ -309,32 +336,16 @@ fn has_glob_metacharacters(component: &std::ffi::OsStr) -> bool {
         || component.contains('}')
 }
 
-fn relative_match_path(
-    path: &Path,
-    resolved_path: &Path,
-    workspace: &Path,
-    resolved_workspace: &Path,
-) -> Result<String, BoxError> {
+/// Strips the workspace prefix without touching the filesystem. Returns `None`
+/// when only the canonicalized path can be related to the workspace.
+fn relative_match_path(path: &Path, workspace: &Path, resolved_workspace: &Path) -> Option<String> {
     if let Ok(relative) = path.strip_prefix(workspace) {
-        return Ok(normalize_relative_path(relative));
+        return Some(normalize_relative_path(relative));
     }
 
-    if let Ok(relative) = path.strip_prefix(resolved_workspace) {
-        return Ok(normalize_relative_path(relative));
-    }
-
-    let relative = resolved_path
-        .strip_prefix(resolved_workspace)
-        .map_err(|err| {
-            format!(
-                "Failed to normalize matched path (workspace: {}, resolved_workspace: {}, matched_path: {}, resolved_matched_path: {}): {err}",
-                workspace.display(),
-                resolved_workspace.display(),
-                path.display(),
-                resolved_path.display()
-            )
-        })?;
-    Ok(normalize_relative_path(relative))
+    path.strip_prefix(resolved_workspace)
+        .ok()
+        .map(normalize_relative_path)
 }
 
 #[cfg(test)]
@@ -691,6 +702,55 @@ mod tests {
 
         assert_eq!(result.output.paths, ["escape/secret.txt"]);
         assert_eq!(result.output.total_matches, 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dangling_symlinks_do_not_fail_the_scan() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = TestTempDir::new().await;
+        let workspace = temp_dir.path().join("workspace");
+        tokio::fs::create_dir_all(workspace.join("sub"))
+            .await
+            .unwrap();
+        tokio::fs::write(workspace.join("real.txt"), "ok")
+            .await
+            .unwrap();
+        symlink(
+            temp_dir.path().join("does-not-exist"),
+            workspace.join("broken.txt"),
+        )
+        .unwrap();
+
+        // Plain patterns list dangling symlinks instead of failing the whole search.
+        let result = glob_tool(&workspace)
+            .call(
+                mock_ctx(),
+                SearchFileArgs {
+                    pattern: "*.txt".to_string(),
+                    limit: 0,
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.output.paths, ["broken.txt", "real.txt"]);
+        assert!(!result.output.scan_truncated);
+
+        // Parent-traversal patterns verify targets, so the dangling entry is skipped.
+        let result = glob_tool(&workspace)
+            .call(
+                mock_ctx(),
+                SearchFileArgs {
+                    pattern: "sub/../*.txt".to_string(),
+                    limit: 0,
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.output.paths, ["sub/../real.txt"]);
     }
 
     #[tokio::test]

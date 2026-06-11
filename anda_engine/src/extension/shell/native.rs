@@ -30,9 +30,76 @@ const BACKGROUND_PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::f
 const AUTO_BACKGROUND_AFTER: std::time::Duration =
     std::time::Duration::from_secs(SHELL_AUTO_BACKGROUND_SECS);
 const OUTPUT_READ_CHUNK_BYTES: usize = 8192;
+/// How long to wait for the output readers after the process exits. Descendant processes can
+/// inherit the pipes and keep them open indefinitely; after this grace period the readers are
+/// aborted and the output captured so far is used.
+#[cfg(not(test))]
+const OUTPUT_READER_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+#[cfg(test)]
+const OUTPUT_READER_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
+/// Maximum bytes kept in memory per output stream. When exceeded, the oldest bytes are dropped
+/// so the tail of the output (where errors usually appear) is preserved.
+const MAX_STREAM_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum bytes for a single background progress chunk pushed through hooks.
+const MAX_PROGRESS_CHUNK_BYTES: usize = 16 * 1024;
+/// Maximum terminal rows kept for progress rendering; older rows are scrolled out.
+const MAX_TERMINAL_ROWS: usize = 4096;
+/// Maximum terminal columns honored from cursor-positioning escape sequences.
+const MAX_TERMINAL_COLUMNS: usize = 8192;
+/// Maximum bytes a single rendered terminal line can grow to.
+const MAX_TERMINAL_LINE_BYTES: usize = 64 * 1024;
 
-type OutputBuffer = std::sync::Arc<TokioMutex<Vec<u8>>>;
+type OutputBuffer = std::sync::Arc<TokioMutex<StreamBuffer>>;
 type OutputReaderHandle = tokio::task::JoinHandle<std::io::Result<()>>;
+
+/// In-memory capture of one output stream, bounded by [`MAX_STREAM_BUFFER_BYTES`].
+///
+/// Offsets used by progress tracking are absolute stream offsets: `trimmed` counts the bytes
+/// already dropped from the head, and `data` holds the bytes from `trimmed` onwards.
+#[derive(Default)]
+struct StreamBuffer {
+    data: Vec<u8>,
+    trimmed: usize,
+}
+
+impl StreamBuffer {
+    #[cfg(test)]
+    fn from_bytes(data: Vec<u8>) -> Self {
+        Self { data, trimmed: 0 }
+    }
+
+    fn append(&mut self, chunk: &[u8]) {
+        self.data.extend_from_slice(chunk);
+        if self.data.len() > MAX_STREAM_BUFFER_BYTES {
+            // Drop down to 7/8 of the cap so trimming is amortized instead of per-append.
+            let excess = self.data.len() - MAX_STREAM_BUFFER_BYTES / 8 * 7;
+            self.data.drain(..excess);
+            self.trimmed += excess;
+        }
+    }
+
+    /// Total bytes ever written to this stream.
+    fn total_len(&self) -> usize {
+        self.trimmed + self.data.len()
+    }
+
+    /// Returns the captured bytes, prefixed with a marker when the head was dropped.
+    fn into_bytes(self, stream_name: &str) -> Vec<u8> {
+        if self.trimmed == 0 {
+            return self.data;
+        }
+
+        let marker = format!(
+            "[{} bytes of {stream_name} dropped: output exceeded the {} MiB in-memory buffer]\n",
+            self.trimmed,
+            MAX_STREAM_BUFFER_BYTES / 1024 / 1024,
+        );
+        let mut bytes = Vec::with_capacity(marker.len() + self.data.len());
+        bytes.extend_from_slice(marker.as_bytes());
+        bytes.extend_from_slice(&self.data);
+        bytes
+    }
+}
 
 struct RunningProcess {
     child: Child,
@@ -144,8 +211,8 @@ impl NativeRuntime {
             }
         };
         let pid = child.id();
-        let stdout = std::sync::Arc::new(TokioMutex::new(Vec::new()));
-        let stderr = std::sync::Arc::new(TokioMutex::new(Vec::new()));
+        let stdout = std::sync::Arc::new(TokioMutex::new(StreamBuffer::default()));
+        let stderr = std::sync::Arc::new(TokioMutex::new(StreamBuffer::default()));
         let stdout_reader = spawn_output_reader(child.stdout.take(), stdout.clone());
         let stderr_reader = spawn_output_reader(child.stderr.take(), stderr.clone());
         let mut running = RunningProcess {
@@ -191,16 +258,14 @@ impl NativeRuntime {
         } else {
             format!("Background process started with task ID {task_id}")
         };
-        let exec_output = ExecOutput::from_output(
-            pid,
-            Some(Output {
-                status: ExitStatus::default(),
-                stdout: start_message.into_bytes(),
-                stderr: Vec::new(),
-            }),
-            &self.temp_dir,
-        )
-        .await;
+        // No `exit_status`: the process has not exited yet, and reporting a default success
+        // status here misleads callers into treating the command as completed.
+        let exec_output = ExecOutput {
+            workspace: Some(workspace_str.clone()),
+            process_id: pid,
+            stdout: Some(start_message),
+            ..Default::default()
+        };
         let json_hook = ctx.get_state::<DynToolJsonHook>();
         if let Some(hook) = &json_hook {
             hook.on_background_start(&ctx, &task_id, json!(&args)).await;
@@ -225,11 +290,16 @@ impl NativeRuntime {
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 interval.tick().await;
 
-                let wait = child.wait();
-                tokio::pin!(wait);
+                let cancellation = ctx.cancellation_token();
+                // `Child::wait` is cancel safe, so a fresh wait future per iteration is fine.
                 let status = loop {
                     tokio::select! {
-                        status = &mut wait => break status,
+                        status = child.wait() => break status,
+                        _ = cancellation.cancelled() => {
+                            // The engine or request was cancelled; do not leave the process behind.
+                            let _ = child.start_kill();
+                            break child.wait().await;
+                        }
                         _ = interval.tick() => {
                             if let Some((stdout_chunk, stderr_chunk)) = collect_progress_output(
                                 &stdout,
@@ -352,12 +422,19 @@ enum ProgressMode {
 }
 
 impl ProgressStreamState {
-    fn next_output(&mut self, output: &[u8]) -> Option<String> {
-        if output.len() <= self.sent_len {
+    /// `sent_len` is an absolute stream offset, so progress stays consistent even after the
+    /// buffer dropped old bytes from its head.
+    fn next_output(&mut self, output: &StreamBuffer) -> Option<String> {
+        if output.total_len() <= self.sent_len {
             return None;
         }
 
-        let unread = &output[self.sent_len..];
+        if self.sent_len < output.trimmed {
+            // The unsent head was dropped by the buffer cap; continue from what is left.
+            self.sent_len = output.trimmed;
+        }
+
+        let unread = &output.data[self.sent_len - output.trimmed..];
         let readable_len = complete_shell_output_prefix_len(unread);
         if readable_len == 0 {
             return None;
@@ -365,8 +442,25 @@ impl ProgressStreamState {
 
         self.sent_len += readable_len;
         let text = decode_shell_output(&unread[..readable_len]);
-        self.terminal.render(&text)
+        self.terminal.render(&text).map(cap_progress_chunk)
     }
+}
+
+/// Keeps the newest part of an oversized progress chunk so hooks are never flooded.
+fn cap_progress_chunk(text: String) -> String {
+    if text.len() <= MAX_PROGRESS_CHUNK_BYTES {
+        return text;
+    }
+
+    let mut start = text.len() - MAX_PROGRESS_CHUNK_BYTES;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    format!(
+        "[progress truncated to the last {} bytes]\n{}",
+        text.len() - start,
+        &text[start..]
+    )
 }
 
 impl TerminalProgressState {
@@ -448,6 +542,11 @@ impl TerminalProgressState {
     fn write_char(&mut self, ch: char) {
         self.ensure_cursor_line();
         if self.cursor >= self.lines[self.cursor_row].len() {
+            // Cap pathological single-line streams; the final output still uses the raw bytes,
+            // this only bounds the progress rendering state.
+            if self.lines[self.cursor_row].len() >= MAX_TERMINAL_LINE_BYTES {
+                return;
+            }
             self.lines[self.cursor_row].push(ch);
             self.cursor = self.lines[self.cursor_row].len();
             self.mark_dirty();
@@ -510,7 +609,8 @@ impl TerminalProgressState {
 
     fn set_cursor_column(&mut self, column: usize) {
         self.ensure_cursor_line();
-        let target_column = column.saturating_sub(1);
+        // Clamp so untrusted escape sequences cannot allocate huge padding strings.
+        let target_column = column.saturating_sub(1).min(MAX_TERMINAL_COLUMNS);
         let char_count = self.lines[self.cursor_row].chars().count();
         if target_column > char_count {
             self.lines[self.cursor_row].extend(std::iter::repeat_n(
@@ -615,9 +715,33 @@ impl TerminalProgressState {
     }
 
     fn ensure_cursor_line(&mut self) {
+        // Clamp before materializing rows so untrusted cursor escapes (e.g. `ESC[2000000000B`)
+        // cannot allocate unbounded numbers of lines.
+        if self.cursor_row >= MAX_TERMINAL_ROWS * 2 {
+            self.cursor_row = MAX_TERMINAL_ROWS * 2 - 1;
+        }
         while self.lines.len() <= self.cursor_row {
             self.lines.push(String::new());
         }
+        self.trim_scrollback();
+    }
+
+    /// Drops the oldest rows once the screen exceeds [`MAX_TERMINAL_ROWS`], rebasing the cursor
+    /// and dirty-row indexes. Long-running plain output would otherwise keep every printed line
+    /// in memory for the lifetime of the process.
+    fn trim_scrollback(&mut self) {
+        if self.lines.len() <= MAX_TERMINAL_ROWS {
+            return;
+        }
+
+        // Drop down to 3/4 of the cap so the drain cost is amortized across many lines.
+        let excess = self.lines.len() - MAX_TERMINAL_ROWS / 4 * 3;
+        self.lines.drain(..excess);
+        self.cursor_row = self.cursor_row.saturating_sub(excess);
+        self.dirty_rows = std::mem::take(&mut self.dirty_rows)
+            .into_iter()
+            .filter_map(|row| row.checked_sub(excess))
+            .collect();
     }
 
     fn clamp_cursor(&mut self) {
@@ -657,7 +781,7 @@ where
             if len == 0 {
                 return Ok(());
             }
-            output.lock().await.extend_from_slice(&chunk[..len]);
+            output.lock().await.append(&chunk[..len]);
         }
     })
 }
@@ -710,8 +834,8 @@ async fn finalize_process_output_with_final_progress(
             .map(|(stdout_chunk, stderr_chunk)| {
                 output_chunks_to_exec_output(process_id, workspace, stdout_chunk, stderr_chunk)
             });
-    let stdout_bytes = std::mem::take(&mut *stdout.lock().await);
-    let mut stderr_bytes = std::mem::take(&mut *stderr.lock().await);
+    let stdout_bytes = std::mem::take(&mut *stdout.lock().await).into_bytes("stdout");
+    let mut stderr_bytes = std::mem::take(&mut *stderr.lock().await).into_bytes("stderr");
     if let Some(err) = stdout_read_error {
         append_output_read_error(&mut stderr_bytes, err);
     }
@@ -829,15 +953,23 @@ fn csi_param_or(values: &[usize], index: usize, default: usize) -> usize {
 }
 
 async fn output_reader_error(
-    handle: tokio::task::JoinHandle<std::io::Result<()>>,
+    mut handle: tokio::task::JoinHandle<std::io::Result<()>>,
     stream_name: &str,
 ) -> Option<String> {
-    match handle.await {
-        Ok(Ok(())) => None,
-        Ok(Err(err)) => Some(format!("Failed to read background {stream_name}: {err}")),
-        Err(err) => Some(format!(
+    match tokio::time::timeout(OUTPUT_READER_GRACE, &mut handle).await {
+        Ok(Ok(Ok(()))) => None,
+        Ok(Ok(Err(err))) => Some(format!("Failed to read background {stream_name}: {err}")),
+        Ok(Err(err)) => Some(format!(
             "Failed to join background {stream_name} reader: {err}"
         )),
+        Err(_) => {
+            // A descendant process inherited the pipe and keeps it open; use what was captured
+            // instead of waiting indefinitely for EOF.
+            handle.abort();
+            Some(format!(
+                "{stream_name} stayed open after the process exited (likely inherited by a background descendant); captured output may be incomplete"
+            ))
+        }
     }
 }
 
@@ -1019,6 +1151,10 @@ mod tests {
         }
     }
 
+    fn buf(bytes: &[u8]) -> StreamBuffer {
+        StreamBuffer::from_bytes(bytes.to_vec())
+    }
+
     fn foreground_command(runtime: &NativeRuntime, env_name: &str, output_file: &str) -> String {
         match runtime.shell() {
             "cmd.exe" => format!(
@@ -1068,13 +1204,13 @@ mod tests {
         let mut state = ProgressStreamState::default();
         let mut output = vec![0xe4, 0xb8];
 
-        assert_eq!(state.next_output(&output), None);
+        assert_eq!(state.next_output(&buf(&output)), None);
 
         output.push(0xad);
-        assert_eq!(state.next_output(&output), None);
+        assert_eq!(state.next_output(&buf(&output)), None);
 
         output.push(b'\n');
-        assert_eq!(state.next_output(&output).as_deref(), Some("中"));
+        assert_eq!(state.next_output(&buf(&output)).as_deref(), Some("中"));
     }
 
     #[test]
@@ -1082,10 +1218,13 @@ mod tests {
         let mut state = ProgressStreamState::default();
         let mut output = b"line 1\npartial".to_vec();
 
-        assert_eq!(state.next_output(&output).as_deref(), Some("line 1"));
+        assert_eq!(state.next_output(&buf(&output)).as_deref(), Some("line 1"));
 
         output.extend_from_slice(b" line\n");
-        assert_eq!(state.next_output(&output).as_deref(), Some("partial line"));
+        assert_eq!(
+            state.next_output(&buf(&output)).as_deref(),
+            Some("partial line")
+        );
     }
 
     #[test]
@@ -1093,7 +1232,7 @@ mod tests {
         let mut state = ProgressStreamState::default();
 
         assert_eq!(
-            state.next_output(b"10%\r20%\r100%").as_deref(),
+            state.next_output(&buf(b"10%\r20%\r100%")).as_deref(),
             Some("100%")
         );
     }
@@ -1103,10 +1242,10 @@ mod tests {
         let mut state = ProgressStreamState::default();
         let mut output = b"10%\r".to_vec();
 
-        assert_eq!(state.next_output(&output).as_deref(), Some("10%"));
+        assert_eq!(state.next_output(&buf(&output)).as_deref(), Some("10%"));
 
         output.extend_from_slice(b"20%");
-        assert_eq!(state.next_output(&output).as_deref(), Some("20%"));
+        assert_eq!(state.next_output(&buf(&output)).as_deref(), Some("20%"));
     }
 
     #[test]
@@ -1114,10 +1253,10 @@ mod tests {
         let mut state = ProgressStreamState::default();
         let mut output = b"\x1b[31mred\x1b[0m".to_vec();
 
-        assert_eq!(state.next_output(&output), None);
+        assert_eq!(state.next_output(&buf(&output)), None);
 
         output.push(b'\n');
-        assert_eq!(state.next_output(&output).as_deref(), Some("red"));
+        assert_eq!(state.next_output(&buf(&output)).as_deref(), Some("red"));
     }
 
     #[test]
@@ -1125,7 +1264,7 @@ mod tests {
         let mut state = ProgressStreamState::default();
 
         assert_eq!(
-            state.next_output(b"abcdef\rxy\x1b[K").as_deref(),
+            state.next_output(&buf(b"abcdef\rxy\x1b[K")).as_deref(),
             Some("xy")
         );
     }
@@ -1135,7 +1274,7 @@ mod tests {
         let mut state = ProgressStreamState::default();
 
         assert_eq!(
-            state.next_output("中\x08文".as_bytes()).as_deref(),
+            state.next_output(&buf("中\x08文".as_bytes())).as_deref(),
             Some("文")
         );
     }
@@ -1146,10 +1285,107 @@ mod tests {
 
         assert_eq!(
             state
-                .next_output(b"file-a 10%\nfile-b 20%\x1b[1A\rfile-a 90%\x1b[1B\rfile-b 80%")
+                .next_output(&buf(
+                    b"file-a 10%\nfile-b 20%\x1b[1A\rfile-a 90%\x1b[1B\rfile-b 80%"
+                ))
                 .as_deref(),
             Some("file-a 90%\nfile-b 80%")
         );
+    }
+
+    #[test]
+    fn stream_buffer_caps_memory_and_progress_survives_trimming() {
+        let mut buffer = StreamBuffer::default();
+        let chunk = vec![b'a'; 1024 * 1024];
+        for _ in 0..12 {
+            buffer.append(&chunk);
+        }
+        assert!(buffer.data.len() <= MAX_STREAM_BUFFER_BYTES);
+        assert_eq!(buffer.total_len(), 12 * 1024 * 1024);
+        assert!(buffer.trimmed > 0);
+
+        // Progress that fell behind the trimmed head skips forward instead of panicking.
+        let mut state = ProgressStreamState::default();
+        let mut buffer = StreamBuffer::default();
+        buffer.append(b"first\n");
+        assert_eq!(state.next_output(&buffer).as_deref(), Some("first"));
+        buffer.trimmed = 100;
+        buffer.data = b"later line\n".to_vec();
+        assert_eq!(state.next_output(&buffer).as_deref(), Some("later line"));
+
+        // The final bytes carry a marker when the head was dropped.
+        let trimmed = StreamBuffer {
+            data: b"tail".to_vec(),
+            trimmed: 9,
+        };
+        let bytes = trimmed.into_bytes("stdout");
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.starts_with("[9 bytes of stdout dropped"));
+        assert!(text.ends_with("tail"));
+        assert_eq!(
+            StreamBuffer::from_bytes(b"plain".to_vec()).into_bytes("stdout"),
+            b"plain"
+        );
+    }
+
+    #[test]
+    fn terminal_state_clamps_hostile_cursor_escapes() {
+        // Huge cursor-down and absolute-position escapes must not allocate unbounded rows.
+        let mut state = ProgressStreamState::default();
+        state.next_output(&buf(b"x\x1b[2000000000Bdown\n"));
+        assert!(state.terminal.lines.len() <= MAX_TERMINAL_ROWS);
+
+        let mut state = ProgressStreamState::default();
+        state.next_output(&buf(b"\x1b[2000000000;2000000000Hfar\n"));
+        assert!(state.terminal.lines.len() <= MAX_TERMINAL_ROWS);
+
+        // Huge column targets are clamped instead of materializing gigabytes of padding.
+        let mut terminal = TerminalProgressState::default();
+        terminal.set_cursor_column(2_000_000_000);
+        assert!(terminal.lines[0].len() <= MAX_TERMINAL_COLUMNS);
+
+        // A single line stops growing at the cap; rendering stays bounded.
+        let mut terminal = TerminalProgressState::default();
+        for _ in 0..(MAX_TERMINAL_LINE_BYTES + 16) {
+            terminal.write_char('y');
+        }
+        assert_eq!(terminal.lines[0].len(), MAX_TERMINAL_LINE_BYTES);
+
+        // Plain-mode scrollback is bounded: old rows are dropped, content still flows.
+        let mut state = ProgressStreamState::default();
+        let mut buffer = StreamBuffer::default();
+        let mut emitted = 0usize;
+        for i in 0..(MAX_TERMINAL_ROWS * 2) {
+            buffer.append(format!("line {i}\n").as_bytes());
+            if let Some(chunk) = state.next_output(&buffer) {
+                emitted += chunk.lines().count();
+            }
+        }
+        assert_eq!(emitted, MAX_TERMINAL_ROWS * 2);
+        assert!(state.terminal.lines.len() <= MAX_TERMINAL_ROWS);
+    }
+
+    #[test]
+    fn cap_progress_chunk_keeps_newest_tail() {
+        let short = "ok".to_string();
+        assert_eq!(cap_progress_chunk(short.clone()), short);
+
+        let long = "异".repeat(MAX_PROGRESS_CHUNK_BYTES);
+        let capped = cap_progress_chunk(long);
+        assert!(capped.len() <= MAX_PROGRESS_CHUNK_BYTES + 64);
+        assert!(capped.starts_with("[progress truncated to the last "));
+        assert!(capped.ends_with('异'));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn output_reader_grace_aborts_readers_held_open_by_descendants() {
+        // Simulates a pipe kept open by an orphaned descendant: the reader never finishes.
+        let stuck_reader = tokio::spawn(async {
+            std::future::pending::<()>().await;
+            Ok::<(), std::io::Error>(())
+        });
+        let message = output_reader_error(stuck_reader, "stdout").await.unwrap();
+        assert!(message.contains("stayed open after the process exited"));
     }
 
     #[test]
@@ -1234,8 +1470,10 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn output_reader_and_finalize_helpers_report_read_join_and_wait_errors() {
-        let empty_reader =
-            spawn_output_reader::<tokio::io::Empty>(None, Arc::new(TokioMutex::new(Vec::new())));
+        let empty_reader = spawn_output_reader::<tokio::io::Empty>(
+            None,
+            Arc::new(TokioMutex::new(StreamBuffer::default())),
+        );
         assert!(output_reader_error(empty_reader, "stdout").await.is_none());
 
         let read_error =
@@ -1259,8 +1497,12 @@ mod tests {
                 .contains("Failed to join background stdout reader")
         );
 
-        let stdout = Arc::new(TokioMutex::new(b"stdout".to_vec()));
-        let stderr = Arc::new(TokioMutex::new(b"stderr".to_vec()));
+        let stdout = Arc::new(TokioMutex::new(StreamBuffer::from_bytes(
+            b"stdout".to_vec(),
+        )));
+        let stderr = Arc::new(TokioMutex::new(StreamBuffer::from_bytes(
+            b"stderr".to_vec(),
+        )));
         let ok_reader = tokio::spawn(async { Ok::<(), std::io::Error>(()) });
         let ok_reader_2 = tokio::spawn(async { Ok::<(), std::io::Error>(()) });
         let output = finalize_process_output(
@@ -1284,8 +1526,8 @@ mod tests {
                 .is_some_and(|stderr| stderr.contains("wait failed") && stderr.contains("stderr"))
         );
 
-        let stdout = Arc::new(TokioMutex::new(Vec::new()));
-        let stderr = Arc::new(TokioMutex::new(Vec::new()));
+        let stdout = Arc::new(TokioMutex::new(StreamBuffer::default()));
+        let stderr = Arc::new(TokioMutex::new(StreamBuffer::default()));
         let read_error = tokio::spawn(async {
             Err::<(), std::io::Error>(std::io::Error::other("stdout failed"))
         });
@@ -1362,7 +1604,7 @@ mod tests {
             .unwrap();
 
         assert!(output.process_id.is_some());
-        assert!(output.exit_status.is_some());
+        assert!(output.exit_status.is_none());
         assert!(output.stdout.is_some());
         assert!(output.stderr.is_none());
 
@@ -1404,7 +1646,7 @@ mod tests {
             .unwrap();
 
         assert!(output.process_id.is_some());
-        assert!(output.exit_status.is_some());
+        assert!(output.exit_status.is_none());
         assert!(output.stdout.is_some());
         assert!(output.stderr.is_none());
 
@@ -1546,6 +1788,57 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn execute_kills_background_process_on_cancellation() {
+        let ctx = EngineBuilder::new().mock_ctx();
+        let workspace = TestTempDir::new("anda-native-cancel").await;
+        let (sender, receiver) = oneshot::channel();
+        let hook = ShellToolHook::new(Arc::new(TestHook::new(sender)));
+        ctx.base.set_state(hook);
+        let runtime = NativeRuntime::new(workspace.path().to_path_buf());
+        let command = match runtime.shell() {
+            "cmd.exe" => {
+                let system_root =
+                    std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+                let system_root = system_root.trim_end_matches(['\\', '/']);
+                format!(r"{system_root}\System32\ping.exe 127.0.0.1 -n 31 > nul")
+            }
+            _ => "sleep 30".to_string(),
+        };
+
+        let output = runtime
+            .execute(
+                ctx.base.clone(),
+                ExecArgs {
+                    command,
+                    background: true,
+                    ..Default::default()
+                },
+                HashMap::new(),
+            )
+            .await
+            .unwrap();
+        assert!(output.exit_status.is_none());
+
+        ctx.base.cancellation_token().cancel();
+
+        let (
+            task_id,
+            ToolOutput {
+                output: hook_output,
+                ..
+            },
+        ) = tokio::time::timeout(Duration::from_secs(5), receiver)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(task_id.contains("shell"));
+        assert_eq!(hook_output.process_id, output.process_id);
+        let exit_status = hook_output.exit_status.unwrap();
+        assert!(!exit_status.contains("exit status: 0"), "{exit_status}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn execute_auto_moves_long_running_foreground_to_background() {
         let ctx = EngineBuilder::new().mock_ctx();
         let workspace = TestTempDir::new("anda-native-auto-background").await;
@@ -1566,7 +1859,7 @@ mod tests {
             .unwrap();
 
         assert!(output.process_id.is_some());
-        assert!(output.exit_status.is_some());
+        assert!(output.exit_status.is_none());
         assert!(
             output
                 .stdout

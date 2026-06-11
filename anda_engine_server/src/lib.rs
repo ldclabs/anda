@@ -155,10 +155,12 @@ impl ServerBuilder {
         self.with_middleware(middleware::RequestFnMiddleware::new(f))
     }
 
-    pub async fn serve(
-        self,
-        signal: impl Future<Output = ()> + Send + 'static,
-    ) -> Result<(), BoxError> {
+    /// Builds the axum [`Router`] with all routes, registered middlewares, and
+    /// application state applied.
+    ///
+    /// Useful for embedding the engine server into a larger axum application
+    /// or driving it with a custom listener; [`Self::serve`] uses it internally.
+    pub fn build_router(self) -> Result<Router, BoxError> {
         if self.engines.is_empty() {
             return Err("no engines registered".into());
         }
@@ -195,16 +197,20 @@ impl ServerBuilder {
             app = middleware.apply(app);
         }
 
-        let app = app.with_state(state);
+        Ok(app.with_state(state))
+    }
 
+    pub async fn serve(
+        self,
+        signal: impl Future<Output = ()> + Send + 'static,
+    ) -> Result<(), BoxError> {
         let addr: SocketAddr = self.addr.parse()?;
+        let app_name = self.app_name.clone();
+        let app_version = self.app_version.clone();
+        let app = self.build_router()?;
+
         let listener = create_reuse_port_listener(addr).await?;
-        log::warn!(
-            "{}@{} listening on {:?}",
-            self.app_name,
-            self.app_version,
-            addr
-        );
+        log::warn!("{}@{} listening on {:?}", app_name, app_version, addr);
 
         axum::serve(listener, app)
             .with_graceful_shutdown(signal)

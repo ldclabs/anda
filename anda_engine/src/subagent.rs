@@ -27,6 +27,8 @@ use crate::{
 
 const CONVERSATION_IDLE_MS: u64 = 10 * 60 * 1000; // 10 minutes
 const CONVERSATION_WAIT_BACKGROUND_TASK_MS: u64 = 60 * 60 * 1000; // 1 hour
+// How long an idle session waits for new input before re-running its idle bookkeeping.
+const SESSION_INPUT_POLL_MS: u64 = 1000;
 const MAX_TURNS_TO_COMPACT: usize = 81; // The number of turns after which the conversation history will be compacted. This is to prevent the conversation history from growing indefinitely and causing performance issues. The optimal value may depend on the typical length of conversations and the token limits of the language model.
 const SUBAGENT_STORE_PATH: &str = "subagents";
 const SUBAGENT_METADATA_LIST_LIMIT: usize = 8;
@@ -180,13 +182,34 @@ pub struct SubAgentArgs {
 }
 
 impl SubAgentArgs {
-    fn from_prompt(prompt: String) -> Self {
-        serde_json::from_str::<Self>(&prompt).unwrap_or(Self {
-            prompt,
-            session: String::new(),
-            model: String::new(),
-            effort: None,
-        })
+    /// Parses tool-call arguments from the routed prompt string.
+    ///
+    /// A bare string is a plain blocking prompt. A JSON object whose keys all belong to
+    /// [`SubAgentArgs`] must deserialize successfully, so invalid structured arguments surface as
+    /// an error instead of silently running with the raw JSON as the prompt. Any other JSON
+    /// payload is treated as task data for the subagent.
+    fn from_prompt(prompt: String) -> Result<Self, BoxError> {
+        if !prompt.trim_start().starts_with('{') {
+            return Ok(Self {
+                prompt,
+                ..Default::default()
+            });
+        }
+
+        match serde_json::from_str::<Json>(&prompt) {
+            Ok(Json::Object(args))
+                if args.keys().all(|key| {
+                    matches!(key.as_str(), "prompt" | "session" | "model" | "effort")
+                }) =>
+            {
+                serde_json::from_value(Json::Object(args))
+                    .map_err(|err| format!("invalid subagent arguments: {err}").into())
+            }
+            _ => Ok(Self {
+                prompt,
+                ..Default::default()
+            }),
+        }
     }
 }
 
@@ -351,6 +374,11 @@ pub struct BackgroundTaskInfo {
     pub agent_name: String,
     pub tool_name: Option<String>,
     pub progress_message: Option<String>,
+
+    /// Cumulative usage already forwarded into the session, used to convert the cumulative
+    /// usage carried by background agent outputs into deltas.
+    #[serde(default)]
+    pub reported_usage: Usage,
 }
 
 pub struct SubSession {
@@ -386,6 +414,12 @@ struct SubSessionRunner {
     agent_hook: Option<DynAgentHook>,
     runner: CompletionRunner,
     last_output: Option<AgentOutput>,
+    /// Artifacts rescued from runners that were replaced during context compaction. They are
+    /// merged back into the session's final output.
+    carried_artifacts: Vec<Resource>,
+    /// Set when the session decided to terminate; the runner then finishes the remaining queued
+    /// inputs and exits at the next idle boundary instead of waiting for more input.
+    closing: bool,
 }
 
 impl SubSessionRunner {
@@ -410,14 +444,14 @@ impl SubSessionRunner {
             || !output.tools_usage.is_empty()
     }
 
+    // Visible signals only. Usage is excluded because carried-over usage from compaction makes
+    // it always non-zero, which must not let an empty finalize output shadow visible content.
     fn has_reportable_output(output: &AgentOutput) -> bool {
         !output.content.is_empty()
             || output.thoughts.is_some()
             || output.failed_reason.is_some()
             || !output.tool_calls.is_empty()
             || !output.artifacts.is_empty()
-            || output.usage.requests > 0
-            || !output.tools_usage.is_empty()
     }
 
     fn latest_output(&mut self) -> AgentOutput {
@@ -430,10 +464,18 @@ impl SubSessionRunner {
         self.with_session(output)
     }
 
+    fn merge_carried_artifacts(&mut self, output: &mut AgentOutput) {
+        if !self.carried_artifacts.is_empty() {
+            let mut artifacts = std::mem::take(&mut self.carried_artifacts);
+            artifacts.append(&mut output.artifacts);
+            output.artifacts = artifacts;
+        }
+    }
+
     async fn finalize_output(&mut self) -> AgentOutput {
         let fallback = self.latest_output();
 
-        match self.runner.finalize(None).await {
+        let mut output = match self.runner.finalize(None).await {
             Ok(output) => {
                 let output = self.with_session(output);
                 if Self::has_reportable_output(&output) || !Self::has_observable_output(&fallback) {
@@ -452,7 +494,10 @@ impl SubSessionRunner {
                     })
                 }
             }
-        }
+        };
+
+        self.merge_carried_artifacts(&mut output);
+        output
     }
 
     fn record_failed_output(&mut self, failed_reason: impl Into<String>) -> String {
@@ -534,12 +579,16 @@ impl SubSessionRunner {
 
         match self.runner.next().await {
             Ok(None) => {
+                if self.closing || self.runner.is_done() {
+                    return Ok(false);
+                }
+
                 let now_ms = unix_ms();
 
                 let idle = now_ms.saturating_sub(self.session.active_at.load(Ordering::SeqCst));
                 let has_background_tasks = !self.session.background_tasks.read().is_empty();
 
-                if idle > CONVERSATION_IDLE_MS && !has_background_tasks
+                if (idle > CONVERSATION_IDLE_MS && !has_background_tasks)
                     || (idle > CONVERSATION_WAIT_BACKGROUND_TASK_MS && has_background_tasks)
                 {
                     return Ok(false);
@@ -561,7 +610,7 @@ impl SubSessionRunner {
                     // 上下文过长，先进行一次压缩总结，更新conversation状态和历史消息，再继续后续的处理
                     let handoff_req = self.runner.req().clone();
                     self.runner.set_tools(Vec::new());
-                    let output = match self
+                    let mut output = match self
                         .runner
                         .finalize(Some(COMPACTION_PROMPT.to_string()))
                         .await
@@ -578,6 +627,13 @@ impl SubSessionRunner {
                         self.last_output = Some(output);
                         return Err(failed_reason.into());
                     }
+
+                    // 旧 runner 在 finalize 时交出了整个会话已累计的 usage/tools_usage/artifacts，
+                    // 必须转移到新 runner，否则会话最终上报的统计与产物会在每次压缩时丢失
+                    let carried_usage = output.usage.clone();
+                    let carried_tools_usage = output.tools_usage.clone();
+                    self.carried_artifacts.append(&mut output.artifacts);
+
                     // 前一轮压缩总结的内容作为新 conversation 的第一条消息，继续后续的交互
                     let now_ms = unix_ms();
                     let compaction_msg = Message {
@@ -605,10 +661,11 @@ impl SubSessionRunner {
                         .completion_iter(req, Vec::new())
                         .reserve_chat_history(vec![compaction_msg])
                         .unbound();
+                    self.runner.accumulate(&carried_usage);
+                    self.runner.accumulate_tools_usage(&carried_tools_usage);
                     return Ok(true);
                 }
 
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 Ok(true)
             }
 
@@ -633,6 +690,37 @@ impl SubSession {
     pub fn close(self: Arc<Self>) {
         // no things to do for now
     }
+
+    /// Converts the cumulative usage reported by a background agent into a delta against what was
+    /// already forwarded for `task_id`, so the session runner does not double-count usage when it
+    /// accumulates progress and final outputs.
+    fn take_usage_delta(&self, task_id: &str, current: &Usage, ended: bool) -> Usage {
+        let mut tasks = self.background_tasks.write();
+        let reported = if ended {
+            tasks
+                .remove(task_id)
+                .map(|info| info.reported_usage)
+                .unwrap_or_default()
+        } else {
+            let info = tasks.entry(task_id.to_string()).or_default();
+            let reported = info.reported_usage.clone();
+            // Keep the watermark monotonic even if a failure output carries empty usage.
+            info.reported_usage = Usage {
+                input_tokens: current.input_tokens.max(reported.input_tokens),
+                output_tokens: current.output_tokens.max(reported.output_tokens),
+                cached_tokens: current.cached_tokens.max(reported.cached_tokens),
+                requests: current.requests.max(reported.requests),
+            };
+            reported
+        };
+
+        Usage {
+            input_tokens: current.input_tokens.saturating_sub(reported.input_tokens),
+            output_tokens: current.output_tokens.saturating_sub(reported.output_tokens),
+            cached_tokens: current.cached_tokens.saturating_sub(reported.cached_tokens),
+            requests: current.requests.saturating_sub(reported.requests),
+        }
+    }
 }
 
 #[async_trait]
@@ -649,6 +737,7 @@ impl AgentHook for SubSession {
                 agent_name: ctx.base.agent.clone(),
                 tool_name: None,
                 progress_message: None,
+                reported_usage: Usage::default(),
             },
         );
     }
@@ -659,16 +748,15 @@ impl AgentHook for SubSession {
         session_id: String,
         output: AgentOutput,
     ) {
+        // Background agent outputs carry cumulative usage; forward only the delta.
+        let usage = self.take_usage_delta(&session_id, &output.usage, false);
         let prompt = if !output.content.is_empty() {
             format!(
                 "Subagent session {session_id} intermediate output:\n\n{}",
                 output.content
             )
         } else if let Some(failed_reason) = output.failed_reason {
-            format!(
-                "Subagent session {session_id} failed with reason: {:?}",
-                failed_reason
-            )
+            format!("Subagent session {session_id} failed with reason: {failed_reason}")
         } else {
             format!("Subagent session {session_id} completed")
         };
@@ -676,7 +764,7 @@ impl AgentHook for SubSession {
             .send(SubAgentInput {
                 command: PromptCommand::Plain { prompt },
                 resources: vec![],
-                usage: output.usage,
+                usage,
                 model: None,
                 effort: None,
             })
@@ -685,20 +773,14 @@ impl AgentHook for SubSession {
     }
 
     async fn on_background_end(&self, _ctx: &AgentCtx, session_id: String, output: AgentOutput) {
-        {
-            self.background_tasks.write().remove(&session_id);
-        }
-
+        let usage = self.take_usage_delta(&session_id, &output.usage, true);
         let prompt = if !output.content.is_empty() {
             format!(
                 "Subagent session {session_id} final output:\n\n{}",
                 output.content
             )
         } else if let Some(failed_reason) = output.failed_reason {
-            format!(
-                "Subagent session {session_id} failed with reason: {:?}",
-                failed_reason
-            )
+            format!("Subagent session {session_id} failed with reason: {failed_reason}")
         } else {
             format!("Subagent session {session_id} completed")
         };
@@ -706,7 +788,7 @@ impl AgentHook for SubSession {
             .send(SubAgentInput {
                 command: PromptCommand::Plain { prompt },
                 resources: vec![],
-                usage: output.usage,
+                usage,
                 model: None,
                 effort: None,
             })
@@ -725,6 +807,7 @@ impl ToolBackgroundHook for SubSession {
                 agent_name: ctx.agent.clone(),
                 tool_name: pid.map(|p| p.prefix),
                 progress_message: None,
+                reported_usage: Usage::default(),
             },
         );
     }
@@ -779,6 +862,39 @@ impl Default for SubSessions {
 impl SubSessions {
     pub fn insert_session(&self, sess: Arc<SubSession>) {
         self.sessions.write().insert(sess.id.clone(), sess);
+    }
+
+    /// Atomically claims the session ID for `sess`.
+    ///
+    /// Returns `None` when `sess` was inserted, or `Some(existing)` when another active session
+    /// already owns the ID, so concurrent callers join the same conversation instead of spawning
+    /// duplicate runners.
+    pub fn try_insert_session(&self, sess: Arc<SubSession>) -> Option<Arc<SubSession>> {
+        let mut sessions = self.sessions.write();
+        if let Some(existing) = sessions.get(&sess.id)
+            && !existing.sender.is_closed()
+        {
+            return Some(existing.clone());
+        }
+
+        sessions.insert(sess.id.clone(), sess);
+        None
+    }
+
+    /// Removes the session only if the registry still holds this exact instance, so a finished
+    /// runner cannot remove a newer session that reused the same ID.
+    pub fn remove_session_if(&self, sess: &Arc<SubSession>) {
+        let removed = {
+            let mut sessions = self.sessions.write();
+            match sessions.get(&sess.id) {
+                Some(existing) if Arc::ptr_eq(existing, sess) => sessions.remove(&sess.id),
+                _ => None,
+            }
+        };
+
+        if let Some(removed) = removed {
+            removed.close();
+        }
     }
 
     pub fn active_session_ids(&self) -> Vec<String> {
@@ -867,12 +983,16 @@ impl Agent<AgentCtx> for SubAgent {
             (prompt, resources)
         };
 
-        let args = SubAgentArgs::from_prompt(prompt);
+        let args = SubAgentArgs::from_prompt(prompt)?;
         let model = selected_model_label(&args.model).or_else(|| selected_model_label(&self.model));
         let effort = args.effort.or(self.effort);
 
         let session_id = args.session.trim().to_ascii_lowercase();
         if session_id.is_empty() {
+            if args.prompt.trim().is_empty() && resources.is_empty() {
+                return Err("prompt cannot be empty".into());
+            }
+
             let rt = ctx
                 .completion(
                     CompletionRequest {
@@ -905,35 +1025,93 @@ impl Agent<AgentCtx> for SubAgent {
         };
 
         let subsessions = self.subsessions.clone();
-        if let Some(session) = subsessions.get_session(&session_id) {
-            // Join existing conversation session if it's active
-            match session.sender.send(input).await {
-                Ok(_) => {
-                    let rt = AgentOutput {
-                        content: format!(
-                            "prompt queued for subagent {} session {}. Progress and final output will be pushed through the hooks.",
-                            session.agent, session_id
-                        ),
-                        session: Some(session_id.clone()),
-                        ..Default::default()
-                    };
-                    if let Some(hook) = &agent_hook {
-                        return hook.after_agent_run(&ctx, rt).await;
+        // Join the active session when one exists, otherwise atomically claim the session ID.
+        // The bounded loop resolves races with concurrent callers using the same session ID, so
+        // two callers can never spawn duplicate runners for one session.
+        let mut claimed: Option<(Arc<SubSession>, tokio::sync::mpsc::Receiver<SubAgentInput>)> =
+            None;
+        for _ in 0..8 {
+            if let Some(session) = subsessions.get_session(&session_id) {
+                // Join existing conversation session if it's active
+                match session.sender.send(input).await {
+                    Ok(_) => {
+                        let rt = AgentOutput {
+                            content: format!(
+                                "prompt queued for subagent {} session {}. Progress and final output will be pushed through the hooks.",
+                                session.agent, session_id
+                            ),
+                            session: Some(session_id.clone()),
+                            ..Default::default()
+                        };
+                        if let Some(hook) = &agent_hook {
+                            return hook.after_agent_run(&ctx, rt).await;
+                        }
+                        return Ok(rt);
                     }
-                    return Ok(rt);
+                    Err(err) => {
+                        log::warn!(
+                            "failed to enqueue prompt for subagent {} session {}: receiver closed",
+                            session.agent,
+                            session_id,
+                        );
+                        subsessions.remove_session_if(&session);
+                        input = err.0;
+                        continue;
+                    }
                 }
-                Err(err) => {
-                    log::warn!(
-                        "Failed to enqueue prompt for processing session {}",
-                        session_id,
-                    );
-                    subsessions.remove_session(&session_id);
-                    input = err.0;
+            }
+
+            // No active session, so control commands have nothing to act on. Report the session
+            // state instead of starting a new session or returning a misleading error.
+            let inactive_op = match &input.command {
+                PromptCommand::Ping if input.resources.is_empty() => Some("ping"),
+                PromptCommand::Command { command, .. }
+                    if matches!(command.as_str(), "stop" | "cancel") =>
+                {
+                    Some("cancel")
                 }
+                _ => None,
+            };
+            if let Some(op) = inactive_op {
+                let rt = AgentOutput {
+                    content: format!(
+                        "subagent {agent} session {session_id} is not active (it may have finished or expired); nothing to {op}. Call again with a non-empty prompt to start a new session."
+                    ),
+                    session: Some(session_id.clone()),
+                    ..Default::default()
+                };
+                if let Some(hook) = &agent_hook {
+                    return hook.after_agent_run(&ctx, rt).await;
+                }
+                return Ok(rt);
+            }
+
+            let (sender, rx) = tokio::sync::mpsc::channel::<SubAgentInput>(42);
+            let candidate = Arc::new(SubSession {
+                id: session_id.clone(),
+                agent: agent.clone(),
+                sender,
+                background_tasks: Arc::new(RwLock::new(HashMap::new())),
+                active_at: AtomicU64::new(unix_ms()),
+            });
+            match subsessions.try_insert_session(candidate.clone()) {
+                None => {
+                    claimed = Some((candidate, rx));
+                    break;
+                }
+                // Lost the claim to a concurrent caller; join that session on the next pass.
+                Some(_) => continue,
             }
         }
 
-        // If the conversation session is not active, start a new session and process the prompt
+        let Some((session, mut rx)) = claimed else {
+            return Err(format!(
+                "subagent {agent} session {session_id} is restarting concurrently, please retry"
+            )
+            .into());
+        };
+
+        // The session ID is claimed; start a new session runner with this prompt.
         let SubAgentInput {
             command,
             resources,
@@ -943,27 +1121,12 @@ impl Agent<AgentCtx> for SubAgent {
         } = input;
 
         let prompt = match command {
-            PromptCommand::Ping if resources.is_empty() => {
-                return Err("prompt cannot be empty".into());
-            }
+            // Empty pings and stop/cancel were answered above; a resource-only ping starts the
+            // session with the resources as content.
             PromptCommand::Ping => String::new(),
             PromptCommand::Plain { prompt } => prompt,
-            PromptCommand::Command { command, prompt } => match command.as_str() {
-                "stop" | "cancel" => {
-                    return Err("prompt cannot be empty".into());
-                }
-                _ => prompt,
-            },
+            PromptCommand::Command { prompt, .. } => prompt,
         };
-
-        let (sender, mut rx) = tokio::sync::mpsc::channel::<SubAgentInput>(42);
-        let session = Arc::new(SubSession {
-            id: session_id,
-            agent,
-            sender,
-            background_tasks: Arc::new(RwLock::new(HashMap::new())),
-            active_at: AtomicU64::new(unix_ms()),
-        });
 
         let rt = AgentOutput {
             content: format!(
@@ -986,7 +1149,14 @@ impl Agent<AgentCtx> for SubAgent {
         };
 
         let rt = if let Some(hook) = &agent_hook {
-            hook.after_agent_run(&ctx, rt).await?
+            match hook.after_agent_run(&ctx, rt).await {
+                Ok(rt) => rt,
+                Err(err) => {
+                    // The session never started; release the claimed session ID.
+                    subsessions.remove_session_if(&session);
+                    return Err(err);
+                }
+            }
         } else {
             rt
         };
@@ -994,7 +1164,6 @@ impl Agent<AgentCtx> for SubAgent {
         ctx.base.set_state(DynAgentHook::new(session.clone()));
         ctx.base.set_state(DynToolJsonHook::new(session.clone()));
 
-        subsessions.insert_session(session.clone());
         if let Some(hook) = &agent_hook {
             hook.on_background_start(&ctx, &session.id, &req).await;
         }
@@ -1006,13 +1175,36 @@ impl Agent<AgentCtx> for SubAgent {
                 agent_hook,
                 runner,
                 last_output: None,
+                carried_artifacts: Vec::new(),
+                closing: false,
             };
 
+            let mut pending: Vec<SubAgentInput> = Vec::new();
             loop {
-                let mut inputs = Vec::new();
-
+                let mut inputs = std::mem::take(&mut pending);
                 while let Ok(input) = rx.try_recv() {
                     inputs.push(input);
+                }
+
+                if inputs.is_empty() && !runner.closing && runner.runner.is_idle() {
+                    // Wait for input so new prompts are processed without polling latency; the
+                    // timeout keeps the idle-timeout bookkeeping in `run` ticking.
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(SESSION_INPUT_POLL_MS),
+                        rx.recv(),
+                    )
+                    .await
+                    {
+                        Ok(Some(input)) => {
+                            inputs.push(input);
+                            while let Ok(input) = rx.try_recv() {
+                                inputs.push(input);
+                            }
+                        }
+                        // The channel cannot close while the session holds its own sender.
+                        Ok(None) => {}
+                        Err(_) => {}
+                    }
                 }
 
                 match runner.run(inputs).await {
@@ -1020,6 +1212,19 @@ impl Agent<AgentCtx> for SubAgent {
                         // continue the subsession
                     }
                     Ok(false) => {
+                        if !runner.closing {
+                            runner.closing = true;
+                            // Stop accepting new prompts, then finish anything that was queued
+                            // (and already acknowledged to callers) before the channel closed.
+                            rx.close();
+                            while let Ok(input) = rx.try_recv() {
+                                pending.push(input);
+                            }
+                            if !pending.is_empty() {
+                                continue;
+                            }
+                        }
+
                         let output = runner.finalize_output().await;
                         if let Some(hook) = &runner.agent_hook {
                             hook.on_background_end(runner.runner.ctx(), session.id.clone(), output)
@@ -1028,7 +1233,8 @@ impl Agent<AgentCtx> for SubAgent {
                         break;
                     }
                     Err(err) => {
-                        let output = runner.latest_output();
+                        let mut output = runner.latest_output();
+                        runner.merge_carried_artifacts(&mut output);
                         if let Some(hook) = &runner.agent_hook {
                             hook.on_background_end(runner.runner.ctx(), session.id.clone(), output)
                                 .await;
@@ -1039,7 +1245,7 @@ impl Agent<AgentCtx> for SubAgent {
                 }
             }
 
-            subsessions.remove_session(&session.id);
+            subsessions.remove_session_if(&session);
         });
 
         Ok(rt)
@@ -1105,16 +1311,38 @@ impl SubAgentManager {
     pub async fn load(&self, ctx: AgentCtx) -> Result<(), BoxError> {
         let offset = Path::from("");
         let prefix = Self::store_prefix();
-        if let Ok(agents) = ctx.root.store_list(Some(&prefix), &offset).await {
-            for meta in agents {
-                let (data, _) = ctx.root.store_get(&meta.location).await?;
-                if let Ok(mut agent) = from_reader::<SubAgent, _>(&data[..]) {
+        let agents = match ctx.root.store_list(Some(&prefix), &offset).await {
+            Ok(agents) => agents,
+            Err(err) => {
+                log::warn!("failed to list persisted subagents: {err}");
+                return Ok(());
+            }
+        };
+
+        // One corrupted or unreadable entry must not prevent the other subagents from loading.
+        for meta in agents {
+            let data = match ctx.root.store_get(&meta.location).await {
+                Ok((data, _)) => data,
+                Err(err) => {
+                    log::warn!("failed to read persisted subagent {}: {err}", meta.location);
+                    continue;
+                }
+            };
+
+            match from_reader::<SubAgent, _>(&data[..]) {
+                Ok(mut agent) => {
                     let name = agent.name.to_ascii_lowercase();
                     self.preserve_runtime_state(&name, &mut agent);
                     self.agents.write().insert(name, agent);
                 }
+                Err(err) => {
+                    log::warn!(
+                        "failed to decode persisted subagent {}: {err}",
+                        meta.location
+                    );
+                }
             }
-        };
+        }
 
         Ok(())
     }
@@ -1825,13 +2053,32 @@ mod tests {
                 "effort": null
             })
             .to_string(),
-        );
+        )
+        .unwrap();
         assert_eq!(args.prompt, "structured");
         assert_eq!(args.effort, None);
         assert_eq!(
-            SubAgentArgs::from_prompt("plain".to_string()).prompt,
+            SubAgentArgs::from_prompt("plain".to_string())
+                .unwrap()
+                .prompt,
             "plain"
         );
+
+        // Invalid structured arguments must surface as errors instead of silently degrading
+        // into a blocking run with the raw JSON as the prompt.
+        assert!(
+            SubAgentArgs::from_prompt(json!({"prompt": "task", "effort": "ultra"}).to_string())
+                .is_err()
+        );
+        // JSON payloads that are not subagent arguments are task data, not arguments.
+        let data_prompt = json!({"city": "Reykjavik", "population": 139000}).to_string();
+        let args = SubAgentArgs::from_prompt(data_prompt.clone()).unwrap();
+        assert_eq!(args.prompt, data_prompt);
+        assert!(args.session.is_empty());
+        // Text that merely starts with '{' is also a plain prompt.
+        let text_prompt = "{\"a\":1} and {\"b\":2} differ, explain why".to_string();
+        let args = SubAgentArgs::from_prompt(text_prompt.clone()).unwrap();
+        assert_eq!(args.prompt, text_prompt);
 
         let manager_args = SubAgentManagerArgs::from_prompt(
             json!({
@@ -2174,6 +2421,8 @@ mod tests {
             agent_hook: Some(DynAgentHook::new(hook.clone())),
             runner: ctx.clone().completion_iter(req, Vec::new()).unbound(),
             last_output: None,
+            carried_artifacts: Vec::new(),
+            closing: false,
         };
 
         assert!(runner.run(Vec::new()).await.unwrap());
@@ -2188,6 +2437,10 @@ mod tests {
         let effort_before_compaction = runner.runner.req().effort;
 
         assert!(runner.run(Vec::new()).await.unwrap());
+
+        // Usage accumulated before compaction is carried into the replacement runner.
+        assert_eq!(runner.runner.total_usage().input_tokens, 100_001);
+        assert_eq!(runner.runner.total_usage().requests, 2);
 
         let progress = hook.progress_events();
         assert_eq!(progress.len(), 1);
@@ -2283,6 +2536,8 @@ mod tests {
             agent_hook: None,
             runner: ctx.completion_iter(req, Vec::new()).unbound(),
             last_output: None,
+            carried_artifacts: Vec::new(),
+            closing: false,
         };
 
         assert!(runner.run(Vec::new()).await.unwrap());
@@ -2345,6 +2600,8 @@ mod tests {
                 )
                 .unbound(),
             last_output: None,
+            carried_artifacts: Vec::new(),
+            closing: false,
         };
 
         assert!(runner.run(Vec::new()).await.unwrap());
@@ -2421,6 +2678,8 @@ mod tests {
                 )
                 .unbound(),
             last_output: None,
+            carried_artifacts: Vec::new(),
+            closing: false,
         };
         let output = runner.finalize_output().await;
         assert_eq!(output.failed_reason.as_deref(), Some("model failed"));
@@ -2455,6 +2714,8 @@ mod tests {
             agent_hook: None,
             runner: ctx.completion_iter(req, Vec::new()).unbound(),
             last_output: None,
+            carried_artifacts: Vec::new(),
+            closing: false,
         };
 
         assert!(runner.run(Vec::new()).await.unwrap());
@@ -2464,9 +2725,19 @@ mod tests {
             Some("compacted handoff")
         );
 
+        runner.carried_artifacts.push(resource(11, &["artifact"]));
         let output = runner.finalize_output().await;
         assert_eq!(output.content, "seed task");
         assert_eq!(output.session.as_deref(), Some("session-1"));
+        // Artifacts rescued from the pre-compaction runner survive into the final output.
+        assert_eq!(
+            output
+                .artifacts
+                .iter()
+                .map(|artifact| artifact._id)
+                .collect::<Vec<_>>(),
+            vec![11]
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2493,6 +2764,8 @@ mod tests {
             agent_hook: None,
             runner: ctx.completion_iter(req, Vec::new()).unbound(),
             last_output: None,
+            carried_artifacts: Vec::new(),
+            closing: false,
         };
 
         assert!(runner.run(Vec::new()).await.unwrap());
@@ -2605,6 +2878,8 @@ mod tests {
                 )
                 .unbound(),
             last_output: None,
+            carried_artifacts: Vec::new(),
+            closing: false,
         };
 
         assert_eq!(
@@ -2644,6 +2919,8 @@ mod tests {
             agent_hook: None,
             runner: ctx.completion_iter(req, Vec::new()).unbound(),
             last_output: None,
+            carried_artifacts: Vec::new(),
+            closing: false,
         };
 
         assert!(runner.run(Vec::new()).await.unwrap());
@@ -3299,5 +3576,179 @@ mod tests {
             assert_eq!(loaded.model, expected.model);
             assert_eq!(loaded.effort, expected.effort);
         }
+    }
+
+    fn test_session(id: &str) -> (Arc<SubSession>, tokio::sync::mpsc::Receiver<SubAgentInput>) {
+        let (sender, rx) = tokio::sync::mpsc::channel(16);
+        (
+            Arc::new(SubSession {
+                id: id.to_string(),
+                agent: "worker".to_string(),
+                sender,
+                background_tasks: Arc::new(RwLock::new(HashMap::new())),
+                active_at: AtomicU64::new(unix_ms()),
+            }),
+            rx,
+        )
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn subsession_agent_hook_forwards_usage_deltas() {
+        let (session, mut rx) = test_session("parent");
+        let ctx = EngineBuilder::new().mock_ctx();
+
+        AgentHook::on_background_start(
+            session.as_ref(),
+            &ctx,
+            "child",
+            &CompletionRequest::default(),
+        )
+        .await;
+
+        // Background agent outputs carry cumulative usage; the session must receive deltas.
+        AgentHook::on_background_progress(
+            session.as_ref(),
+            &ctx,
+            "child".into(),
+            AgentOutput {
+                content: "step-1".into(),
+                usage: Usage {
+                    input_tokens: 100,
+                    output_tokens: 10,
+                    cached_tokens: 0,
+                    requests: 1,
+                },
+                ..Default::default()
+            },
+        )
+        .await;
+        let input = rx.recv().await.unwrap();
+        assert_eq!(input.usage.input_tokens, 100);
+        assert_eq!(input.usage.output_tokens, 10);
+        assert_eq!(input.usage.requests, 1);
+
+        AgentHook::on_background_progress(
+            session.as_ref(),
+            &ctx,
+            "child".into(),
+            AgentOutput {
+                content: "step-2".into(),
+                usage: Usage {
+                    input_tokens: 250,
+                    output_tokens: 25,
+                    cached_tokens: 0,
+                    requests: 3,
+                },
+                ..Default::default()
+            },
+        )
+        .await;
+        let input = rx.recv().await.unwrap();
+        assert_eq!(input.usage.input_tokens, 150);
+        assert_eq!(input.usage.output_tokens, 15);
+        assert_eq!(input.usage.requests, 2);
+
+        // A failure output with empty usage must not reset the watermark.
+        AgentHook::on_background_progress(
+            session.as_ref(),
+            &ctx,
+            "child".into(),
+            AgentOutput {
+                failed_reason: Some("transient".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+        let input = rx.recv().await.unwrap();
+        assert_eq!(input.usage.input_tokens, 0);
+        assert_eq!(input.usage.requests, 0);
+
+        AgentHook::on_background_end(
+            session.as_ref(),
+            &ctx,
+            "child".into(),
+            AgentOutput {
+                content: "done".into(),
+                usage: Usage {
+                    input_tokens: 300,
+                    output_tokens: 30,
+                    cached_tokens: 0,
+                    requests: 4,
+                },
+                ..Default::default()
+            },
+        )
+        .await;
+        let input = rx.recv().await.unwrap();
+        assert_eq!(input.usage.input_tokens, 50);
+        assert_eq!(input.usage.output_tokens, 5);
+        assert_eq!(input.usage.requests, 1);
+        assert!(session.background_tasks.read().is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn subsessions_claim_and_conditional_remove_handle_races() {
+        let sessions = SubSessions::default();
+        let (first, _rx1) = test_session("job");
+        assert!(sessions.try_insert_session(first.clone()).is_none());
+
+        // A concurrent claim joins the active session instead of replacing it.
+        let (second, _rx2) = test_session("job");
+        let existing = sessions.try_insert_session(second.clone()).unwrap();
+        assert!(Arc::ptr_eq(&existing, &first));
+
+        // A stale runner must not remove a session it no longer owns.
+        sessions.remove_session_if(&second);
+        assert!(sessions.get_session("job").is_some());
+        sessions.remove_session_if(&first);
+        assert!(sessions.get_session("job").is_none());
+
+        // A closed session is replaced by a fresh claim.
+        let (closed, closed_rx) = test_session("job");
+        drop(closed_rx);
+        sessions.insert_session(closed);
+        let (fresh, _rx3) = test_session("job");
+        assert!(sessions.try_insert_session(fresh.clone()).is_none());
+        assert!(Arc::ptr_eq(&sessions.get_session("job").unwrap(), &fresh));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn subagent_control_commands_report_inactive_sessions() {
+        let model = Model::with_completer(Arc::new(EchoCompleter));
+        let ctx = EngineBuilder::new().with_model(model).mock_ctx();
+        let agent = SubAgent {
+            name: "echo_helper".to_string(),
+            description: "Echoes input.".to_string(),
+            instructions: "Echo the prompt.".to_string(),
+            ..Default::default()
+        };
+
+        for prompt in ["/stop finish now", "/cancel", "", "/ping"] {
+            let output = agent
+                .run(
+                    ctx.clone(),
+                    serde_json::to_string(&SubAgentArgs {
+                        prompt: prompt.to_string(),
+                        session: "Ghost".to_string(),
+                        model: String::new(),
+                        effort: None,
+                    })
+                    .unwrap(),
+                    Vec::new(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(output.session.as_deref(), Some("ghost"));
+            assert!(output.content.contains("not active"), "{}", output.content);
+            assert!(output.failed_reason.is_none());
+            assert!(agent.subsessions.active_session_ids().is_empty());
+        }
+
+        // A blocking run still rejects an empty prompt explicitly.
+        let err = agent
+            .run(ctx, "".to_string(), Vec::new())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("prompt cannot be empty"));
     }
 }

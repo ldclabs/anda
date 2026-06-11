@@ -5,9 +5,9 @@ use serde_json::json;
 use std::path::PathBuf;
 
 use super::{
-    BASE64_ENCODING, MAX_FILE_SIZE_BYTES, UTF8_ENCODING, decode_file_text,
-    ensure_file_size_within_limit, ensure_regular_file, format_workspaces, normalize_workspaces,
-    resolve_read_path_in_workspaces, tool_workspaces,
+    BASE64_ENCODING, MAX_FILE_SIZE_BYTES, MAX_INLINE_CONTENT_BYTES, UTF8_ENCODING,
+    decode_file_text, ensure_file_size_within_limit, ensure_regular_file, format_workspaces,
+    normalize_workspaces, resolve_read_path_in_workspaces, tool_workspaces, truncate_inline_text,
 };
 use crate::{
     context::BaseCtx,
@@ -42,6 +42,10 @@ pub struct ReadFileOutput {
     /// The number of lines in the file content, if the content is decoded text.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_lines: Option<usize>,
+    /// True when `content` was truncated to the inline output limit. Page through
+    /// large text files with `offset` and `limit`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
 }
 
 pub type ReadFileHook = DynToolHook<ReadFileArgs, ReadFileOutput>;
@@ -114,7 +118,7 @@ impl Tool<BaseCtx> for ReadFileTool {
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Maximum number of decoded text lines to return (default: 0, all remaining lines)"
+                        "description": "Maximum number of decoded text lines to return (default: 0, all remaining lines). Responses are capped at 256KiB and marked with `truncated: true` when cut; use offset and limit to page through large files."
                     }
                 },
                 "required": ["path", "offset", "limit"],
@@ -182,21 +186,34 @@ impl Tool<BaseCtx> for ReadFileTool {
             Ok(decoded) => {
                 output.encoding = decoded.encoding;
                 let text = decoded.text;
-                let all_lines = text.lines();
-                output.total_lines = Some(all_lines.clone().count());
+                output.total_lines = Some(text.lines().count());
                 if args.offset == 0 && args.limit == 0 {
                     output.content = text;
                 } else if args.limit == 0 {
-                    output.content = all_lines.skip(args.offset).collect::<Vec<_>>().join("\n");
+                    output.content = text
+                        .lines()
+                        .skip(args.offset)
+                        .collect::<Vec<_>>()
+                        .join("\n");
                 } else {
-                    output.content = all_lines
+                    output.content = text
+                        .lines()
                         .skip(args.offset)
                         .take(args.limit)
                         .collect::<Vec<_>>()
                         .join("\n");
                 }
+                output.truncated =
+                    truncate_inline_text(&mut output.content, MAX_INLINE_CONTENT_BYTES);
             }
-            Err(bytes) => {
+            Err(mut bytes) => {
+                // Cap binary previews as well; keep the length a multiple of 3 so the
+                // base64 prefix decodes cleanly.
+                let max_raw_bytes = MAX_INLINE_CONTENT_BYTES / 4 * 3;
+                if bytes.len() > max_raw_bytes {
+                    bytes.truncate(max_raw_bytes);
+                    output.truncated = true;
+                }
                 output.content = ByteBufB64(bytes).to_base64();
                 output.encoding = BASE64_ENCODING.to_string();
             }
@@ -420,6 +437,86 @@ mod tests {
 
         assert_eq!(result.output.content, "one\ntwo");
         assert_eq!(result.output.size, 19);
+    }
+
+    #[tokio::test]
+    async fn truncates_oversized_text_and_binary_content() {
+        use crate::extension::fs::MAX_INLINE_CONTENT_BYTES;
+        use std::str::FromStr;
+
+        let temp_dir = TestTempDir::new().await;
+        let workspace = temp_dir.path().join("workspace");
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+
+        let line = "0123456789abcdef\n";
+        let total_lines = MAX_INLINE_CONTENT_BYTES / line.len() + 1024;
+        let text = line.repeat(total_lines);
+        tokio::fs::write(workspace.join("big.txt"), &text)
+            .await
+            .unwrap();
+
+        let tool = read_tool(&workspace);
+        let result = tool
+            .call(
+                mock_ctx(),
+                ReadFileArgs {
+                    path: "big.txt".to_string(),
+                    offset: 0,
+                    limit: 0,
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert!(result.output.truncated);
+        assert!(result.output.content.len() <= MAX_INLINE_CONTENT_BYTES);
+        assert!(result.output.content.ends_with('\n'));
+        assert_eq!(result.output.total_lines, Some(total_lines));
+
+        // Paging through the same file stays untruncated.
+        let window = tool
+            .call(
+                mock_ctx(),
+                ReadFileArgs {
+                    path: "big.txt".to_string(),
+                    offset: total_lines - 2,
+                    limit: 2,
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!window.output.truncated);
+        assert_eq!(
+            window.output.content,
+            format!("{}\n{}", line.trim_end(), line.trim_end())
+        );
+
+        let mut binary = vec![0u8; MAX_INLINE_CONTENT_BYTES];
+        binary[0] = 0xff;
+        binary[1] = 0xfe;
+        tokio::fs::write(workspace.join("big.bin"), &binary)
+            .await
+            .unwrap();
+        let result = tool
+            .call(
+                mock_ctx(),
+                ReadFileArgs {
+                    path: "big.bin".to_string(),
+                    offset: 0,
+                    limit: 0,
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert!(result.output.truncated);
+        assert_eq!(result.output.encoding, BASE64_ENCODING);
+        assert!(result.output.content.len() <= MAX_INLINE_CONTENT_BYTES);
+        // The truncated base64 prefix still decodes to the head of the file.
+        let decoded = ByteBufB64::from_str(&result.output.content).unwrap();
+        assert_eq!(decoded.0.len(), MAX_INLINE_CONTENT_BYTES / 4 * 3);
+        assert_eq!(&decoded.0[..2], &[0xff, 0xfe]);
     }
 
     #[tokio::test]

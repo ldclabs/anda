@@ -317,12 +317,7 @@ async fn http_guards_local_calls_and_signed_rpc_paths_are_exercised() {
     );
     let guarded_rpc: Result<String, _> =
         HttpFeatures::https_signed_rpc(&guarded, "http://example.test/rpc", "ping", &()).await;
-    assert!(
-        guarded_rpc
-            .unwrap_err()
-            .to_string()
-            .contains("Invalid endpoint")
-    );
+    assert!(guarded_rpc.unwrap_err().to_string().contains("Invalid url"));
 
     assert!(
         Web3ClientFeatures::https_call(
@@ -361,7 +356,7 @@ async fn http_guards_local_calls_and_signed_rpc_paths_are_exercised() {
         .await
         .unwrap_err()
         .to_string()
-        .contains("Invalid endpoint")
+        .contains("Invalid url")
     );
 
     let endpoint = spawn_server().await;

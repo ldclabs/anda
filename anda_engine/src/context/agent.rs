@@ -35,7 +35,7 @@ use anda_core::{
 use bytes::Bytes;
 use candid::{CandidType, Principal, utils::ArgumentEncoder};
 use futures_util::Stream;
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
@@ -249,10 +249,7 @@ impl AgentCtx {
         req: CompletionRequest,
         resources: Vec<Resource>,
     ) -> CompletionStream {
-        CompletionStream {
-            runner: self.completion_iter(req, resources),
-            pending: None,
-        }
+        CompletionStream::new(self.completion_iter(req, resources))
     }
 }
 
@@ -1219,7 +1216,7 @@ impl CompletionRunner {
             return;
         }
 
-        let Ok(tools_output) = serde_json::from_value::<ToolsOutput>(output.clone()) else {
+        let Ok(tools_output) = ToolsOutput::deserialize(output) else {
             return;
         };
 
@@ -1267,9 +1264,12 @@ impl CompletionRunner {
         }
     }
 
-    fn compact_discovery_tool_output_for_context(&self, tool_name: &str, output: &Json) -> Json {
+    /// Compacts a discovery tool output in place once discovered definitions
+    /// are merged into the request tools, so full schemas are not duplicated
+    /// in the conversation context. Non-discovery outputs are left untouched.
+    fn compact_discovery_tool_output_for_context(&self, tool_name: &str, output: &mut Json) {
         if !self.merge_discovered_tools {
-            return output.clone();
+            return;
         }
 
         let keep_description = if tool_name.eq_ignore_ascii_case(TOOLS_SEARCH_NAME) {
@@ -1277,11 +1277,11 @@ impl CompletionRunner {
         } else if tool_name.eq_ignore_ascii_case(TOOLS_SELECT_NAME) {
             false
         } else {
-            return output.clone();
+            return;
         };
 
-        let Ok(tools_output) = serde_json::from_value::<ToolsOutput>(output.clone()) else {
-            return output.clone();
+        let Ok(tools_output) = ToolsOutput::deserialize(&*output) else {
+            return;
         };
 
         let tools = tools_output
@@ -1301,10 +1301,10 @@ impl CompletionRunner {
             })
             .collect::<Vec<_>>();
 
-        json!({
+        *output = json!({
             "tools": tools,
             "total_tools": tools_output.total_tools,
-        })
+        });
     }
 
     // Drains all queued steering messages into a single user turn. When steering exists, queued
@@ -1542,7 +1542,8 @@ impl CompletionRunner {
                 let mut tool_call_futs: Vec<BoxPinFut<ToolCall>> = Vec::new();
                 for mut tool in tool_calls.into_iter() {
                     let tool_name = tool.name.to_ascii_lowercase();
-                    if self.ctx.tools.contains_lowercase(&tool_name) || tool_name.starts_with("rt_")
+                    if self.ctx.tools.contains_lowercase(&tool_name)
+                        || strip_prefix_ignore_ascii_case(&tool_name, REMOTE_TOOL_PREFIX).is_some()
                     {
                         let ctx = self.ctx.clone();
                         let input = ToolInput {
@@ -1576,8 +1577,8 @@ impl CompletionRunner {
                         }));
                     } else if self.ctx.agents.contains_lowercase(&tool_name)
                         || self.ctx.subagents.contains_lowercase(&tool_name)
-                        || tool_name.starts_with("sa_")
-                        || tool_name.starts_with("ra_")
+                        || strip_prefix_ignore_ascii_case(&tool_name, SUB_AGENT_PREFIX).is_some()
+                        || strip_prefix_ignore_ascii_case(&tool_name, REMOTE_AGENT_PREFIX).is_some()
                     {
                         // Subagents consume structured controls such as `session`, `model`, and
                         // `effort`, so preserve their full argument object. Plain string args and
@@ -1656,8 +1657,10 @@ impl CompletionRunner {
                             self.accumulate_tools_usage(&res.tools_usage);
                             self.accumulate(&res.usage);
                             self.add_discovered_tools_from_output(&tool.name, &res.output);
-                            res.output = self
-                                .compact_discovery_tool_output_for_context(&tool.name, &res.output);
+                            self.compact_discovery_tool_output_for_context(
+                                &tool.name,
+                                &mut res.output,
+                            );
 
                             // We can not ignore some tool calls.
                             // GPT-5: An assistant message with 'tool_calls' must be followed by tool messages responding to each 'tool_call_id'.
@@ -1696,7 +1699,7 @@ impl CompletionRunner {
 
                         self.req.chat_history.push(msg.clone());
                         self.set_next_user_content(follow_up_content);
-                        self.append_chat_history(vec![msg]);
+                        self.chat_history.push(msg);
                     }
                 }
             } else if let Some(content) = self.drain_queued_message() {
@@ -1815,12 +1818,60 @@ impl CompletionRunner {
 ///
 /// Note that a stream is terminal after yielding `None`. If you need resumable idle behavior via
 /// `set_unbound(true)`, drive [`CompletionRunner::next`] directly instead of using this stream.
+///
+/// While a step is in flight, the `runner` field holds an inert placeholder, so queue mid-run
+/// messages through [`CompletionStream::steer`] and [`CompletionStream::follow_up`] instead of
+/// calling the runner directly; they are delivered to the live runner when the step completes.
 pub struct CompletionStream {
     pub runner: CompletionRunner,
     pending: Option<PendingCompletion>,
+    queued_steering: Vec<ContentPart>,
+    queued_follow_up: Vec<ContentPart>,
 }
 
 type PendingCompletion = BoxPinFut<(CompletionRunner, Result<Option<AgentOutput>, BoxError>)>;
+
+impl CompletionStream {
+    pub(crate) fn new(runner: CompletionRunner) -> Self {
+        Self {
+            runner,
+            pending: None,
+            queued_steering: Vec::new(),
+            queued_follow_up: Vec::new(),
+        }
+    }
+
+    /// Queue a steering message, buffering it while a step is in flight.
+    pub fn steer(&mut self, message: impl Into<ContentPart>) {
+        if self.pending.is_none() {
+            self.runner.steer(message);
+        } else {
+            self.queued_steering.push(message.into());
+        }
+    }
+
+    /// Queue a follow-up message, buffering it while a step is in flight.
+    pub fn follow_up(&mut self, message: impl Into<ContentPart>) {
+        if self.pending.is_none() {
+            self.runner.follow_up(message);
+        } else {
+            self.queued_follow_up.push(message.into());
+        }
+    }
+
+    fn restore_runner(&mut self, runner: CompletionRunner) {
+        self.runner = runner;
+        self.pending = None;
+        if !self.queued_follow_up.is_empty() {
+            self.runner
+                .follow_up_content(std::mem::take(&mut self.queued_follow_up));
+        }
+        if !self.queued_steering.is_empty() {
+            self.runner
+                .steer_content(std::mem::take(&mut self.queued_steering));
+        }
+    }
+}
 
 impl Stream for CompletionStream {
     type Item = Result<AgentOutput, BoxError>;
@@ -1842,20 +1893,13 @@ impl Stream for CompletionStream {
             .as_mut()
             .expect("completion stream pending future must be initialized");
         match pending.as_mut().poll(cx) {
-            Poll::Ready((runner, Ok(Some(output)))) => {
-                this.runner = runner;
-                this.pending = None;
-                Poll::Ready(Some(Ok(output)))
-            }
-            Poll::Ready((runner, Ok(None))) => {
-                this.runner = runner;
-                this.pending = None;
-                Poll::Ready(None)
-            }
-            Poll::Ready((runner, Err(e))) => {
-                this.runner = runner;
-                this.pending = None;
-                Poll::Ready(Some(Err(e)))
+            Poll::Ready((runner, res)) => {
+                this.restore_runner(runner);
+                match res {
+                    Ok(Some(output)) => Poll::Ready(Some(Ok(output))),
+                    Ok(None) => Poll::Ready(None),
+                    Err(e) => Poll::Ready(Some(Err(e))),
+                }
             }
             Poll::Pending => Poll::Pending,
         }
@@ -3143,21 +3187,32 @@ mod tests {
             "total_tools": 9
         });
 
-        let search_output =
-            runner.compact_discovery_tool_output_for_context("tools_search", &full_output);
+        let mut search_output = full_output.clone();
+        runner.compact_discovery_tool_output_for_context("tools_search", &mut search_output);
         assert_eq!(search_output["tools"][0]["name"], "echo_tool");
         assert_eq!(search_output["tools"][0]["description"], "Echoes input");
         assert!(search_output["tools"][0].get("parameters").is_none());
         assert!(search_output["tools"][0].get("strict").is_none());
         assert_eq!(search_output["total_tools"], 9);
 
-        let select_output =
-            runner.compact_discovery_tool_output_for_context("tools_select", &full_output);
+        let mut select_output = full_output.clone();
+        runner.compact_discovery_tool_output_for_context("tools_select", &mut select_output);
         assert_eq!(select_output["tools"][0]["name"], "echo_tool");
         assert!(select_output["tools"][0].get("description").is_none());
         assert!(select_output["tools"][0].get("parameters").is_none());
         assert!(select_output["tools"][0].get("strict").is_none());
         assert_eq!(select_output["total_tools"], 9);
+
+        // Non-discovery tool outputs stay untouched.
+        let mut other_output = full_output.clone();
+        runner.compact_discovery_tool_output_for_context("echo_tool", &mut other_output);
+        assert_eq!(other_output, full_output);
+
+        // Without schema merge, discovery outputs also stay untouched.
+        runner.merge_discovered_tools = false;
+        let mut unmerged_output = full_output.clone();
+        runner.compact_discovery_tool_output_for_context("tools_search", &mut unmerged_output);
+        assert_eq!(unmerged_output, full_output);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -4366,6 +4421,106 @@ mod tests {
         let item = stream.next().await;
         assert!(item.is_some());
         assert!(item.unwrap().is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stream_buffers_steering_while_step_in_flight() {
+        /// Completer whose first call blocks on a gate, then emits a tool call.
+        /// A steered user turn is echoed back with a `steered:` marker.
+        #[derive(Clone)]
+        struct GatedToolCallCompleter {
+            gate: Arc<tokio::sync::Notify>,
+        }
+
+        impl CompletionFeaturesDyn for GatedToolCallCompleter {
+            fn model_name(&self) -> String {
+                "gated_tool_call".to_string()
+            }
+
+            fn completion(
+                &self,
+                req: CompletionRequest,
+            ) -> anda_core::BoxPinFut<Result<AgentOutput, BoxError>> {
+                let gate = self.gate.clone();
+                Box::pin(async move {
+                    if req.role.as_deref() == Some("user") {
+                        let text = req
+                            .content
+                            .iter()
+                            .filter_map(|part| match part {
+                                ContentPart::Text { text } => Some(text.as_str()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        return Ok(AgentOutput {
+                            content: format!("steered:{text}"),
+                            usage: Usage {
+                                requests: 1,
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        });
+                    }
+                    if req.role.as_deref() == Some("tool") {
+                        return Ok(AgentOutput {
+                            content: "tool_result_processed".to_string(),
+                            ..Default::default()
+                        });
+                    }
+
+                    gate.notified().await;
+                    Ok(AgentOutput {
+                        tool_calls: vec![ToolCall {
+                            name: "echo_tool".to_string(),
+                            args: json!({"input": "x"}),
+                            call_id: Some("gated_call".into()),
+                            result: None,
+                            remote_id: None,
+                        }],
+                        usage: Usage {
+                            requests: 1,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    })
+                })
+            }
+        }
+
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let model = Model::with_completer(Arc::new(GatedToolCallCompleter { gate: gate.clone() }));
+        let ctx = EngineBuilder::new()
+            .with_model(model)
+            .register_tool(Arc::new(EchoTool))
+            .unwrap()
+            .mock_ctx();
+
+        let mut stream = ctx.completion_stream(
+            CompletionRequest {
+                prompt: "start".to_string(),
+                ..Default::default()
+            },
+            Vec::new(),
+        );
+
+        // Start the first step; the gated completer keeps it in flight.
+        let waker = futures::task::noop_waker();
+        let mut poll_cx = std::task::Context::from_waker(&waker);
+        assert!(stream.poll_next_unpin(&mut poll_cx).is_pending());
+
+        // Steering while the step is in flight must be buffered, not dropped.
+        stream.steer("redirect".to_string());
+        gate.notify_one();
+
+        let step1 = stream.next().await.unwrap().unwrap();
+        assert_eq!(step1.tool_calls.len(), 1);
+
+        // The buffered steering interrupts the pending tool call and becomes
+        // the next user turn.
+        let step2 = stream.next().await.unwrap().unwrap();
+        assert_eq!(step2.content, "steered:redirect");
+        assert!(stream.next().await.is_none());
     }
 
     // ── Step counter tests ──
