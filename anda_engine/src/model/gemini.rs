@@ -38,6 +38,7 @@ impl From<ModelEffort> for types::ThinkingLevel {
 // ================================================================
 const API_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta/models";
 
+/// Default Gemini completion model used when no model is configured.
 pub static DEFAULT_COMPLETION_MODEL: &str = "gemini-flash-latest";
 
 /// Gemini API client configuration and HTTP client

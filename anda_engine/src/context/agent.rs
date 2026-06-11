@@ -56,9 +56,13 @@ use crate::{
     subagent::{SubAgentSet, SubAgentSetManager},
 };
 
+/// Reserved dynamic-configuration key for remote engine registrations.
 pub static DYNAMIC_REMOTE_ENGINES: &str = "_engines";
+/// Prefix used for routed remote-agent calls in model-facing tool names.
 pub static REMOTE_AGENT_PREFIX: &str = "RA_";
+/// Prefix used for routed remote-tool calls in model-facing tool names.
 pub static REMOTE_TOOL_PREFIX: &str = "RT_";
+/// Prefix used for routed subagent calls in model-facing tool names.
 pub static SUB_AGENT_PREFIX: &str = "SA_";
 const MAX_DISCOVERED_REQUEST_TOOLS: usize = 16;
 
@@ -1065,6 +1069,7 @@ impl CompletionRunner {
         self.turns
     }
 
+    /// Returns the agent context driving this completion.
     pub fn ctx(&self) -> &AgentCtx {
         &self.ctx
     }
@@ -1099,6 +1104,7 @@ impl CompletionRunner {
         &self.tools_usage
     }
 
+    /// Returns the most recent non-final output, when one is available.
     pub fn last_output(&self) -> Option<&AgentOutput> {
         self.last_output.as_ref()
     }
@@ -1823,6 +1829,7 @@ impl CompletionRunner {
 /// messages through [`CompletionStream::steer`] and [`CompletionStream::follow_up`] instead of
 /// calling the runner directly; they are delivered to the live runner when the step completes.
 pub struct CompletionStream {
+    /// Runner owned by the stream between poll steps.
     pub runner: CompletionRunner,
     pending: Option<PendingCompletion>,
     queued_steering: Vec<ContentPart>,

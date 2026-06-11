@@ -75,6 +75,7 @@ impl Default for FetchWebResourcesTool {
 }
 
 impl FetchWebResourcesTool {
+    /// Function name used when registering the fetch tool.
     pub const NAME: &'static str = "fetch_web_resources";
 
     /// Creates a new FetchWebResourcesTool instance

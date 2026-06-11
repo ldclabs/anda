@@ -820,6 +820,7 @@ pub struct EchoEngineInfo {
 }
 
 impl EchoEngineInfo {
+    /// Creates an echo agent from static engine metadata.
     pub fn new(info: AgentInfo) -> Self {
         let content = serde_json::to_string(&info).unwrap_or_default();
         Self { info, content }
@@ -862,6 +863,7 @@ impl Default for EngineRef {
 }
 
 impl EngineRef {
+    /// Creates an unbound engine reference.
     pub fn new() -> Self {
         Self {
             inner: OnceLock::new(),

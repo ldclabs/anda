@@ -1,3 +1,8 @@
+//! Axum handlers for engine information and signed RPC calls.
+//!
+//! The handlers verify CWT or signed-envelope credentials, resolve the target
+//! engine, and dispatch typed CBOR/JSON payloads into the engine runtime.
+
 use anda_core::{AgentInput, Json, RPCRequest, ToolInput};
 use anda_engine::engine::Engine;
 use axum::{
@@ -29,12 +34,18 @@ use std::{collections::BTreeMap, str::FromStr, sync::Arc};
 
 use crate::types::*;
 
+/// Shared axum application state for engine server routes.
 #[derive(Clone)]
 pub struct AppState {
+    /// Registered engines keyed by principal.
     pub engines: Arc<BTreeMap<Principal, Arc<Engine>>>,
+    /// Default engine used by discovery routes.
     pub default_engine: Principal,
+    /// Server start timestamp in milliseconds.
     pub start_time_ms: u64,
+    /// Additional metadata returned from information endpoints.
     pub extra_info: Arc<BTreeMap<String, Json>>,
+    /// Trusted Ed25519 public keys for bearer CWT verification.
     pub ed25519_pubkeys: Arc<Vec<VerifyingKey>>,
 }
 

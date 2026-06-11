@@ -1,3 +1,9 @@
+//! Native shell command executor.
+//!
+//! This runtime launches commands on the host operating system and optionally
+//! streams long-running output through background hooks. It is intended for
+//! trusted environments; sandboxed execution lives behind the `sandbox` feature.
+
 use anda_core::{BoxError, StateFeatures, ToolOutput};
 use async_trait::async_trait;
 use ic_auth_types::Xid;
@@ -119,6 +125,7 @@ pub struct NativeRuntime {
 }
 
 impl NativeRuntime {
+    /// Builds the platform shell command used to execute a command string.
     pub fn build_shell_command(command: &str) -> std::process::Command {
         #[cfg(not(target_os = "windows"))]
         {
@@ -135,6 +142,7 @@ impl NativeRuntime {
         }
     }
 
+    /// Creates a native runtime rooted at `workspace`.
     pub fn new(workspace: PathBuf) -> Self {
         Self {
             workspace,
@@ -145,10 +153,12 @@ impl NativeRuntime {
         }
     }
 
+    /// Overrides the temporary directory used for raw output files.
     pub fn temp_dir(self, temp_dir: PathBuf) -> Self {
         Self { temp_dir, ..self }
     }
 
+    /// Allows commands to inherit the process environment.
     pub fn insecure(self) -> Self {
         Self {
             insecure: true,
@@ -156,6 +166,7 @@ impl NativeRuntime {
         }
     }
 
+    /// Sets how often background command progress is emitted.
     pub fn background_progress_interval(self, interval: std::time::Duration) -> Self {
         Self {
             background_progress_interval: interval,
@@ -163,6 +174,7 @@ impl NativeRuntime {
         }
     }
 
+    /// Sets the foreground duration after which a command moves to background mode.
     pub fn auto_background_after(self, interval: std::time::Duration) -> Self {
         Self {
             auto_background_after: interval,
@@ -170,6 +182,7 @@ impl NativeRuntime {
         }
     }
 
+    /// Executes a prepared native command and normalizes its output.
     pub async fn execute_command(
         &self,
         ctx: BaseCtx,

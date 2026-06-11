@@ -1,3 +1,9 @@
+//! Middleware helpers for [`ServerBuilder`](crate::ServerBuilder).
+//!
+//! Callers can register arbitrary router middleware, request middleware, gzip
+//! compression, or a simple API-key guard without making the server builder
+//! generic over every tower layer.
+
 use axum::{
     Router,
     extract::Request,
@@ -9,6 +15,7 @@ use std::{future::Future, sync::Arc};
 
 pub use crate::handler::AppState;
 pub use tower_http::compression::CompressionLayer;
+/// Axum router type carrying server application state.
 pub type AppRouter = Router<AppState>;
 
 /// Object-safe middleware trait for applying HTTP middleware to the server `Router`.
@@ -16,6 +23,7 @@ pub type AppRouter = Router<AppState>;
 /// This is intentionally type-erased so callers can register arbitrary axum/tower
 /// middleware without turning `ServerBuilder` into a giant generic type.
 pub trait HttpMiddleware: Send + Sync + 'static {
+    /// Applies this middleware to the router.
     fn apply(&self, router: AppRouter) -> AppRouter;
 }
 
@@ -34,6 +42,7 @@ pub struct RequestFnMiddleware<F> {
 }
 
 impl<F> RequestFnMiddleware<F> {
+    /// Wraps a request middleware function.
     pub fn new(f: F) -> Self {
         Self { f }
     }
@@ -55,6 +64,7 @@ pub struct CompressionMiddleware {
 }
 
 impl CompressionMiddleware {
+    /// Creates compression middleware from a specific tower-http layer.
     pub fn new(layer: CompressionLayer) -> Self {
         Self { layer }
     }
@@ -86,6 +96,7 @@ pub struct ApiKeyMiddleware {
 }
 
 impl ApiKeyMiddleware {
+    /// Creates an API-key middleware that expects `x-api-key` to match.
     pub fn new(expected_key: impl Into<String>) -> Self {
         Self {
             expected_key: expected_key.into(),
@@ -93,6 +104,7 @@ impl ApiKeyMiddleware {
         }
     }
 
+    /// Adds a path that bypasses API-key validation.
     pub fn exempt_path(mut self, path: impl Into<String>) -> Self {
         self.exempt_paths.push(path.into());
         self

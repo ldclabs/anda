@@ -130,18 +130,25 @@ pub trait DynTool<C>: Send + Sync
 where
     C: BaseContext + Send + Sync,
 {
+    /// Returns this tool as [`Any`] for type inspection.
     fn as_any(&self) -> &(dyn Any + Send + Sync);
 
+    /// Converts the shared tool into [`Any`] for downcasting.
     fn into_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync>;
 
+    /// Returns the unique tool name.
     fn name(&self) -> String;
 
+    /// Returns the function definition exposed to model providers.
     fn definition(&self) -> FunctionDefinition;
 
+    /// Returns resource tags this tool can consume.
     fn supported_resource_tags(&self) -> Vec<String>;
 
+    /// Initializes the tool through object-safe dispatch.
     fn init(&self, ctx: C) -> BoxPinFut<Result<(), BoxError>>;
 
+    /// Executes the tool through object-safe dispatch with raw JSON arguments.
     fn call(
         &self,
         ctx: C,
@@ -227,6 +234,7 @@ where
 /// - `C`: The context type that implements [`BaseContext`].
 #[derive(Default)]
 pub struct ToolSet<C: BaseContext> {
+    /// Registered tools keyed by their lowercase function names.
     pub set: BTreeMap<String, Arc<dyn DynTool<C>>>,
 }
 

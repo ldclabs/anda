@@ -1,3 +1,11 @@
+//! Gemini GenerateContent wire types used by the Gemini model adapter.
+//!
+//! The public types in this module mirror Google's request, response, tool,
+//! grounding, safety, and streaming payload shapes. The adapter relies on these
+//! names matching the provider JSON contract, so detailed per-field semantics
+//! are deferred to the upstream API documentation.
+#![allow(missing_docs)]
+
 use anda_core::{
     AgentOutput, BoxError, ByteBufB64, ContentPart, FunctionDefinition, Message,
     Usage as ModelUsage,

@@ -51,8 +51,14 @@ use super::{
 };
 use crate::store::Store;
 
+/// Runtime context shared by engine tools and nested agent calls.
+///
+/// `BaseCtx` owns the current agent namespace and request metadata while
+/// sharing storage, cache, Web3, remote-engine, and cancellation services with
+/// child contexts.
 #[derive(Clone)]
 pub struct BaseCtx {
+    /// Agent namespace that owns this context's storage and cache view.
     pub agent: String,
 
     pub(crate) id: Principal,
@@ -224,6 +230,7 @@ impl BaseCtx {
         }
     }
 
+    /// Returns a cloned typed value from this context's extension state.
     pub fn get_state<T>(&self) -> Option<T>
     where
         T: Clone + Send + Sync + 'static,
@@ -231,6 +238,7 @@ impl BaseCtx {
         self.state.read().get::<T>().cloned()
     }
 
+    /// Inserts a typed value into this context's extension state.
     pub fn set_state<T>(&self, v: T) -> Option<T>
     where
         T: Clone + Send + Sync + 'static,
@@ -238,6 +246,7 @@ impl BaseCtx {
         self.state.write().insert(v)
     }
 
+    /// Strips this context's path prefix from `path` when it is present.
     pub fn try_strip_prefix_path<'a>(&'a self, path: &'a Path) -> Cow<'a, Path> {
         if let Some(p) = path.prefix_match(&self.path) {
             Cow::Owned(Path::from_iter(p))

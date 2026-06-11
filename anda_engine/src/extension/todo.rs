@@ -49,26 +49,32 @@ pub struct TodoSession {
 }
 
 impl TodoSession {
+    /// Creates an empty todo session.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Replaces the session list and returns the full normalized snapshot.
     pub fn set(&self, items: Vec<TodoItemInput>) -> Vec<TodoItem> {
         self.inner.write().set(items)
     }
 
+    /// Applies partial updates and returns the full normalized snapshot.
     pub fn update(&self, items: Vec<TodoItemInput>) -> Vec<TodoItem> {
         self.inner.write().update(items)
     }
 
+    /// Returns the current ordered task list.
     pub fn snapshot(&self) -> Vec<TodoItem> {
         self.inner.read().snapshot()
     }
 
+    /// Returns true when at least one task is stored.
     pub fn has_items(&self) -> bool {
         self.inner.read().has_items()
     }
 
+    /// Formats active tasks for reinjection after context compression.
     pub fn format_for_injection(&self) -> Option<String> {
         self.inner.read().format_for_injection()
     }
@@ -257,10 +263,15 @@ impl TodoItem {
 /// Summary counts returned with the todo list.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct TodoSummary {
+    /// Total number of tasks.
     pub total: usize,
+    /// Number of pending tasks.
     pub pending: usize,
+    /// Number of tasks currently in progress.
     pub in_progress: usize,
+    /// Number of completed tasks.
     pub completed: usize,
+    /// Number of cancelled tasks.
     pub cancelled: usize,
 }
 
@@ -288,12 +299,14 @@ impl TodoSummary {
 /// Output returned by the todo tool.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct TodoOutput {
+    /// Summary counts for the current task list.
     pub summary: TodoSummary,
     /// Full task list. Present only for read operations.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub items: Vec<TodoItem>,
 }
 
+/// Typed hook for todo tool calls.
 pub type TodoToolHook = DynToolHook<TodoArgs, TodoOutput>;
 
 /// Tool implementation that exposes the session todo list to the agent.
@@ -326,6 +339,7 @@ impl TodoTool {
         }
     }
 
+    /// Overrides the function description exposed to the model.
     pub fn with_description(mut self, description: String) -> Self {
         self.description = description;
         self

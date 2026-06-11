@@ -1,3 +1,8 @@
+//! Text replacement tool for files inside configured workspaces.
+//!
+//! Edits are applied atomically after validating that the target file is regular
+//! and stays within the filesystem tool size limit.
+
 use anda_core::{BoxError, FunctionDefinition, Resource, StateFeatures, Tool, ToolOutput};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -38,8 +43,10 @@ pub struct EditFileOutput {
     pub size: u64,
 }
 
+/// Typed hook for edit-file tool calls.
 pub type EditFileHook = DynToolHook<EditFileArgs, EditFileOutput>;
 
+/// Tool implementation for atomic string replacement in text files.
 #[derive(Clone)]
 pub struct EditFileTool {
     workspaces: Vec<PathBuf>,
@@ -73,6 +80,7 @@ impl EditFileTool {
         }
     }
 
+    /// Overrides the function description exposed to the model.
     pub fn with_description(mut self, description: String) -> Self {
         self.description = description;
         self

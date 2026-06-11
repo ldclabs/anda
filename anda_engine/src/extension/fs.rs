@@ -1,3 +1,9 @@
+//! Workspace-scoped filesystem tool support.
+//!
+//! This module contains shared path resolution, text decoding/encoding, size
+//! limits, and atomic write helpers used by the read, write, search, and edit
+//! filesystem tools. Public tool structs are re-exported from the submodules.
+
 use anda_core::{
     BoxError, RequestMeta, platform_text_encoding, text_encoding_for_label, text_encoding_label,
     text_from_bytes_with_encoding,

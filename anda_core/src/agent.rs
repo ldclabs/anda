@@ -135,22 +135,31 @@ pub trait DynAgent<C>: Send + Sync
 where
     C: AgentContext + Send + Sync,
 {
+    /// Returns this agent as [`Any`] for type inspection.
     fn as_any(&self) -> &(dyn Any + Send + Sync);
 
+    /// Converts the shared agent into [`Any`] for downcasting.
     fn into_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync>;
 
+    /// Returns the registry label used for name-based lookup.
     fn label(&self) -> &str;
 
+    /// Returns the unique agent name.
     fn name(&self) -> String;
 
+    /// Returns the function definition exposed to model providers.
     fn definition(&self) -> FunctionDefinition;
 
+    /// Returns tool names required by this agent.
     fn tool_dependencies(&self) -> Vec<String>;
 
+    /// Returns resource tags this agent can consume.
     fn supported_resource_tags(&self) -> Vec<String>;
 
+    /// Initializes the agent through object-safe dispatch.
     fn init(&self, ctx: C) -> BoxPinFut<Result<(), BoxError>>;
 
+    /// Executes the agent through object-safe dispatch.
     fn run(
         &self,
         ctx: C,
@@ -249,6 +258,7 @@ where
 /// - `C`: The context type that implements [`AgentContext`].
 #[derive(Default)]
 pub struct AgentSet<C: AgentContext> {
+    /// Registered agents keyed by their lowercase function names.
     pub set: BTreeMap<String, Arc<dyn DynAgent<C>>>,
 }
 

@@ -23,14 +23,20 @@ pub trait CompletionFeatures: Sized {
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ModelEffort {
+    /// Smallest reasoning budget supported by the provider.
     Minimal,
+    /// Low reasoning budget.
     Low,
+    /// Medium reasoning budget.
     Medium,
+    /// High reasoning budget.
     High,
+    /// Maximum reasoning budget supported by the provider.
     Max,
 }
 
 impl ModelEffort {
+    /// Returns the lowercase wire value for this effort level.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Minimal => "minimal",

@@ -12,7 +12,7 @@
 //! - [`note`]: lightweight per-agent note storage.
 //! - [`shell`]: native or sandboxed command execution.
 //! - [`skill`]: file-backed skill loading and lifecycle management.
-//! - [`todo`]: session-scoped task tracking for long-running agents.
+//! - [`mod@todo`]: session-scoped task tracking for long-running agents.
 
 pub mod fetch;
 pub mod fs;

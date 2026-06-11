@@ -1,3 +1,9 @@
+//! Built-in callable discovery tools.
+//!
+//! The search and select helpers keep large tool schemas out of the prompt
+//! until the model asks for them. They are registered as lightweight agents
+//! whose outputs carry the matching [`FunctionDefinition`] values.
+
 use anda_core::{
     Agent, AgentContext, AgentOutput, BoxError, CompletionFeatures, CompletionRequest,
     FunctionDefinition, Resource,
@@ -12,9 +18,12 @@ use crate::context::{
     strip_prefix_ignore_ascii_case,
 };
 
+/// Built-in name for keyword search across available callables.
 pub const TOOLS_SEARCH_NAME: &str = "tools_search";
+/// Built-in name for selecting callables by exact name.
 pub const TOOLS_SELECT_NAME: &str = "tools_select";
 
+/// Arguments for [`ToolsSearch`].
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ToolsSearchArgs {
     /// Search terms, or `*` to enumerate every available callable name.
@@ -24,6 +33,7 @@ pub struct ToolsSearchArgs {
     pub limit: usize,
 }
 
+/// Output returned by callable discovery tools.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ToolsOutput {
     /// Matching callable definitions returned as tool-output context.
@@ -48,13 +58,16 @@ impl Default for ToolsSearch {
 }
 
 impl ToolsSearch {
+    /// Function name used when registering the search helper.
     pub const NAME: &'static str = TOOLS_SEARCH_NAME;
 
+    /// Creates a search helper with the default tokenizer.
     pub fn new() -> Self {
         let tokenizer = jieba_tokenizer();
         Self { tokenizer }
     }
 
+    /// Searches candidate definitions by name, description, and token overlap.
     pub fn search(&self, candidates: &[FunctionDefinition], args: &ToolsSearchArgs) -> ToolsOutput {
         let normalized_query = args.query.trim().to_lowercase();
         let tools: Vec<FunctionDefinition> = candidates.to_vec();
@@ -144,6 +157,7 @@ impl Agent<AgentCtx> for ToolsSearch {
     }
 }
 
+/// Arguments for [`ToolsSelect`].
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ToolsSelectArgs {
     /// Callable names whose schemas should be returned for direct calls.
@@ -179,8 +193,10 @@ const MAX_SELECTOR_LIMIT: usize = 16;
 const MAX_SELECTOR_CANDIDATE_LIMIT: usize = 1000;
 
 impl ToolsSelect {
+    /// Function name used when registering the selection helper.
     pub const NAME: &'static str = TOOLS_SELECT_NAME;
 
+    /// Creates a callable selection helper.
     pub fn new() -> Self {
         Self {
             tokenizer: jieba_tokenizer(),

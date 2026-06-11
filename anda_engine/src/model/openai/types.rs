@@ -1,3 +1,11 @@
+//! OpenAI Responses API wire types used by the OpenAI model adapter.
+//!
+//! These structs and enums intentionally mirror provider request, response,
+//! stream, and tool-schema payloads. Field-level semantics are controlled by
+//! the upstream API contract, so this module documents the adapter boundary and
+//! keeps the wire mirror close to the JSON shape it serializes.
+#![allow(missing_docs)]
+
 use anda_core::{
     AgentOutput, BoxError, ContentPart, Json, Message, Usage as ModelUsage,
     inline_data_from_data_url, normalize_strict_schema, part_to_data_url,

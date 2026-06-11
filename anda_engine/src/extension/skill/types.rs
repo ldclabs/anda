@@ -1,3 +1,9 @@
+//! Skill frontmatter and parsed skill types.
+//!
+//! These structs implement the local Agent Skills file format used by the skill
+//! extension. They validate frontmatter, normalize names, and convert a skill
+//! directory into a runnable subagent definition.
+
 use anda_core::{BoxError, Json, validate_function_name};
 use serde::{Deserialize, Deserializer, Serialize, de};
 use serde_json::Value;
@@ -48,6 +54,7 @@ pub struct SkillFrontmatter {
 
     #[serde(flatten)]
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    /// Unrecognized frontmatter fields preserved for round-tripping and callers.
     pub extra: BTreeMap<String, Json>,
 }
 

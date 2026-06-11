@@ -1,3 +1,11 @@
+//! Anthropic Messages API wire types used by the Anthropic model adapter.
+//!
+//! These request, response, content-block, tool, cache, and stream event types
+//! intentionally track Anthropic's JSON contract. Keeping the mirror compact
+//! makes provider updates easier while the surrounding adapter documents how
+//! Anda maps these payloads into the core model types.
+#![allow(missing_docs)]
+
 use anda_core::{
     AgentOutput, BoxError, ByteBufB64, ContentPart, FunctionDefinition, Message as CoreMessage,
     Usage as ModelUsage,

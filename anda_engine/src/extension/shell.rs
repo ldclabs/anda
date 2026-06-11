@@ -88,7 +88,7 @@ pub trait Executor: Send + Sync {
 
     /// Return the runtime base working directory.
     ///
-    /// The user-provided [`ExecArgs::workspace`] is resolved relative to this path.
+    /// Runtime implementations resolve command execution relative to this path.
     fn workspace(&self) -> &PathBuf;
 
     /// Return the shell program name used by this runtime, if any.
@@ -209,6 +209,7 @@ impl ExecOutput {
     }
 }
 
+/// Typed hook for shell tool calls.
 pub type ShellToolHook = DynToolHook<ExecArgs, ExecOutput>;
 
 /// Configured environment variable available to shell commands.
@@ -737,6 +738,7 @@ fn build_raw_output_bytes(stdout: Option<&[u8]>, stderr: Option<&[u8]>) -> Vec<u
     }
 }
 
+/// Truncates a UTF-8 string to at most `max_bytes` without splitting a codepoint.
 pub fn truncate_utf8_to_max_bytes(text: &mut String, max_bytes: usize) -> Option<usize> {
     if text.len() <= max_bytes {
         return None;

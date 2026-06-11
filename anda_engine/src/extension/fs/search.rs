@@ -1,3 +1,8 @@
+//! Glob search tool for paths inside configured workspaces.
+//!
+//! Relative patterns are evaluated against every configured workspace, while
+//! absolute patterns must remain inside a workspace boundary.
+
 use anda_core::{BoxError, FunctionDefinition, Resource, StateFeatures, Tool, ToolOutput};
 use glob::{MatchOptions, glob_with};
 use serde::{Deserialize, Serialize};
@@ -43,8 +48,10 @@ pub struct SearchFileOutput {
     pub scan_truncated: bool,
 }
 
+/// Typed hook for search-file tool calls.
 pub type SearchFileHook = DynToolHook<SearchFileArgs, SearchFileOutput>;
 
+/// Tool implementation for glob-based workspace path search.
 #[derive(Clone)]
 pub struct SearchFileTool {
     workspaces: Vec<PathBuf>,
@@ -78,6 +85,7 @@ impl SearchFileTool {
         }
     }
 
+    /// Overrides the function description exposed to the model.
     pub fn with_description(mut self, description: String) -> Self {
         self.description = description;
         self

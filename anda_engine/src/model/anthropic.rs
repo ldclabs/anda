@@ -39,6 +39,7 @@ impl From<ModelEffort> for types::OutputEffort {
 const API_BASE_URL: &str = "https://api.anthropic.com/v1";
 const API_VERSION: &str = "2023-06-01";
 
+/// Default Anthropic completion model used when no model is configured.
 pub static DEFAULT_COMPLETION_MODEL: &str = "claude-sonnet-4-6";
 
 /// Anthropic Claude API client configuration and HTTP client
@@ -89,11 +90,13 @@ impl Client {
         }
     }
 
+    /// Overrides the Anthropic API version header value.
     pub fn with_api_version(mut self, api_version: String) -> Self {
         self.api_version = api_version;
         self
     }
 
+    /// Selects bearer authentication instead of the `x-api-key` header.
     pub fn with_bearer_auth(mut self, bearer_auth: bool) -> Self {
         self.bearer_auth = bearer_auth;
         self

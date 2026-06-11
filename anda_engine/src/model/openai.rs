@@ -5,6 +5,12 @@
 //! - Completion model handling
 //! - Embedding model handling
 //! - Response parsing and conversion to Anda's internal formats
+//!
+//! Public request/response structs in this module mirror OpenAI Chat
+//! Completions wire payloads. Detailed per-field semantics are defined by the
+//! upstream API, while the adapter methods document how they map into Anda core
+//! completion types.
+#![allow(missing_docs)]
 
 use anda_core::{
     AgentOutput, BoxError, BoxPinFut, CompletionRequest, ContentPart, FunctionDefinition, Json,

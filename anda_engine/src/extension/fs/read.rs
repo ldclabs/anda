@@ -1,3 +1,9 @@
+//! File read tool for configured workspaces.
+//!
+//! Text files are decoded with platform-aware fallbacks, while binary or
+//! unsupported files are returned as base64. Large inline output is truncated
+//! with paging metadata.
+
 use anda_core::{BoxError, FunctionDefinition, Resource, StateFeatures, Tool, ToolOutput};
 use ic_auth_types::ByteBufB64;
 use serde::{Deserialize, Serialize};
@@ -48,8 +54,10 @@ pub struct ReadFileOutput {
     pub truncated: bool,
 }
 
+/// Typed hook for read-file tool calls.
 pub type ReadFileHook = DynToolHook<ReadFileArgs, ReadFileOutput>;
 
+/// Tool implementation for reading files inside configured workspaces.
 #[derive(Clone)]
 pub struct ReadFileTool {
     workspaces: Vec<PathBuf>,
@@ -83,6 +91,7 @@ impl ReadFileTool {
         }
     }
 
+    /// Overrides the function description exposed to the model.
     pub fn with_description(mut self, description: String) -> Self {
         self.description = description;
         self

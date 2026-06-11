@@ -25,8 +25,11 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::fmt::Display;
 
+/// MIME type used for CBOR-encoded RPC request and response bodies.
 pub const CONTENT_TYPE_CBOR: &str = "application/cbor";
+/// MIME type used for JSON HTTP request and response bodies.
 pub const CONTENT_TYPE_JSON: &str = "application/json";
+/// MIME type used for plain text HTTP response bodies.
 pub const CONTENT_TYPE_TEXT: &str = "text/plain";
 
 /// Owned RPC request with a method name and CBOR-encoded parameters.
@@ -90,11 +93,14 @@ pub type RPCResponse = Result<ByteBufB64, String>;
 /// Paginated list response.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ListObject<T> {
+    /// Items returned on this page.
     pub data: Vec<T>,
 
+    /// Total number of matching items when the backend can report it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_size: Option<u64>,
 
+    /// Opaque token to request the next page.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_page_token: Option<String>,
 }
@@ -102,25 +108,38 @@ pub struct ListObject<T> {
 /// Errors returned by [`http_rpc`], [`canister_rpc`], and [`cbor_rpc`].
 #[derive(Debug, thiserror::Error)]
 pub enum HttpRPCError {
+    /// The request body could not be encoded or the HTTP request failed.
     #[error("http_rpc({endpoint:?}, {path:?}): send error: {error}")]
     RequestError {
+        /// Remote endpoint URL used for the RPC request.
         endpoint: String,
+        /// RPC path, method, or canister identifier associated with the request.
         path: String,
+        /// Underlying request or encoding error.
         error: String,
     },
 
+    /// The remote endpoint returned a non-success status code.
     #[error("http_rpc({endpoint:?}, {path:?}): response status {status}, error: {error}")]
     ResponseError {
+        /// Remote endpoint URL used for the RPC request.
         endpoint: String,
+        /// RPC path, method, or canister identifier associated with the response.
         path: String,
+        /// HTTP status code returned by the remote endpoint.
         status: u16,
+        /// Response body or status parsing error.
         error: String,
     },
 
+    /// The response payload could not be decoded into the expected type.
     #[error("http_rpc({endpoint:?}, {path:?}): parse result error: {error}")]
     ResultError {
+        /// Remote endpoint URL used for the RPC request.
         endpoint: String,
+        /// RPC path, method, or canister identifier associated with the result.
         path: String,
+        /// Underlying payload decoding error.
         error: String,
     },
 }

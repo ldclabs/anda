@@ -62,15 +62,26 @@ impl AgentInput {
     }
 }
 
+/// Parsed command prefix from an agent prompt.
+///
+/// Empty prompts and `/ping` are treated as lightweight health checks. Prompts
+/// without a leading slash are plain user prompts. Other slash-prefixed prompts
+/// keep the original prompt while exposing the lowercase command name.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum PromptCommand {
+    /// Empty prompt or `/ping`.
     #[default]
     Ping,
+    /// Prompt text without a command prefix.
     Plain {
+        /// Original prompt text.
         prompt: String,
     },
+    /// Slash-prefixed command and the original prompt text.
     Command {
+        /// Lowercase command name without the leading slash.
         command: String,
+        /// Original prompt text.
         prompt: String,
     },
 }
@@ -149,10 +160,17 @@ pub struct AgentOutput {
     pub model: Option<String>,
 }
 
+/// Partial agent output serialized when metadata must be preserved.
+///
+/// This compact shape is used when an [`AgentOutput`] is converted into a tool
+/// output and cannot be represented as just the final content string or JSON
+/// value.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct PartialAgentOutput {
+    /// Final visible content from the agent.
     pub content: String,
 
+    /// Optional intermediate reasoning text returned by the provider.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thoughts: Option<String>,
 
@@ -175,6 +193,12 @@ pub struct PartialAgentOutput {
 }
 
 impl AgentOutput {
+    /// Converts an agent result into a JSON tool output.
+    ///
+    /// If the agent produced metadata such as thoughts, failure information,
+    /// conversation IDs, or model labels, the output is wrapped as
+    /// [`PartialAgentOutput`]. Otherwise the final content is parsed as JSON
+    /// when possible and falls back to a JSON string.
     pub fn into_tool_output(self) -> ToolOutput<Json> {
         let AgentOutput {
             content,
@@ -343,52 +367,78 @@ impl Message {
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all_fields = "camelCase")]
 pub enum ContentPart {
+    /// Visible text content.
     Text {
+        /// Text body.
         text: String,
     },
+    /// Provider reasoning or thinking text.
     Reasoning {
+        /// Reasoning text body.
         text: String,
     },
+    /// File content referenced by URI.
     FileData {
+        /// URI pointing to the file data.
         file_uri: String,
 
+        /// MIME type if known.
         #[serde(skip_serializing_if = "Option::is_none")]
         mime_type: Option<String>,
     },
+    /// Inline binary data with an explicit MIME type.
     InlineData {
+        /// MIME type for the inline bytes.
         mime_type: String,
+        /// Base64-encoded binary payload.
         data: ByteBufB64,
     },
+    /// Tool call requested by a model.
     ToolCall {
+        /// Tool function name.
         name: String,
+        /// JSON arguments for the tool call.
         args: Json,
 
+        /// Provider call identifier used to correlate tool outputs.
         #[serde(skip_serializing_if = "Option::is_none")]
         call_id: Option<String>,
     },
+    /// Tool output returned to a model.
     ToolOutput {
+        /// Tool function name.
         name: String,
+        /// JSON output payload.
         output: Json,
 
+        /// Whether the tool output represents an error.
         #[serde(skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
 
+        /// Provider call identifier this output answers.
         #[serde(skip_serializing_if = "Option::is_none")]
         call_id: Option<String>,
 
+        /// Remote engine principal when the tool call was delegated.
         #[serde(skip_serializing_if = "Option::is_none")]
         remote_id: Option<Principal>,
     },
+    /// Signed action payload emitted by an agent.
     Action {
+        /// Action name.
         name: String,
+        /// Action-specific payload.
         payload: Json,
 
+        /// Principals that should receive the action.
         #[serde(skip_serializing_if = "Option::is_none")]
         recipients: Option<Vec<Principal>>,
 
+        /// Optional signature over the action payload.
         #[serde(skip_serializing_if = "Option::is_none")]
         signature: Option<ByteBufB64>,
     },
+    /// Provider-specific content part preserved as raw JSON.
     #[serde(untagged)]
     Any(Json),
 }

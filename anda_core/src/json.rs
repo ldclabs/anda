@@ -1,3 +1,9 @@
+//! JSON Schema helpers used to describe tools, agents, and structured outputs.
+//!
+//! The functions in this module generate compact provider-friendly schemas and
+//! normalize them into the strict object shape expected by function-calling
+//! model APIs.
+
 use schemars::{JsonSchema, Schema, generate::SchemaSettings, transform::RestrictFormats};
 use serde_json::{Map, Value, json};
 

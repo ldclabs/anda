@@ -1,3 +1,9 @@
+//! HTTP server for exposing one or more Anda engines.
+//!
+//! `anda_engine_server` builds an axum router with well-known information
+//! endpoints and a signed RPC endpoint for agent/tool calls. Applications can
+//! embed the router or run it directly with graceful shutdown.
+
 use anda_core::{BoxError, Json};
 use anda_engine::engine::Engine;
 use axum::{Router, routing};
@@ -8,8 +14,11 @@ use structured_logger::unix_ms;
 use tokio::signal;
 use tokio_util::sync::CancellationToken;
 
+/// HTTP handlers and authentication helpers.
 pub mod handler;
+/// Pluggable axum middleware helpers.
 pub mod middleware;
+/// Public response types returned by server endpoints.
 pub mod types;
 
 use handler::*;
@@ -18,6 +27,7 @@ use middleware::*;
 const APP_NAME: &str = env!("CARGO_PKG_NAME");
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Builder for an Anda engine HTTP server.
 pub struct ServerBuilder {
     app_name: String,
     app_version: String,
@@ -37,7 +47,8 @@ impl Default for ServerBuilder {
 }
 
 /// Builder for creating a new Server.
-/// Example: https://github.com/ldclabs/anda/tree/main/examples/icp_ledger_agent
+///
+/// Example: <https://github.com/ldclabs/anda/tree/main/examples/icp_ledger_agent>
 impl ServerBuilder {
     /// Creates a new ServerBuilder with default values.
     pub fn new() -> Self {
@@ -54,31 +65,37 @@ impl ServerBuilder {
         }
     }
 
+    /// Sets the application name advertised in logs and metadata.
     pub fn with_app_name(mut self, app_name: String) -> Self {
         self.app_name = app_name;
         self
     }
 
+    /// Sets the application version advertised in logs and metadata.
     pub fn with_app_version(mut self, app_version: String) -> Self {
         self.app_version = app_version;
         self
     }
 
+    /// Sets the TCP bind address, for example `127.0.0.1:8042`.
     pub fn with_addr(mut self, addr: String) -> Self {
         self.addr = addr;
         self
     }
 
+    /// Sets the public origin used by clients for discovery.
     pub fn with_origin(mut self, origin: String) -> Self {
         self.origin = origin;
         self
     }
 
+    /// Adds extra metadata to information responses.
     pub fn with_extra_info(mut self, extra_info: BTreeMap<String, Json>) -> Self {
         self.extra_info = extra_info;
         self
     }
 
+    /// Registers engines and optionally selects the default engine principal.
     pub fn with_engines(
         mut self,
         engines: BTreeMap<Principal, Arc<Engine>>,
@@ -89,6 +106,7 @@ impl ServerBuilder {
         self
     }
 
+    /// Sets trusted Ed25519 public keys for bearer CWT authentication.
     pub fn with_ed25519_pubkeys(mut self, pubkeys: Vec<VerifyingKey>) -> Self {
         self.ed25519_pubkeys = pubkeys;
         self
@@ -100,10 +118,10 @@ impl ServerBuilder {
     /// axum `Router` (typically via `router.layer(...)`). Middlewares are applied
     /// in the order they are added.
     ///
-    /// More details: https://docs.rs/axum/latest/axum/middleware/index.html#ordering
+    /// More details: <https://docs.rs/axum/latest/axum/middleware/index.html#ordering>
     ///
     /// If you want a middleware that looks like `axum::middleware::from_fn`
-    /// (i.e. can operate on `(req, next)`), prefer [`with_request_middleware`].
+    /// (i.e. can operate on `(req, next)`), prefer [`Self::with_request_middleware`].
     ///
     /// Example:
     /// ```ignore
@@ -200,6 +218,7 @@ impl ServerBuilder {
         Ok(app.with_state(state))
     }
 
+    /// Serves the router on the configured address until `signal` resolves.
     pub async fn serve(
         self,
         signal: impl Future<Output = ()> + Send + 'static,
@@ -220,6 +239,7 @@ impl ServerBuilder {
     }
 }
 
+/// Waits for Ctrl+C or SIGTERM, then cancels the provided token.
 pub async fn shutdown_signal(cancel_token: CancellationToken) {
     let ctrl_c = async {
         signal::ctrl_c()
@@ -247,6 +267,7 @@ pub async fn shutdown_signal(cancel_token: CancellationToken) {
     cancel_token.cancel();
 }
 
+/// Creates a TCP listener with `SO_REUSEPORT` on supported Unix targets.
 pub async fn create_reuse_port_listener(
     addr: SocketAddr,
 ) -> Result<tokio::net::TcpListener, BoxError> {

@@ -1,3 +1,10 @@
+//! Dynamic subagent definitions, sessions, and management tools.
+//!
+//! Subagents let an engine delegate focused work to named worker agents with
+//! their own instructions, allowed tools, resource tags, optional output
+//! schemas, and optional long-lived session state. This module also owns
+//! session compaction and background progress forwarding for those workers.
+
 use anda_core::{
     Agent, AgentContext, AgentOutput, BoxError, CompletionFeatures, CompletionRequest, ContentPart,
     FunctionDefinition, Json, Message, ModelEffort, Path, PromptCommand, PutMode, Resource,
@@ -51,18 +58,25 @@ Record actual state, not intent:
 Keep the summary compact, structured, and actionable. Prefer short sections and bullets. Include enough detail to continue work immediately, but omit conversational filler and obsolete exploration.
 "#;
 
+/// Configurable worker agent that can be registered at runtime.
 #[derive(Clone, Default, Deserialize, Serialize)]
 pub struct SubAgent {
+    /// Unique lowercase agent name.
     pub name: String,
+    /// Short capability summary exposed to the model.
     pub description: String,
+    /// System instructions used when running this subagent.
     pub instructions: String,
 
+    /// Tool names this subagent is allowed to call.
     #[serde(default)]
     pub tools: Vec<String>,
 
+    /// Resource tags this subagent can consume.
     #[serde(default)]
     pub tags: Vec<String>,
 
+    /// Optional JSON schema that constrains the subagent's final output.
     #[serde(default)]
     pub output_schema: Option<Json>,
 
@@ -74,6 +88,7 @@ pub struct SubAgent {
     #[serde(default, deserialize_with = "deserialize_optional_model_effort")]
     pub effort: Option<ModelEffort>,
 
+    /// Active background sessions owned by this subagent.
     #[serde(skip)]
     pub subsessions: Arc<SubSessions>,
 }
@@ -150,8 +165,10 @@ fn selected_model_label(model: &str) -> Option<String> {
     }
 }
 
+/// Arguments used to run a subagent.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct SubAgentArgs {
+    /// Task prompt passed to the subagent.
     pub prompt: String,
 
     /// Optional session ID for non-blocking session mode.
@@ -213,6 +230,7 @@ impl SubAgentArgs {
     }
 }
 
+/// Arguments accepted by the subagent manager tool.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SubAgentManagerArgs {
     /// Operation to perform. Defaults to creating or updating a subagent.
@@ -220,21 +238,27 @@ pub struct SubAgentManagerArgs {
     pub operation: String,
 
     #[serde(default)]
+    /// Subagent name to create, update, remove, or inspect.
     pub name: String,
 
     #[serde(default)]
+    /// Short capability summary for the subagent.
     pub description: String,
 
     #[serde(default)]
+    /// System instructions stored on the subagent.
     pub instructions: String,
 
     #[serde(default)]
+    /// Tool names allowed for the subagent.
     pub tools: Vec<String>,
 
     #[serde(default)]
+    /// Resource tags the subagent can consume.
     pub tags: Vec<String>,
 
     #[serde(default, deserialize_with = "deserialize_optional_json_schema")]
+    /// Optional JSON schema for the subagent's final output.
     pub output_schema: Option<Json>,
 
     /// Optional default model label used to run this subagent.
@@ -369,10 +393,14 @@ struct SubAgentInput {
     effort: Option<ModelEffort>,
 }
 
+/// Metadata tracked for a background task running inside a subagent session.
 #[derive(Debug, Default, Deserialize, Serialize, Clone)]
 pub struct BackgroundTaskInfo {
+    /// Subagent that owns the background task.
     pub agent_name: String,
+    /// Tool name when the background task was started by a tool call.
     pub tool_name: Option<String>,
+    /// Last progress message forwarded to the parent agent.
     pub progress_message: Option<String>,
 
     /// Cumulative usage already forwarded into the session, used to convert the cumulative
@@ -381,6 +409,7 @@ pub struct BackgroundTaskInfo {
     pub reported_usage: Usage,
 }
 
+/// Long-lived conversation session for a subagent.
 pub struct SubSession {
     id: String,
     agent: String,
@@ -687,6 +716,7 @@ impl SubSessionRunner {
 }
 
 impl SubSession {
+    /// Closes the session input side.
     pub fn close(self: Arc<Self>) {
         // no things to do for now
     }
@@ -847,6 +877,7 @@ impl ToolBackgroundHook for SubSession {
     }
 }
 
+/// Registry of active subagent sessions for one subagent definition.
 pub struct SubSessions {
     sessions: RwLock<BTreeMap<String, Arc<SubSession>>>,
 }
@@ -860,6 +891,7 @@ impl Default for SubSessions {
 }
 
 impl SubSessions {
+    /// Inserts or replaces a session by ID.
     pub fn insert_session(&self, sess: Arc<SubSession>) {
         self.sessions.write().insert(sess.id.clone(), sess);
     }
@@ -897,18 +929,21 @@ impl SubSessions {
         }
     }
 
+    /// Returns IDs for sessions whose runners are still active.
     pub fn active_session_ids(&self) -> Vec<String> {
         let mut sessions = self.sessions.write();
         sessions.retain(|_, sess| !sess.sender.is_closed());
         sessions.keys().cloned().collect()
     }
 
+    /// Returns an active session by ID.
     pub fn get_session(&self, id: &str) -> Option<Arc<SubSession>> {
         let mut sessions = self.sessions.write();
         sessions.retain(|_, sess| !sess.sender.is_closed());
         sessions.get(id).cloned()
     }
 
+    /// Removes a session by ID and closes its input channel.
     pub fn remove_session(&self, id: &str) {
         if let Some(subsession) = self.sessions.write().remove(id) {
             subsession.close();
@@ -1252,7 +1287,9 @@ impl Agent<AgentCtx> for SubAgent {
     }
 }
 
+/// Object-safe registry interface for groups of subagents.
 pub trait SubAgentSet: Send + Sync {
+    /// Converts the registry into [`Any`] for downcasting.
     fn into_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync>;
 
     /// Checks if a subagent with the given lowercase name exists.
@@ -1274,6 +1311,7 @@ pub trait SubAgentSet: Send + Sync {
     fn select_resources(&self, name: &str, resources: &mut Vec<Resource>) -> Vec<Resource>;
 }
 
+/// Tool and registry for creating, updating, loading, and running subagents.
 pub struct SubAgentManager {
     agents: RwLock<BTreeMap<String, SubAgent>>,
     models: Vec<String>,
@@ -1286,8 +1324,10 @@ impl Default for SubAgentManager {
 }
 
 impl SubAgentManager {
+    /// Function name used when registering the manager tool.
     pub const NAME: &'static str = "subagents_manager";
 
+    /// Creates an empty subagent manager.
     pub fn new() -> Self {
         Self {
             agents: RwLock::new(BTreeMap::new()),
@@ -1295,6 +1335,7 @@ impl SubAgentManager {
         }
     }
 
+    /// Sets the model labels allowed for managed subagents.
     pub fn with_models(mut self, models: Vec<String>) -> Self {
         self.models = models;
         self
@@ -1308,6 +1349,7 @@ impl SubAgentManager {
         Path::from(format!("{SUBAGENT_STORE_PATH}/{name}"))
     }
 
+    /// Loads persisted subagents from engine storage.
     pub async fn load(&self, ctx: AgentCtx) -> Result<(), BoxError> {
         let offset = Path::from("");
         let prefix = Self::store_prefix();
@@ -1652,6 +1694,7 @@ impl SubAgentSet for SubAgentManager {
     }
 }
 
+/// Type-indexed collection of subagent registries.
 pub struct SubAgentSetManager {
     sets: RwLock<BTreeMap<TypeId, Arc<dyn SubAgentSet>>>,
 }
@@ -1663,12 +1706,14 @@ impl Default for SubAgentSetManager {
 }
 
 impl SubAgentSetManager {
+    /// Creates an empty collection of subagent registries.
     pub fn new() -> Self {
         Self {
             sets: RwLock::new(BTreeMap::new()),
         }
     }
 
+    /// Inserts a typed subagent registry and returns the previous registry of the same type.
     pub fn insert<T: SubAgentSet + Sized + 'static>(&self, set: Arc<T>) -> Option<Arc<T>> {
         let type_id = TypeId::of::<T>();
         self.sets
@@ -1677,6 +1722,7 @@ impl SubAgentSetManager {
             .and_then(|boxed| boxed.into_any().downcast::<T>().ok())
     }
 
+    /// Returns a typed subagent registry when one has been inserted.
     pub fn get<T: SubAgentSet + Sized + 'static>(&self) -> Option<Arc<T>> {
         let type_id = TypeId::of::<T>();
         self.sets
@@ -1731,6 +1777,7 @@ impl SubAgentSet for SubAgentSetManager {
     }
 }
 
+/// Returns true when a session runner should compact its conversation history.
 pub fn needs_compaction(runner: &CompletionRunner) -> bool {
     let current_usage = runner.current_usage();
     let context_window = runner.model().context_window as u64;

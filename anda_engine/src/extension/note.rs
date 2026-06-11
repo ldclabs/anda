@@ -58,15 +58,20 @@ pub struct NoteItemInput {
 /// Normalized persistent note item.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct NoteItem {
+    /// Stable short note identifier.
     pub id: String,
+    /// Note content.
     pub content: String,
 }
 
 /// Compact note store usage summary.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct NoteSummary {
+    /// Number of stored notes.
     pub total: usize,
+    /// Character count after notes are joined for prompt use.
     pub chars: usize,
+    /// Configured character limit, when one is enforced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
 }
@@ -74,11 +79,14 @@ pub struct NoteSummary {
 /// Output returned by the note tool.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct NoteOutput {
+    /// Whether the requested operation succeeded.
     pub success: bool,
+    /// Store usage summary after the operation.
     pub summary: NoteSummary,
     /// Full note list. Present only for read operations and `load_notes`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub items: Vec<NoteItem>,
+    /// Human-readable error message for failed operations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -174,6 +182,7 @@ impl NoteStore {
     }
 }
 
+/// Typed hook for note tool calls.
 pub type NoteToolHook = DynToolHook<NoteArgs, NoteOutput>;
 
 /// Tool implementation that exposes a persistent agent-scoped note store.
@@ -207,11 +216,13 @@ impl NoteTool {
         }
     }
 
+    /// Sets the maximum total note content length accepted by write operations.
     pub fn with_char_limit(mut self, char_limit: usize) -> Self {
         self.char_limit = char_limit;
         self
     }
 
+    /// Overrides the function description exposed to the model.
     pub fn with_description(mut self, description: String) -> Self {
         self.description = description;
         self

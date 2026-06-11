@@ -64,9 +64,11 @@ pub struct ModelConfig {
     pub labels: Vec<String>,
 
     #[serde(default)]
+    /// Provider context window in input tokens; `0` means unknown.
     pub context_window: usize,
 
     #[serde(default)]
+    /// Provider maximum output tokens; `0` means unknown.
     pub max_output: usize,
 
     /// Optional reasoning/thinking effort for providers and models that support it.
@@ -86,6 +88,7 @@ pub struct ModelConfig {
     pub bearer_auth: bool,
 
     #[serde(default)]
+    /// Whether to request streaming completions from this model.
     pub stream: bool,
 }
 
@@ -378,8 +381,10 @@ pub struct Model {
     /// Labels that can route requests to this model.
     pub labels: Vec<String>,
 
+    /// Context window in input tokens; `0` means unknown.
     pub context_window: usize,
 
+    /// Maximum output tokens; `0` means unknown.
     pub max_output: usize,
 }
 
@@ -748,6 +753,7 @@ fn log_completion_retry(model: &str, retry: usize, reason: &str) {
     );
 }
 
+/// Host matcher that accepts every provider host.
 #[derive(Clone, Copy, Debug)]
 pub struct AnyHost;
 

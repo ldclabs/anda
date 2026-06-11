@@ -1,3 +1,10 @@
+//! Remote engine registration and local wrappers.
+//!
+//! Remote engines expose agents and tools over the signed HTTP RPC protocol.
+//! This module stores the discovered engine cards, maps prefixed function names
+//! back to remote endpoints, and wraps remote functions as local [`Agent`] and
+//! [`Tool`] implementations.
+
 use anda_core::{
     Agent, AgentContext, AgentInput, AgentOutput, BaseContext, BoxError, Function,
     FunctionDefinition, HttpFeatures, Json, Resource, Tool, ToolInput, ToolOutput,
@@ -27,6 +34,7 @@ pub struct EngineCard {
 /// Collection of remote engines.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RemoteEngines {
+    /// Registered engine cards keyed by their lowercase handle.
     pub engines: BTreeMap<String, EngineCard>,
 }
 
@@ -50,6 +58,7 @@ impl Default for RemoteEngines {
 }
 
 impl RemoteEngines {
+    /// Creates an empty remote-engine registry.
     pub fn new() -> Self {
         Self {
             engines: BTreeMap::new(),
@@ -338,6 +347,7 @@ pub struct RemoteTool {
 }
 
 impl RemoteTool {
+    /// Creates a local wrapper around a tool exported by a remote engine.
     pub fn new(
         engine: Principal,
         endpoint: String,
@@ -411,6 +421,7 @@ pub struct RemoteAgent {
 }
 
 impl RemoteAgent {
+    /// Creates a local wrapper around an agent exported by a remote engine.
     pub fn new(
         engine: Principal,
         endpoint: String,

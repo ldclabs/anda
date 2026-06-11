@@ -17,9 +17,12 @@ use structured_logger::unix_ms;
 
 use crate::context::{AgentCtx, BaseCtx};
 
+/// Identifier split into a namespace prefix and local ID.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PrefixedId {
+    /// Namespace or hook prefix.
     pub prefix: String,
+    /// Local identifier within the prefix.
     pub id: String,
 }
 
@@ -132,6 +135,7 @@ where
     async fn on_background_end(&self, _ctx: &BaseCtx, _task_id: String, _output: ToolOutput<O>) {}
 }
 
+/// Type-erased background hook used when a tool's typed arguments are not available.
 #[async_trait]
 pub trait ToolBackgroundHook: Send + Sync {
     /// Called when a tool starts a background task.
@@ -201,6 +205,7 @@ where
     }
 }
 
+/// Type-erased wrapper for [`ToolBackgroundHook`].
 #[derive(Clone)]
 pub struct DynToolJsonHook {
     inner: Arc<dyn ToolBackgroundHook>,

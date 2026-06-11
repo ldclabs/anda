@@ -160,11 +160,13 @@ impl SkillManager {
         &self.skills_dirs
     }
 
+    /// Overrides the function description exposed to the model.
     pub fn with_description(mut self, description: String) -> Self {
         self.description = description;
         self
     }
 
+    /// Sets the default tool names granted to newly loaded skill subagents.
     pub fn with_default_skill_tools(mut self, tools: Vec<String>) -> Self {
         self.default_skill_tools = tools;
         self

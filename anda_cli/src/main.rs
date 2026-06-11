@@ -1,3 +1,8 @@
+//! Command-line client for interacting with Anda engine servers.
+//!
+//! The binary can generate random material, make signed RPC calls, run agents,
+//! and call tools against an `anda_engine_server` endpoint.
+
 use anda_core::{AgentInput, AgentOutput, BoxError, HttpFeatures, ToolInput, ToolOutput};
 use anda_web3_client::client::{Client as Web3Client, load_identity};
 use base64::{Engine, prelude::BASE64_URL_SAFE};
@@ -21,6 +26,7 @@ struct Cli {
     command: Option<Commands>,
 }
 
+/// CLI subcommands supported by `anda`.
 #[derive(Subcommand)]
 pub enum Commands {
     /// Generate random bytes with the given length and format
@@ -41,6 +47,7 @@ pub enum Commands {
     /// The RPC response from the endpoint should be string.
     /// Example: `anda_engine_cli rpc -i ./identity.pem -e 'https://andaicp.anda.bot/proposal'  -m start_x_bot`
     Rpc {
+        /// Signed RPC endpoint URL.
         #[arg(short, long, default_value = "http://127.0.0.1:8042/default")]
         endpoint: String,
 
@@ -55,24 +62,30 @@ pub enum Commands {
 
     /// Run an AI agent with the given prompt and name on the endpoint.
     AgentRun {
+        /// Engine endpoint URL.
         #[arg(short, long, default_value = "http://127.0.0.1:8042/default")]
         endpoint: String,
 
+        /// Prompt to send to the agent.
         #[arg(short, long)]
         prompt: String,
 
+        /// Optional agent name. Empty means the server default.
         #[arg(short, long)]
         name: Option<String>,
     },
 
     /// Call a tool with the given name and args on the endpoint.
     ToolCall {
+        /// Engine endpoint URL.
         #[arg(short, long, default_value = "http://127.0.0.1:8042/default")]
         endpoint: String,
 
+        /// Tool name to call.
         #[arg(short, long)]
         name: String,
 
+        /// Tool arguments as a JSON string.
         #[arg(short, long)]
         args: String,
     },

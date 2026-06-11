@@ -1,3 +1,10 @@
+//! Web3 capability adapter used by engine contexts.
+//!
+//! The engine can run against either the TEE gateway client or a generic Web3
+//! client supplied by host applications. This module normalizes both options
+//! into the [`Web3SDK`] enum and implements the core cryptographic, canister,
+//! and HTTP traits against that abstraction.
+
 use anda_core::{BoxError, BoxPinFut, CanisterCaller, HttpFeatures};
 use candid::{
     CandidType, Decode, Principal,
@@ -13,23 +20,29 @@ pub use ic_tee_gateway_sdk::client::{Client as TEEClient, ClientBuilder as TEECl
 
 /// Represents a Web3 client for interacting with the Internet Computer and other services.
 pub enum Web3SDK {
+    /// TEE gateway SDK client.
     Tee(Arc<TEEClient>),
+    /// Host-provided Web3 client implementation.
     Web3(Web3Client),
 }
 
 impl Web3SDK {
+    /// Wraps a TEE gateway client.
     pub fn from_tee(client: Arc<TEEClient>) -> Self {
         Self::Tee(client)
     }
 
+    /// Wraps a generic Web3 client implementation.
     pub fn from_web3(client: Arc<dyn Web3ClientFeatures>) -> Self {
         Self::Web3(Web3Client { client })
     }
 
+    /// Returns a placeholder client whose operations fail with `not implemented`.
     pub fn not_implemented() -> Self {
         Self::Web3(Web3Client::not_implemented())
     }
 
+    /// Returns the principal associated with the underlying client.
     pub fn get_principal(&self) -> Principal {
         match self {
             Web3SDK::Tee(cli) => cli.get_principal(),
@@ -38,9 +51,12 @@ impl Web3SDK {
     }
 }
 
+/// Object-safe Web3 capability surface required by [`Web3SDK`].
 pub trait Web3ClientFeatures: Send + Sync + 'static {
+    /// Returns the principal associated with the client identity.
     fn get_principal(&self) -> Principal;
 
+    /// Signs a digest and returns an authorization envelope.
     fn sign_envelope(
         &self,
         message_digest: [u8; 32],
@@ -326,12 +342,15 @@ impl Web3ClientFeatures for NotImplemented {
     }
 }
 
+/// Shared object-safe Web3 client wrapper.
 #[derive(Clone)]
 pub struct Web3Client {
+    /// Shared object-safe Web3 capability implementation.
     pub client: Arc<dyn Web3ClientFeatures>,
 }
 
 impl Web3Client {
+    /// Creates a placeholder client whose operations fail with `not implemented`.
     pub fn not_implemented() -> Self {
         Self {
             client: Arc::new(NotImplemented),

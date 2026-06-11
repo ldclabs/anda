@@ -1,3 +1,8 @@
+//! Atomic file write tool for configured workspaces.
+//!
+//! Supports UTF-8, base64, and selected legacy text encodings through the
+//! shared filesystem encoding helpers.
+
 use anda_core::{BoxError, FunctionDefinition, Resource, StateFeatures, Tool, ToolOutput};
 use ic_auth_types::ByteBufB64;
 use serde::{Deserialize, Serialize};
@@ -43,8 +48,10 @@ pub struct WriteFileOutput {
     pub size: u64,
 }
 
+/// Typed hook for write-file tool calls.
 pub type WriteFileHook = DynToolHook<WriteFileArgs, WriteFileOutput>;
 
+/// Tool implementation for atomic writes inside configured workspaces.
 #[derive(Clone)]
 pub struct WriteFileTool {
     workspaces: Vec<PathBuf>,
@@ -78,6 +85,7 @@ impl WriteFileTool {
         }
     }
 
+    /// Overrides the function description exposed to the model.
     pub fn with_description(mut self, description: String) -> Self {
         self.description = description;
         self

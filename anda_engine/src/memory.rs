@@ -39,6 +39,7 @@ use std::{
 
 use crate::{context::BaseCtx, extension::fetch::FetchWebResourcesTool, rfc3339_datetime, unix_ms};
 
+/// Default KIP tool function definition used by [`MemoryManagement`].
 pub static FUNCTION_DEFINITION: LazyLock<FunctionDefinition> = LazyLock::new(|| {
     serde_json::from_value(json!({
         "name": "execute_kip",
@@ -174,10 +175,12 @@ impl Default for Conversation {
 }
 
 impl Conversation {
+    /// Appends messages to the serialized chat history.
     pub fn append_messages(&mut self, message: Vec<Message>) {
         self.messages.extend(message.into_iter().map(|v| json!(v)));
     }
 
+    /// Converts mutable conversation fields into AndaDB update values.
     pub fn to_changes(&self) -> Result<BTreeMap<String, Fv>, BoxError> {
         let messages = cbor!(self.messages).map_err(|err| format!("encode messages: {err}"))?;
         let resources = cbor!(self.resources).map_err(|err| format!("encode resources: {err}"))?;
@@ -245,6 +248,7 @@ impl Conversation {
         Ok(changes)
     }
 
+    /// Builds an incremental delta from borrowed conversation data.
     pub fn to_delta(&self, messages_offset: usize, artifacts_offset: usize) -> ConversationDelta {
         ConversationDelta {
             _id: self._id,
@@ -268,6 +272,7 @@ impl Conversation {
         }
     }
 
+    /// Builds an incremental delta while consuming the conversation.
     pub fn into_delta(self, messages_offset: usize, artifacts_offset: usize) -> ConversationDelta {
         ConversationDelta {
             _id: self._id,
@@ -282,23 +287,30 @@ impl Conversation {
     }
 }
 
+/// Message view used when embedding conversations for search and recall.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct PrunedMessage {
+    /// Message role.
     pub role: String,
 
+    /// Visible or reasoning content retained after pruning.
     pub content: Vec<ContentPart>,
 
+    /// Optional participant name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
 
+    /// Optional sender principal string.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
 
+    /// Optional RFC 3339 timestamp string.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timestamp: Option<String>,
 }
 
 impl PrunedMessage {
+    /// Prunes non-visible content from a message and converts metadata to strings.
     pub fn try_from(mut msg: Message) -> Option<Self> {
         msg.prune_content();
         Some(Self {
@@ -347,28 +359,46 @@ impl From<Conversation> for Document {
     }
 }
 
+/// Borrowed view of a conversation for insertion into AndaDB.
 #[derive(Debug, Serialize)]
 pub struct ConversationRef<'a> {
+    /// Conversation ID. `0` lets AndaDB assign a new ID.
     pub _id: u64,
+    /// Principal that owns the conversation.
     pub user: &'a Principal,
+    /// Optional thread identifier.
     pub thread: Option<&'a Xid>,
+    /// Serialized message history.
     pub messages: &'a [Json],
+    /// Input resources attached to the conversation.
     pub resources: &'a [Resource],
+    /// Artifacts produced by the conversation.
     pub artifacts: &'a [Resource],
+    /// Current conversation lifecycle status.
     pub status: &'a ConversationStatus,
+    /// Accumulated model and tool usage.
     pub usage: &'a Usage,
+    /// Pending steering messages.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub steering_messages: &'a Option<Vec<String>>,
+    /// Pending follow-up messages.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub follow_up_messages: &'a Option<Vec<String>>,
+    /// Optional conversation label.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label: &'a Option<String>,
+    /// Extra unindexed metadata.
     pub extra: &'a Option<Json>,
+    /// Hour bucket used for expiration scans.
     pub period: u64,
+    /// Creation timestamp in milliseconds.
     pub created_at: u64,
+    /// Last update timestamp in milliseconds.
     pub updated_at: u64,
+    /// Child continuation conversation ID.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub child: &'a Option<u64>,
+    /// Ancestor conversation IDs from root to parent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ancestors: &'a Option<Vec<u64>>,
 }
@@ -397,9 +427,12 @@ impl<'a> From<&'a Conversation> for ConversationRef<'a> {
     }
 }
 
+/// Lightweight conversation state returned by management APIs.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ConversationState {
+    /// Conversation ID.
     pub _id: u64,
+    /// Current lifecycle status.
     pub status: ConversationStatus,
 }
 
@@ -424,26 +457,40 @@ impl From<&Conversation> for ConversationState {
 /// A delta of a conversation since a given offset, used for incremental fetching of conversation messages.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ConversationDelta {
+    /// Conversation ID.
     pub _id: u64,
     /// The new messages since the given offset. The offset is determined by the client and is not stored in the database. It is used to support incremental fetching of conversation messages.
     pub messages: Vec<Json>,
+    /// New artifacts since the requested offset.
     pub artifacts: Vec<Resource>,
+    /// Current lifecycle status.
     pub status: ConversationStatus,
+    /// Accumulated usage at the time the delta was read.
     pub usage: Usage,
+    /// Failure reason when the conversation failed.
     pub failed_reason: Option<String>,
+    /// Last update timestamp in milliseconds.
     pub updated_at: u64,
+    /// Child continuation conversation ID, when present.
     pub child: Option<u64>,
 }
 
+/// Conversation lifecycle state.
 #[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ConversationStatus {
+    /// Conversation has been submitted but not yet picked up by a runner.
     #[default]
     Submitted,
+    /// Runner is actively processing the conversation.
     Working,
+    /// Runner is idle and can accept follow-up input.
     Idle,
+    /// Conversation finished successfully.
     Completed,
+    /// Conversation was cancelled.
     Cancelled,
+    /// Conversation failed.
     Failed,
 }
 
@@ -460,12 +507,15 @@ impl fmt::Display for ConversationStatus {
     }
 }
 
+/// Storage wrapper for the conversations collection.
 #[derive(Debug, Clone)]
 pub struct Conversations {
+    /// Underlying AndaDB collection.
     pub conversations: Arc<Collection>,
 }
 
 impl Conversations {
+    /// Opens or creates the conversations collection and indexes.
     pub async fn connect(db: Arc<AndaDB>, name: String) -> Result<Self, BoxError> {
         let mut schema = Conversation::schema()?;
         schema.with_version(4);
@@ -496,6 +546,7 @@ impl Conversations {
         Ok(Self { conversations })
     }
 
+    /// Adds a conversation and flushes the collection.
     pub async fn add_conversation(
         &self,
         conversation: ConversationRef<'_>,
@@ -505,6 +556,7 @@ impl Conversations {
         Ok(id)
     }
 
+    /// Updates selected conversation fields and flushes the collection.
     pub async fn update_conversation(
         &self,
         id: u64,
@@ -515,10 +567,12 @@ impl Conversations {
         Ok(())
     }
 
+    /// Retrieves a conversation by ID.
     pub async fn get_conversation(&self, id: u64) -> Result<Conversation, DBError> {
         self.conversations.get_as(id).await
     }
 
+    /// Deletes a conversation by ID and returns whether it existed.
     pub async fn delete_conversation(&self, id: u64) -> Result<bool, DBError> {
         let doc = self.conversations.remove(id).await?;
         self.conversations.flush(unix_ms()).await?;
@@ -607,6 +661,7 @@ impl Conversations {
         Ok((rt, cursor))
     }
 
+    /// Searches a user's conversations with the BM25 conversation index.
     pub async fn search_conversations(
         &self,
         user: &Principal,
@@ -679,15 +734,21 @@ async fn next_expired_batch(conversations: &Collection, period: u64) -> Result<V
     Ok(ids)
 }
 
+/// High-level memory manager for conversations, resources, and the Cognitive Nexus.
 #[derive(Debug, Clone)]
 pub struct MemoryManagement {
+    /// Shared Cognitive Nexus used for KIP execution.
     pub nexus: Arc<CognitiveNexus>,
+    /// Conversation collection.
     pub conversations: Arc<Collection>,
+    /// Resource collection.
     pub resources: Arc<Collection>,
+    /// Function definition exposed for the writable KIP tool.
     pub kip_function_definitions: FunctionDefinition,
 }
 
 impl MemoryManagement {
+    /// Opens or creates all memory collections and connects them to a nexus.
     pub async fn connect(db: Arc<AndaDB>, nexus: Arc<CognitiveNexus>) -> Result<Self, BoxError> {
         let conversations = Conversations::connect(db.clone(), "conversations".to_string())
             .await?
@@ -725,11 +786,13 @@ impl MemoryManagement {
         })
     }
 
+    /// Overrides the writable KIP tool definition.
     pub fn with_kip_function_definitions(mut self, def: FunctionDefinition) -> Self {
         self.kip_function_definitions = def;
         self
     }
 
+    /// Returns the shared Cognitive Nexus handle.
     pub fn nexus(&self) -> Arc<CognitiveNexus> {
         self.nexus.clone()
     }
@@ -741,10 +804,12 @@ impl MemoryManagement {
         }
     }
 
+    /// Returns the largest conversation document ID currently known.
     pub fn max_conversation_id(&self) -> u64 {
         self.conversations.max_document_id()
     }
 
+    /// Describes the Cognitive Nexus primer.
     pub async fn describe_primer(&self) -> Result<Json, KipError> {
         let (primer, _) = self
             .nexus
@@ -753,6 +818,7 @@ impl MemoryManagement {
         Ok(primer)
     }
 
+    /// Describes the system identity and known domains.
     pub async fn describe_system(&self) -> Result<Json, KipError> {
         let system = self
             .nexus
@@ -771,6 +837,7 @@ impl MemoryManagement {
         }))
     }
 
+    /// Describes the caller identity stored in the nexus.
     pub async fn describe_caller(&self, id: &Principal) -> Result<Json, KipError> {
         let user = self
             .nexus
@@ -783,6 +850,7 @@ impl MemoryManagement {
         Ok(user.to_concept_node())
     }
 
+    /// Gets or initializes the caller identity concept in the nexus.
     pub async fn get_or_init_caller(
         &self,
         id: &Principal,
@@ -810,12 +878,14 @@ impl MemoryManagement {
         Ok(user.to_concept_node())
     }
 
+    /// Adds one resource reference and flushes the resource collection.
     pub async fn add_resource(&self, resource: ResourceRef<'_>) -> Result<u64, DBError> {
         let id = self.resources.add_from(&resource).await?;
         self.resources.flush(unix_ms()).await?;
         Ok(id)
     }
 
+    /// Adds resources when needed and returns resource references without blobs.
     pub async fn try_add_resources(
         &self,
         resources: &[Resource],
@@ -857,10 +927,12 @@ impl MemoryManagement {
         Ok(rs)
     }
 
+    /// Retrieves a resource by ID.
     pub async fn get_resource(&self, id: u64) -> Result<Resource, DBError> {
         self.resources.get_as(id).await
     }
 
+    /// Adds a conversation through the shared conversations API.
     pub async fn add_conversation(
         &self,
         conversation: ConversationRef<'_>,
@@ -868,6 +940,7 @@ impl MemoryManagement {
         self.as_conversations().add_conversation(conversation).await
     }
 
+    /// Updates selected conversation fields through the shared conversations API.
     pub async fn update_conversation(
         &self,
         id: u64,
@@ -878,14 +951,17 @@ impl MemoryManagement {
             .await
     }
 
+    /// Retrieves a conversation by ID.
     pub async fn get_conversation(&self, id: u64) -> Result<Conversation, DBError> {
         self.as_conversations().get_conversation(id).await
     }
 
+    /// Deletes a conversation by ID.
     pub async fn delete_conversation(&self, id: u64) -> Result<bool, DBError> {
         self.as_conversations().delete_conversation(id).await
     }
 
+    /// Lists a user's conversations with cursor-based pagination.
     pub async fn list_conversations_by_user(
         &self,
         user: &Principal,
@@ -897,6 +973,7 @@ impl MemoryManagement {
             .await
     }
 
+    /// Searches a user's conversations by text query.
     pub async fn search_conversations(
         &self,
         user: &Principal,
@@ -995,6 +1072,7 @@ pub struct MemoryReadonly {
 }
 
 impl MemoryReadonly {
+    /// Function name used when registering the read-only KIP tool.
     pub const NAME: &'static str = "execute_kip_readonly";
 
     /// Creates a new MemoryReadonly instance
@@ -1052,6 +1130,7 @@ pub struct GetResourceContentArgs {
     pub _id: u64,
 }
 
+/// Tool that retrieves the full content for a stored resource.
 #[derive(Debug, Clone)]
 pub struct GetResourceContentTool {
     memory: Arc<MemoryManagement>,
@@ -1059,6 +1138,7 @@ pub struct GetResourceContentTool {
 }
 
 impl GetResourceContentTool {
+    /// Function name used when registering the resource-content tool.
     pub const NAME: &'static str = "get_resource_content";
 
     /// Creates a new GetResourceContentTool instance
@@ -1122,6 +1202,7 @@ pub struct ListConversationsArgs {
     pub limit: usize,
 }
 
+/// Tool that lists previous conversations for the current caller.
 #[derive(Debug, Clone)]
 pub struct ListConversationsTool {
     conversations: Conversations,
@@ -1129,6 +1210,7 @@ pub struct ListConversationsTool {
 }
 
 impl ListConversationsTool {
+    /// Function name used when registering the conversation-list tool.
     pub const NAME: &'static str = "list_previous_conversations";
 
     /// Creates a new ListConversationsTool instance
@@ -1136,6 +1218,7 @@ impl ListConversationsTool {
         Self { conversations, description: "Lists the current user's previous conversations in reverse chronological order with cursor-based pagination. Returns conversation metadata including status, timestamps, messages, and usage statistics. Use the cursor parameter to paginate through older conversations.".to_string() }
     }
 
+    /// Overrides the function description exposed to the model.
     pub fn with_description(mut self, description: String) -> Self {
         self.description = description;
         self
@@ -1217,6 +1300,7 @@ pub struct SearchConversationsArgs {
     pub limit: usize,
 }
 
+/// Tool that searches previous conversations for the current caller.
 #[derive(Debug, Clone)]
 pub struct SearchConversationsTool {
     conversations: Conversations,
@@ -1224,6 +1308,7 @@ pub struct SearchConversationsTool {
 }
 
 impl SearchConversationsTool {
+    /// Function name used when registering the conversation-search tool.
     pub const NAME: &'static str = "search_conversations";
 
     /// Creates a new SearchConversationsTool instance
@@ -1231,6 +1316,7 @@ impl SearchConversationsTool {
         Self { conversations, description: "Performs a full-text search across the current user's conversation history using a query string. Searches through messages, resources, and artifacts to find relevant past conversations. Use this to recall specific topics, instructions, or context from previous interactions.".to_string() }
     }
 
+    /// Overrides the function description exposed to the model.
     pub fn with_description(mut self, description: String) -> Self {
         self.description = description;
         self
@@ -1303,6 +1389,7 @@ impl Tool<BaseCtx> for SearchConversationsTool {
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(tag = "type")]
 pub enum MemoryToolArgs {
+    /// Get one resource from a conversation owned by the caller.
     GetResource {
         /// The ID of the resource to get
         _id: u64,
@@ -1314,6 +1401,7 @@ pub enum MemoryToolArgs {
         /// The ID of the conversation to get
         _id: u64,
     },
+    /// Get a conversation delta by message and artifact offsets.
     GetConversationDelta {
         /// The ID of the conversation to get
         _id: u64,
@@ -1322,22 +1410,26 @@ pub enum MemoryToolArgs {
         /// The artifacts offset for the conversation delta
         artifacts_offset: usize,
     },
+    /// Stop an in-progress conversation.
     StopConversation {
         /// The ID of the conversation to stop
         _id: u64,
     },
+    /// Interrupt a conversation with a steering message.
     SteerConversation {
         /// The ID of the conversation to steer
         _id: u64,
         /// The steering message to interrupt the agent mid-run, delivered after current tool execution, skips remaining tools.
         message: String,
     },
+    /// Queue a follow-up message for the next safe turn.
     FollowUpConversation {
         /// The ID of the conversation to follow up
         _id: u64,
         /// The follow-up message to queue for the agent's next safe user turn.
         message: String,
     },
+    /// Delete a conversation owned by the caller.
     DeleteConversation {
         /// The ID of the conversation to delete
         _id: u64,
@@ -1366,6 +1458,7 @@ pub struct MemoryTool {
 }
 
 impl MemoryTool {
+    /// Function name used when registering the unified memory API tool.
     pub const NAME: &'static str = "memory_api";
 
     /// Creates a new SearchConversationsTool instance

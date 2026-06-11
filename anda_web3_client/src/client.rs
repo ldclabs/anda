@@ -1,3 +1,9 @@
+//! Concrete Web3 client for ICP, COSE, HTTPS, and signing operations.
+//!
+//! The client implements the capability traits consumed by `anda_engine`
+//! contexts, including canister calls, signed HTTP calls, and deterministic
+//! key derivation.
+
 use anda_core::{BoxError, BoxPinFut, HttpFeatures, RPCRequestRef, cbor_rpc};
 use anda_engine::context::Web3ClientFeatures;
 use candid::{
@@ -151,6 +157,7 @@ impl ClientBuilder {
         self
     }
 
+    /// Builds a [`Client`] with the configured identity, agent, and HTTP client.
     pub async fn build(self) -> Result<Client, BoxError> {
         let identity = match self.identity {
             Some(identity) => identity,
@@ -206,6 +213,7 @@ impl ClientBuilder {
 }
 
 impl Client {
+    /// Creates a client builder with secure defaults.
     pub fn builder() -> ClientBuilder {
         ClientBuilder::default()
     }
@@ -215,6 +223,7 @@ impl Client {
         self.principal
     }
 
+    /// Signs a message digest with the client identity.
     pub async fn sign_envelope(
         &self,
         message_digest: [u8; 32],
