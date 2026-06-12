@@ -18,7 +18,7 @@ use futures_util::StreamExt;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{
     collections::{BTreeSet, HashMap, hash_map::Entry},
     error::Error,
@@ -597,13 +597,46 @@ pub(crate) fn is_retryable_reqwest_error(err: &reqwest::Error) -> bool {
         || err.status().is_some_and(is_retryable_status)
 }
 
+/// Formats an error together with its source chain, e.g.
+/// "error decoding response body: request or response body error: operation
+/// timed out". reqwest 0.12.2+ stopped including sources in `Display`, so the
+/// top-level message alone hides the root cause of transport failures behind
+/// a generic phrase.
+pub(crate) fn format_error_chain(err: &(dyn Error + 'static)) -> String {
+    let mut message = err.to_string();
+    let mut source = err.source();
+    while let Some(err) = source {
+        let text = err.to_string();
+        // Some errors repeat their source in `Display`; skip duplicates.
+        if !message.contains(&text) {
+            message.push_str(": ");
+            message.push_str(&text);
+        }
+        source = err.source();
+    }
+    message
+}
+
+/// Extracts the upstream request id from response headers for error context.
+/// Covers the header names used by OpenAI-compatible APIs, Anthropic, and
+/// common gateway/CDN fronts.
+fn upstream_request_id(headers: &http::HeaderMap) -> Option<String> {
+    ["x-request-id", "request-id", "x-amzn-requestid", "cf-ray"]
+        .into_iter()
+        .find_map(|name| headers.get(name)?.to_str().ok())
+        .map(str::to_string)
+}
+
 pub(crate) fn completion_transport_error(
     model: &str,
     action: &str,
     err: reqwest::Error,
 ) -> BoxError {
     let retryable = is_retryable_reqwest_error(&err);
-    let message = format!("{action}, model: {model}, error: {err}");
+    let message = format!(
+        "{action}, model: {model}, error: {}",
+        format_error_chain(&err)
+    );
     Box::new(
         ModelError::new(message)
             .with_retryable(retryable)
@@ -615,10 +648,14 @@ pub(crate) async fn read_completion_response_bytes(
     response: reqwest::Response,
     model: &str,
 ) -> Result<bytes::Bytes, BoxError> {
-    response
-        .bytes()
-        .await
-        .map_err(|err| completion_transport_error(model, "Failed to read completion response", err))
+    let request_id = upstream_request_id(response.headers());
+    response.bytes().await.map_err(|err| {
+        let action = format!(
+            "Failed to read completion response (request_id: {})",
+            request_id.as_deref().unwrap_or("-")
+        );
+        completion_transport_error(model, &action, err)
+    })
 }
 
 pub(crate) async fn execute_completion_request_with_retry<T, BuildRequest, HandleResponse, Fut>(
@@ -638,7 +675,8 @@ where
                 let retryable = is_retryable_reqwest_error(&err);
                 let message = format!(
                     "Failed to send completion request, model: {}, error: {}",
-                    model, err
+                    model,
+                    format_error_chain(&err)
                 );
                 if retryable && attempt < MODEL_REQUEST_MAX_RETRIES {
                     log_completion_retry(model, attempt + 1, &message);
@@ -675,7 +713,9 @@ where
                 let retryable = retryable || is_retryable_reqwest_error(&err);
                 let message = format!(
                     "Completion failed, model: {}, status: {}; failed to read error body: {}",
-                    model, status, err
+                    model,
+                    status,
+                    format_error_chain(&err)
                 );
                 if retryable && attempt < MODEL_REQUEST_MAX_RETRIES {
                     log_completion_retry(model, attempt + 1, &message);
@@ -823,13 +863,25 @@ pub(crate) async fn read_sse_json_events<T>(
 where
     T: DeserializeOwned,
 {
+    let request_id = upstream_request_id(response.headers());
+    let started = Instant::now();
     let mut body = Vec::new();
     let mut scanned: usize = 0;
     let mut stream = response.bytes_stream();
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|err| {
-            completion_transport_error(model, "Failed to read streaming completion response", err)
+            // Mid-stream failures are reported with enough context to tell a
+            // client-side timeout (elapsed near the request deadline) apart
+            // from an upstream/gateway abort, and to follow up with the
+            // provider via the request id.
+            let action = format!(
+                "Failed to read streaming completion response (request_id: {}, received: {} bytes, elapsed: {:.1?})",
+                request_id.as_deref().unwrap_or("-"),
+                body.len(),
+                started.elapsed(),
+            );
+            completion_transport_error(model, &action, err)
         })?;
         body.extend_from_slice(&chunk);
         // Only scan the unscanned tail (with marker-sized overlap), so long
@@ -1598,8 +1650,49 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(err.to_string().contains("error decoding response body"));
+        let message = err.to_string();
+        assert!(message.contains("error decoding response body"));
+        // The reported error carries stream context and the decode source
+        // chain, which reqwest's `Display` alone no longer exposes.
+        assert!(message.contains("received: 0 bytes"), "{message}");
+        assert!(message.contains("request_id: -"), "{message}");
+        assert!(
+            message.contains("error decoding response body: "),
+            "{message}"
+        );
         assert!(is_retryable_box_error(&err));
+    }
+
+    #[test]
+    fn error_chain_formatting_appends_unique_sources() {
+        let root = std::io::Error::new(std::io::ErrorKind::TimedOut, "operation timed out");
+        let outer =
+            ModelError::new("error decoding response body".to_string()).with_source(Box::new(root));
+        assert_eq!(
+            format_error_chain(&outer),
+            "error decoding response body: operation timed out"
+        );
+
+        // A source already repeated in the message is not appended twice.
+        let root = std::io::Error::new(std::io::ErrorKind::TimedOut, "operation timed out");
+        let outer = ModelError::new("request failed: operation timed out".to_string())
+            .with_source(Box::new(root));
+        assert_eq!(
+            format_error_chain(&outer),
+            "request failed: operation timed out"
+        );
+    }
+
+    #[test]
+    fn upstream_request_id_checks_known_headers() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(upstream_request_id(&headers), None);
+
+        headers.insert("cf-ray", HeaderValue::from_static("ray-123"));
+        assert_eq!(upstream_request_id(&headers), Some("ray-123".to_string()));
+
+        headers.insert("x-request-id", HeaderValue::from_static("req-456"));
+        assert_eq!(upstream_request_id(&headers), Some("req-456".to_string()));
     }
 
     #[tokio::test]
