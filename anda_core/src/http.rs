@@ -18,9 +18,9 @@
 //! - [`cbor_rpc`]: Internal function for making CBOR-encoded HTTP requests.
 
 use candid::{CandidType, Principal, decode_args, encode_args, utils::ArgumentEncoder};
-use ciborium::from_reader;
+use cbor2::{from_slice, to_canonical_vec};
 use http::header;
-use ic_auth_types::{ByteBufB64, deterministic_cbor_into_vec};
+use ic_auth_types::ByteBufB64;
 use reqwest::Client;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::fmt::Display;
@@ -163,7 +163,7 @@ pub async fn http_rpc<T>(
 where
     T: DeserializeOwned,
 {
-    let args = deterministic_cbor_into_vec(args).map_err(|e| HttpRPCError::RequestError {
+    let args = to_canonical_vec(args).map_err(|e| HttpRPCError::RequestError {
         endpoint: endpoint.to_string(),
         path: method.to_string(),
         error: format!("{e:?}"),
@@ -172,14 +172,14 @@ where
         method,
         params: &args.into(),
     };
-    let req = deterministic_cbor_into_vec(&req).map_err(|e| HttpRPCError::RequestError {
+    let req = to_canonical_vec(&req).map_err(|e| HttpRPCError::RequestError {
         endpoint: endpoint.to_string(),
         path: method.to_string(),
         error: format!("{e:?}"),
     })?;
 
     let res = cbor_rpc(client, endpoint, method, None, req).await?;
-    from_reader(&res[..]).map_err(|e| HttpRPCError::ResultError {
+    from_slice(&res[..]).map_err(|e| HttpRPCError::ResultError {
         endpoint: endpoint.to_string(),
         path: method.to_string(),
         error: format!("{e:?}"),
@@ -213,7 +213,7 @@ where
         path: method.to_string(),
         error: format!("{e:?}"),
     })?;
-    let req = deterministic_cbor_into_vec(&CanisterRequestRef {
+    let req = to_canonical_vec(&CanisterRequestRef {
         canister,
         method,
         params: &ByteBufB64::from(args),
@@ -280,7 +280,7 @@ pub async fn cbor_rpc(
         path: path.to_string(),
         error: format!("{e:?}"),
     })?;
-    let res: RPCResponse = from_reader(&data[..]).map_err(|e| HttpRPCError::ResultError {
+    let res: RPCResponse = from_slice(&data[..]).map_err(|e| HttpRPCError::ResultError {
         endpoint: endpoint.to_string(),
         path: path.to_string(),
         error: format!("{e:?}"),
@@ -385,11 +385,11 @@ mod tests {
     }
 
     fn rpc_response(result: RPCResponse) -> Vec<u8> {
-        deterministic_cbor_into_vec(&result).unwrap()
+        to_canonical_vec(&result).unwrap()
     }
 
     fn rpc_success<T: Serialize>(value: &T) -> Vec<u8> {
-        let payload = deterministic_cbor_into_vec(value).unwrap();
+        let payload = to_canonical_vec(value).unwrap();
         rpc_response(Ok(ByteBufB64::from(payload)))
     }
 
@@ -416,9 +416,9 @@ mod tests {
             CONTENT_TYPE_CBOR
         );
         assert_eq!(req.headers.get(header::ACCEPT).unwrap(), CONTENT_TYPE_CBOR);
-        let decoded: RPCRequest = from_reader(&req.body[..]).unwrap();
+        let decoded: RPCRequest = from_slice(&req.body[..]).unwrap();
         assert_eq!(decoded.method, "ping");
-        let args: (String, u8) = from_reader(&decoded.params.0[..]).unwrap();
+        let args: (String, u8) = from_slice(&decoded.params.0[..]).unwrap();
         assert_eq!(args, ("arg".to_string(), 7));
     }
 
@@ -435,7 +435,7 @@ mod tests {
         assert_eq!(output, "hello");
 
         let req = recorded(&state);
-        let value: ciborium::value::Value = from_reader(&req.body[..]).unwrap();
+        let value: cbor2::Value = from_slice(&req.body[..]).unwrap();
         let text = format!("{value:?}");
         assert!(text.contains("greet"));
     }

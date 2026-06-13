@@ -11,8 +11,7 @@ use anda_core::{
     StoreFeatures, ToolOutput, Usage, select_resources, validate_function_name,
 };
 use async_trait::async_trait;
-use ciborium::from_reader;
-use ic_auth_types::deterministic_cbor_into_vec;
+use cbor2::{from_slice, to_canonical_vec};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -1371,7 +1370,7 @@ impl SubAgentManager {
                 }
             };
 
-            match from_reader::<SubAgent, _>(&data[..]) {
+            match from_slice::<SubAgent>(&data[..]) {
                 Ok(mut agent) => {
                     let name = agent.name.to_ascii_lowercase();
                     self.preserve_runtime_state(&name, &mut agent);
@@ -1433,7 +1432,7 @@ impl SubAgentManager {
         validate_function_name(&name)?;
         self.preserve_runtime_state(&name, &mut agent);
 
-        let data = deterministic_cbor_into_vec(&agent)?;
+        let data = to_canonical_vec(&agent)?;
         self.agents.write().insert(name.clone(), agent);
 
         ctx.root
@@ -3581,7 +3580,7 @@ mod tests {
         ctx.store_put(
             &Path::from("legacy_agent"),
             PutMode::Overwrite,
-            deterministic_cbor_into_vec(&legacy_agent).unwrap().into(),
+            to_canonical_vec(&legacy_agent).unwrap().into(),
         )
         .await
         .unwrap();
@@ -3599,7 +3598,7 @@ mod tests {
 
         for meta in &stored {
             let (data, _) = ctx.store_get(&meta.location).await.unwrap();
-            let loaded = from_reader::<SubAgent, _>(&data[..]).unwrap();
+            let loaded = from_slice::<SubAgent>(&data[..]).unwrap();
             assert!(agents.iter().any(|agent| agent.name == loaded.name));
         }
 

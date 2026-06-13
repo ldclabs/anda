@@ -10,9 +10,9 @@ use candid::{
     CandidType, Decode, Principal,
     utils::{ArgumentEncoder, encode_args},
 };
-use ciborium::from_reader;
+use cbor2::{from_slice, to_canonical_vec};
 use ic_agent::identity::{AnonymousIdentity, BasicIdentity, Secp256k1Identity};
-use ic_auth_types::{ByteBufB64, deterministic_cbor_into_vec};
+use ic_auth_types::ByteBufB64;
 use ic_auth_verifier::envelope::SignedEnvelope;
 use ic_cose::client::CoseSDK;
 use ic_cose_types::{
@@ -265,7 +265,7 @@ impl Client {
             method,
             params: &params,
         };
-        let body = deterministic_cbor_into_vec(&req)?;
+        let body = to_canonical_vec(&req)?;
         let digest: [u8; 32] = sha3_256(&body);
         let headers = self.sign_headers(digest, None)?;
         Ok((headers, body))
@@ -642,10 +642,10 @@ impl HttpFeatures for Client {
         T: DeserializeOwned,
     {
         self.check_url(endpoint)?;
-        let args = deterministic_cbor_into_vec(&args)?;
+        let args = to_canonical_vec(&args)?;
         let (headers, body) = self.signed_rpc_request(method, args)?;
         let res = cbor_rpc(&self.outer_http, endpoint, method, Some(headers), body).await?;
-        let res = from_reader(&res[..])?;
+        let res = from_slice(&res[..])?;
         Ok(res)
     }
 }

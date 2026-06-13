@@ -1924,7 +1924,7 @@ mod tests {
     };
     use bytes::Bytes;
     use candid::Principal;
-    use ciborium::from_reader;
+    use cbor2::from_slice;
     use futures_util::StreamExt;
     use ic_cose_types::to_cbor_bytes;
     use serde::Deserialize;
@@ -1959,7 +1959,7 @@ mod tests {
             }
         });
         let data = to_cbor_bytes(&json);
-        let val: serde_json::Value = from_reader(&data[..]).unwrap();
+        let val: serde_json::Value = from_slice(&data[..]).unwrap();
         assert_eq!(json, val);
     }
 

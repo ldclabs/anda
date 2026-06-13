@@ -3,15 +3,15 @@ name = "anda_cli"
 description = "The command line interface for Anda engine server."
 repository = "https://github.com/ldclabs/anda/tree/main/anda_cli"
 publish = true
-version = "0.12.0"
+version = "0.13.0"
 edition.workspace = true
 keywords.workspace = true
 categories.workspace = true
 license.workspace = true
 
 [dependencies]
-anda_core = { path = "../anda_core", version = "0.12" }
-anda_web3_client = { path = "../anda_web3_client", version = "0.12" }
+anda_core = { path = "../anda_core", version = "0.13" }
+anda_web3_client = { path = "../anda_web3_client", version = "0.13" }
 ic_cose_types = { workspace = true }
 base64 = { workspace = true }
 clap = { workspace = true }
@@ -20,6 +20,6 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 hex = { workspace = true }
 rand = { workspace = true }
-ciborium = { workspace = true }
+cbor2 = { workspace = true }
 
 [dev-dependencies]

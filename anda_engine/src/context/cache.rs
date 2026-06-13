@@ -28,8 +28,7 @@
 use anda_core::BoxError;
 use anda_core::context::CacheExpiry;
 use bytes::Bytes;
-use ciborium::from_reader;
-use ic_auth_types::deterministic_cbor_into_vec;
+use cbor2::{from_slice, to_canonical_vec};
 use moka::{future::Cache, policy::Expiry};
 use object_store::path::Path;
 use serde::{Serialize, de::DeserializeOwned};
@@ -123,7 +122,7 @@ impl CacheService {
     {
         match self.cache(path) {
             Some(cache) => match cache.get(key).await {
-                Some(val) => from_reader(&val.0[..]).map_err(|err| err.into()),
+                Some(val) => from_slice(&val.0[..]).map_err(|err| err.into()),
                 None => Err(format!("key {} not found", key).into()),
             },
             None => Err(Self::missing_path(path)),
@@ -152,7 +151,7 @@ impl CacheService {
             .try_get_with_by_ref(key, async move {
                 match init.await {
                     Ok((val, expiry)) => {
-                        let data = deterministic_cbor_into_vec(&val)?;
+                        let data = to_canonical_vec(&val)?;
                         Ok(Arc::new((data.into(), expiry)))
                     }
                     Err(e) => Err(e),
@@ -160,7 +159,7 @@ impl CacheService {
             })
             .await
         {
-            Ok(val) => from_reader(&val.0[..]).map_err(|e| e.into()),
+            Ok(val) => from_slice(&val.0[..]).map_err(|e| e.into()),
             Err(err) => Err(format!("key {} init failed: {}", key, err).into()),
         }
     }
@@ -178,7 +177,7 @@ impl CacheService {
         let Some(cache) = self.cache(path) else {
             return;
         };
-        let data = match deterministic_cbor_into_vec(&value.0) {
+        let data = match to_canonical_vec(&value.0) {
             Ok(data) => data,
             Err(err) => {
                 log::error!("CacheService failed to serialize value, key: {key}, error: {err}");
@@ -208,7 +207,7 @@ impl CacheService {
         let Some(cache) = self.cache(path) else {
             return false;
         };
-        let data = match deterministic_cbor_into_vec(&value.0) {
+        let data = match to_canonical_vec(&value.0) {
             Ok(data) => data,
             Err(err) => {
                 log::error!("CacheService failed to serialize value, key: {key}, error: {err}");

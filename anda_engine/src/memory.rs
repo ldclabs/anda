@@ -26,7 +26,7 @@ use anda_kip::{
     DescribeTarget, KipError, META_SYSTEM_NAME, MetaCommand, PERSON_TYPE, Request, Response,
 };
 use candid::Principal;
-use ciborium::cbor;
+use cbor2::cbor;
 use ic_auth_types::ByteBufB64;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};

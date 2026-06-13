@@ -23,8 +23,7 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use ciborium::from_reader;
-use ic_auth_types::deterministic_cbor_into_vec;
+use cbor2::{from_slice, to_canonical_vec};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{future::Future, sync::Arc, time::Duration};
 
@@ -467,7 +466,7 @@ pub trait CacheStoreFeatures: StoreFeatures + CacheFeatures + Send + Sync + 'sta
         let p = Path::from(key);
         match self.store_get(&p).await {
             Ok((v, meta)) => {
-                let val: T = from_reader(&v[..])?;
+                let val: T = from_slice(&v[..])?;
                 self.cache_set(
                     key,
                     (
@@ -486,7 +485,7 @@ pub trait CacheStoreFeatures: StoreFeatures + CacheFeatures + Send + Sync + 'sta
             }
             Err(_) => {
                 let val: T = init.await?;
-                let data = deterministic_cbor_into_vec(&val)?;
+                let data = to_canonical_vec(&val)?;
                 let res = self.store_put(&p, PutMode::Create, data.into()).await?;
                 self.cache_set(
                     key,
@@ -518,7 +517,7 @@ pub trait CacheStoreFeatures: StoreFeatures + CacheFeatures + Send + Sync + 'sta
                 // fetch from store and set in cache
                 let p = Path::from(key);
                 let (v, meta) = self.store_get(&p).await?;
-                let val: T = from_reader(&v[..])?;
+                let val: T = from_slice(&v[..])?;
                 let version = UpdateVersion {
                     e_tag: meta.e_tag,
                     version: meta.version,
@@ -544,7 +543,7 @@ pub trait CacheStoreFeatures: StoreFeatures + CacheFeatures + Send + Sync + 'sta
     where
         T: DeserializeOwned + Serialize + Send,
     {
-        let data = deterministic_cbor_into_vec(&val)?;
+        let data = to_canonical_vec(&val)?;
         let p = Path::from(key);
         if let Some(ver) = version {
             // atomic update
@@ -650,7 +649,7 @@ mod tests {
                 .get(key)
                 .cloned()
                 .ok_or_else(|| format!("key {key} not found"))?;
-            from_reader(&value.0[..]).map_err(|err| err.into())
+            from_slice(&value.0[..]).map_err(|err| err.into())
         }
 
         async fn cache_get_with<T, F>(&self, key: &str, init: F) -> Result<T, BoxError>
@@ -659,11 +658,11 @@ mod tests {
             F: Future<Output = Result<(T, Option<CacheExpiry>), BoxError>> + Send + 'static,
         {
             if let Some(value) = self.cache.lock().unwrap().get(key).cloned() {
-                return from_reader(&value.0[..]).map_err(|err| err.into());
+                return from_slice(&value.0[..]).map_err(|err| err.into());
             }
 
             let (value, expiry) = init.await?;
-            let data = deterministic_cbor_into_vec(&value)?;
+            let data = to_canonical_vec(&value)?;
             self.cache
                 .lock()
                 .unwrap()
@@ -675,7 +674,7 @@ mod tests {
         where
             T: Sized + Serialize + Send,
         {
-            let data = deterministic_cbor_into_vec(&val.0).unwrap();
+            let data = to_canonical_vec(&val.0).unwrap();
             self.cache
                 .lock()
                 .unwrap()
@@ -691,7 +690,7 @@ mod tests {
                 return false;
             }
 
-            let data = deterministic_cbor_into_vec(&val.0).unwrap();
+            let data = to_canonical_vec(&val.0).unwrap();
             cache.insert(key.to_string(), Arc::new((data.into(), val.1)));
             true
         }
@@ -803,7 +802,7 @@ mod tests {
             e_tag: Some("etag-stored".to_string()),
             version: Some("1".to_string()),
         };
-        let data = deterministic_cbor_into_vec(&123_u32).unwrap();
+        let data = to_canonical_vec(&123_u32).unwrap();
         ctx.put_serialized("answer", data, stored_version.clone());
 
         let (value, version) = block_on(ctx.cache_store_get::<u32>("answer")).unwrap();
@@ -838,7 +837,7 @@ mod tests {
             e_tag: Some("etag-existing".to_string()),
             version: Some("7".to_string()),
         };
-        let data = deterministic_cbor_into_vec(&"stored".to_string()).unwrap();
+        let data = to_canonical_vec(&"stored".to_string()).unwrap();
         ctx.put_serialized("message", data, stored_version.clone());
 
         block_on(ctx.cache_store_init("message", async {

@@ -10,8 +10,7 @@ use candid::{
     CandidType, Decode, Principal,
     utils::{ArgumentEncoder, encode_args},
 };
-use ciborium::from_reader;
-use ic_auth_types::deterministic_cbor_into_vec;
+use cbor2::{from_slice, to_canonical_vec};
 use ic_auth_verifier::envelope::SignedEnvelope;
 use serde::{Serialize, de::DeserializeOwned};
 use std::sync::Arc;
@@ -485,11 +484,11 @@ impl HttpFeatures for &Web3SDK {
         match self {
             Web3SDK::Tee(cli) => cli.https_signed_rpc(endpoint, method, args).await,
             Web3SDK::Web3(Web3Client { client: cli }) => {
-                let args = deterministic_cbor_into_vec(&args)?;
+                let args = to_canonical_vec(&args)?;
                 let res = cli
                     .https_signed_rpc_raw(endpoint.to_string(), method.to_string(), args)
                     .await?;
-                let res = from_reader(&res[..])?;
+                let res = from_slice(&res[..])?;
                 Ok(res)
             }
         }
@@ -662,7 +661,7 @@ mod tests {
             _args: Vec<u8>,
         ) -> BoxPinFut<Result<Vec<u8>, BoxError>> {
             Box::pin(futures::future::ready(
-                deterministic_cbor_into_vec(&format!("rpc:{method}")).map_err(|err| err.into()),
+                to_canonical_vec(&format!("rpc:{method}")).map_err(|err| err.into()),
             ))
         }
     }

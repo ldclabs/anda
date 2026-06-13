@@ -5,7 +5,8 @@ use anda_web3_client::{
 };
 use axum::{Router, body::Bytes, http::StatusCode, response::IntoResponse, routing::post};
 use candid::Principal;
-use ic_auth_types::{ByteBufB64, deterministic_cbor_into_vec};
+use cbor2::to_canonical_vec;
+use ic_auth_types::ByteBufB64;
 use ic_cose::client::CoseSDK;
 use ic_cose_types::CanisterCaller;
 use std::sync::Arc;
@@ -40,14 +41,14 @@ async fn client_with_identity(allow_http: bool) -> Client {
 }
 
 fn rpc_response(result: RPCResponse) -> Vec<u8> {
-    deterministic_cbor_into_vec(&result).unwrap()
+    to_canonical_vec(&result).unwrap()
 }
 
 async fn rpc_handler(body: Bytes) -> impl IntoResponse {
     if body.is_empty() {
         return (StatusCode::BAD_REQUEST, "missing body".as_bytes().to_vec());
     }
-    let payload = deterministic_cbor_into_vec(&"pong".to_string()).unwrap();
+    let payload = to_canonical_vec(&"pong".to_string()).unwrap();
     (StatusCode::OK, rpc_response(Ok(ByteBufB64::from(payload))))
 }
 

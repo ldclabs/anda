@@ -11,8 +11,7 @@
 use anda_core::{
     BoxError, FunctionDefinition, Path, PutMode, Resource, StoreFeatures, Tool, ToolOutput,
 };
-use ciborium::from_reader;
-use ic_auth_types::deterministic_cbor_into_vec;
+use cbor2::{from_slice, to_canonical_vec};
 use object_store::Error as ObjectStoreError;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -238,7 +237,7 @@ impl NoteTool {
 
     async fn load_store(ctx: &BaseCtx) -> Result<NoteStore, BoxError> {
         match ctx.store_get(&Self::store_path(&ctx.agent)).await {
-            Ok((data, _)) => Ok(from_reader(&data[..])?),
+            Ok((data, _)) => Ok(from_slice(&data[..])?),
             Err(err) if is_missing_store_object(err.as_ref()) => Ok(NoteStore::default()),
             Err(err) => Err(err),
         }
@@ -246,14 +245,14 @@ impl NoteTool {
 
     async fn load_legacy_store(ctx: &BaseCtx) -> Result<LegacyNoteStore, BoxError> {
         match ctx.store_get(&Self::legacy_store_path(&ctx.agent)).await {
-            Ok((data, _)) => Ok(from_reader(&data[..])?),
+            Ok((data, _)) => Ok(from_slice(&data[..])?),
             Err(err) if is_missing_store_object(err.as_ref()) => Ok(LegacyNoteStore::default()),
             Err(err) => Err(err),
         }
     }
 
     async fn save_store(ctx: &BaseCtx, store: &NoteStore) -> Result<(), BoxError> {
-        let data = deterministic_cbor_into_vec(store)?;
+        let data = to_canonical_vec(store)?;
         ctx.store_put(
             &Self::store_path(&ctx.agent),
             PutMode::Overwrite,
@@ -866,7 +865,7 @@ mod tests {
         ctx.store_put(
             &NoteTool::legacy_store_path(&ctx.agent),
             PutMode::Overwrite,
-            deterministic_cbor_into_vec(&legacy).unwrap().into(),
+            to_canonical_vec(&legacy).unwrap().into(),
         )
         .await
         .unwrap();

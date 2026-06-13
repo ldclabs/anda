@@ -2,6 +2,17 @@
 
 All notable changes to the Anda project will be documented in this file.
 
+## [0.13.0] — 2026-06-13
+
+### Changed
+
+- **Workspace release and dependency alignment** — Bumped the Anda workspace crates to `0.13.0`, aligned internal crate dependencies on the `0.13` series, and upgraded the ICP/TEE/Anda data stack to `anda_db_tfs 0.8`, `anda_db_schema 0.8`, `anda_cloud_cdk 0.5`, `ic_cose 0.10`, `ic_cose_types 0.10`, `ic-oss-types 1.3`, `ic_auth_types 0.9`, `ic_auth_verifier 0.9`, and `ic_tee_* 0.7`.
+- **CBOR serialization backend** — Replaced direct `ciborium` usage across the published workspace crates with `cbor2`, using canonical encoding for cache/store data, HTTP RPC payloads, signed Web3 requests, engine server RPC responses, notes, and subagent persistence.
+
+### Fixed — anda_engine v0.12.37
+
+- **Transport error diagnostics** — Completion transport errors now preserve their source chain and include upstream request IDs, received stream byte counts, and elapsed time for response-body and mid-stream SSE failures, making timeout and upstream-abort diagnosis more actionable.
+
 ## [0.12.36] — 2026-06-11
 
 ### Fixed — anda_engine v0.12.36

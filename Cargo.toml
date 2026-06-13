@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.12.0"
+version = "0.13.0"
 description = "Anda is an AI agent framework built with Rust, powered by ICP and TEEs."
 repository = "https://github.com/ldclabs/anda"
 homepage = "https://github.com/ldclabs/anda"
@@ -35,15 +35,15 @@ axum = { version = "0.8", features = [
 ], default-features = true }
 async-trait = "0.1"
 anda_db = { version = "0.8", features = ["full"] }
-anda_db_tfs = { version = "0.5", features = ["full"] }
+anda_db_tfs = { version = "0.8", features = ["full"] }
 anda_cognitive_nexus = "0.8"
-anda_db_schema = "0.4"
+anda_db_schema = "0.8"
 anda_kip = "0.8"
 arc-swap = "1.9"
 bytes = "1"
 base64 = "0.22"
 candid = "0.10"
-ciborium = "0.2"
+cbor2 = "1"
 chrono = "0.4"
 encoding_rs = "0.8"
 futures = "0.3"
@@ -53,17 +53,17 @@ mime = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1" }
 serde_bytes = "0.11"
-ic_cose_types = "0.9"
-ic_cose = "0.9"
-ic-oss-types = "1.2"
+ic_cose_types = "0.10"
+ic_cose = "0.10"
+ic-oss-types = "1.3"
 ic-agent = "0.47"
-ic_auth_types = "0.8"
-ic_auth_verifier = "0.8"
-ic_tee_cdk = "0.6"
-ic_tee_agent = "0.6"
-ic_tee_gateway_sdk = "0.6"
+ic_auth_types = "0.9"
+ic_auth_verifier = "0.9"
+ic_tee_cdk = "0.7"
+ic_tee_agent = "0.7"
+ic_tee_gateway_sdk = "0.7"
 infer2 = "0.21"
-anda_cloud_cdk = "0.4"
+anda_cloud_cdk = "0.5"
 object_store = { version = "0.13" }
 parking_lot = "0.12"
 tokio-util = "0.7"

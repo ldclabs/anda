@@ -104,7 +104,7 @@ async fn information_endpoints_serve_json_and_cbor() {
         CONTENT_TYPE_CBOR
     );
     let body = res.bytes().await.unwrap();
-    let info: AppInformation = ciborium::from_reader(&body[..]).unwrap();
+    let info: AppInformation = cbor2::from_slice(&body[..]).unwrap();
     assert_eq!(info.default_engine, id);
 
     // engine information endpoint
@@ -182,7 +182,7 @@ async fn rpc_handles_cbor_requests_and_errors() {
     assert!(err.to_string().contains("not found"));
 
     // invalid engine id in the path is rejected before dispatch
-    let body = ic_auth_types::deterministic_cbor_into_vec(&RPCRequest {
+    let body = cbor2::to_canonical_vec(&RPCRequest {
         method: "information".to_string(),
         params: ByteBufB64::default(),
     })

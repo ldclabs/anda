@@ -11,9 +11,9 @@ use axum::{
     response::IntoResponse,
 };
 use candid::Principal;
-use ciborium::from_reader;
+use cbor2::{from_slice, to_canonical_vec};
 use http::header::AUTHORIZATION;
-use ic_auth_types::{ByteBufB64, deterministic_cbor_into_vec};
+use ic_auth_types::ByteBufB64;
 use ic_auth_verifier::{
     envelope::{ANONYMOUS_PRINCIPAL, SignedEnvelope},
     unix_timestamp,
@@ -203,7 +203,7 @@ impl Codec {
     fn decode_params<T: DeserializeOwned>(self, params: &[u8]) -> Result<T, String> {
         match self {
             Codec::Cbor => {
-                from_reader(params).map_err(|err| format!("failed to decode params: {err:?}"))
+                from_slice(params).map_err(|err| format!("failed to decode params: {err:?}"))
             }
             Codec::Json => serde_json::from_slice(params)
                 .map_err(|err| format!("failed to decode params: {err:?}")),
@@ -212,7 +212,9 @@ impl Codec {
 
     fn encode_result<T: Serialize>(self, value: &T) -> Result<ByteBufB64, String> {
         match self {
-            Codec::Cbor => deterministic_cbor_into_vec(value).map(ByteBufB64::from),
+            Codec::Cbor => to_canonical_vec(value)
+                .map(ByteBufB64::from)
+                .map_err(|err| format!("failed to encode result: {err:?}")),
             Codec::Json => serde_json::to_vec(value)
                 .map(ByteBufB64::from)
                 .map_err(|err| format!("failed to encode result: {err:?}")),

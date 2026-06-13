@@ -6,7 +6,7 @@
 use anda_core::{AgentInput, AgentOutput, BoxError, HttpFeatures, ToolInput, ToolOutput};
 use anda_web3_client::client::{Client as Web3Client, load_identity};
 use base64::{Engine, prelude::BASE64_URL_SAFE};
-use ciborium::value::Value;
+use cbor2::Value;
 use clap::{Parser, Subcommand};
 use ic_cose_types::cose::ed25519::{SigningKey, VerifyingKey};
 use rand::Rng;
