@@ -31,7 +31,7 @@ use crate::{
     unix_ms,
 };
 
-const CONVERSATION_IDLE_MS: u64 = 10 * 60 * 1000; // 10 minutes
+const CONVERSATION_IDLE_MS: u64 = 60 * 1000; // 1 minute
 const CONVERSATION_WAIT_BACKGROUND_TASK_MS: u64 = 60 * 60 * 1000; // 1 hour
 // How long an idle session waits for new input before re-running its idle bookkeeping.
 const SESSION_INPUT_POLL_MS: u64 = 1000;
@@ -87,6 +87,16 @@ pub struct SubAgent {
     #[serde(default, deserialize_with = "deserialize_optional_model_effort")]
     pub effort: Option<ModelEffort>,
 
+    /// Optional idle timeout, in seconds, for this subagent's sessions.
+    ///
+    /// When a session has no running background task and receives no new input for this long, its
+    /// runner ends and the session is reclaimed. `0` keeps the engine default
+    /// ([`CONVERSATION_IDLE_MS`]); any positive value is clamped to the background-task wait
+    /// ceiling ([`CONVERSATION_WAIT_BACKGROUND_TASK_MS`]) so a session can never outlive it. Only
+    /// affects session mode; blocking runs ignore it.
+    #[serde(default)]
+    pub idle_timeout: u64,
+
     /// Active background sessions owned by this subagent.
     #[serde(skip)]
     pub subsessions: Arc<SubSessions>,
@@ -125,6 +135,10 @@ impl SubAgent {
             parts.push(format!("Default effort: {effort}."));
         }
 
+        if self.idle_timeout > 0 {
+            parts.push(format!("Session idle timeout: {}s.", self.idle_timeout));
+        }
+
         let sessions = self.subsessions.active_session_ids();
         if !sessions.is_empty() {
             parts.push(format!(
@@ -161,6 +175,20 @@ fn selected_model_label(model: &str) -> Option<String> {
         None
     } else {
         Some(model.to_ascii_lowercase())
+    }
+}
+
+/// Resolves a subagent's configured idle timeout (in seconds) into the per-session idle window in
+/// milliseconds. `0` keeps the engine default; any positive value is clamped to
+/// `[1s, CONVERSATION_WAIT_BACKGROUND_TASK_MS]` so a session can neither expire instantly nor
+/// outlive the hard background-task wait ceiling.
+fn resolve_idle_timeout_ms(idle_timeout_secs: u64) -> u64 {
+    if idle_timeout_secs == 0 {
+        CONVERSATION_IDLE_MS
+    } else {
+        idle_timeout_secs
+            .saturating_mul(1000)
+            .clamp(1000, CONVERSATION_WAIT_BACKGROUND_TASK_MS)
     }
 }
 
@@ -268,6 +296,11 @@ pub struct SubAgentManagerArgs {
     #[serde(default, deserialize_with = "deserialize_optional_model_effort")]
     pub effort: Option<ModelEffort>,
 
+    /// Optional idle timeout, in seconds, for this subagent's sessions. `0` keeps the engine
+    /// default. See [`SubAgent::idle_timeout`].
+    #[serde(default)]
+    pub idle_timeout: u64,
+
     /// Optional task to run immediately after creating or updating the subagent.
     #[serde(default)]
     pub task: String,
@@ -297,6 +330,7 @@ impl Default for SubAgentManagerArgs {
             output_schema: None,
             model: String::new(),
             effort: None,
+            idle_timeout: 0,
             task: String::new(),
             session: String::new(),
             persist: false,
@@ -376,6 +410,7 @@ impl SubAgentManagerArgs {
             output_schema: self.output_schema,
             model: self.model.trim().to_string(),
             effort: self.effort,
+            idle_timeout: self.idle_timeout,
             ..Default::default()
         };
 
@@ -416,6 +451,8 @@ pub struct SubSession {
     // task_id -> BackgroundTaskInfo
     background_tasks: Arc<RwLock<HashMap<String, BackgroundTaskInfo>>>,
     active_at: AtomicU64,
+    // Idle window in ms before an input-less, background-task-less session is reclaimed.
+    idle_timeout_ms: u64,
 }
 
 fn resources_into_content(resources: Vec<Resource>) -> Vec<ContentPart> {
@@ -482,6 +519,10 @@ impl SubSessionRunner {
             || !output.artifacts.is_empty()
     }
 
+    fn has_progress_signal(output: &AgentOutput) -> bool {
+        !output.content.is_empty() || output.failed_reason.is_some()
+    }
+
     fn latest_output(&mut self) -> AgentOutput {
         let output = self
             .last_output
@@ -541,6 +582,97 @@ impl SubSessionRunner {
 
         self.last_output = Some(output);
         failed_reason
+    }
+
+    async fn emit_progress(&self, output: AgentOutput) {
+        if let Some(hook) = &self.agent_hook {
+            hook.on_background_progress(self.runner.ctx(), self.session.id.clone(), output)
+                .await;
+        }
+    }
+
+    /// Summarizes the current conversation into a single handoff message and swaps in a fresh
+    /// runner seeded with that summary, discarding the bloated history while preserving the
+    /// session's accumulated usage, tool usage, and artifacts.
+    ///
+    /// Must only be called at an idle boundary (no pending tool calls or queued input), so the
+    /// summarization turn does not strand an unanswered tool-call requirement.
+    async fn compact(&mut self) -> Result<(), BoxError> {
+        // Captured before clearing tools so the replacement runner restores the base toolset.
+        let handoff_req = self.runner.req().clone();
+        // Drop tools so the summarization turn cannot spawn more tool calls.
+        self.runner.set_tools(Vec::new());
+
+        let mut output = match self
+            .runner
+            .finalize(Some(COMPACTION_PROMPT.to_string()))
+            .await
+        {
+            Ok(output) => output,
+            Err(err) => {
+                let failed_reason = self.record_failed_output(err.to_string());
+                return Err(failed_reason.into());
+            }
+        };
+
+        if let Some(failed_reason) = output.failed_reason.clone() {
+            self.last_output = Some(self.with_session(output));
+            return Err(failed_reason.into());
+        }
+
+        // The old runner handed over the whole session's accumulated usage/tools_usage/artifacts on
+        // finalize; rescue them first so nothing is lost even if the summary turns out unusable.
+        let carried_usage = output.usage.clone();
+        let carried_tools_usage = output.tools_usage.clone();
+        self.carried_artifacts.append(&mut output.artifacts);
+
+        // The summary becomes the sole surviving context. Refuse to replace the whole conversation
+        // with an empty message, which would silently erase the task; fail loudly instead so the
+        // parent can retry rather than letting the next turn run blind.
+        let summary = if !output.content.trim().is_empty() {
+            std::mem::take(&mut output.content)
+        } else {
+            match output.thoughts.as_deref().map(str::trim) {
+                Some(thoughts) if !thoughts.is_empty() => thoughts.to_string(),
+                _ => {
+                    let failed_reason =
+                        self.record_failed_output("context compaction produced an empty summary");
+                    return Err(failed_reason.into());
+                }
+            }
+        };
+
+        // The summary seeds the next conversation as its first message. It lives in `chat_history`
+        // for the first request and migrates into the runner's raw history on later turns.
+        let compaction_msg = Message {
+            role: "assistant".into(),
+            content: vec![summary.into()],
+            timestamp: Some(unix_ms()),
+            ..Default::default()
+        };
+
+        let req = CompletionRequest {
+            instructions: handoff_req.instructions,
+            role: handoff_req.role,
+            chat_history: vec![compaction_msg.clone()],
+            tools: handoff_req.tools,
+            output_schema: handoff_req.output_schema,
+            model: handoff_req.model,
+            effort: handoff_req.effort,
+            ..Default::default()
+        };
+
+        self.runner = self
+            .runner
+            .ctx()
+            .clone()
+            .completion_iter(req, Vec::new())
+            // Seed the reported chat history too, so the summary survives into the final output.
+            .reserve_chat_history(vec![compaction_msg])
+            .unbound();
+        self.runner.accumulate(&carried_usage);
+        self.runner.accumulate_tools_usage(&carried_tools_usage);
+        Ok(())
     }
 
     // returns true if the conversation should continue to be active after processing the inputs, or false if it should be terminated
@@ -616,82 +748,17 @@ impl SubSessionRunner {
                 let idle = now_ms.saturating_sub(self.session.active_at.load(Ordering::SeqCst));
                 let has_background_tasks = !self.session.background_tasks.read().is_empty();
 
-                if (idle > CONVERSATION_IDLE_MS && !has_background_tasks)
+                if (idle > self.session.idle_timeout_ms && !has_background_tasks)
                     || (idle > CONVERSATION_WAIT_BACKGROUND_TASK_MS && has_background_tasks)
                 {
                     return Ok(false);
                 }
 
-                if let Some(hook) = &self.agent_hook
-                    && let Some(last_output) = self.last_output.take()
-                {
-                    // 仅当空闲下来时响应 progress，避免过于频繁地推送中间结果
-                    hook.on_background_progress(
-                        self.runner.ctx(),
-                        self.session.id.clone(),
-                        last_output,
-                    )
-                    .await;
-                }
-
                 if needs_compaction(&self.runner) {
-                    // 上下文过长，先进行一次压缩总结，更新conversation状态和历史消息，再继续后续的处理
-                    let handoff_req = self.runner.req().clone();
-                    self.runner.set_tools(Vec::new());
-                    let mut output = match self
-                        .runner
-                        .finalize(Some(COMPACTION_PROMPT.to_string()))
-                        .await
-                    {
-                        Ok(output) => output,
-                        Err(err) => {
-                            let failed_reason = self.record_failed_output(err.to_string());
-                            return Err(failed_reason.into());
-                        }
-                    };
-
-                    if let Some(failed_reason) = output.failed_reason.clone() {
-                        let output = self.with_session(output);
-                        self.last_output = Some(output);
-                        return Err(failed_reason.into());
-                    }
-
-                    // 旧 runner 在 finalize 时交出了整个会话已累计的 usage/tools_usage/artifacts，
-                    // 必须转移到新 runner，否则会话最终上报的统计与产物会在每次压缩时丢失
-                    let carried_usage = output.usage.clone();
-                    let carried_tools_usage = output.tools_usage.clone();
-                    self.carried_artifacts.append(&mut output.artifacts);
-
-                    // 前一轮压缩总结的内容作为新 conversation 的第一条消息，继续后续的交互
-                    let now_ms = unix_ms();
-                    let compaction_msg = Message {
-                        role: "assistant".into(),
-                        content: vec![output.content.into()],
-                        timestamp: Some(now_ms),
-                        ..Default::default()
-                    };
-
-                    let req = CompletionRequest {
-                        instructions: handoff_req.instructions,
-                        role: handoff_req.role,
-                        chat_history: vec![compaction_msg.clone()],
-                        tools: handoff_req.tools,
-                        output_schema: handoff_req.output_schema,
-                        model: handoff_req.model,
-                        effort: handoff_req.effort,
-                        ..Default::default()
-                    };
-
-                    self.runner = self
-                        .runner
-                        .ctx()
-                        .clone()
-                        .completion_iter(req, Vec::new())
-                        .reserve_chat_history(vec![compaction_msg])
-                        .unbound();
-                    self.runner.accumulate(&carried_usage);
-                    self.runner.accumulate_tools_usage(&carried_tools_usage);
-                    return Ok(true);
+                    // 上下文过长，先进行一次压缩总结，用压缩后的 handoff 替换 runner，再继续后续的处理
+                    // 压缩只在 idle 边界触发：只有 idle 时才没有 pending tool call，中途压缩会丢掉未应答的 tool 要求。
+                    // 但副作用是：一个持续 tool-loop、从不产出非 tool 回复的超长任务，会在到达 idle 前就把 context 撑爆、先撞模型硬上限。
+                    self.compact().await?;
                 }
 
                 Ok(true)
@@ -702,7 +769,10 @@ impl SubSessionRunner {
                 self.session.active_at.store(now_ms, Ordering::SeqCst);
                 res.session = Some(self.session.id.clone());
                 let is_done = self.runner.is_done() || res.failed_reason.is_some();
-                self.last_output = Some(res);
+                self.last_output = Some(res.clone());
+                if !is_done && Self::has_progress_signal(&res) {
+                    self.emit_progress(res).await;
+                }
                 Ok(!is_done)
             }
 
@@ -969,7 +1039,7 @@ impl Agent<AgentCtx> for SubAgent {
                 "properties": {
                     "prompt": {
                         "type": "string",
-                        "description": "Self-contained task handoff for this subagent. Include objective, context/resources, constraints, dependencies, expected deliverable, success criteria, and what progress/final output should contain."
+                        "description": "Self-contained task handoff for this subagent. Include objective, context/resources, constraints, dependencies, expected deliverable, success criteria, and what progress/final output should contain. To control an already-running session, send a control command here instead of a task: `/steer <guidance>` to adjust course mid-run, or `/stop <reason>` to end it."
                     },
                     "session": {
                         "type": "string",
@@ -1127,6 +1197,7 @@ impl Agent<AgentCtx> for SubAgent {
                 sender,
                 background_tasks: Arc::new(RwLock::new(HashMap::new())),
                 active_at: AtomicU64::new(unix_ms()),
+                idle_timeout_ms: resolve_idle_timeout_ms(self.idle_timeout),
             });
             match subsessions.try_insert_session(candidate.clone()) {
                 None => {
@@ -1413,6 +1484,7 @@ impl SubAgentManager {
                     "has_output_schema": has_output_schema,
                     "model": model,
                     "effort": agent.effort,
+                    "idle_timeout": agent.idle_timeout,
                     "active_sessions": active_sessions,
                 })
             })
@@ -1516,6 +1588,12 @@ impl SubAgentManager {
                         "description": "Optional default reasoning/thinking effort used to run this subagent. Use null to leave the selected model's default effort unchanged. For operation=list, use null.",
                         "default": null
                     },
+                    "idle_timeout": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Optional idle timeout in seconds for this subagent's sessions. A session with no running background task ends after this much inactivity. Use 0 to keep the engine default; larger values are capped at the background-task wait ceiling. Tune it up for sessions you will revisit after gaps, down to reclaim idle workers sooner. For operation=list, use 0.",
+                        "default": 0
+                    },
                     "task": {
                         "type": "string",
                         "description": "Optional immediate task handoff to run with the newly created or updated subagent. Include objective, context/resources, constraints, dependencies, expected deliverable, and success criteria. Leave empty to only create/update or when operation=list.",
@@ -1532,7 +1610,7 @@ impl SubAgentManager {
                         "default": false
                     }
                 },
-                "required": ["operation", "name", "description", "instructions", "tools", "tags", "output_schema", "model", "effort", "task", "session", "persist"],
+                "required": ["operation", "name", "description", "instructions", "tools", "tags", "output_schema", "model", "effort", "idle_timeout", "task", "session", "persist"],
                 "additionalProperties": false
             }),
             strict: Some(true),
@@ -1897,6 +1975,32 @@ mod tests {
     }
 
     #[derive(Clone, Debug)]
+    struct EmptyCompactionCompleter;
+
+    impl CompletionFeaturesDyn for EmptyCompactionCompleter {
+        fn model_name(&self) -> String {
+            "empty-compaction".to_string()
+        }
+
+        fn completion(&self, req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
+            let prompt = request_text(&req);
+            let is_compaction = prompt.trim() == COMPACTION_PROMPT.trim();
+            Box::pin(futures::future::ready(Ok(AgentOutput {
+                // Normal turns echo their input and push usage over the compaction threshold; the
+                // compaction turn returns no usable summary at all.
+                content: if is_compaction { String::new() } else { prompt },
+                usage: Usage {
+                    input_tokens: if is_compaction { 1 } else { 100_000 },
+                    output_tokens: 1,
+                    cached_tokens: 0,
+                    requests: 1,
+                },
+                ..Default::default()
+            })))
+        }
+    }
+
+    #[derive(Clone, Debug)]
     struct RecordingRequestCompleter {
         name: &'static str,
         requests: Arc<Mutex<Vec<CompletionRequest>>>,
@@ -1933,6 +2037,65 @@ mod tests {
 
         fn completion(&self, _req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
             Box::pin(futures::future::ready(Err("model failed".into())))
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct ToolCallProgressCompleter;
+
+    impl CompletionFeaturesDyn for ToolCallProgressCompleter {
+        fn model_name(&self) -> String {
+            "tool-call-progress".to_string()
+        }
+
+        fn completion(&self, _req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
+            Box::pin(futures::future::ready(Ok(AgentOutput {
+                tool_calls: vec![anda_core::ToolCall {
+                    name: "long_running_tool".to_string(),
+                    args: json!({}),
+                    result: None,
+                    call_id: Some("call-1".to_string()),
+                    remote_id: None,
+                }],
+                usage: Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cached_tokens: 0,
+                    requests: 1,
+                },
+                ..Default::default()
+            })))
+        }
+    }
+
+    // Emits visible narration alongside a tool call, so the step carries a progress signal while
+    // tool calls keep the runner busy (non-idle).
+    #[derive(Clone, Debug)]
+    struct NarratingToolCallCompleter;
+
+    impl CompletionFeaturesDyn for NarratingToolCallCompleter {
+        fn model_name(&self) -> String {
+            "narrating-tool-call".to_string()
+        }
+
+        fn completion(&self, _req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
+            Box::pin(futures::future::ready(Ok(AgentOutput {
+                content: "searching now".to_string(),
+                tool_calls: vec![anda_core::ToolCall {
+                    name: "long_running_tool".to_string(),
+                    args: json!({}),
+                    result: None,
+                    call_id: Some("call-1".to_string()),
+                    remote_id: None,
+                }],
+                usage: Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cached_tokens: 0,
+                    requests: 1,
+                },
+                ..Default::default()
+            })))
         }
     }
 
@@ -2055,6 +2218,7 @@ mod tests {
             output_schema: Some(json!({"type": "object"})),
             model: " Pro ".to_string(),
             effort: Some(ModelEffort::Max),
+            idle_timeout: 120,
             ..Default::default()
         };
         let (sender, _rx) = tokio::sync::mpsc::channel(4);
@@ -2064,6 +2228,7 @@ mod tests {
             sender,
             background_tasks: Arc::new(RwLock::new(HashMap::new())),
             active_at: AtomicU64::new(unix_ms()),
+            idle_timeout_ms: 0,
         }));
         let definition = agent.definition();
         assert!(
@@ -2080,6 +2245,11 @@ mod tests {
         );
         assert!(definition.description.contains("Default model label: pro."));
         assert!(definition.description.contains("Default effort: max."));
+        assert!(
+            definition
+                .description
+                .contains("Session idle timeout: 120s.")
+        );
         assert!(definition.description.contains("Active sessions: Job-A."));
         assert_eq!(Agent::<AgentCtx>::description(&agent), "  ");
         assert_eq!(
@@ -2130,6 +2300,7 @@ mod tests {
             json!({
                 "output_schema": {"type": "object"},
                 "effort": null,
+                "idle_timeout": 90,
                 "task": "  run task  ",
                 "session": "  Thread  ",
                 "model": "  Pro  ",
@@ -2140,10 +2311,12 @@ mod tests {
         .unwrap();
         assert_eq!(manager_args.output_schema, Some(json!({"type": "object"})));
         assert_eq!(manager_args.effort, None);
+        assert_eq!(manager_args.idle_timeout, 90);
         let (agent, task, session, persist) = manager_args.into_subagent();
         assert_eq!(task.as_deref(), Some("run task"));
         assert_eq!(session, "thread");
         assert_eq!(agent.model, "Pro");
+        assert_eq!(agent.idle_timeout, 90);
         assert!(persist);
         assert!(SubAgentManagerArgs::from_prompt("not json".to_string()).is_err());
 
@@ -2340,6 +2513,79 @@ mod tests {
         );
     }
 
+    #[test]
+    fn resolve_idle_timeout_ms_applies_default_and_clamps() {
+        // 0 keeps the engine default.
+        assert_eq!(resolve_idle_timeout_ms(0), CONVERSATION_IDLE_MS);
+        // A positive value converts seconds to milliseconds.
+        assert_eq!(resolve_idle_timeout_ms(30), 30_000);
+        // Anything above the background-task ceiling is clamped down to it.
+        assert_eq!(
+            resolve_idle_timeout_ms(u64::MAX),
+            CONVERSATION_WAIT_BACKGROUND_TASK_MS
+        );
+        assert_eq!(
+            resolve_idle_timeout_ms(CONVERSATION_WAIT_BACKGROUND_TASK_MS / 1000 + 60),
+            CONVERSATION_WAIT_BACKGROUND_TASK_MS
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn subsession_runner_honors_configured_idle_timeout() {
+        let model = Model::with_completer(Arc::new(EchoCompleter));
+        let ctx = EngineBuilder::new().with_model(model).mock_ctx();
+
+        // Builds a runner whose session uses the given idle window, seeds it with one step, then
+        // rewinds `active_at` by a second to simulate the window elapsing.
+        async fn aged_runner(
+            ctx: &AgentCtx,
+            idle_timeout_ms: u64,
+        ) -> (Arc<SubSession>, SubSessionRunner) {
+            let (sender, _rx) = tokio::sync::mpsc::channel(4);
+            let session = Arc::new(SubSession {
+                id: "session-1".to_string(),
+                agent: "worker".to_string(),
+                sender,
+                background_tasks: Arc::new(RwLock::new(HashMap::new())),
+                active_at: AtomicU64::new(unix_ms()),
+                idle_timeout_ms,
+            });
+            let mut runner = SubSessionRunner {
+                session: session.clone(),
+                agent_hook: None,
+                runner: ctx
+                    .clone()
+                    .completion_iter(
+                        CompletionRequest {
+                            prompt: "seed task".to_string(),
+                            ..Default::default()
+                        },
+                        Vec::new(),
+                    )
+                    .unbound(),
+                last_output: None,
+                carried_artifacts: Vec::new(),
+                closing: false,
+            };
+            // First step consumes the seed and keeps the session active.
+            assert!(runner.run(Vec::new()).await.unwrap());
+            session
+                .active_at
+                .store(unix_ms().saturating_sub(1000), Ordering::SeqCst);
+            (session, runner)
+        }
+
+        // A tiny window: ~1s of inactivity exceeds it, so the idle session is reclaimed.
+        let (_session, mut tight) = aged_runner(&ctx, 5).await;
+        assert!(!tight.run(Vec::new()).await.unwrap());
+
+        // A generous window: the same ~1s of inactivity stays well within it, so the session
+        // survives. This proves the boundary tracks the configured value, not merely "active_at is
+        // old".
+        let (_session, mut roomy) = aged_runner(&ctx, 60_000).await;
+        assert!(roomy.run(Vec::new()).await.unwrap());
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn needs_compaction_respects_usage_threshold() {
         let low_model = Model::with_completer(Arc::new(UsageCompleter {
@@ -2460,6 +2706,7 @@ mod tests {
             sender,
             background_tasks: Arc::new(RwLock::new(HashMap::new())),
             active_at: AtomicU64::new(unix_ms()),
+            idle_timeout_ms: 0,
         });
 
         let mut runner = SubSessionRunner {
@@ -2517,7 +2764,13 @@ mod tests {
         assert_eq!(runner.runner.req().tools[0].name, "lookup");
         assert!(runner.runner.req().prompt.is_empty());
         assert!(runner.runner.req().content.is_empty());
-        assert!(runner.last_output.is_none());
+        assert_eq!(
+            runner
+                .last_output
+                .as_ref()
+                .map(|output| output.content.as_str()),
+            Some("seed task")
+        );
 
         assert!(
             runner
@@ -2555,6 +2808,165 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn subsession_runner_fails_when_compaction_summary_is_empty() {
+        let model = Model::with_completer(Arc::new(EmptyCompactionCompleter));
+        let ctx = EngineBuilder::new().with_model(model).mock_ctx();
+
+        let req = CompletionRequest {
+            instructions: "Keep working".to_string(),
+            prompt: "seed task".to_string(),
+            ..Default::default()
+        };
+
+        let (sender, _rx) = tokio::sync::mpsc::channel(4);
+        let session = Arc::new(SubSession {
+            id: "session-1".to_string(),
+            agent: "compactor".to_string(),
+            sender,
+            background_tasks: Arc::new(RwLock::new(HashMap::new())),
+            active_at: AtomicU64::new(unix_ms()),
+            idle_timeout_ms: 0,
+        });
+
+        let mut runner = SubSessionRunner {
+            session,
+            agent_hook: None,
+            runner: ctx.completion_iter(req, Vec::new()).unbound(),
+            last_output: None,
+            // A previously rescued artifact must survive even when compaction fails.
+            carried_artifacts: vec![resource(5, &["artifact"])],
+            closing: false,
+        };
+
+        // First step seeds the conversation and pushes usage over the compaction threshold.
+        assert!(runner.run(Vec::new()).await.unwrap());
+
+        // The next idle step triggers compaction. An empty summary must fail loudly instead of
+        // replacing the entire conversation with an empty handoff message.
+        let err = runner.run(Vec::new()).await.unwrap_err();
+        assert!(err.to_string().contains("empty summary"), "{err}");
+
+        let mut output = runner.latest_output();
+        runner.merge_carried_artifacts(&mut output);
+        assert_eq!(
+            output.failed_reason.as_deref(),
+            Some("context compaction produced an empty summary")
+        );
+        assert_eq!(output.session.as_deref(), Some("session-1"));
+        assert!(output.content.is_empty());
+        assert_eq!(
+            output
+                .artifacts
+                .iter()
+                .map(|artifact| artifact._id)
+                .collect::<Vec<_>>(),
+            vec![5]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn subsession_runner_emits_progress_for_signal_steps_without_waiting_for_idle() {
+        // A step that carries visible narration emits progress immediately, even while tool calls
+        // keep the runner busy (i.e. without waiting for an idle boundary).
+        let model = Model::with_completer(Arc::new(NarratingToolCallCompleter));
+        let ctx = EngineBuilder::new().with_model(model).mock_ctx();
+        let hook = Arc::new(RecordingAgentHook::default());
+
+        let (sender, _rx) = tokio::sync::mpsc::channel(4);
+        let session = Arc::new(SubSession {
+            id: "session-1".to_string(),
+            agent: "worker".to_string(),
+            sender,
+            background_tasks: Arc::new(RwLock::new(HashMap::new())),
+            active_at: AtomicU64::new(unix_ms()),
+            idle_timeout_ms: 0,
+        });
+
+        let mut runner = SubSessionRunner {
+            session,
+            agent_hook: Some(DynAgentHook::new(hook.clone())),
+            runner: ctx
+                .completion_iter(
+                    CompletionRequest {
+                        prompt: "start long work".to_string(),
+                        ..Default::default()
+                    },
+                    Vec::new(),
+                )
+                .unbound(),
+            last_output: None,
+            carried_artifacts: Vec::new(),
+            closing: false,
+        };
+
+        assert!(runner.run(Vec::new()).await.unwrap());
+        assert!(!runner.runner.is_idle());
+
+        let progress = hook.progress_events();
+        assert_eq!(progress.len(), 1);
+        assert_eq!(progress[0].0, "session-1");
+        assert_eq!(progress[0].1.session.as_deref(), Some("session-1"));
+        assert_eq!(progress[0].1.content, "searching now");
+        assert_eq!(progress[0].1.tool_calls.len(), 1);
+        assert_eq!(
+            runner
+                .last_output
+                .as_ref()
+                .map(|output| output.tool_calls.len()),
+            Some(1)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn subsession_runner_filters_signalless_tool_call_steps_from_progress() {
+        // A pure tool-call step carries no visible signal; it must be filtered out so the parent
+        // is not flooded with mechanical "still calling tools" noise. The step is still tracked in
+        // last_output for the eventual final report.
+        let model = Model::with_completer(Arc::new(ToolCallProgressCompleter));
+        let ctx = EngineBuilder::new().with_model(model).mock_ctx();
+        let hook = Arc::new(RecordingAgentHook::default());
+
+        let (sender, _rx) = tokio::sync::mpsc::channel(4);
+        let session = Arc::new(SubSession {
+            id: "session-1".to_string(),
+            agent: "worker".to_string(),
+            sender,
+            background_tasks: Arc::new(RwLock::new(HashMap::new())),
+            active_at: AtomicU64::new(unix_ms()),
+            idle_timeout_ms: 0,
+        });
+
+        let mut runner = SubSessionRunner {
+            session,
+            agent_hook: Some(DynAgentHook::new(hook.clone())),
+            runner: ctx
+                .completion_iter(
+                    CompletionRequest {
+                        prompt: "start long work".to_string(),
+                        ..Default::default()
+                    },
+                    Vec::new(),
+                )
+                .unbound(),
+            last_output: None,
+            carried_artifacts: Vec::new(),
+            closing: false,
+        };
+
+        assert!(runner.run(Vec::new()).await.unwrap());
+        assert!(!runner.runner.is_idle());
+
+        assert!(hook.progress_events().is_empty());
+        assert_eq!(
+            runner
+                .last_output
+                .as_ref()
+                .map(|output| output.tool_calls.len()),
+            Some(1)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn subsession_runner_accepts_resource_only_follow_up() {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let model = Model::with_completer(Arc::new(RecordingRequestCompleter {
@@ -2575,6 +2987,7 @@ mod tests {
             sender,
             background_tasks: Arc::new(RwLock::new(HashMap::new())),
             active_at: AtomicU64::new(unix_ms()),
+            idle_timeout_ms: 0,
         });
 
         let mut runner = SubSessionRunner {
@@ -2631,6 +3044,7 @@ mod tests {
             sender,
             background_tasks: Arc::new(RwLock::new(HashMap::new())),
             active_at: AtomicU64::new(unix_ms()),
+            idle_timeout_ms: 0,
         });
 
         let mut runner = SubSessionRunner {
@@ -2710,6 +3124,7 @@ mod tests {
             sender,
             background_tasks: Arc::new(RwLock::new(HashMap::new())),
             active_at: AtomicU64::new(unix_ms()),
+            idle_timeout_ms: 0,
         });
         let mut runner = SubSessionRunner {
             session,
@@ -2753,6 +3168,7 @@ mod tests {
             sender,
             background_tasks: Arc::new(RwLock::new(HashMap::new())),
             active_at: AtomicU64::new(unix_ms()),
+            idle_timeout_ms: 0,
         });
 
         let mut runner = SubSessionRunner {
@@ -2803,6 +3219,7 @@ mod tests {
             sender,
             background_tasks: Arc::new(RwLock::new(HashMap::new())),
             active_at: AtomicU64::new(unix_ms()),
+            idle_timeout_ms: 0,
         });
 
         let mut runner = SubSessionRunner {
@@ -2909,6 +3326,7 @@ mod tests {
             sender,
             background_tasks: Arc::new(RwLock::new(HashMap::new())),
             active_at: AtomicU64::new(unix_ms()),
+            idle_timeout_ms: 0,
         });
 
         let mut runner = SubSessionRunner {
@@ -2958,6 +3376,7 @@ mod tests {
             sender,
             background_tasks: Arc::new(RwLock::new(HashMap::new())),
             active_at: AtomicU64::new(unix_ms()),
+            idle_timeout_ms: 0,
         });
 
         let mut runner = SubSessionRunner {
@@ -3174,6 +3593,7 @@ mod tests {
             sender,
             background_tasks: Arc::new(RwLock::new(HashMap::new())),
             active_at: AtomicU64::new(unix_ms()),
+            idle_timeout_ms: 0,
         }));
 
         manager.upsert_temporary(agent).unwrap();
@@ -3270,6 +3690,7 @@ mod tests {
             sender: tx,
             background_tasks: Arc::new(RwLock::new(HashMap::new())),
             active_at: AtomicU64::new(unix_ms()),
+            idle_timeout_ms: 0,
         });
         let ctx = EngineBuilder::new().mock_ctx();
 
@@ -3442,6 +3863,7 @@ mod tests {
             sender: closed_tx,
             background_tasks: Arc::new(RwLock::new(HashMap::new())),
             active_at: AtomicU64::new(unix_ms()),
+            idle_timeout_ms: 0,
         });
         drop(closed_rx);
         sessions.insert_session(closed);
@@ -3497,6 +3919,7 @@ mod tests {
             sender,
             background_tasks: Arc::new(RwLock::new(HashMap::new())),
             active_at: AtomicU64::new(unix_ms()),
+            idle_timeout_ms: 0,
         }));
         manager.upsert_temporary(agent).unwrap();
 
@@ -3548,6 +3971,7 @@ mod tests {
                 tags: vec!["code".to_string(), "review".to_string()],
                 model: "pro".to_string(),
                 effort: Some(ModelEffort::Medium),
+                idle_timeout: 300,
                 ..Default::default()
             },
             SubAgent {
@@ -3621,6 +4045,7 @@ mod tests {
             assert_eq!(loaded.output_schema, expected.output_schema);
             assert_eq!(loaded.model, expected.model);
             assert_eq!(loaded.effort, expected.effort);
+            assert_eq!(loaded.idle_timeout, expected.idle_timeout);
         }
     }
 
@@ -3633,6 +4058,7 @@ mod tests {
                 sender,
                 background_tasks: Arc::new(RwLock::new(HashMap::new())),
                 active_at: AtomicU64::new(unix_ms()),
+                idle_timeout_ms: 0,
             }),
             rx,
         )
