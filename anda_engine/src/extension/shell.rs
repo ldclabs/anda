@@ -949,6 +949,29 @@ mod tests {
     }
 
     #[test]
+    fn collect_shell_env_vars_injects_safe_host_vars_for_native_runtime() {
+        // Regression guard: the native runtime must report `name() == "native"` so safe host
+        // env vars (PATH/HOME/...) are forwarded. A mismatched name silently dropped them.
+        let tool = ShellTool::new(
+            Arc::new(NativeRuntime::new(PathBuf::from(
+                "/tmp/anda-native-env-test",
+            ))),
+            HashMap::new(),
+            None,
+        );
+
+        let collected = tool.collect_shell_env_vars(&[]);
+
+        // PATH is part of SAFE_ENV_VARS on every platform and is set in the test environment.
+        if std::env::var_os("PATH").is_some() {
+            assert!(
+                collected.contains_key("PATH"),
+                "native runtime should forward host PATH"
+            );
+        }
+    }
+
+    #[test]
     fn collect_shell_env_vars_uses_configured_keys_once() {
         let mut envs = HashMap::new();
         envs.insert("ANDA_TEST_ENV".to_string(), "configured".to_string());

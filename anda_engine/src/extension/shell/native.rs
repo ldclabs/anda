@@ -381,7 +381,10 @@ impl NativeRuntime {
 #[async_trait]
 impl Executor for NativeRuntime {
     fn name(&self) -> &str {
-        "shell"
+        // Runtime identity, surfaced in diagnostics and used by `ShellTool` to gate
+        // host-environment injection (`collect_shell_env_vars`). This must stay "native";
+        // the background task-id prefix is the *tool* name and is passed in separately below.
+        "native"
     }
 
     fn workspace(&self) -> &PathBuf {
@@ -407,7 +410,8 @@ impl Executor for NativeRuntime {
         envs: HashMap<String, String>,
     ) -> Result<ExecOutput, BoxError> {
         let cmd = Self::build_shell_command(&input.command);
-        self.execute_command(ctx, self.name(), cmd, envs, Some(input))
+        // Background task IDs are prefixed with the tool name (not the runtime name).
+        self.execute_command(ctx, super::ShellTool::NAME, cmd, envs, Some(input))
             .await
     }
 }
@@ -839,8 +843,12 @@ async fn finalize_process_output_with_final_progress(
     stdout_progress: &mut ProgressStreamState,
     stderr_progress: &mut ProgressStreamState,
 ) -> (Option<ExecOutput>, ExecOutput) {
-    let stdout_read_error = output_reader_error(stdout_reader, "stdout").await;
-    let stderr_read_error = output_reader_error(stderr_reader, "stderr").await;
+    // Await both readers concurrently: each can block up to `OUTPUT_READER_GRACE` when a
+    // descendant keeps the pipe open, so joining avoids doubling that wait.
+    let (stdout_read_error, stderr_read_error) = tokio::join!(
+        output_reader_error(stdout_reader, "stdout"),
+        output_reader_error(stderr_reader, "stderr"),
+    );
     let final_progress =
         collect_progress_output(&stdout, &stderr, stdout_progress, stderr_progress)
             .await
@@ -1405,7 +1413,7 @@ mod tests {
     fn new_initializes_paths_and_shell() {
         let runtime = NativeRuntime::new(PathBuf::from("/home/anda-native-runtime-tests"));
 
-        assert_eq!(runtime.name(), "shell");
+        assert_eq!(runtime.name(), "native");
         assert_eq!(
             runtime.workspace(),
             &PathBuf::from("/home/anda-native-runtime-tests")

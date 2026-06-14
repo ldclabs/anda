@@ -9,6 +9,11 @@ All notable changes to the Anda project will be documented in this file.
 - **Subagent session lifecycle controls** — Subagent definitions and the manager tool schema now support an `idle_timeout` setting for session mode, letting callers tune idle session reclamation while preserving the engine default when unset.
 - **Subagent progress and compaction robustness** — Session runners now emit visible progress signals before the next idle boundary, filter signalless tool-call noise, preserve usage/artifacts across context compaction, and fail loudly instead of replacing history with an empty compaction summary.
 
+### Fixed — anda_engine v0.13.1
+
+- **Native shell environment injection** — Restored the native shell runtime identity so safe host environment variables such as `PATH` are forwarded correctly, while keeping background task IDs prefixed with the shell tool name.
+- **Native shell finalization latency** — stdout and stderr reader shutdown checks now run concurrently, avoiding doubled grace-period waits when descendant processes keep both pipes open.
+
 ## [0.13.0] — 2026-06-13
 
 ### Changed
