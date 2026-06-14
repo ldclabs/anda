@@ -296,23 +296,17 @@ impl AgentContext for AgentCtx {
             .cache_store_get::<RemoteEngines>(DYNAMIC_REMOTE_ENGINES)
             .await
         {
-            let defs2 = engines.tool_definitions(endpoint, names);
-            for def in defs2 {
+            for def in engines.tool_definitions(endpoint, names) {
                 if !defs.iter().any(|d| d.name == def.name) {
                     defs.push(def);
                 }
             }
-
-            Ok(defs
-                .into_iter()
-                .map(|d| d.name_with_prefix(REMOTE_TOOL_PREFIX))
-                .collect())
-        } else {
-            Ok(defs
-                .into_iter()
-                .map(|d| d.name_with_prefix(REMOTE_TOOL_PREFIX))
-                .collect())
         }
+
+        Ok(defs
+            .into_iter()
+            .map(|d| d.name_with_prefix(REMOTE_TOOL_PREFIX))
+            .collect())
     }
 
     /// Extracts resources from the provided list based on the tool's supported tags.
@@ -388,23 +382,17 @@ impl AgentContext for AgentCtx {
             .cache_store_get::<RemoteEngines>(DYNAMIC_REMOTE_ENGINES)
             .await
         {
-            let defs2 = engines.agent_definitions(endpoint, names);
-            for def in defs2 {
+            for def in engines.agent_definitions(endpoint, names) {
                 if !defs.iter().any(|d| d.name == def.name) {
                     defs.push(def);
                 }
             }
-
-            Ok(defs
-                .into_iter()
-                .map(|d| d.name_with_prefix(REMOTE_AGENT_PREFIX))
-                .collect())
-        } else {
-            Ok(defs
-                .into_iter()
-                .map(|d| d.name_with_prefix(REMOTE_AGENT_PREFIX))
-                .collect())
         }
+
+        Ok(defs
+            .into_iter()
+            .map(|d| d.name_with_prefix(REMOTE_AGENT_PREFIX))
+            .collect())
     }
 
     /// Extracts resources from the provided list based on the agent's supported tags.
