@@ -5,7 +5,7 @@
 //! into the [`Web3SDK`] enum and implements the core cryptographic, canister,
 //! and HTTP traits against that abstraction.
 
-use anda_core::{BoxError, BoxPinFut, CanisterCaller, HttpFeatures};
+use anda_core::{BoxError, BoxPinFut, CanisterCaller, HttpFeatures, KeysFeatures};
 use candid::{
     CandidType, Decode, Principal,
     utils::{ArgumentEncoder, encode_args},
@@ -490,6 +490,153 @@ impl HttpFeatures for &Web3SDK {
                     .await?;
                 let res = from_slice(&res[..])?;
                 Ok(res)
+            }
+        }
+    }
+}
+
+impl KeysFeatures for &Web3SDK {
+    async fn a256gcm_key(&self, derivation_path: Vec<Vec<u8>>) -> Result<[u8; 32], BoxError> {
+        match self {
+            Web3SDK::Tee(cli) => cli.a256gcm_key(derivation_path).await,
+            Web3SDK::Web3(Web3Client { client: cli }) => cli.a256gcm_key(derivation_path).await,
+        }
+    }
+
+    async fn ed25519_sign_message(
+        &self,
+        derivation_path: Vec<Vec<u8>>,
+        message: &[u8],
+    ) -> Result<[u8; 64], BoxError> {
+        match self {
+            Web3SDK::Tee(cli) => cli.ed25519_sign_message(derivation_path, message).await,
+            Web3SDK::Web3(Web3Client { client: cli }) => {
+                cli.ed25519_sign_message(derivation_path, message).await
+            }
+        }
+    }
+
+    async fn ed25519_verify(
+        &self,
+        derivation_path: Vec<Vec<u8>>,
+        message: &[u8],
+        signature: &[u8],
+    ) -> Result<(), BoxError> {
+        match self {
+            Web3SDK::Tee(cli) => cli.ed25519_verify(derivation_path, message, signature).await,
+            Web3SDK::Web3(Web3Client { client: cli }) => {
+                cli.ed25519_verify(derivation_path, message, signature).await
+            }
+        }
+    }
+
+    async fn ed25519_public_key(
+        &self,
+        derivation_path: Vec<Vec<u8>>,
+    ) -> Result<[u8; 32], BoxError> {
+        match self {
+            Web3SDK::Tee(cli) => cli.ed25519_public_key(derivation_path).await,
+            Web3SDK::Web3(Web3Client { client: cli }) => {
+                cli.ed25519_public_key(derivation_path).await
+            }
+        }
+    }
+
+    async fn secp256k1_sign_message_bip340(
+        &self,
+        derivation_path: Vec<Vec<u8>>,
+        message: &[u8],
+    ) -> Result<[u8; 64], BoxError> {
+        match self {
+            Web3SDK::Tee(cli) => {
+                cli.secp256k1_sign_message_bip340(derivation_path, message)
+                    .await
+            }
+            Web3SDK::Web3(Web3Client { client: cli }) => {
+                cli.secp256k1_sign_message_bip340(derivation_path, message)
+                    .await
+            }
+        }
+    }
+
+    async fn secp256k1_verify_bip340(
+        &self,
+        derivation_path: Vec<Vec<u8>>,
+        message: &[u8],
+        signature: &[u8],
+    ) -> Result<(), BoxError> {
+        match self {
+            Web3SDK::Tee(cli) => {
+                cli.secp256k1_verify_bip340(derivation_path, message, signature)
+                    .await
+            }
+            Web3SDK::Web3(Web3Client { client: cli }) => {
+                cli.secp256k1_verify_bip340(derivation_path, message, signature)
+                    .await
+            }
+        }
+    }
+
+    async fn secp256k1_sign_message_ecdsa(
+        &self,
+        derivation_path: Vec<Vec<u8>>,
+        message: &[u8],
+    ) -> Result<[u8; 64], BoxError> {
+        match self {
+            Web3SDK::Tee(cli) => {
+                cli.secp256k1_sign_message_ecdsa(derivation_path, message)
+                    .await
+            }
+            Web3SDK::Web3(Web3Client { client: cli }) => {
+                cli.secp256k1_sign_message_ecdsa(derivation_path, message)
+                    .await
+            }
+        }
+    }
+
+    async fn secp256k1_sign_digest_ecdsa(
+        &self,
+        derivation_path: Vec<Vec<u8>>,
+        message_hash: &[u8],
+    ) -> Result<[u8; 64], BoxError> {
+        match self {
+            Web3SDK::Tee(cli) => {
+                cli.secp256k1_sign_digest_ecdsa(derivation_path, message_hash)
+                    .await
+            }
+            Web3SDK::Web3(Web3Client { client: cli }) => {
+                cli.secp256k1_sign_digest_ecdsa(derivation_path, message_hash)
+                    .await
+            }
+        }
+    }
+
+    async fn secp256k1_verify_ecdsa(
+        &self,
+        derivation_path: Vec<Vec<u8>>,
+        message_hash: &[u8],
+        signature: &[u8],
+    ) -> Result<(), BoxError> {
+        match self {
+            Web3SDK::Tee(cli) => {
+                cli.secp256k1_verify_ecdsa(derivation_path, message_hash, signature)
+                    .await
+            }
+            Web3SDK::Web3(Web3Client { client: cli }) => {
+                cli.secp256k1_verify_ecdsa(derivation_path, message_hash, signature)
+                    .await
+            }
+        }
+    }
+
+    async fn secp256k1_public_key(
+        &self,
+        derivation_path: Vec<Vec<u8>>,
+    ) -> Result<[u8; 33], BoxError> {
+        match self {
+            Web3SDK::Tee(cli) => cli.secp256k1_public_key(derivation_path).await,
+            Web3SDK::Web3(Web3Client { client: cli }) => {
+                cli.secp256k1_public_key(derivation_path).await
             }
         }
     }

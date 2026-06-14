@@ -119,6 +119,18 @@ impl RemoteEngines {
         name.strip_prefix(handle)?.strip_prefix('_')
     }
 
+    /// Clones `function`'s definition with the engine `prefix` applied, when it
+    /// passes the optional `names` filter.
+    fn filter_definition(
+        function: &Function,
+        names: Option<&[String]>,
+        prefix: &str,
+    ) -> Option<FunctionDefinition> {
+        names
+            .is_none_or(|names| names.contains(&function.definition.name))
+            .then(|| function.definition.clone().name_with_prefix(prefix))
+    }
+
     /// Retrieves a remote tool endpoint and name from a prefixed name.
     pub fn get_tool_endpoint(&self, name: &str) -> Option<(Principal, String, String)> {
         self.engines
@@ -196,46 +208,18 @@ impl RemoteEngines {
         endpoint: Option<&str>,
         names: Option<&[String]>,
     ) -> Vec<FunctionDefinition> {
-        if let Some(endpoint) = endpoint {
-            for (handle, engine) in self.engines.iter() {
-                if endpoint == engine.info.endpoint {
-                    let prefix = format!("{handle}_");
-                    return engine
-                        .tools
-                        .iter()
-                        .filter_map(|d| {
-                            if let Some(names) = names {
-                                if names.contains(&d.definition.name) {
-                                    Some(d.definition.clone().name_with_prefix(&prefix))
-                                } else {
-                                    None
-                                }
-                            } else {
-                                Some(d.definition.clone().name_with_prefix(&prefix))
-                            }
-                        })
-                        .collect();
-                }
-            }
-            return Vec::new();
-        }
-
-        let mut definitions =
-            Vec::with_capacity(self.engines.values().map(|e| e.tools.len()).sum());
-
+        let mut definitions = Vec::new();
         for (handle, engine) in self.engines.iter() {
+            if endpoint.is_some_and(|endpoint| endpoint != engine.info.endpoint) {
+                continue;
+            }
             let prefix = format!("{handle}_");
-            definitions.extend(engine.tools.iter().filter_map(|d| {
-                if let Some(names) = names {
-                    if names.contains(&d.definition.name) {
-                        Some(d.definition.clone().name_with_prefix(&prefix))
-                    } else {
-                        None
-                    }
-                } else {
-                    Some(d.definition.clone().name_with_prefix(&prefix))
-                }
-            }));
+            definitions.extend(
+                engine
+                    .tools
+                    .iter()
+                    .filter_map(|d| Self::filter_definition(d, names, &prefix)),
+            );
         }
 
         definitions
@@ -273,45 +257,18 @@ impl RemoteEngines {
         endpoint: Option<&str>,
         names: Option<&[String]>,
     ) -> Vec<FunctionDefinition> {
-        if let Some(endpoint) = endpoint {
-            for (handle, engine) in self.engines.iter() {
-                if endpoint == engine.info.endpoint {
-                    let prefix = format!("{handle}_");
-                    return engine
-                        .agents
-                        .iter()
-                        .filter_map(|d| {
-                            if let Some(names) = names {
-                                if names.contains(&d.definition.name) {
-                                    Some(d.definition.clone().name_with_prefix(&prefix))
-                                } else {
-                                    None
-                                }
-                            } else {
-                                Some(d.definition.clone().name_with_prefix(&prefix))
-                            }
-                        })
-                        .collect();
-                }
-            }
-            return Vec::new();
-        }
-
-        let mut definitions =
-            Vec::with_capacity(self.engines.values().map(|e| e.agents.len()).sum());
+        let mut definitions = Vec::new();
         for (handle, engine) in self.engines.iter() {
+            if endpoint.is_some_and(|endpoint| endpoint != engine.info.endpoint) {
+                continue;
+            }
             let prefix = format!("{handle}_");
-            definitions.extend(engine.agents.iter().filter_map(|d| {
-                if let Some(names) = names {
-                    if names.contains(&d.definition.name) {
-                        Some(d.definition.clone().name_with_prefix(&prefix))
-                    } else {
-                        None
-                    }
-                } else {
-                    Some(d.definition.clone().name_with_prefix(&prefix))
-                }
-            }));
+            definitions.extend(
+                engine
+                    .agents
+                    .iter()
+                    .filter_map(|d| Self::filter_definition(d, names, &prefix)),
+            );
         }
 
         definitions
