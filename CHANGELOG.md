@@ -2,6 +2,13 @@
 
 All notable changes to the Anda project will be documented in this file.
 
+## [0.13.2] — 2026-06-14
+
+### Added — anda_engine v0.13.2
+
+- **Runtime model registry replacement** — Added `Models::replace` to atomically replace a model registry from another `Models` instance, enabling callers to reload model configuration without preserving stale labels from the previous registry.
+
+
 ## [0.13.1] — 2026-06-14
 
 ### Changed — anda_engine v0.13.1

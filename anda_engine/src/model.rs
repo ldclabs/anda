@@ -203,6 +203,20 @@ impl Models {
         }
     }
 
+    /// Replaces this registry with a clone of another [`Models`] instance.
+    pub fn replace(&self, other: &Models) {
+        let model = other.model.load_full();
+        let models: HashMap<String, Vec<Model>> = HashMap::from_iter(
+            other
+                .models
+                .load()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone())),
+        );
+        self.model.store(model);
+        self.models.store(Arc::new(models));
+    }
+
     /// Builds a registry from model configs by registering every resolved label.
     pub fn from_configs(configs: &[ModelConfig], http_client: reqwest::Client) -> Self {
         let models = Self::default();
@@ -1421,6 +1435,21 @@ mod tests {
             cloned.resolve("missing").unwrap().model_name(),
             "primary-v2"
         );
+
+        let replacement = Models::default();
+        replacement.set_model(test_model("replacement-primary").with_labels(vec!["next".into()]));
+        let replaced = Models::default();
+        replaced.set("old".to_string(), test_model("old"));
+        replaced.replace(&replacement);
+        assert!(!replaced.contains("old"));
+        assert!(replaced.contains("next"));
+        assert_eq!(
+            replaced.get_model().unwrap().model_name(),
+            "replacement-primary"
+        );
+
+        replacement.set("later".to_string(), test_model("later"));
+        assert!(!replaced.contains("later"));
 
         let configs = vec![
             ModelConfig {
