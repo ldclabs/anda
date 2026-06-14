@@ -2,7 +2,8 @@
 //!
 //! This runtime launches commands on the host operating system and optionally
 //! streams long-running output through background hooks. It is intended for
-//! trusted environments; sandboxed execution lives behind the `sandbox` feature.
+//! trusted environments; for untrusted commands, supply a sandboxed
+//! [`Executor`](crate::extension::shell::Executor) implementation instead.
 
 use anda_core::{BoxError, StateFeatures, ToolOutput};
 use async_trait::async_trait;

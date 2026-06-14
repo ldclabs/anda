@@ -1,9 +1,9 @@
 //! Shell command execution extension.
 //!
 //! [`ShellTool`] exposes controlled command execution to agents. The tool is
-//! runtime-agnostic: [`NativeRuntime`] runs commands on the host, while the
-//! `sandbox` module (behind the `sandbox` feature) runs commands in an isolated
-//! Boxlite environment.
+//! runtime-agnostic through the [`Executor`] trait: [`NativeRuntime`] runs
+//! commands on the host, and callers can supply an alternative executor (for
+//! example, a sandboxed runtime) by implementing [`Executor`].
 //!
 //! Command output is normalized into [`ExecOutput`]. Large stdout or stderr
 //! streams are truncated in the tool response and written to a temporary file

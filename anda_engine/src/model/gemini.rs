@@ -1,6 +1,6 @@
-//! Gemini Moonshot API client implementation for Anda Engine
+//! Gemini API client implementation for Anda Engine
 //!
-//! This module provides integration with Gemini's API, including:
+//! This module provides integration with Google's Gemini API, including:
 //! - Client configuration and management
 //! - Completion model handling
 //! - Response parsing and conversion to Anda's internal formats

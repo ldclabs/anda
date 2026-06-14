@@ -11,16 +11,11 @@
 //! - [`context`]: runtime contexts passed to agents and tools, including cache,
 //!   storage, HTTP, Web3, cancellation, and state features.
 //! - [`model`]: model provider adapters and label-based model routing.
-//! - [`extension`]: reusable tools such as filesystem, shell, fetch, notes,
-//!   skills, todos, extraction, and search.
+//! - [`extension`]: reusable tools such as filesystem (read, write, search,
+//!   edit), shell, fetch, notes, skills, and todos.
 //! - [`memory`]: persistent conversation and resource memory backed by AndaDB
 //!   and the Cognitive Nexus.
 //! - [`store`]: object storage abstraction used by engine contexts.
-//!
-//! # Feature flags
-//! - `sandbox`: enables the sandboxed shell runtime backed by `boxlite`.
-//! - `full`: enables all optional runtime features currently provided by this
-//!   crate.
 
 use anda_core::Json;
 use candid::Principal;
