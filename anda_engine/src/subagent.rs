@@ -38,6 +38,8 @@ const SESSION_INPUT_POLL_MS: u64 = 1000;
 const MAX_TURNS_TO_COMPACT: usize = 81; // The number of turns after which the conversation history will be compacted. This is to prevent the conversation history from growing indefinitely and causing performance issues. The optimal value may depend on the typical length of conversations and the token limits of the language model.
 const SUBAGENT_STORE_PATH: &str = "subagents";
 const SUBAGENT_METADATA_LIST_LIMIT: usize = 8;
+const DEFAULT_STOP_REASON: &str = "subagent session stopped";
+const DEFAULT_CANCEL_REASON: &str = "subagent session cancelled";
 static COMPACTION_PROMPT: &str = r#"
 Compress the current conversation into a concise continuation handoff. This is not a final answer to the user. Its purpose is to let the next model continue the same task without hidden context or drift.
 
@@ -441,6 +443,9 @@ pub struct BackgroundTaskInfo {
     /// usage carried by background agent outputs into deltas.
     #[serde(default)]
     pub reported_usage: Usage,
+    /// Whether this task belonged to a stopped session task and should no longer be forwarded.
+    #[serde(default)]
+    pub stopped: bool,
 }
 
 /// Long-lived conversation session for a subagent.
@@ -572,7 +577,7 @@ impl SubSessionRunner {
     fn record_failed_output(&mut self, failed_reason: impl Into<String>) -> String {
         let mut failed_reason = failed_reason.into();
         if failed_reason.trim().is_empty() {
-            failed_reason = "subagent session cancelled".to_string();
+            failed_reason = DEFAULT_CANCEL_REASON.to_string();
         }
 
         let mut output = self.latest_output();
@@ -582,6 +587,25 @@ impl SubSessionRunner {
 
         self.last_output = Some(output);
         failed_reason
+    }
+
+    async fn stop_current_task(&mut self, reason: impl Into<String>) {
+        self.session.stop_background_tasks();
+
+        let reason = reason.into();
+        let content = if reason.trim().is_empty() {
+            DEFAULT_STOP_REASON.to_string()
+        } else {
+            format!("Subagent session stopped: {}", reason.trim())
+        };
+
+        let output = self.with_session(AgentOutput {
+            content,
+            ..Default::default()
+        });
+        let output = self.runner.stop_current_task(output);
+        self.last_output = Some(output.clone());
+        self.emit_progress(output).await;
     }
 
     async fn emit_progress(&self, output: AgentOutput) {
@@ -600,6 +624,7 @@ impl SubSessionRunner {
     async fn compact(&mut self) -> Result<(), BoxError> {
         // Captured before clearing tools so the replacement runner restores the base toolset.
         let handoff_req = self.runner.req().clone();
+        let merge_discovered_tools = self.runner.merge_discovered_tools();
         // Drop tools so the summarization turn cannot spawn more tool calls.
         self.runner.set_tools(Vec::new());
 
@@ -662,7 +687,7 @@ impl SubSessionRunner {
             ..Default::default()
         };
 
-        self.runner = self
+        let mut runner = self
             .runner
             .ctx()
             .clone()
@@ -670,6 +695,8 @@ impl SubSessionRunner {
             // Seed the reported chat history too, so the summary survives into the final output.
             .reserve_chat_history(vec![compaction_msg])
             .unbound();
+        runner.set_merge_discovered_tools(merge_discovered_tools);
+        self.runner = runner;
         self.runner.accumulate(&carried_usage);
         self.runner.accumulate_tools_usage(&carried_tools_usage);
         Ok(())
@@ -677,6 +704,7 @@ impl SubSessionRunner {
 
     // returns true if the conversation should continue to be active after processing the inputs, or false if it should be terminated
     async fn run(&mut self, inputs: Vec<SubAgentInput>) -> Result<bool, BoxError> {
+        let mut stop_requested: Option<String> = None;
         let mut cancellation_requested: Option<String> = None;
         if !inputs.is_empty() {
             self.session.active_at.store(unix_ms(), Ordering::SeqCst);
@@ -692,6 +720,32 @@ impl SubSessionRunner {
 
             if input.effort.is_some() {
                 self.runner.set_effort(input.effort);
+            }
+
+            if let PromptCommand::Command { command, .. } = &input.command {
+                match command.as_str() {
+                    "stop" => {
+                        stop_requested = Some(
+                            input
+                                .command
+                                .command_argument()
+                                .unwrap_or_default()
+                                .to_string(),
+                        );
+                        break;
+                    }
+                    "cancel" => {
+                        cancellation_requested = Some(
+                            input
+                                .command
+                                .command_argument()
+                                .unwrap_or_default()
+                                .to_string(),
+                        );
+                        break;
+                    }
+                    _ => {}
+                }
             }
 
             match input.command {
@@ -710,10 +764,6 @@ impl SubSessionRunner {
                     }
                 }
                 PromptCommand::Command { command, prompt } => match command.as_str() {
-                    "stop" | "cancel" => {
-                        cancellation_requested = Some(prompt);
-                        break;
-                    }
                     "steer" => {
                         let content =
                             prompt_and_resources_into_content(prompt, &mut input.resources);
@@ -735,6 +785,11 @@ impl SubSessionRunner {
         if let Some(failed_reason) = cancellation_requested {
             let failed_reason = self.record_failed_output(failed_reason);
             return Err(failed_reason.into());
+        }
+
+        if let Some(reason) = stop_requested {
+            self.stop_current_task(reason).await;
+            return Ok(true);
         }
 
         match self.runner.next().await {
@@ -790,18 +845,28 @@ impl SubSession {
         // no things to do for now
     }
 
+    fn stop_background_tasks(&self) {
+        for info in self.background_tasks.write().values_mut() {
+            info.stopped = true;
+        }
+    }
+
     /// Converts the cumulative usage reported by a background agent into a delta against what was
     /// already forwarded for `task_id`, so the session runner does not double-count usage when it
     /// accumulates progress and final outputs.
-    fn take_usage_delta(&self, task_id: &str, current: &Usage, ended: bool) -> Usage {
+    fn take_usage_delta(&self, task_id: &str, current: &Usage, ended: bool) -> Option<Usage> {
         let mut tasks = self.background_tasks.write();
         let reported = if ended {
-            tasks
-                .remove(task_id)
-                .map(|info| info.reported_usage)
-                .unwrap_or_default()
+            let info = tasks.remove(task_id).unwrap_or_default();
+            if info.stopped {
+                return None;
+            }
+            info.reported_usage
         } else {
             let info = tasks.entry(task_id.to_string()).or_default();
+            if info.stopped {
+                return None;
+            }
             let reported = info.reported_usage.clone();
             // Keep the watermark monotonic even if a failure output carries empty usage.
             info.reported_usage = Usage {
@@ -813,12 +878,12 @@ impl SubSession {
             reported
         };
 
-        Usage {
+        Some(Usage {
             input_tokens: current.input_tokens.saturating_sub(reported.input_tokens),
             output_tokens: current.output_tokens.saturating_sub(reported.output_tokens),
             cached_tokens: current.cached_tokens.saturating_sub(reported.cached_tokens),
             requests: current.requests.saturating_sub(reported.requests),
-        }
+        })
     }
 }
 
@@ -837,6 +902,7 @@ impl AgentHook for SubSession {
                 tool_name: None,
                 progress_message: None,
                 reported_usage: Usage::default(),
+                stopped: false,
             },
         );
     }
@@ -848,7 +914,9 @@ impl AgentHook for SubSession {
         output: AgentOutput,
     ) {
         // Background agent outputs carry cumulative usage; forward only the delta.
-        let usage = self.take_usage_delta(&session_id, &output.usage, false);
+        let Some(usage) = self.take_usage_delta(&session_id, &output.usage, false) else {
+            return;
+        };
         let prompt = if !output.content.is_empty() {
             format!(
                 "Subagent session {session_id} intermediate output:\n\n{}",
@@ -872,7 +940,9 @@ impl AgentHook for SubSession {
     }
 
     async fn on_background_end(&self, _ctx: &AgentCtx, session_id: String, output: AgentOutput) {
-        let usage = self.take_usage_delta(&session_id, &output.usage, true);
+        let Some(usage) = self.take_usage_delta(&session_id, &output.usage, true) else {
+            return;
+        };
         let prompt = if !output.content.is_empty() {
             format!(
                 "Subagent session {session_id} final output:\n\n{}",
@@ -907,6 +977,7 @@ impl ToolBackgroundHook for SubSession {
                 tool_name: pid.map(|p| p.prefix),
                 progress_message: None,
                 reported_usage: Usage::default(),
+                stopped: false,
             },
         );
     }
@@ -919,13 +990,23 @@ impl ToolBackgroundHook for SubSession {
     ) {
         let mut tasks = self.background_tasks.write();
         if let Some(info) = tasks.get_mut(&task_id) {
+            if info.stopped {
+                return;
+            }
             info.progress_message = serde_json::to_string(&output.output).ok();
         }
     }
 
     async fn on_background_end(&self, _ctx: &BaseCtx, task_id: String, output: ToolOutput<Json>) {
-        {
-            self.background_tasks.write().remove(&task_id);
+        let stopped = {
+            self.background_tasks
+                .write()
+                .remove(&task_id)
+                .map(|info| info.stopped)
+                .unwrap_or(false)
+        };
+        if stopped {
+            return;
         }
 
         self.sender
@@ -1039,7 +1120,7 @@ impl Agent<AgentCtx> for SubAgent {
                 "properties": {
                     "prompt": {
                         "type": "string",
-                        "description": "Self-contained task handoff for this subagent. Include objective, context/resources, constraints, dependencies, expected deliverable, success criteria, and what progress/final output should contain. To control an already-running session, send a control command here instead of a task: `/steer <guidance>` to adjust course mid-run, or `/stop <reason>` to end it."
+                        "description": "Self-contained task handoff for this subagent. Include objective, context/resources, constraints, dependencies, expected deliverable, success criteria, and what progress/final output should contain. To control an already-running session, send a control command here instead of a task: `/steer <guidance>` to adjust course mid-run, `/stop <reason>` to stop the current task and keep the session idle, or `/cancel <reason>` to end the session runner."
                     },
                     "session": {
                         "type": "string",
@@ -1169,11 +1250,8 @@ impl Agent<AgentCtx> for SubAgent {
             // state instead of starting a new session or returning a misleading error.
             let inactive_op = match &input.command {
                 PromptCommand::Ping if input.resources.is_empty() => Some("ping"),
-                PromptCommand::Command { command, .. }
-                    if matches!(command.as_str(), "stop" | "cancel") =>
-                {
-                    Some("cancel")
-                }
+                PromptCommand::Command { command, .. } if command == "stop" => Some("stop"),
+                PromptCommand::Command { command, .. } if command == "cancel" => Some("cancel"),
                 _ => None,
             };
             if let Some(op) = inactive_op {
@@ -2096,6 +2174,55 @@ mod tests {
                 },
                 ..Default::default()
             })))
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct StopResumeCompleter {
+        requests: Arc<Mutex<Vec<CompletionRequest>>>,
+    }
+
+    impl CompletionFeaturesDyn for StopResumeCompleter {
+        fn model_name(&self) -> String {
+            "stop-resume".to_string()
+        }
+
+        fn completion(&self, req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
+            let content = request_text(&req);
+            self.requests.lock().push(req);
+
+            let output = if content == "seed task" {
+                AgentOutput {
+                    content: "working".to_string(),
+                    tool_calls: vec![anda_core::ToolCall {
+                        name: "long_running_tool".to_string(),
+                        args: json!({}),
+                        result: None,
+                        call_id: Some("call-1".to_string()),
+                        remote_id: None,
+                    }],
+                    usage: Usage {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                        cached_tokens: 0,
+                        requests: 1,
+                    },
+                    ..Default::default()
+                }
+            } else {
+                AgentOutput {
+                    content,
+                    usage: Usage {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                        cached_tokens: 0,
+                        requests: 1,
+                    },
+                    ..Default::default()
+                }
+            };
+
+            Box::pin(futures::future::ready(Ok(output)))
         }
     }
 
@@ -3394,7 +3521,7 @@ mod tests {
             .run(vec![SubAgentInput {
                 command: PromptCommand::Command {
                     command: "cancel".to_string(),
-                    prompt: "stop because requested".to_string(),
+                    prompt: "/cancel stop because requested".to_string(),
                 },
                 resources: Vec::new(),
                 usage: Usage::default(),
@@ -3412,6 +3539,139 @@ mod tests {
         );
         assert_eq!(final_output.session.as_deref(), Some("session-1"));
         assert!(final_output.content.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn subsession_runner_stop_idles_current_task_without_ending_session() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let model = Model::with_completer(Arc::new(StopResumeCompleter {
+            requests: requests.clone(),
+        }));
+        let ctx = EngineBuilder::new().with_model(model).mock_ctx();
+        let hook = Arc::new(RecordingAgentHook::default());
+
+        let req = CompletionRequest {
+            prompt: "seed task".to_string(),
+            ..Default::default()
+        };
+
+        let (sender, mut rx) = tokio::sync::mpsc::channel(4);
+        let session = Arc::new(SubSession {
+            id: "session-1".to_string(),
+            agent: "worker".to_string(),
+            sender,
+            background_tasks: Arc::new(RwLock::new(HashMap::new())),
+            active_at: AtomicU64::new(unix_ms()),
+            idle_timeout_ms: 0,
+        });
+
+        let mut runner = SubSessionRunner {
+            session,
+            agent_hook: Some(DynAgentHook::new(hook.clone())),
+            runner: ctx.clone().completion_iter(req, Vec::new()).unbound(),
+            last_output: None,
+            carried_artifacts: Vec::new(),
+            closing: false,
+        };
+
+        assert!(runner.run(Vec::new()).await.unwrap());
+        assert!(!runner.runner.is_idle());
+        assert_eq!(requests.lock().len(), 1);
+
+        runner.session.background_tasks.write().insert(
+            "child-session".to_string(),
+            BackgroundTaskInfo {
+                agent_name: "child".to_string(),
+                ..Default::default()
+            },
+        );
+
+        assert!(
+            runner
+                .run(vec![SubAgentInput {
+                    command: PromptCommand::Command {
+                        command: "stop".to_string(),
+                        prompt: "/stop wrong branch".to_string(),
+                    },
+                    resources: Vec::new(),
+                    usage: Usage::default(),
+                    model: None,
+                    effort: None,
+                }])
+                .await
+                .unwrap()
+        );
+
+        assert!(runner.runner.is_idle());
+        assert!(!runner.runner.is_done());
+        assert_eq!(requests.lock().len(), 1);
+        assert!(
+            runner
+                .session
+                .background_tasks
+                .read()
+                .get("child-session")
+                .is_some_and(|info| info.stopped)
+        );
+
+        let progress = hook.progress_events();
+        assert_eq!(progress.len(), 2);
+        assert_eq!(progress[0].1.content, "working");
+        assert_eq!(
+            progress[1].1.content,
+            "Subagent session stopped: wrong branch"
+        );
+        assert!(progress[1].1.failed_reason.is_none());
+        assert_eq!(progress[1].1.session.as_deref(), Some("session-1"));
+
+        AgentHook::on_background_end(
+            runner.session.as_ref(),
+            &ctx,
+            "child-session".to_string(),
+            AgentOutput {
+                content: "late child result".to_string(),
+                usage: Usage {
+                    requests: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(
+            !runner
+                .session
+                .background_tasks
+                .read()
+                .contains_key("child-session")
+        );
+        assert!(rx.try_recv().is_err());
+
+        assert!(
+            runner
+                .run(vec![SubAgentInput {
+                    command: PromptCommand::Plain {
+                        prompt: "next task".to_string(),
+                    },
+                    resources: Vec::new(),
+                    usage: Usage::default(),
+                    model: None,
+                    effort: None,
+                }])
+                .await
+                .unwrap()
+        );
+
+        let recorded = requests.lock().clone();
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(request_text(&recorded[1]), "next task");
+        assert_eq!(
+            runner
+                .last_output
+                .as_ref()
+                .map(|output| output.content.as_str()),
+            Some("next task")
+        );
     }
 
     #[test]
@@ -4195,7 +4455,12 @@ mod tests {
             ..Default::default()
         };
 
-        for prompt in ["/stop finish now", "/cancel", "", "/ping"] {
+        for (prompt, expected_op) in [
+            ("/stop finish now", "nothing to stop"),
+            ("/cancel", "nothing to cancel"),
+            ("", "nothing to ping"),
+            ("/ping", "nothing to ping"),
+        ] {
             let output = agent
                 .run(
                     ctx.clone(),
@@ -4212,6 +4477,7 @@ mod tests {
                 .unwrap();
             assert_eq!(output.session.as_deref(), Some("ghost"));
             assert!(output.content.contains("not active"), "{}", output.content);
+            assert!(output.content.contains(expected_op), "{}", output.content);
             assert!(output.failed_reason.is_none());
             assert!(agent.subsessions.active_session_ids().is_empty());
         }

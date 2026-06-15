@@ -106,6 +106,30 @@ impl From<String> for PromptCommand {
     }
 }
 
+impl PromptCommand {
+    /// Returns the argument text after the slash command prefix.
+    ///
+    /// If this command was built manually with a prompt that does not contain a matching slash
+    /// prefix, the trimmed prompt is treated as the argument.
+    pub fn command_argument(&self) -> Option<&str> {
+        let Self::Command { command, prompt } = self else {
+            return None;
+        };
+
+        let trimmed = prompt.trim();
+        let Some(stripped) = trimmed.strip_prefix('/') else {
+            return Some(trimmed);
+        };
+
+        let command_end = stripped.find(char::is_whitespace).unwrap_or(stripped.len());
+        if !stripped[..command_end].eq_ignore_ascii_case(command) {
+            return Some(trimmed);
+        }
+
+        Some(stripped[command_end..].trim())
+    }
+}
+
 /// Output produced by an agent execution.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct AgentOutput {
@@ -1384,6 +1408,17 @@ mod tests {
                 prompt: "/help".into(),
             }
         );
+
+        let stop = PromptCommand::from("/stop  停止当前任务，保留会话".to_string());
+        assert_eq!(stop.command_argument(), Some("停止当前任务，保留会话"));
+
+        let manual = PromptCommand::Command {
+            command: "cancel".into(),
+            prompt: "取消当前任务".into(),
+        };
+        assert_eq!(manual.command_argument(), Some("取消当前任务"));
+
+        assert_eq!(PromptCommand::Ping.command_argument(), None);
     }
 
     #[test]

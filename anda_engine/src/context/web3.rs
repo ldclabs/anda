@@ -523,9 +523,13 @@ impl KeysFeatures for &Web3SDK {
         signature: &[u8],
     ) -> Result<(), BoxError> {
         match self {
-            Web3SDK::Tee(cli) => cli.ed25519_verify(derivation_path, message, signature).await,
+            Web3SDK::Tee(cli) => {
+                cli.ed25519_verify(derivation_path, message, signature)
+                    .await
+            }
             Web3SDK::Web3(Web3Client { client: cli }) => {
-                cli.ed25519_verify(derivation_path, message, signature).await
+                cli.ed25519_verify(derivation_path, message, signature)
+                    .await
             }
         }
     }

@@ -240,7 +240,7 @@ impl AgentCtx {
             last_output: None,
             discovered_tools: BTreeMap::new(),
             discovery_selection_counts: BTreeMap::new(),
-            merge_discovered_tools: false,
+            merge_discovered_tools: None,
             done: false,
             unbound: false,
             turns: 0,
@@ -1011,7 +1011,7 @@ pub struct CompletionRunner {
     last_output: Option<AgentOutput>,
     discovered_tools: BTreeMap<String, FunctionDefinition>,
     discovery_selection_counts: BTreeMap<String, usize>,
-    merge_discovered_tools: bool,
+    merge_discovered_tools: Option<bool>,
     done: bool,
     unbound: bool,
     turns: usize,
@@ -1097,6 +1097,15 @@ impl CompletionRunner {
         self.last_output.as_ref()
     }
 
+    /// Returns the discovered-tool merge policy.
+    ///
+    /// `Some(true)` forces discovered tool definitions into later requests, `Some(false)` keeps
+    /// them only in discovery-tool output context, and `None` lets the runner probe whether the
+    /// current model needs request-side merging.
+    pub fn merge_discovered_tools(&self) -> Option<bool> {
+        self.merge_discovered_tools
+    }
+
     /// Enables or disables unbound mode.
     ///
     /// In unbound mode, reaching an idle boundary does not finalize the runner. The step still
@@ -1109,6 +1118,17 @@ impl CompletionRunner {
     /// contract.
     pub fn set_unbound(&mut self, unbound: bool) {
         self.unbound = unbound;
+    }
+
+    /// Sets the discovered-tool merge policy.
+    ///
+    /// `Some(true)` adds definitions returned by discovery tools such as `tools_search` and
+    /// `tools_select` to later request tool lists, and compacts discovery output kept in
+    /// conversation context. `Some(false)` keeps discovered schemas only in discovery-tool output
+    /// context. `None` enables the repeated-selection probe so the runner can discover whether the
+    /// current model needs request-side merging.
+    pub fn set_merge_discovered_tools(&mut self, merge_discovered_tools: Option<bool>) {
+        self.merge_discovered_tools = merge_discovered_tools;
     }
 
     /// Queue a steering message to interrupt the agent mid-run.
@@ -1165,6 +1185,30 @@ impl CompletionRunner {
         self.discard_pending_tool_call_raw_history();
     }
 
+    /// Stops the current task while keeping the runner reusable for later input.
+    ///
+    /// This drops in-flight request state, pending tools, queued steering, and queued follow-up
+    /// text, but it does not mark the runner done. The returned output is recorded as the latest
+    /// idle-state output and includes accumulated usage/history so observers can account for work
+    /// already performed before the stop.
+    pub fn stop_current_task(&mut self, mut output: AgentOutput) -> AgentOutput {
+        self.discard_in_flight_request();
+        self.req.chat_history.clear();
+        self.steering_message.clear();
+        self.follow_up_message.clear();
+        self.implicit_context = None;
+        self.current_usage = Usage::default();
+
+        output.chat_history = self.chat_history.clone();
+        output.tool_calls = self.tool_calls.clone();
+        output.artifacts = self.artifacts.clone();
+        output.usage = self.total_usage.clone();
+        output.tools_usage = self.tools_usage.clone();
+
+        self.last_output = Some(output.clone());
+        output
+    }
+
     /// Set an implicit context message that is automatically included in the next request.
     pub fn implicit_context(&mut self, message: Message) {
         self.implicit_context = Some(message);
@@ -1185,7 +1229,6 @@ impl CompletionRunner {
         self.req.tools = tools;
         self.discovered_tools.clear();
         self.discovery_selection_counts.clear();
-        self.merge_discovered_tools = false;
     }
 
     /// Accumulate usage from an intermediate step into the runner's total usage.
@@ -1204,8 +1247,9 @@ impl CompletionRunner {
     }
 
     fn add_discovered_tools_from_output(&mut self, tool_name: &str, output: &Json) {
-        if !tool_name.eq_ignore_ascii_case(TOOLS_SELECT_NAME)
-            && !tool_name.eq_ignore_ascii_case(TOOLS_SEARCH_NAME)
+        if self.merge_discovered_tools == Some(false)
+            || (!tool_name.eq_ignore_ascii_case(TOOLS_SELECT_NAME)
+                && !tool_name.eq_ignore_ascii_case(TOOLS_SEARCH_NAME))
         {
             return;
         }
@@ -1214,8 +1258,8 @@ impl CompletionRunner {
             return;
         };
 
-        let count_selection =
-            tool_name.eq_ignore_ascii_case(TOOLS_SELECT_NAME) && !self.merge_discovered_tools;
+        let count_selection = tool_name.eq_ignore_ascii_case(TOOLS_SELECT_NAME)
+            && self.merge_discovered_tools.is_none();
         let mut added = 0;
         for definition in tools_output.tools {
             if definition.name.trim().is_empty() {
@@ -1230,7 +1274,7 @@ impl CompletionRunner {
                     .and_modify(|count| *count += 1)
                     .or_insert(1);
                 if *count >= 2 {
-                    self.merge_discovered_tools = true;
+                    self.merge_discovered_tools = Some(true);
                 }
             }
             self.discovered_tools.entry(key).or_insert(definition);
@@ -1242,7 +1286,7 @@ impl CompletionRunner {
     }
 
     fn merge_discovered_tools_into_request(&self, req: &mut CompletionRequest) {
-        if !self.merge_discovered_tools || self.discovered_tools.is_empty() {
+        if self.merge_discovered_tools != Some(true) || self.discovered_tools.is_empty() {
             return;
         }
 
@@ -1262,7 +1306,7 @@ impl CompletionRunner {
     /// are merged into the request tools, so full schemas are not duplicated
     /// in the conversation context. Non-discovery outputs are left untouched.
     fn compact_discovery_tool_output_for_context(&self, tool_name: &str, output: &mut Json) {
-        if !self.merge_discovered_tools {
+        if self.merge_discovered_tools != Some(true) {
             return;
         }
 
@@ -1448,7 +1492,7 @@ impl CompletionRunner {
             last_output: None,
             discovered_tools: BTreeMap::new(),
             discovery_selection_counts: BTreeMap::new(),
-            merge_discovered_tools: false,
+            merge_discovered_tools: None,
             done: true,
             unbound: self.unbound,
             turns: self.turns,
@@ -2989,6 +3033,7 @@ mod tests {
         assert_eq!(runner.current_usage().requests, 0);
         assert!(runner.tools_usage().is_empty());
         assert!(runner.last_output().is_none());
+        assert_eq!(runner.merge_discovered_tools(), None);
 
         runner.append_chat_history(vec![Message {
             role: "system".to_string(),
@@ -3015,10 +3060,12 @@ mod tests {
         });
         runner.set_model(Some("alt".to_string()));
         runner.set_effort(Some(ModelEffort::Low));
+        runner.set_merge_discovered_tools(Some(true));
         runner.set_tools(vec![FunctionDefinition {
             name: "forced_tool".to_string(),
             ..Default::default()
         }]);
+        assert_eq!(runner.merge_discovered_tools(), Some(true));
 
         let output = runner.next().await.unwrap().unwrap();
         assert_eq!(output.content, "follow\n\nsteer");
@@ -3122,6 +3169,7 @@ mod tests {
 
         let third = runner.next().await.unwrap().unwrap();
         assert_eq!(third.tool_calls[0].name, "echo_tool");
+        assert_eq!(runner.merge_discovered_tools(), Some(true));
 
         let fourth = runner.next().await.unwrap().unwrap();
         assert_eq!(fourth.content, "echo tool used after discovery");
@@ -3168,10 +3216,104 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn runner_can_merge_discovered_tool_schemas_without_repeated_selection_probe() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let model = Model::with_completer(Arc::new(DiscoveryCompleter {
+            requests: requests.clone(),
+        }));
+        let ctx = EngineBuilder::new()
+            .with_model(model)
+            .register_tool(Arc::new(EchoTool))
+            .unwrap()
+            .mock_ctx();
+        let initial_tools = ctx.definitions(Some(&["tools_select".to_string()])).await;
+        let req = CompletionRequest {
+            prompt: "select echo tool".to_string(),
+            tools: initial_tools,
+            ..Default::default()
+        };
+        let mut runner = ctx.completion_iter(req, Vec::new());
+        runner.set_merge_discovered_tools(Some(true));
+
+        let first = runner.next().await.unwrap().unwrap();
+        assert_eq!(first.tool_calls[0].name, "tools_select");
+
+        let second = runner.next().await.unwrap().unwrap();
+        assert_eq!(second.tool_calls[0].name, "echo_tool");
+
+        let third = runner.next().await.unwrap().unwrap();
+        assert_eq!(third.content, "echo tool used after discovery");
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        let after_first_select_tool_names = requests[1]
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(after_first_select_tool_names.contains(&"tools_select"));
+        assert!(after_first_select_tool_names.contains(&"echo_tool"));
+        assert!(requests[1].content.iter().any(|part| matches!(
+            part,
+            ContentPart::ToolOutput { name, output, .. }
+                if name == "tools_select"
+                    && output["tools"][0]["name"] == "echo_tool"
+                    && output["tools"][0].get("parameters").is_none()
+                    && output["tools"][0].get("description").is_none()
+        )));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_does_not_probe_when_discovered_tool_merge_is_disabled() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let model = Model::with_completer(Arc::new(DiscoveryCompleter {
+            requests: requests.clone(),
+        }));
+        let ctx = EngineBuilder::new()
+            .with_model(model)
+            .register_tool(Arc::new(EchoTool))
+            .unwrap()
+            .mock_ctx();
+        let initial_tools = ctx.definitions(Some(&["tools_select".to_string()])).await;
+        let req = CompletionRequest {
+            prompt: "select echo tool".to_string(),
+            tools: initial_tools,
+            ..Default::default()
+        };
+        let mut runner = ctx.completion_iter(req, Vec::new());
+        runner.set_merge_discovered_tools(Some(false));
+
+        let first = runner.next().await.unwrap().unwrap();
+        assert_eq!(first.tool_calls[0].name, "tools_select");
+
+        let second = runner.next().await.unwrap().unwrap();
+        assert_eq!(second.tool_calls[0].name, "tools_select");
+
+        let third = runner.next().await.unwrap().unwrap();
+        assert_eq!(third.tool_calls[0].name, "tools_select");
+        assert_eq!(runner.merge_discovered_tools(), Some(false));
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(
+            requests[1]
+                .tools
+                .iter()
+                .all(|tool| tool.name != "echo_tool")
+        );
+        assert!(
+            requests[2]
+                .tools
+                .iter()
+                .all(|tool| tool.name != "echo_tool")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn runner_compacts_discovery_outputs_after_schema_merge_is_enabled() {
         let ctx = EngineBuilder::new().mock_ctx();
         let mut runner = ctx.completion_iter(CompletionRequest::default(), Vec::new());
-        runner.merge_discovered_tools = true;
+        runner.set_merge_discovered_tools(Some(true));
         let full_output = json!({
             "tools": [{
                 "name": "echo_tool",
@@ -3204,7 +3346,7 @@ mod tests {
         assert_eq!(other_output, full_output);
 
         // Without schema merge, discovery outputs also stay untouched.
-        runner.merge_discovered_tools = false;
+        runner.set_merge_discovered_tools(Some(false));
         let mut unmerged_output = full_output.clone();
         runner.compact_discovery_tool_output_for_context("tools_search", &mut unmerged_output);
         assert_eq!(unmerged_output, full_output);

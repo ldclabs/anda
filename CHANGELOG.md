@@ -2,6 +2,18 @@
 
 All notable changes to the Anda project will be documented in this file.
 
+## [0.13.3] — 2026-06-15
+
+### Changed — anda_core v0.13.3
+
+- **Slash command argument parsing** — Added `PromptCommand::command_argument()` so command handlers can consistently extract the user-provided text after a slash command prefix.
+
+### Changed — anda_engine v0.13.3
+
+- **Subagent stop and cancel semantics** — `/stop <reason>` now stops the current session task while keeping the session idle and reusable, while `/cancel <reason>` continues to end the session runner. Stopped background task output is suppressed so stale child results are not forwarded after a stop.
+- **Subagent compaction tool discovery retention** — Session compaction now preserves whether discovered tool definitions should be merged into future completion requests, avoiding tool-discovery state loss after long session handoffs.
+
+
 ## [0.13.2] — 2026-06-14
 
 ### Added — anda_engine v0.13.2

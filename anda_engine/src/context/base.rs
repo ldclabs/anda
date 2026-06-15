@@ -44,11 +44,7 @@ use std::{
 const CONTEXT_MAX_DEPTH: u8 = 42;
 const CACHE_MAX_CAPACITY: u64 = 1000000;
 
-use super::{
-    RemoteEngines,
-    cache::CacheService,
-    web3::Web3SDK,
-};
+use super::{RemoteEngines, cache::CacheService, web3::Web3SDK};
 use crate::store::Store;
 
 /// Runtime context shared by engine tools and nested agent calls.
