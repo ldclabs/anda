@@ -699,6 +699,22 @@ impl SubSessionRunner {
         self.runner = runner;
         self.runner.accumulate(&carried_usage);
         self.runner.accumulate_tools_usage(&carried_tools_usage);
+        // Compaction is real work: refresh the activity clock so the idle-timeout check on the
+        // turn that follows does not mistake the session for stale.
+        self.session.active_at.store(unix_ms(), Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Compacts the idle context when the committed history — or the batch about to be attached —
+    /// would exceed the window. `pending_tokens` is the estimated size of follow-up/steer content
+    /// queued in this run() call but not yet attached: compaction drains queued follow-ups into its
+    /// own request, so it must run *before* the content is attached or the compaction request would
+    /// overflow too.
+    async fn compact_if_needed(&mut self, pending_tokens: u64) -> Result<(), BoxError> {
+        if self.runner.is_idle() && needs_compaction_with_pending(&self.runner, pending_tokens) {
+            self.compact().await?;
+        }
+
         Ok(())
     }
 
@@ -709,6 +725,15 @@ impl SubSessionRunner {
         if !inputs.is_empty() {
             self.session.active_at.store(unix_ms(), Ordering::SeqCst);
         }
+
+        // Accumulate all follow-up/steer content for this batch instead of queueing it
+        // input-by-input. Background results arrive as separate inputs and are drained into a
+        // single run() call, so a batch can be far larger than any single input. Queueing each one
+        // immediately defeated compaction: only the first input was size-checked, because attaching
+        // it made the runner report not-idle and the rest bypassed the check. Sizing the whole
+        // batch up front lets idle compaction run before the content is attached.
+        let mut follow_up_batch: Vec<ContentPart> = Vec::new();
+        let mut steer_batch: Vec<ContentPart> = Vec::new();
 
         for mut input in inputs {
             // 累计来自于后台任务的工具使用情况
@@ -750,33 +775,30 @@ impl SubSessionRunner {
 
             match input.command {
                 PromptCommand::Ping => {
-                    let content =
-                        prompt_and_resources_into_content(String::new(), &mut input.resources);
-                    if !content.is_empty() {
-                        self.runner.follow_up_content(content);
-                    }
+                    follow_up_batch.extend(prompt_and_resources_into_content(
+                        String::new(),
+                        &mut input.resources,
+                    ));
                     continue;
                 }
                 PromptCommand::Plain { prompt } => {
-                    let content = prompt_and_resources_into_content(prompt, &mut input.resources);
-                    if !content.is_empty() {
-                        self.runner.follow_up_content(content);
-                    }
+                    follow_up_batch.extend(prompt_and_resources_into_content(
+                        prompt,
+                        &mut input.resources,
+                    ));
                 }
                 PromptCommand::Command { command, prompt } => match command.as_str() {
                     "steer" => {
-                        let content =
-                            prompt_and_resources_into_content(prompt, &mut input.resources);
-                        if !content.is_empty() {
-                            self.runner.steer_content(content);
-                        }
+                        steer_batch.extend(prompt_and_resources_into_content(
+                            prompt,
+                            &mut input.resources,
+                        ));
                     }
                     _ => {
-                        let content =
-                            prompt_and_resources_into_content(prompt, &mut input.resources);
-                        if !content.is_empty() {
-                            self.runner.follow_up_content(content);
-                        }
+                        follow_up_batch.extend(prompt_and_resources_into_content(
+                            prompt,
+                            &mut input.resources,
+                        ));
                     }
                 },
             }
@@ -790,6 +812,19 @@ impl SubSessionRunner {
         if let Some(reason) = stop_requested {
             self.stop_current_task(reason).await;
             return Ok(true);
+        }
+
+        // Compact (if needed) before attaching the batch, accounting for its estimated size, then
+        // queue it. Running unconditionally also covers the case where the committed history grew
+        // over the threshold without any new input this round.
+        let pending_tokens = estimated_content_tokens(&follow_up_batch)
+            .saturating_add(estimated_content_tokens(&steer_batch));
+        self.compact_if_needed(pending_tokens).await?;
+        if !follow_up_batch.is_empty() {
+            self.runner.follow_up_content(follow_up_batch);
+        }
+        if !steer_batch.is_empty() {
+            self.runner.steer_content(steer_batch);
         }
 
         match self.runner.next().await {
@@ -1934,15 +1969,96 @@ impl SubAgentSet for SubAgentSetManager {
 
 /// Returns true when a session runner should compact its conversation history.
 pub fn needs_compaction(runner: &CompletionRunner) -> bool {
-    let current_usage = runner.current_usage();
+    needs_compaction_with_pending(runner, 0)
+}
+
+/// Like [`needs_compaction`], but also accounts for `pending_tokens` — the estimated size of
+/// follow-up/steer content about to be attached. This lets compaction run before a large batch of
+/// background results is queued, instead of after the next request has already overflowed.
+fn needs_compaction_with_pending(runner: &CompletionRunner, pending_tokens: u64) -> bool {
+    let threshold = compaction_threshold(runner);
+
+    // Cheap signals first: the model-reported size of the last request and the turn count.
+    if runner.current_usage().input_tokens >= threshold || runner.turns() >= MAX_TURNS_TO_COMPACT {
+        return true;
+    }
+
+    if pending_tokens == 0 {
+        return false;
+    }
+
+    // Use the larger of the model-reported size of the current context (which already counts the
+    // system prompt and tool schemas) and a char-based history estimate (a fallback before the
+    // first turn reports usage).
+    let current = runner
+        .current_usage()
+        .input_tokens
+        .max(estimated_history_tokens(runner));
+    current.saturating_add(pending_tokens) >= threshold
+}
+
+fn compaction_threshold(runner: &CompletionRunner) -> u64 {
     let context_window = runner.model().context_window as u64;
-    let threshold = if context_window == 0 {
+    if context_window == 0 {
         100_000
     } else {
         context_window.saturating_mul(8).saturating_div(10).max(1)
-    };
+    }
+}
 
-    current_usage.input_tokens >= threshold || runner.turns() >= MAX_TURNS_TO_COMPACT
+/// Rough char-based token estimate of the committed history. Used only as a pre-queue safety check
+/// for a batch about to be attached; `current_usage` is the authoritative size once the first turn
+/// has reported it.
+fn estimated_history_tokens(runner: &CompletionRunner) -> u64 {
+    runner
+        .chat_history()
+        .iter()
+        .map(estimated_message_tokens)
+        .sum()
+}
+
+fn estimated_message_tokens(message: &Message) -> u64 {
+    8u64.saturating_add(estimated_content_tokens(&message.content))
+}
+
+fn estimated_content_tokens(content: &[ContentPart]) -> u64 {
+    content.iter().map(estimated_content_part_tokens).sum()
+}
+
+fn estimated_content_part_tokens(content: &ContentPart) -> u64 {
+    match content {
+        ContentPart::Text { text } | ContentPart::Reasoning { text } => estimated_text_tokens(text),
+        ContentPart::FileData {
+            file_uri,
+            mime_type,
+        } => estimated_text_tokens(file_uri)
+            .saturating_add(mime_type.as_deref().map_or(0, estimated_text_tokens)),
+        ContentPart::InlineData { mime_type, data } => estimated_text_tokens(mime_type)
+            .saturating_add((data.len() as u64).saturating_add(3) / 4),
+        ContentPart::ToolCall {
+            name,
+            args,
+            call_id,
+        } => estimated_text_tokens(name)
+            .saturating_add(estimated_text_tokens(&args.to_string()))
+            .saturating_add(call_id.as_deref().map_or(0, estimated_text_tokens)),
+        ContentPart::ToolOutput {
+            name,
+            output,
+            call_id,
+            ..
+        } => estimated_text_tokens(name)
+            .saturating_add(estimated_text_tokens(&output.to_string()))
+            .saturating_add(call_id.as_deref().map_or(0, estimated_text_tokens)),
+        ContentPart::Action { name, payload, .. } => {
+            estimated_text_tokens(name).saturating_add(estimated_text_tokens(&payload.to_string()))
+        }
+        ContentPart::Any(value) => estimated_text_tokens(&value.to_string()),
+    }
+}
+
+fn estimated_text_tokens(text: &str) -> u64 {
+    (text.chars().count() as u64).saturating_add(3) / 4
 }
 
 #[cfg(test)]
@@ -2043,6 +2159,48 @@ mod tests {
                 content,
                 usage: Usage {
                     input_tokens,
+                    output_tokens: 1,
+                    cached_tokens: 0,
+                    requests: 1,
+                },
+                ..Default::default()
+            })))
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct RecordingLowUsageCompactionCompleter {
+        requests: Arc<Mutex<Vec<CompletionRequest>>>,
+    }
+
+    impl CompletionFeaturesDyn for RecordingLowUsageCompactionCompleter {
+        fn model_name(&self) -> String {
+            "recording-low-usage-compaction".to_string()
+        }
+
+        fn completion(&self, req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
+            self.requests.lock().push(req.clone());
+
+            let prompt = request_text(&req);
+            let history = req
+                .chat_history
+                .iter()
+                .filter_map(Message::text)
+                .collect::<Vec<_>>()
+                .join(" | ");
+
+            let content = if prompt.trim() == COMPACTION_PROMPT.trim() {
+                "compacted handoff".to_string()
+            } else if history.is_empty() {
+                prompt.clone()
+            } else {
+                format!("history={history}; input={prompt}")
+            };
+
+            Box::pin(futures::future::ready(Ok(AgentOutput {
+                content,
+                usage: Usage {
+                    input_tokens: 1,
                     output_tokens: 1,
                     cached_tokens: 0,
                     requests: 1,
@@ -2935,6 +3093,79 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn subsession_runner_compacts_oversized_input_batch_before_queueing() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let mut model = Model::with_completer(Arc::new(RecordingLowUsageCompactionCompleter {
+            requests: requests.clone(),
+        }));
+        model.context_window = 1_000; // compaction threshold = 800 tokens
+        let ctx = EngineBuilder::new().with_model(model).mock_ctx();
+
+        let (sender, _rx) = tokio::sync::mpsc::channel(4);
+        let session = Arc::new(SubSession {
+            id: "session-batch".to_string(),
+            agent: "compactor".to_string(),
+            sender,
+            background_tasks: Arc::new(RwLock::new(HashMap::new())),
+            active_at: AtomicU64::new(unix_ms()),
+            idle_timeout_ms: 0,
+        });
+
+        let mut runner = SubSessionRunner {
+            session,
+            agent_hook: None,
+            runner: ctx
+                .completion_iter(CompletionRequest::default(), Vec::new())
+                .unbound(),
+            last_output: None,
+            carried_artifacts: Vec::new(),
+            closing: false,
+        };
+
+        // Each input carries no usage, so only the batch content estimate can trigger compaction.
+        // Each chunk is ~400 tokens (under the 800 threshold); the three batched together are
+        // ~1200 (over it). The per-input check missed this: queueing the first follow-up made the
+        // runner report not-idle, so the rest bypassed the size check.
+        let chunk = "y".repeat(1_600);
+        let plain = |prompt: String| SubAgentInput {
+            command: PromptCommand::Plain { prompt },
+            resources: Vec::new(),
+            usage: Usage::default(),
+            model: None,
+            effort: None,
+        };
+
+        assert!(
+            runner
+                .run(vec![
+                    plain(chunk.clone()),
+                    plain(chunk.clone()),
+                    plain(chunk.clone()),
+                ])
+                .await
+                .unwrap()
+        );
+
+        let recorded = requests.lock().clone();
+        // Compaction runs once up front, then the whole batch is queued on top of the compacted
+        // handoff in a single follow-up request.
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(request_text(&recorded[0]).trim(), COMPACTION_PROMPT.trim());
+        assert_eq!(
+            recorded[1]
+                .chat_history
+                .iter()
+                .filter_map(Message::text)
+                .collect::<Vec<_>>(),
+            vec!["compacted handoff".to_string()]
+        );
+        assert_eq!(
+            request_text(&recorded[1]).matches(chunk.as_str()).count(),
+            3
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn subsession_runner_fails_when_compaction_summary_is_empty() {
         let model = Model::with_completer(Arc::new(EmptyCompactionCompleter));
         let ctx = EngineBuilder::new().with_model(model).mock_ctx();
@@ -2959,8 +3190,7 @@ mod tests {
             session,
             agent_hook: None,
             runner: ctx.completion_iter(req, Vec::new()).unbound(),
-            last_output: None,
-            // A previously rescued artifact must survive even when compaction fails.
+            last_output: None, // A previously rescued artifact must survive even when compaction fails.
             carried_artifacts: vec![resource(5, &["artifact"])],
             closing: false,
         };

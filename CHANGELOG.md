@@ -2,6 +2,13 @@
 
 All notable changes to the Anda project will be documented in this file.
 
+## [0.13.4] — 2026-06-17
+
+### Fixed — anda_engine v0.13.4
+
+- **Subagent compaction before oversized input batches** — Idle subagent sessions now compact before attaching large batched follow-up or steering inputs, preventing background-result bursts from overflowing the context window before summarization can run. Compaction also refreshes session activity so small idle timeouts do not immediately reclaim freshly compacted sessions.
+
+
 ## [0.13.3] — 2026-06-15
 
 ### Changed — anda_core v0.13.3
