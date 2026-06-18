@@ -2,6 +2,13 @@
 
 All notable changes to the Anda project will be documented in this file.
 
+## [0.13.5] — 2026-06-18
+
+### Fixed — anda_engine v0.13.5
+
+- **Streaming completion timeout handling** — Model completion clients no longer use HTTP/2 keep-alive PINGs as the liveness detector for long SSE reasoning streams. Completion transport now relies on a per-read body idle timeout plus the existing total request timeout, preventing provider/CDN PING ACK delays from aborting streams that are still producing body chunks.
+
+
 ## [0.13.4] — 2026-06-17
 
 ### Fixed — anda_engine v0.13.4

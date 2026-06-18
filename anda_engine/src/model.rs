@@ -40,6 +40,10 @@ pub use anda_core::ModelEffort;
 const MODEL_REQUEST_MAX_RETRIES: usize = 1;
 const MODEL_RETRY_BACKOFF: Duration = Duration::from_millis(300);
 const MODEL_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(1);
+const COMPLETION_HTTP2_KEEP_ALIVE_INTERVAL: Option<Duration> = None;
+const COMPLETION_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const COMPLETION_READ_TIMEOUT: Duration = Duration::from_secs(180);
+const COMPLETION_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Serializable configuration for constructing a model adapter.
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
@@ -850,14 +854,23 @@ pub fn request_client_builder() -> reqwest::ClientBuilder {
                     }
                 }),
         )
-        .http2_keep_alive_interval(Some(Duration::from_secs(25)))
-        .http2_keep_alive_timeout(Duration::from_secs(15))
-        .http2_keep_alive_while_idle(true)
-        .connect_timeout(Duration::from_secs(10))
+        // Do not use HTTP/2 PINGs as the liveness detector for model SSE
+        // streams. Some provider/CDN edges can keep a long reasoning stream
+        // alive while delaying PING ACKs; hyper then closes the connection and
+        // reqwest reports "error decoding response body: ... operation timed
+        // out" even though the body was still progressing. The per-read body
+        // timeout below is the stall detector for completions.
+        .http2_keep_alive_interval(COMPLETION_HTTP2_KEEP_ALIVE_INTERVAL)
+        .connect_timeout(COMPLETION_CONNECT_TIMEOUT)
+        // Read (idle) timeout is the authoritative stall detector for streamed
+        // completions: it resets on every chunk, so a long-but-progressing
+        // reasoning stream of unknown size is never killed, while a connection
+        // that goes silent is failed promptly with clear attribution.
+        .read_timeout(COMPLETION_READ_TIMEOUT)
         // Total request timeout, including the streamed body. Heavy reasoning
         // completions can run for many minutes; provider SDKs default to 10
-        // minutes. Stalled connections are detected earlier by h2 keep-alive.
-        .timeout(Duration::from_secs(600))
+        // minutes.
+        .timeout(COMPLETION_REQUEST_TIMEOUT)
         .user_agent(APP_USER_AGENT)
         .default_headers({
             let mut headers = reqwest::header::HeaderMap::new();
@@ -1190,6 +1203,30 @@ mod tests {
                 .write_all(b"data: {\"b\":2}\n\ndata: [DONE]\n\n")
                 .await
                 .unwrap();
+            let _ = socket.shutdown().await;
+        });
+        format!("http://{addr}")
+    }
+
+    async fn spawn_stalling_sse_body_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            let _ = socket.read(&mut request).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+                      Content-Type: text/event-stream\r\n\
+                      Connection: close\r\n\
+                      \r\n\
+                      data: {\"a\":1}\n\n",
+                )
+                .await
+                .unwrap();
+            socket.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(500)).await;
             let _ = socket.shutdown().await;
         });
         format!("http://{addr}")
@@ -1617,6 +1654,47 @@ mod tests {
                 serde_json::json!({"b": 2})
             ]
         );
+    }
+
+    #[test]
+    fn completion_transport_timeouts_are_streaming_safe() {
+        // The observed failure hit at ~118s with body bytes already received;
+        // HTTP/2 PING ACK timeouts must not be able to abort such a stream
+        // before the explicit idle body timeout can make that decision.
+        assert_eq!(COMPLETION_HTTP2_KEEP_ALIVE_INTERVAL, None);
+        assert!(COMPLETION_READ_TIMEOUT > Duration::from_secs(118));
+        assert!(COMPLETION_READ_TIMEOUT < COMPLETION_REQUEST_TIMEOUT);
+        assert_eq!(COMPLETION_REQUEST_TIMEOUT, Duration::from_secs(600));
+    }
+
+    #[tokio::test]
+    async fn streaming_reader_body_idle_timeout_is_retryable() {
+        let endpoint = spawn_stalling_sse_body_server().await;
+        let client = request_client_builder()
+            .https_only(false)
+            .no_proxy()
+            .read_timeout(Duration::from_millis(100))
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let response = client.get(endpoint).send().await.unwrap();
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(2),
+            read_sse_json_events::<serde_json::Value>(response, "test-model"),
+        )
+        .await
+        .expect("body read timeout should fire")
+        .unwrap_err();
+
+        let message = err.to_string();
+        assert!(
+            message.contains("Failed to read streaming completion response"),
+            "{message}"
+        );
+        assert!(message.contains("received:"), "{message}");
+        assert!(message.contains("operation timed out"), "{message}");
+        assert!(is_retryable_box_error(&err));
     }
 
     #[test]
