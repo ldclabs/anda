@@ -13,6 +13,8 @@ All notable changes to the Anda project will be documented in this file.
 - **Tool group discovery helpers** — Added `tools_groups` plus `tools_select { group }` expansion and group annotations in `tools_search` / `tools_select` outputs, letting agents survey capability bundles first and then load all member schemas on demand.
 - **Built-in filesystem and memory groups** — Filesystem workspace tools and persistent-memory/conversation tools now advertise shared capability groups with usage guidance and complete member lists.
 - **MCP server capability groups** — MCP tool providers now capture server title, description, and `instructions` from the initialize handshake and surface each server as one discovery-layer tool group.
+- **Subagent live status polling** — Added read-only `/status` session polling and manager-level `status` catalog output with elapsed time, idle time, token usage, turns, latest progress, and active background tasks.
+- **Grapheme-safe output truncation** — Shared truncation helpers now respect Unicode grapheme-cluster boundaries, so shell/status/filesystem inline previews do not split multi-codepoint emoji, flags, skin-tone modifiers, or combining marks.
 
 ### Fixed — anda_engine v0.13.6
 

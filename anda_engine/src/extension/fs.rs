@@ -461,17 +461,16 @@ fn is_text_like(text: &str) -> bool {
         .all(|ch| matches!(ch, '\n' | '\r' | '\t' | '\u{000c}') || !ch.is_control())
 }
 
-/// Truncates `content` to at most `max_bytes`, preferring a line boundary and
-/// falling back to a character boundary. Returns true when content was cut.
+/// Truncates `content` to at most `max_bytes`, preferring a line boundary and falling back to a
+/// grapheme-cluster boundary so a multibyte character or emoji cluster is never split. Returns true
+/// when content was cut.
 pub(crate) fn truncate_inline_text(content: &mut String, max_bytes: usize) -> bool {
     if content.len() <= max_bytes {
         return false;
     }
 
-    let mut end = max_bytes;
-    while end > 0 && !content.is_char_boundary(end) {
-        end -= 1;
-    }
+    // Grapheme-cluster-safe byte cutoff within the budget (shared with truncate_utf8_to_max_bytes).
+    let end = crate::grapheme_safe_cutoff(content, max_bytes);
     let cut = match content[..end].rfind('\n') {
         // Keep whole lines when possible; a single oversized line is cut at `end`.
         Some(idx) if idx > 0 => idx + 1,
@@ -872,7 +871,7 @@ mod tests {
         assert!(truncate_inline_text(&mut text, 20));
         assert_eq!(text, "line one\nline two\n");
 
-        // A single oversized line is cut at a char boundary instead of dropped.
+        // A single oversized line is cut at a grapheme boundary instead of dropped.
         let mut text = "中文内容没有换行".to_string();
         assert!(truncate_inline_text(&mut text, 10));
         assert_eq!(text, "中文内");
@@ -881,6 +880,14 @@ mod tests {
         let mut text = "\nabcdefghijklmnop".to_string();
         assert!(truncate_inline_text(&mut text, 8));
         assert_eq!(text, "\nabcdefg");
+
+        // A multi-codepoint grapheme cluster (family emoji joined by ZWJ, 25 bytes) on a single
+        // oversized line is never split: a budget landing mid-cluster backs off to the previous
+        // cluster boundary.
+        let family = "👨‍👩‍👧‍👦";
+        let mut text = family.repeat(3); // 75 bytes, no newline
+        assert!(truncate_inline_text(&mut text, 60));
+        assert_eq!(text, family.repeat(2));
     }
 
     #[test]

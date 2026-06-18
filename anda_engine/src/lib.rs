@@ -21,6 +21,7 @@ use anda_core::Json;
 use candid::Principal;
 use chrono::prelude::*;
 use rand::RngExt;
+use unicode_segmentation::UnicodeSegmentation;
 
 pub mod context;
 pub mod engine;
@@ -100,6 +101,41 @@ pub fn local_date_hour(now_ms: u64) -> Option<String> {
     local_datetime.map(|dt| dt.format("%Y-%m-%d %I%p %:z").to_string())
 }
 
+/// Returns the largest byte length `<= max_bytes` that falls on a grapheme-cluster boundary of
+/// `text`, so multi-codepoint characters — emoji ZWJ sequences (e.g. 👨‍👩‍👧‍👦), regional-indicator
+/// flags, skin-tone modifiers, and combining marks — are never split.
+///
+/// The result is always a valid UTF-8 boundary. It is `text.len()` when the whole string fits, and
+/// `0` when not even the first grapheme cluster fits within `max_bytes`.
+pub fn grapheme_safe_cutoff(text: &str, max_bytes: usize) -> usize {
+    if text.len() <= max_bytes {
+        return text.len();
+    }
+
+    text.grapheme_indices(true)
+        .map(|(idx, g)| idx + g.len())
+        .take_while(|&end| end <= max_bytes)
+        .last()
+        .unwrap_or(0)
+}
+
+/// Truncates a UTF-8 string in place to at most `max_bytes`, backing off to the nearest
+/// grapheme-cluster boundary via [`grapheme_safe_cutoff`] so multi-codepoint characters are never
+/// split.
+///
+/// Returns the new byte length when truncation happened, or `None` when the string already fit
+/// within `max_bytes`. When not even the first grapheme cluster fits, the string is truncated to
+/// empty.
+pub fn truncate_utf8_to_max_bytes(text: &mut String, max_bytes: usize) -> Option<usize> {
+    if text.len() <= max_bytes {
+        return None;
+    }
+
+    let cutoff = grapheme_safe_cutoff(text, max_bytes);
+    text.truncate(cutoff);
+    Some(cutoff)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,5 +209,38 @@ mod tests {
         assert_eq!(parts[2].len(), 6);
 
         assert_eq!(local_date_hour(invalid_ms), None);
+    }
+
+    #[test]
+    fn truncate_utf8_to_max_bytes_respects_budget_and_grapheme_boundaries() {
+        // Within budget: untouched.
+        let mut text = "hello".to_string();
+        assert_eq!(truncate_utf8_to_max_bytes(&mut text, 5), None);
+        assert_eq!(text, "hello");
+
+        // ASCII over budget: truncated exactly to the byte budget.
+        let mut text = "hello world".to_string();
+        assert_eq!(truncate_utf8_to_max_bytes(&mut text, 5), Some(5));
+        assert_eq!(text, "hello");
+
+        // A multibyte codepoint is never split: "héllo" is 6 bytes (é = 2 bytes). A 2-byte budget
+        // backs off to the boundary after "h".
+        let mut text = "héllo".to_string();
+        assert_eq!(truncate_utf8_to_max_bytes(&mut text, 2), Some(1));
+        assert_eq!(text, "h");
+
+        // A multi-codepoint grapheme cluster (family emoji joined by ZWJ, 25 bytes) is never split.
+        // A budget that lands mid-cluster backs off to the previous cluster boundary.
+        let family = "👨‍👩‍👧‍👦";
+        assert_eq!(family.len(), 25);
+        let mut text = family.repeat(3); // 75 bytes
+        let cutoff = truncate_utf8_to_max_bytes(&mut text, 60).unwrap();
+        assert_eq!(cutoff, 50);
+        assert_eq!(text, family.repeat(2));
+
+        // Budget smaller than the first cluster: truncated to empty rather than split.
+        let mut text = family.to_string();
+        assert_eq!(truncate_utf8_to_max_bytes(&mut text, 10), Some(0));
+        assert!(text.is_empty());
     }
 }

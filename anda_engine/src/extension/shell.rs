@@ -36,6 +36,10 @@ use crate::{
     hook::{DynToolHook, ToolHook},
 };
 
+// Re-export the shared, grapheme-cluster-safe truncation helper so the historical
+// `extension::shell::truncate_utf8_to_max_bytes` path keeps working.
+pub use crate::truncate_utf8_to_max_bytes;
+
 /// Maximum foreground shell command execution time before timeout handling.
 pub const SHELL_TIMEOUT_SECS: u64 = 180;
 /// Maximum native foreground shell runtime before moving the command to background execution.
@@ -736,19 +740,6 @@ fn build_raw_output_bytes(stdout: Option<&[u8]>, stderr: Option<&[u8]>) -> Vec<u
         }
         (None, None) => Vec::new(),
     }
-}
-
-/// Truncates a UTF-8 string to at most `max_bytes` without splitting a codepoint.
-pub fn truncate_utf8_to_max_bytes(text: &mut String, max_bytes: usize) -> Option<usize> {
-    if text.len() <= max_bytes {
-        return None;
-    }
-    let mut cutoff = max_bytes;
-    while cutoff > 0 && !text.is_char_boundary(cutoff) {
-        cutoff -= 1;
-    }
-    text.truncate(cutoff);
-    Some(cutoff)
 }
 
 #[cfg(test)]

@@ -48,20 +48,16 @@ rand = { workspace = true }
 moka = { workspace = true }
 tokio = { workspace = true }
 log = { workspace = true }
-url = { workspace = true }
 serde-saphyr = { workspace = true }
 glob = { workspace = true }
 rmcp = { workspace = true }
+unicode-segmentation = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }
-dotenv = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = ["Win32_Globalization"] }
-
-[lib]
-doctest = false
 
 [package.metadata.docs.rs]
 all-features = true

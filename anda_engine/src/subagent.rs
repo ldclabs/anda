@@ -28,7 +28,7 @@ use std::{
 use crate::{
     context::{AgentCtx, BaseCtx, CompletionRunner},
     hook::{AgentHook, DynAgentHook, DynToolJsonHook, PrefixedId, ToolBackgroundHook},
-    unix_ms,
+    truncate_utf8_to_max_bytes, unix_ms,
 };
 
 const CONVERSATION_IDLE_MS: u64 = 60 * 1000; // 1 minute
@@ -448,6 +448,33 @@ pub struct BackgroundTaskInfo {
     pub stopped: bool,
 }
 
+/// Live progress snapshot for a subagent session.
+///
+/// The session runner refreshes this after each step so the parent agent can poll a session's
+/// current state through `/status` (or the manager catalog) without waiting for hook callbacks.
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct SubSessionStatus {
+    /// Cumulative token usage across every turn in this session.
+    pub usage: Usage,
+    /// Per-tool token usage accumulated by the session runner.
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub tools_usage: HashMap<String, Usage>,
+    /// Number of completed model turns.
+    pub turns: usize,
+    /// Resolved model label currently driving the session, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// True while the runner is mid-task (an in-flight request or pending tool calls); false when
+    /// it is idle and waiting for the next prompt.
+    pub busy: bool,
+    /// Latest visible output text from the subagent, truncated for a compact status view.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_progress: Option<String>,
+}
+
+/// Maximum number of bytes retained for [`SubSessionStatus::last_progress`].
+const STATUS_PROGRESS_MAX_BYTES: usize = 2000;
+
 /// Long-lived conversation session for a subagent.
 pub struct SubSession {
     id: String,
@@ -456,8 +483,13 @@ pub struct SubSession {
     // task_id -> BackgroundTaskInfo
     background_tasks: Arc<RwLock<HashMap<String, BackgroundTaskInfo>>>,
     active_at: AtomicU64,
+    // Wall-clock ms when this session's runner started, used to report elapsed run time.
+    created_at: u64,
     // Idle window in ms before an input-less, background-task-less session is reclaimed.
     idle_timeout_ms: u64,
+    // Live progress snapshot refreshed after each runner step so the parent can poll status
+    // without waiting for hook callbacks.
+    status: RwLock<SubSessionStatus>,
 }
 
 fn resources_into_content(resources: Vec<Resource>) -> Vec<ContentPart> {
@@ -465,6 +497,29 @@ fn resources_into_content(resources: Vec<Resource>) -> Vec<ContentPart> {
         .into_iter()
         .filter_map(|resource| ContentPart::try_from(resource).ok())
         .collect()
+}
+
+/// Extracts a short, human-readable progress line from an output for the live status snapshot.
+/// Prefers visible content, then a failure reason, then reasoning thoughts; truncates with the
+/// shared [`truncate_utf8_to_max_bytes`] helper (grapheme-cluster-safe) to keep the report compact.
+fn progress_text(output: &AgentOutput) -> Option<String> {
+    let text = if !output.content.is_empty() {
+        output.content.clone()
+    } else if let Some(reason) = &output.failed_reason {
+        format!("failed: {reason}")
+    } else {
+        output.thoughts.clone()?
+    };
+
+    let mut text = text.trim().to_string();
+    if text.is_empty() {
+        return None;
+    }
+
+    if truncate_utf8_to_max_bytes(&mut text, STATUS_PROGRESS_MAX_BYTES).is_some() {
+        text.push('…');
+    }
+    Some(text)
 }
 
 fn prompt_and_resources_into_content(
@@ -526,6 +581,30 @@ impl SubSessionRunner {
 
     fn has_progress_signal(output: &AgentOutput) -> bool {
         !output.content.is_empty() || output.failed_reason.is_some()
+    }
+
+    /// Refreshes the session's live status snapshot from the runner's current state, so a `/status`
+    /// poll reflects the latest usage, turn count, and visible progress without waiting for hooks.
+    fn sync_status(&self) {
+        let last_progress = self
+            .last_output
+            .as_ref()
+            .or_else(|| self.runner.last_output())
+            .and_then(progress_text);
+        let model = self
+            .runner
+            .last_output()
+            .and_then(|output| output.model.clone())
+            .or_else(|| self.runner.req().model.clone());
+
+        self.session.record_status(SubSessionStatus {
+            usage: self.runner.total_usage().clone(),
+            tools_usage: self.runner.tools_usage().clone(),
+            turns: self.runner.turns(),
+            model,
+            busy: !self.runner.is_idle(),
+            last_progress,
+        });
     }
 
     fn latest_output(&mut self) -> AgentOutput {
@@ -875,6 +954,71 @@ impl SubSessionRunner {
 }
 
 impl SubSession {
+    /// Creates a new session handle. `created_at` and `active_at` are stamped with the current
+    /// time and the live status snapshot starts empty.
+    fn new(
+        id: String,
+        agent: String,
+        sender: tokio::sync::mpsc::Sender<SubAgentInput>,
+        idle_timeout_ms: u64,
+    ) -> Self {
+        let now = unix_ms();
+        Self {
+            id,
+            agent,
+            sender,
+            background_tasks: Arc::new(RwLock::new(HashMap::new())),
+            active_at: AtomicU64::new(now),
+            created_at: now,
+            idle_timeout_ms,
+            status: RwLock::new(SubSessionStatus::default()),
+        }
+    }
+
+    /// Overwrites the live progress snapshot with the runner's latest state.
+    fn record_status(&self, status: SubSessionStatus) {
+        *self.status.write() = status;
+    }
+
+    /// Renders a synchronous, read-only status report for this session: elapsed run time, idle
+    /// time, the latest progress snapshot, and any active background tasks. Used by the `/status`
+    /// control command and the manager catalog so the parent can poll progress without waiting for
+    /// hook callbacks.
+    fn detail(&self) -> Json {
+        let now = unix_ms();
+        let active_at = self.active_at.load(Ordering::SeqCst);
+        let status = self.status.read().clone();
+        let background_tasks = self
+            .background_tasks
+            .read()
+            .iter()
+            .filter(|(_, info)| !info.stopped)
+            .map(|(task_id, info)| {
+                json!({
+                    "task_id": task_id,
+                    "agent": info.agent_name,
+                    "tool": info.tool_name,
+                    "progress": info.progress_message,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        json!({
+            "session": self.id,
+            "agent": self.agent,
+            "active": true,
+            "busy": status.busy,
+            "running_ms": now.saturating_sub(self.created_at),
+            "idle_ms": now.saturating_sub(active_at),
+            "turns": status.turns,
+            "model": status.model,
+            "usage": status.usage,
+            "tools_usage": status.tools_usage,
+            "background_tasks": background_tasks,
+            "last_progress": status.last_progress,
+        })
+    }
+
     /// Closes the session input side.
     pub fn close(self: Arc<Self>) {
         // no things to do for now
@@ -1121,6 +1265,14 @@ impl SubSessions {
         sessions.keys().cloned().collect()
     }
 
+    /// Returns a live status report for each active session: elapsed run time, idle time, token
+    /// usage, turn count, latest progress, and active background tasks.
+    pub fn session_details(&self) -> Vec<Json> {
+        let mut sessions = self.sessions.write();
+        sessions.retain(|_, sess| !sess.sender.is_closed());
+        sessions.values().map(|sess| sess.detail()).collect()
+    }
+
     /// Returns an active session by ID.
     pub fn get_session(&self, id: &str) -> Option<Arc<SubSession>> {
         let mut sessions = self.sessions.write();
@@ -1155,7 +1307,7 @@ impl Agent<AgentCtx> for SubAgent {
                 "properties": {
                     "prompt": {
                         "type": "string",
-                        "description": "Self-contained task handoff for this subagent. Include objective, context/resources, constraints, dependencies, expected deliverable, success criteria, and what progress/final output should contain. To control an already-running session, send a control command here instead of a task: `/steer <guidance>` to adjust course mid-run, `/stop <reason>` to stop the current task and keep the session idle, or `/cancel <reason>` to end the session runner."
+                        "description": "Self-contained task handoff for this subagent. Include objective, context/resources, constraints, dependencies, expected deliverable, success criteria, and what progress/final output should contain. To control or inspect an already-running session, send a control command here instead of a task: `/status` to fetch the session's live progress (elapsed time, token usage, turns, active background tasks) synchronously without disturbing the run, `/steer <guidance>` to adjust course mid-run, `/stop <reason>` to stop the current task and keep the session idle, or `/cancel <reason>` to end the session runner."
                     },
                     "session": {
                         "type": "string",
@@ -1245,6 +1397,37 @@ impl Agent<AgentCtx> for SubAgent {
         };
 
         let subsessions = self.subsessions.clone();
+
+        // `/status` is a read-only poll: report the session's live snapshot synchronously without
+        // enqueuing anything into the runner, so the parent can check progress (elapsed time, token
+        // usage, turns, background tasks) without waiting for hook callbacks.
+        if let PromptCommand::Command { command, .. } = &input.command
+            && command == "status"
+        {
+            let rt = match subsessions.get_session(&session_id) {
+                Some(session) => AgentOutput {
+                    content: session.detail().to_string(),
+                    session: Some(session_id.clone()),
+                    ..Default::default()
+                },
+                None => AgentOutput {
+                    content: json!({
+                        "session": session_id,
+                        "agent": agent,
+                        "active": false,
+                        "note": "session is not active (it may have finished or expired); call again with a non-empty prompt to start a new session."
+                    })
+                    .to_string(),
+                    session: Some(session_id.clone()),
+                    ..Default::default()
+                },
+            };
+            if let Some(hook) = &agent_hook {
+                return hook.after_agent_run(&ctx, rt).await;
+            }
+            return Ok(rt);
+        }
+
         // Join the active session when one exists, otherwise atomically claim the session ID.
         // The bounded loop resolves races with concurrent callers using the same session ID, so
         // two callers can never spawn duplicate runners for one session.
@@ -1304,14 +1487,12 @@ impl Agent<AgentCtx> for SubAgent {
             }
 
             let (sender, rx) = tokio::sync::mpsc::channel::<SubAgentInput>(42);
-            let candidate = Arc::new(SubSession {
-                id: session_id.clone(),
-                agent: agent.clone(),
+            let candidate = Arc::new(SubSession::new(
+                session_id.clone(),
+                agent.clone(),
                 sender,
-                background_tasks: Arc::new(RwLock::new(HashMap::new())),
-                active_at: AtomicU64::new(unix_ms()),
-                idle_timeout_ms: resolve_idle_timeout_ms(self.idle_timeout),
-            });
+                resolve_idle_timeout_ms(self.idle_timeout),
+            ));
             match subsessions.try_insert_session(candidate.clone()) {
                 None => {
                     claimed = Some((candidate, rx));
@@ -1397,6 +1578,10 @@ impl Agent<AgentCtx> for SubAgent {
                 closing: false,
             };
 
+            // Publish an initial snapshot so a `/status` poll right after launch reports the
+            // session as running even before the first step completes.
+            runner.sync_status();
+
             let mut pending: Vec<SubAgentInput> = Vec::new();
             loop {
                 let mut inputs = std::mem::take(&mut pending);
@@ -1425,7 +1610,11 @@ impl Agent<AgentCtx> for SubAgent {
                     }
                 }
 
-                match runner.run(inputs).await {
+                let result = runner.run(inputs).await;
+                // Refresh the live snapshot after every step so a concurrent `/status` poll sees
+                // the latest usage, turn count, and progress.
+                runner.sync_status();
+                match result {
                     Ok(true) => {
                         // continue the subsession
                     }
@@ -1578,15 +1767,27 @@ impl SubAgentManager {
         }
     }
 
-    fn catalog(&self) -> Json {
+    /// Lists registered subagents and their active sessions. When `name_filter` is non-empty, only
+    /// the matching subagent is reported. Each session entry carries a live status snapshot
+    /// (elapsed run time, idle time, token usage, turns, latest progress, and background tasks) so
+    /// the parent can poll progress without waiting for hook callbacks.
+    fn catalog(&self, name_filter: &str) -> Json {
+        let name_filter = name_filter.trim().to_ascii_lowercase();
         let agents = self.agents.read().values().cloned().collect::<Vec<_>>();
         let subagents = agents
             .into_iter()
+            .filter(|agent| {
+                name_filter.is_empty() || agent.name.to_ascii_lowercase() == name_filter
+            })
             .map(|agent| {
                 let name = agent.name.to_ascii_lowercase();
                 let callable = format!("SA_{name}");
                 let has_output_schema = agent.output_schema.is_some();
-                let active_sessions = agent.subsessions.active_session_ids();
+                let sessions = agent.subsessions.session_details();
+                let active_sessions = sessions
+                    .iter()
+                    .map(|detail| detail["session"].clone())
+                    .collect::<Vec<_>>();
                 let model = selected_model_label(&agent.model);
                 json!({
                     "name": name,
@@ -1599,6 +1800,7 @@ impl SubAgentManager {
                     "effort": agent.effort,
                     "idle_timeout": agent.idle_timeout,
                     "active_sessions": active_sessions,
+                    "sessions": sessions,
                 })
             })
             .collect::<Vec<_>>();
@@ -1607,7 +1809,7 @@ impl SubAgentManager {
             "result": "listed",
             "count": subagents.len(),
             "subagents": subagents,
-            "hint": "Use SA_<name> for delegated work. Use a stable session ID for long-running, parallel, asynchronous, or follow-up tasks."
+            "hint": "Use SA_<name> for delegated work. Use a stable session ID for long-running, parallel, asynchronous, or follow-up tasks. To poll a running session, call SA_<name> with `/status` and its session ID, or list with a `name` to inspect that worker's live sessions."
         })
     }
 
@@ -1657,13 +1859,13 @@ impl SubAgentManager {
                 "properties": {
                     "operation": {
                         "type": "string",
-                        "enum": ["upsert", "list"],
-                        "description": "Use `list` to inspect registered subagents and active sessions. Use `upsert` to create or update a worker and optionally run a delegated task.",
+                        "enum": ["upsert", "list", "status"],
+                        "description": "Use `list` or `status` to inspect registered subagents and the live progress of their active sessions (elapsed run time, idle time, token usage, turns, latest progress, and background tasks); pass a `name` to inspect a single worker. Use `upsert` to create or update a worker and optionally run a delegated task.",
                         "default": "upsert"
                     },
                     "name": {
                         "type": "string",
-                        "description": "For operation=upsert, the unique callable subagent name. Must be lowercase snake_case, start with a letter, contain only letters, digits, or underscores, and be no longer than 64 characters. The subagent becomes callable as SA_<name>. For operation=list, use an empty string."
+                        "description": "For operation=upsert, the unique callable subagent name. Must be lowercase snake_case, start with a letter, contain only letters, digits, or underscores, and be no longer than 64 characters. The subagent becomes callable as SA_<name>. For operation=list or status, optionally set it to a subagent name to report only that worker's sessions, or use an empty string to report all."
                     },
                     "description": {
                         "type": "string",
@@ -1780,7 +1982,7 @@ impl Agent<AgentCtx> for SubAgentManager {
         let operation = args.operation.trim().to_ascii_lowercase();
         if matches!(operation.as_str(), "list" | "status" | "catalog") {
             return Ok(AgentOutput {
-                content: self.catalog().to_string(),
+                content: self.catalog(&args.name).to_string(),
                 ..Default::default()
             });
         }
@@ -2507,14 +2709,12 @@ mod tests {
             ..Default::default()
         };
         let (sender, _rx) = tokio::sync::mpsc::channel(4);
-        agent.subsessions.insert_session(Arc::new(SubSession {
-            id: "Job-A".to_string(),
-            agent: "meta_worker".to_string(),
+        agent.subsessions.insert_session(Arc::new(SubSession::new(
+            "Job-A".to_string(),
+            "meta_worker".to_string(),
             sender,
-            background_tasks: Arc::new(RwLock::new(HashMap::new())),
-            active_at: AtomicU64::new(unix_ms()),
-            idle_timeout_ms: 0,
-        }));
+            0,
+        )));
         let definition = agent.definition();
         assert!(
             definition
@@ -2827,14 +3027,12 @@ mod tests {
             idle_timeout_ms: u64,
         ) -> (Arc<SubSession>, SubSessionRunner) {
             let (sender, _rx) = tokio::sync::mpsc::channel(4);
-            let session = Arc::new(SubSession {
-                id: "session-1".to_string(),
-                agent: "worker".to_string(),
+            let session = Arc::new(SubSession::new(
+                "session-1".to_string(),
+                "worker".to_string(),
                 sender,
-                background_tasks: Arc::new(RwLock::new(HashMap::new())),
-                active_at: AtomicU64::new(unix_ms()),
                 idle_timeout_ms,
-            });
+            ));
             let mut runner = SubSessionRunner {
                 session: session.clone(),
                 agent_hook: None,
@@ -2985,14 +3183,12 @@ mod tests {
         };
 
         let (sender, _rx) = tokio::sync::mpsc::channel(4);
-        let session = Arc::new(SubSession {
-            id: "session-1".to_string(),
-            agent: "compactor".to_string(),
+        let session = Arc::new(SubSession::new(
+            "session-1".to_string(),
+            "compactor".to_string(),
             sender,
-            background_tasks: Arc::new(RwLock::new(HashMap::new())),
-            active_at: AtomicU64::new(unix_ms()),
-            idle_timeout_ms: 0,
-        });
+            0,
+        ));
 
         let mut runner = SubSessionRunner {
             session,
@@ -3102,14 +3298,12 @@ mod tests {
         let ctx = EngineBuilder::new().with_model(model).mock_ctx();
 
         let (sender, _rx) = tokio::sync::mpsc::channel(4);
-        let session = Arc::new(SubSession {
-            id: "session-batch".to_string(),
-            agent: "compactor".to_string(),
+        let session = Arc::new(SubSession::new(
+            "session-batch".to_string(),
+            "compactor".to_string(),
             sender,
-            background_tasks: Arc::new(RwLock::new(HashMap::new())),
-            active_at: AtomicU64::new(unix_ms()),
-            idle_timeout_ms: 0,
-        });
+            0,
+        ));
 
         let mut runner = SubSessionRunner {
             session,
@@ -3177,14 +3371,12 @@ mod tests {
         };
 
         let (sender, _rx) = tokio::sync::mpsc::channel(4);
-        let session = Arc::new(SubSession {
-            id: "session-1".to_string(),
-            agent: "compactor".to_string(),
+        let session = Arc::new(SubSession::new(
+            "session-1".to_string(),
+            "compactor".to_string(),
             sender,
-            background_tasks: Arc::new(RwLock::new(HashMap::new())),
-            active_at: AtomicU64::new(unix_ms()),
-            idle_timeout_ms: 0,
-        });
+            0,
+        ));
 
         let mut runner = SubSessionRunner {
             session,
@@ -3230,14 +3422,12 @@ mod tests {
         let hook = Arc::new(RecordingAgentHook::default());
 
         let (sender, _rx) = tokio::sync::mpsc::channel(4);
-        let session = Arc::new(SubSession {
-            id: "session-1".to_string(),
-            agent: "worker".to_string(),
+        let session = Arc::new(SubSession::new(
+            "session-1".to_string(),
+            "worker".to_string(),
             sender,
-            background_tasks: Arc::new(RwLock::new(HashMap::new())),
-            active_at: AtomicU64::new(unix_ms()),
-            idle_timeout_ms: 0,
-        });
+            0,
+        ));
 
         let mut runner = SubSessionRunner {
             session,
@@ -3284,14 +3474,12 @@ mod tests {
         let hook = Arc::new(RecordingAgentHook::default());
 
         let (sender, _rx) = tokio::sync::mpsc::channel(4);
-        let session = Arc::new(SubSession {
-            id: "session-1".to_string(),
-            agent: "worker".to_string(),
+        let session = Arc::new(SubSession::new(
+            "session-1".to_string(),
+            "worker".to_string(),
             sender,
-            background_tasks: Arc::new(RwLock::new(HashMap::new())),
-            active_at: AtomicU64::new(unix_ms()),
-            idle_timeout_ms: 0,
-        });
+            0,
+        ));
 
         let mut runner = SubSessionRunner {
             session,
@@ -3338,14 +3526,12 @@ mod tests {
         };
 
         let (sender, _rx) = tokio::sync::mpsc::channel(4);
-        let session = Arc::new(SubSession {
-            id: "session-1".to_string(),
-            agent: "worker".to_string(),
+        let session = Arc::new(SubSession::new(
+            "session-1".to_string(),
+            "worker".to_string(),
             sender,
-            background_tasks: Arc::new(RwLock::new(HashMap::new())),
-            active_at: AtomicU64::new(unix_ms()),
-            idle_timeout_ms: 0,
-        });
+            0,
+        ));
 
         let mut runner = SubSessionRunner {
             session,
@@ -3395,14 +3581,12 @@ mod tests {
         let ctx = EngineBuilder::new().with_model(model).mock_ctx();
 
         let (sender, _rx) = tokio::sync::mpsc::channel(4);
-        let session = Arc::new(SubSession {
-            id: "session-1".to_string(),
-            agent: "worker".to_string(),
+        let session = Arc::new(SubSession::new(
+            "session-1".to_string(),
+            "worker".to_string(),
             sender,
-            background_tasks: Arc::new(RwLock::new(HashMap::new())),
-            active_at: AtomicU64::new(unix_ms()),
-            idle_timeout_ms: 0,
-        });
+            0,
+        ));
 
         let mut runner = SubSessionRunner {
             session,
@@ -3475,14 +3659,12 @@ mod tests {
             .with_model(Model::with_completer(Arc::new(ErrorCompleter)))
             .mock_ctx();
         let (sender, _rx) = tokio::sync::mpsc::channel(4);
-        let session = Arc::new(SubSession {
-            id: "session-err".to_string(),
-            agent: "worker".to_string(),
+        let session = Arc::new(SubSession::new(
+            "session-err".to_string(),
+            "worker".to_string(),
             sender,
-            background_tasks: Arc::new(RwLock::new(HashMap::new())),
-            active_at: AtomicU64::new(unix_ms()),
-            idle_timeout_ms: 0,
-        });
+            0,
+        ));
         let mut runner = SubSessionRunner {
             session,
             agent_hook: None,
@@ -3519,14 +3701,12 @@ mod tests {
         };
 
         let (sender, _rx) = tokio::sync::mpsc::channel(4);
-        let session = Arc::new(SubSession {
-            id: "session-1".to_string(),
-            agent: "compactor".to_string(),
+        let session = Arc::new(SubSession::new(
+            "session-1".to_string(),
+            "compactor".to_string(),
             sender,
-            background_tasks: Arc::new(RwLock::new(HashMap::new())),
-            active_at: AtomicU64::new(unix_ms()),
-            idle_timeout_ms: 0,
-        });
+            0,
+        ));
 
         let mut runner = SubSessionRunner {
             session,
@@ -3570,14 +3750,12 @@ mod tests {
         };
 
         let (sender, _rx) = tokio::sync::mpsc::channel(4);
-        let session = Arc::new(SubSession {
-            id: "session-1".to_string(),
-            agent: "worker".to_string(),
+        let session = Arc::new(SubSession::new(
+            "session-1".to_string(),
+            "worker".to_string(),
             sender,
-            background_tasks: Arc::new(RwLock::new(HashMap::new())),
-            active_at: AtomicU64::new(unix_ms()),
-            idle_timeout_ms: 0,
-        });
+            0,
+        ));
 
         let mut runner = SubSessionRunner {
             session,
@@ -3677,14 +3855,12 @@ mod tests {
         let ctx = EngineBuilder::new().with_model(model).mock_ctx();
 
         let (sender, _rx) = tokio::sync::mpsc::channel(4);
-        let session = Arc::new(SubSession {
-            id: "session-1".to_string(),
-            agent: "worker".to_string(),
+        let session = Arc::new(SubSession::new(
+            "session-1".to_string(),
+            "worker".to_string(),
             sender,
-            background_tasks: Arc::new(RwLock::new(HashMap::new())),
-            active_at: AtomicU64::new(unix_ms()),
-            idle_timeout_ms: 0,
-        });
+            0,
+        ));
 
         let mut runner = SubSessionRunner {
             session,
@@ -3727,14 +3903,12 @@ mod tests {
         };
 
         let (sender, _rx) = tokio::sync::mpsc::channel(4);
-        let session = Arc::new(SubSession {
-            id: "session-1".to_string(),
-            agent: "worker".to_string(),
+        let session = Arc::new(SubSession::new(
+            "session-1".to_string(),
+            "worker".to_string(),
             sender,
-            background_tasks: Arc::new(RwLock::new(HashMap::new())),
-            active_at: AtomicU64::new(unix_ms()),
-            idle_timeout_ms: 0,
-        });
+            0,
+        ));
 
         let mut runner = SubSessionRunner {
             session,
@@ -3786,14 +3960,12 @@ mod tests {
         };
 
         let (sender, mut rx) = tokio::sync::mpsc::channel(4);
-        let session = Arc::new(SubSession {
-            id: "session-1".to_string(),
-            agent: "worker".to_string(),
+        let session = Arc::new(SubSession::new(
+            "session-1".to_string(),
+            "worker".to_string(),
             sender,
-            background_tasks: Arc::new(RwLock::new(HashMap::new())),
-            active_at: AtomicU64::new(unix_ms()),
-            idle_timeout_ms: 0,
-        });
+            0,
+        ));
 
         let mut runner = SubSessionRunner {
             session,
@@ -4077,14 +4249,12 @@ mod tests {
             ..Default::default()
         };
         let (sender, _rx) = tokio::sync::mpsc::channel(4);
-        agent.subsessions.insert_session(Arc::new(SubSession {
-            id: "job-1".to_string(),
-            agent: "worker".to_string(),
+        agent.subsessions.insert_session(Arc::new(SubSession::new(
+            "job-1".to_string(),
+            "worker".to_string(),
             sender,
-            background_tasks: Arc::new(RwLock::new(HashMap::new())),
-            active_at: AtomicU64::new(unix_ms()),
-            idle_timeout_ms: 0,
-        }));
+            0,
+        )));
 
         manager.upsert_temporary(agent).unwrap();
         manager
@@ -4174,14 +4344,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn subsession_background_hooks_forward_outputs_and_manage_registry() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
-        let session = Arc::new(SubSession {
-            id: "session-1".into(),
-            agent: "worker".into(),
-            sender: tx,
-            background_tasks: Arc::new(RwLock::new(HashMap::new())),
-            active_at: AtomicU64::new(unix_ms()),
-            idle_timeout_ms: 0,
-        });
+        let session = Arc::new(SubSession::new("session-1".into(), "worker".into(), tx, 0));
         let ctx = EngineBuilder::new().mock_ctx();
 
         let sessions = SubSessions::default();
@@ -4347,14 +4510,12 @@ mod tests {
         assert!(sessions.get_session("session-1").is_none());
 
         let (closed_tx, closed_rx) = tokio::sync::mpsc::channel(1);
-        let closed = Arc::new(SubSession {
-            id: "closed".into(),
-            agent: "worker".into(),
-            sender: closed_tx,
-            background_tasks: Arc::new(RwLock::new(HashMap::new())),
-            active_at: AtomicU64::new(unix_ms()),
-            idle_timeout_ms: 0,
-        });
+        let closed = Arc::new(SubSession::new(
+            "closed".into(),
+            "worker".into(),
+            closed_tx,
+            0,
+        ));
         drop(closed_rx);
         sessions.insert_session(closed);
         assert!(sessions.active_session_ids().is_empty());
@@ -4403,14 +4564,12 @@ mod tests {
             ..Default::default()
         };
         let (sender, _rx) = tokio::sync::mpsc::channel(4);
-        agent.subsessions.insert_session(Arc::new(SubSession {
-            id: "plan-1".to_string(),
-            agent: "planner".to_string(),
+        agent.subsessions.insert_session(Arc::new(SubSession::new(
+            "plan-1".to_string(),
+            "planner".to_string(),
             sender,
-            background_tasks: Arc::new(RwLock::new(HashMap::new())),
-            active_at: AtomicU64::new(unix_ms()),
-            idle_timeout_ms: 0,
-        }));
+            0,
+        )));
         manager.upsert_temporary(agent).unwrap();
 
         let output = Agent::<AgentCtx>::run(
@@ -4542,14 +4701,12 @@ mod tests {
     fn test_session(id: &str) -> (Arc<SubSession>, tokio::sync::mpsc::Receiver<SubAgentInput>) {
         let (sender, rx) = tokio::sync::mpsc::channel(16);
         (
-            Arc::new(SubSession {
-                id: id.to_string(),
-                agent: "worker".to_string(),
+            Arc::new(SubSession::new(
+                id.to_string(),
+                "worker".to_string(),
                 sender,
-                background_tasks: Arc::new(RwLock::new(HashMap::new())),
-                active_at: AtomicU64::new(unix_ms()),
-                idle_timeout_ms: 0,
-            }),
+                0,
+            )),
             rx,
         )
     }
@@ -4718,5 +4875,313 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("prompt cannot be empty"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn subsession_runner_sync_status_snapshots_progress_and_usage() {
+        let model = Model::with_completer(Arc::new(EchoCompleter));
+        let ctx = EngineBuilder::new().with_model(model).mock_ctx();
+
+        let (sender, _rx) = tokio::sync::mpsc::channel(4);
+        let session = Arc::new(SubSession::new(
+            "session-1".to_string(),
+            "worker".to_string(),
+            sender,
+            0,
+        ));
+
+        let mut runner = SubSessionRunner {
+            session: session.clone(),
+            agent_hook: None,
+            runner: ctx
+                .completion_iter(
+                    CompletionRequest {
+                        prompt: "seed task".to_string(),
+                        ..Default::default()
+                    },
+                    Vec::new(),
+                )
+                .unbound(),
+            last_output: None,
+            carried_artifacts: Vec::new(),
+            closing: false,
+        };
+
+        // Before any step the snapshot is empty.
+        let detail = session.detail();
+        assert_eq!(detail["turns"], json!(0));
+        assert_eq!(detail["usage"]["requests"], json!(0));
+        assert_eq!(detail["last_progress"], Json::Null);
+
+        assert!(runner.run(Vec::new()).await.unwrap());
+        runner.sync_status();
+
+        let detail = session.detail();
+        assert_eq!(detail["session"], json!("session-1"));
+        assert_eq!(detail["agent"], json!("worker"));
+        assert_eq!(detail["active"], json!(true));
+        assert_eq!(detail["turns"], json!(1));
+        assert_eq!(detail["usage"]["requests"], json!(1));
+        assert_eq!(detail["last_progress"], json!("seed task"));
+        // EchoCompleter returns no tool calls, so the completed turn leaves the runner idle.
+        assert_eq!(detail["busy"], json!(false));
+        assert!(detail["running_ms"].is_u64());
+        assert!(detail["idle_ms"].is_u64());
+    }
+
+    #[test]
+    fn progress_text_prefers_content_then_failure_and_truncates() {
+        assert_eq!(progress_text(&AgentOutput::default()), None);
+        assert_eq!(
+            progress_text(&AgentOutput {
+                content: "  done  ".to_string(),
+                ..Default::default()
+            }),
+            Some("done".to_string())
+        );
+        assert_eq!(
+            progress_text(&AgentOutput {
+                failed_reason: Some("boom".to_string()),
+                ..Default::default()
+            }),
+            Some("failed: boom".to_string())
+        );
+        assert_eq!(
+            progress_text(&AgentOutput {
+                thoughts: Some("thinking".to_string()),
+                ..Default::default()
+            }),
+            Some("thinking".to_string())
+        );
+
+        // ASCII over the byte budget: truncated to exactly the budget, plus the ellipsis marker.
+        let long = "a".repeat(STATUS_PROGRESS_MAX_BYTES + 50);
+        let truncated = progress_text(&AgentOutput {
+            content: long,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(truncated.ends_with('…'));
+        let body = truncated.strip_suffix('…').unwrap();
+        assert_eq!(body.len(), STATUS_PROGRESS_MAX_BYTES);
+
+        // A multi-code-point grapheme cluster (family emoji joined by ZWJ) must never be split
+        // mid-character: the kept body stays within the byte budget and holds only whole clusters.
+        let family = "👨‍👩‍👧‍👦"; // 25 bytes, a single grapheme cluster
+        let text = family.repeat(200); // 5000 bytes, well over the budget
+        let truncated = progress_text(&AgentOutput {
+            content: text,
+            ..Default::default()
+        })
+        .unwrap();
+        let body = truncated.strip_suffix('…').unwrap();
+        assert!(body.len() <= STATUS_PROGRESS_MAX_BYTES);
+        assert_eq!(
+            body,
+            family.repeat(STATUS_PROGRESS_MAX_BYTES / family.len())
+        );
+        // A single oversized cluster is shorter than the limit, so it survives intact.
+        assert_eq!(
+            progress_text(&AgentOutput {
+                content: family.to_string(),
+                ..Default::default()
+            }),
+            Some(family.to_string())
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn subagent_status_command_reports_live_session_snapshot() {
+        let model = Model::with_completer(Arc::new(EchoCompleter));
+        let ctx = EngineBuilder::new().with_model(model).mock_ctx();
+        let agent = SubAgent {
+            name: "status_worker".to_string(),
+            description: "Reports status.".to_string(),
+            instructions: "Work.".to_string(),
+            ..Default::default()
+        };
+
+        // An inactive session reports active=false without starting a runner.
+        let output = agent
+            .run(
+                ctx.clone(),
+                serde_json::to_string(&SubAgentArgs {
+                    prompt: "/status".to_string(),
+                    session: "Job-1".to_string(),
+                    model: String::new(),
+                    effort: None,
+                })
+                .unwrap(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.session.as_deref(), Some("job-1"));
+        let detail: Json = serde_json::from_str(&output.content).unwrap();
+        assert_eq!(detail["active"], json!(false));
+        assert_eq!(detail["session"], json!("job-1"));
+        assert!(agent.subsessions.active_session_ids().is_empty());
+
+        // An active session returns its live snapshot synchronously, without enqueuing into the
+        // runner.
+        let (sender, mut rx) = tokio::sync::mpsc::channel(4);
+        let session = Arc::new(SubSession::new(
+            "job-1".to_string(),
+            "status_worker".to_string(),
+            sender,
+            0,
+        ));
+        session.background_tasks.write().insert(
+            "fetch:task-1".to_string(),
+            BackgroundTaskInfo {
+                agent_name: "status_worker".to_string(),
+                tool_name: Some("fetch".to_string()),
+                progress_message: Some("halfway".to_string()),
+                ..Default::default()
+            },
+        );
+        // A stopped task must be excluded from the report.
+        session.background_tasks.write().insert(
+            "fetch:task-2".to_string(),
+            BackgroundTaskInfo {
+                agent_name: "status_worker".to_string(),
+                stopped: true,
+                ..Default::default()
+            },
+        );
+        session.record_status(SubSessionStatus {
+            usage: Usage {
+                input_tokens: 120,
+                output_tokens: 30,
+                cached_tokens: 0,
+                requests: 2,
+            },
+            turns: 2,
+            model: Some("flash".to_string()),
+            busy: true,
+            last_progress: Some("still working".to_string()),
+            ..Default::default()
+        });
+        agent.subsessions.insert_session(session);
+
+        let output = agent
+            .run(
+                ctx,
+                serde_json::to_string(&SubAgentArgs {
+                    // Case-insensitive session ID and trailing argument are tolerated.
+                    prompt: "/status please".to_string(),
+                    session: "JOB-1".to_string(),
+                    model: String::new(),
+                    effort: None,
+                })
+                .unwrap(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(output.session.as_deref(), Some("job-1"));
+        let detail: Json = serde_json::from_str(&output.content).unwrap();
+        assert_eq!(detail["active"], json!(true));
+        assert_eq!(detail["busy"], json!(true));
+        assert_eq!(detail["turns"], json!(2));
+        assert_eq!(detail["model"], json!("flash"));
+        assert_eq!(detail["usage"]["input_tokens"], json!(120));
+        assert_eq!(detail["usage"]["requests"], json!(2));
+        assert_eq!(detail["last_progress"], json!("still working"));
+        let tasks = detail["background_tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["task_id"], json!("fetch:task-1"));
+        assert_eq!(tasks[0]["tool"], json!("fetch"));
+        assert_eq!(tasks[0]["progress"], json!("halfway"));
+        assert!(detail["running_ms"].is_u64());
+        assert!(detail["idle_ms"].is_u64());
+
+        // The poll is read-only: nothing was enqueued into the session runner.
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn subagents_manager_status_reports_session_details_and_filters_by_name() {
+        let ctx = EngineBuilder::new().mock_ctx();
+        let manager: Arc<SubAgentManager> = ctx.subagents.get().unwrap();
+
+        let worker = SubAgent {
+            name: "worker".to_string(),
+            description: "Works.".to_string(),
+            instructions: "Work.".to_string(),
+            ..Default::default()
+        };
+        let (sender, _rx) = tokio::sync::mpsc::channel(4);
+        let session = Arc::new(SubSession::new(
+            "job-1".to_string(),
+            "worker".to_string(),
+            sender,
+            0,
+        ));
+        session.record_status(SubSessionStatus {
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                cached_tokens: 0,
+                requests: 1,
+            },
+            turns: 1,
+            busy: true,
+            last_progress: Some("in progress".to_string()),
+            ..Default::default()
+        });
+        worker.subsessions.insert_session(session);
+        manager.upsert_temporary(worker).unwrap();
+
+        manager
+            .upsert_temporary(SubAgent {
+                name: "idle_worker".to_string(),
+                description: "Idle.".to_string(),
+                instructions: "Idle.".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        // No filter: both subagents are reported.
+        let output = Agent::<AgentCtx>::run(
+            manager.as_ref(),
+            ctx.clone(),
+            serde_json::to_string(&SubAgentManagerArgs {
+                operation: "status".to_string(),
+                ..Default::default()
+            })
+            .unwrap(),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let content: Json = serde_json::from_str(&output.content).unwrap();
+        assert_eq!(content["count"], json!(2));
+
+        // A name filter narrows the report to one worker and includes its live session detail.
+        let output = Agent::<AgentCtx>::run(
+            manager.as_ref(),
+            ctx,
+            serde_json::to_string(&SubAgentManagerArgs {
+                operation: "status".to_string(),
+                name: "WORKER".to_string(),
+                ..Default::default()
+            })
+            .unwrap(),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let content: Json = serde_json::from_str(&output.content).unwrap();
+        assert_eq!(content["count"], json!(1));
+        assert_eq!(content["subagents"][0]["name"], json!("worker"));
+        assert_eq!(content["subagents"][0]["active_sessions"], json!(["job-1"]));
+        let session = &content["subagents"][0]["sessions"][0];
+        assert_eq!(session["session"], json!("job-1"));
+        assert_eq!(session["busy"], json!(true));
+        assert_eq!(session["turns"], json!(1));
+        assert_eq!(session["usage"]["input_tokens"], json!(10));
+        assert_eq!(session["last_progress"], json!("in progress"));
     }
 }

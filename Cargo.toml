@@ -91,12 +91,12 @@ dotenv = "0.15"
 schemars = { version = "1.0" }
 clap = { version = "4.5", features = ["derive", "env"] }
 idna = "1.0" # https://github.com/ldclabs/anda/security/dependabot/1
-url = "2.5"
 windows-sys = "0.52"
 hex = "0.4"
 tower-http = { version = "0.6", features = ["compression-gzip"] }
 glob = "0.3"
 serde-saphyr = "0.0"
+unicode-segmentation = "1"
 
 [patch.crates-io]
 
