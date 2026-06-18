@@ -78,6 +78,12 @@ reqwest = { version = "0.13", features = [
   "http2",
   # "hickory-dns",
 ], default-features = true }
+rmcp = { version = "1.7", default-features = false, features = [
+  "client",
+  "reqwest",
+  "transport-child-process",
+  "transport-streamable-http-client-reqwest",
+] }
 thiserror = "2"
 moka = { version = "0.12", features = ["future"] }
 log = { version = "0.4", features = ["kv_serde"] }

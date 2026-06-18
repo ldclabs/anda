@@ -454,7 +454,7 @@ impl Hook for SingleThreadHook {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anda_core::{AgentSet, CancellationToken, ToolSet};
+    use anda_core::{AgentSet, CancellationToken, ToolProviderSet, ToolSet};
     use parking_lot::Mutex;
 
     use crate::{
@@ -482,6 +482,7 @@ mod tests {
             base_ctx(),
             Arc::new(Models::default()),
             Arc::new(ToolSet::new()),
+            Arc::new(ToolProviderSet::new()),
             Arc::new(AgentSet::new()),
             Arc::new(SubAgentSetManager::new()),
         )

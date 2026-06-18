@@ -30,7 +30,8 @@ use anda_core::{
     CacheExpiry, CacheFeatures, CacheStoreFeatures, CancellationToken, CanisterCaller,
     CompletionFeatures, CompletionRequest, ContentPart, FunctionDefinition, HttpFeatures, Json,
     KeysFeatures, Message, ModelEffort, ObjectMeta, Path, PutMode, PutResult, RequestMeta,
-    Resource, StateFeatures, StoreFeatures, ToolCall, ToolInput, ToolOutput, ToolSet, Usage,
+    Resource, StateFeatures, StoreFeatures, ToolCall, ToolInput, ToolOutput, ToolProviderSet,
+    ToolSet, Usage,
 };
 use bytes::Bytes;
 use candid::{CandidType, Principal, utils::ArgumentEncoder};
@@ -97,6 +98,8 @@ pub struct AgentCtx {
 
     /// Set of available tools that can be called.
     pub(crate) tools: Arc<ToolSet<BaseCtx>>,
+    /// Runtime-discovered tool providers.
+    pub(crate) tool_providers: Arc<ToolProviderSet<BaseCtx>>,
     /// Set of available agents that can be invoked.
     pub(crate) agents: Arc<AgentSet<AgentCtx>>,
     pub(crate) subagents: Arc<SubAgentSetManager>,
@@ -114,6 +117,7 @@ impl AgentCtx {
         base: BaseCtx,
         models: Arc<Models>,
         tools: Arc<ToolSet<BaseCtx>>,
+        tool_providers: Arc<ToolProviderSet<BaseCtx>>,
         agents: Arc<AgentSet<AgentCtx>>,
         subagents: Arc<SubAgentSetManager>,
     ) -> Self {
@@ -123,6 +127,7 @@ impl AgentCtx {
             root: base,
             models,
             tools,
+            tool_providers,
             agents,
             subagents,
         }
@@ -139,6 +144,7 @@ impl AgentCtx {
             root: self.root.clone(),
             models: self.models.clone(),
             tools: self.tools.clone(),
+            tool_providers: self.tool_providers.clone(),
             agents: self.agents.clone(),
             subagents: self.subagents.clone(),
         })
@@ -176,6 +182,7 @@ impl AgentCtx {
             root: self.root.clone(),
             models: self.models.clone(),
             tools: self.tools.clone(),
+            tool_providers: self.tool_providers.clone(),
             agents: self.agents.clone(),
             subagents: self.subagents.clone(),
         })
@@ -208,6 +215,11 @@ impl AgentCtx {
             base: self.base.with_caller(caller),
             ..self.clone()
         }
+    }
+
+    pub(crate) fn has_tool_lowercase(&self, lowercase_name: &str) -> bool {
+        self.tools.contains_lowercase(lowercase_name)
+            || self.tool_providers.contains_lowercase(lowercase_name)
     }
 
     /// Creates a completion runner for iterative processing of completion requests.
@@ -268,7 +280,15 @@ impl AgentContext for AgentCtx {
     /// # Returns
     /// Vector of function definitions for the requested tools.
     fn tool_definitions(&self, names: Option<&[String]>) -> Vec<FunctionDefinition> {
-        self.tools.definitions(names)
+        let mut definitions = self.tools.definitions(names);
+        let mut seen: BTreeSet<String> =
+            BTreeSet::from_iter(definitions.iter().map(|d| d.name.to_ascii_lowercase()));
+        for definition in self.tool_providers.definitions(names) {
+            if seen.insert(definition.name.to_ascii_lowercase()) {
+                definitions.push(definition);
+            }
+        }
+        definitions
     }
 
     /// Retrieves definitions for available tools in the remote engines.
@@ -291,13 +311,15 @@ impl AgentContext for AgentCtx {
         }
 
         let mut defs = self.base.remote.tool_definitions(endpoint, names);
+        let mut seen: BTreeSet<String> =
+            BTreeSet::from_iter(defs.iter().map(|d| d.name.to_ascii_lowercase()));
         if let Ok((engines, _)) = self
             .root
             .cache_store_get::<RemoteEngines>(DYNAMIC_REMOTE_ENGINES)
             .await
         {
             for def in engines.tool_definitions(endpoint, names) {
-                if !defs.iter().any(|d| d.name == def.name) {
+                if seen.insert(def.name.to_ascii_lowercase()) {
                     defs.push(def);
                 }
             }
@@ -330,7 +352,12 @@ impl AgentContext for AgentCtx {
             }
         }
 
-        self.tools.select_resources(prefixed_name, resources)
+        if self.tools.contains(prefixed_name) {
+            return self.tools.select_resources(prefixed_name, resources);
+        }
+
+        self.tool_providers
+            .select_resources(prefixed_name, resources)
     }
 
     /// Retrieves definitions for available agents.
@@ -488,11 +515,15 @@ impl AgentContext for AgentCtx {
         }
 
         let ctx = self.child_base(&input.name)?;
-        let tool = self
-            .tools
-            .get(&input.name)
-            .ok_or_else(|| format!("tool {} not found", &input.name))?;
-        tool.call(ctx, input.args, input.resources)
+        if let Some(tool) = self.tools.get(&input.name) {
+            return tool
+                .call(ctx, input.args, input.resources)
+                .await
+                .map(|output| (output, None));
+        }
+
+        self.tool_providers
+            .call(ctx, input)
             .await
             .map(|output| (output, None))
     }
@@ -1580,7 +1611,7 @@ impl CompletionRunner {
                 let mut tool_call_futs: Vec<BoxPinFut<ToolCall>> = Vec::new();
                 for mut tool in tool_calls.into_iter() {
                     let tool_name = tool.name.to_ascii_lowercase();
-                    if self.ctx.tools.contains_lowercase(&tool_name)
+                    if self.ctx.has_tool_lowercase(&tool_name)
                         || strip_prefix_ignore_ascii_case(&tool_name, REMOTE_TOOL_PREFIX).is_some()
                     {
                         let ctx = self.ctx.clone();

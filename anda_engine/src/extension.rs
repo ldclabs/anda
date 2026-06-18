@@ -8,6 +8,7 @@
 //! # Key Components
 //! - [`fetch`]: HTTP fetching and resource loading.
 //! - [`fs`]: workspace-scoped file read, write, search, and edit tools.
+//! - [`mcp`]: dynamic tool provider for external MCP servers.
 //! - [`note`]: lightweight per-agent note storage.
 //! - [`shell`]: shell command execution via a pluggable [`shell::Executor`]
 //!   runtime (the host [`shell::NativeRuntime`] by default).
@@ -16,6 +17,7 @@
 
 pub mod fetch;
 pub mod fs;
+pub mod mcp;
 pub mod note;
 pub mod shell;
 pub mod skill;

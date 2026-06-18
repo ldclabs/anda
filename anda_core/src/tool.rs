@@ -14,8 +14,8 @@ use serde::{Serialize, de::DeserializeOwned};
 use std::{any::Any, collections::BTreeMap, future::Future, marker::PhantomData, sync::Arc};
 
 use crate::{
-    BoxError, BoxPinFut, Function, Json, Resource, ToolOutput, context::BaseContext,
-    model::FunctionDefinition, select_resources, validate_function_name,
+    BoxError, BoxFut, BoxPinFut, Function, Json, Resource, ToolInput, ToolOutput,
+    context::BaseContext, model::FunctionDefinition, select_resources, validate_function_name,
 };
 
 /// Strongly typed interface for an agent tool.
@@ -157,6 +157,61 @@ where
     ) -> BoxPinFut<Result<ToolOutput<Json>, BoxError>>;
 }
 
+/// Dynamic source of callable tools.
+///
+/// Providers are useful for integrations whose tool set is discovered at
+/// runtime, such as remote MCP servers. A provider exposes a synchronous
+/// snapshot for model-facing discovery and async methods for refresh and call
+/// execution.
+pub trait ToolProvider<C>: Send + Sync
+where
+    C: BaseContext + Send + Sync,
+{
+    /// Returns the provider registry name.
+    ///
+    /// This name is for engine configuration and diagnostics, not a
+    /// model-facing tool name.
+    fn name(&self) -> String;
+
+    /// Returns the current function definitions from this provider.
+    fn definitions(&self, names: Option<&[String]>) -> Vec<FunctionDefinition>;
+
+    /// Returns whether this provider can currently dispatch the lowercase name.
+    fn contains_lowercase(&self, lowercase_name: &str) -> bool {
+        self.definitions(Some(&[lowercase_name.to_string()]))
+            .iter()
+            .any(|definition| definition.name.eq_ignore_ascii_case(lowercase_name))
+    }
+
+    /// Returns resource tags this provider's named tool can consume.
+    fn supported_resource_tags(&self, _name: &str) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Removes and returns resources matching the named tool.
+    fn select_resources(&self, name: &str, resources: &mut Vec<Resource>) -> Vec<Resource> {
+        let supported_tags = self.supported_resource_tags(name);
+        select_resources(resources, &supported_tags)
+    }
+
+    /// Initializes the provider and refreshes any runtime discovery cache.
+    fn init(&self, _ctx: C) -> BoxFut<'_, Result<(), BoxError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Refreshes the provider's discovery cache.
+    fn refresh(&self) -> BoxFut<'_, Result<(), BoxError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Executes a provider-backed tool by model-facing name.
+    fn call(
+        &self,
+        ctx: C,
+        input: ToolInput<Json>,
+    ) -> BoxFut<'_, Result<ToolOutput<Json>, BoxError>>;
+}
+
 impl<C> dyn DynTool<C>
 where
     C: BaseContext + Send + Sync + 'static,
@@ -236,6 +291,130 @@ where
 pub struct ToolSet<C: BaseContext> {
     /// Registered tools keyed by their lowercase function names.
     pub set: BTreeMap<String, Arc<dyn DynTool<C>>>,
+}
+
+/// Registry for runtime-discovered tool providers.
+#[derive(Default)]
+pub struct ToolProviderSet<C: BaseContext> {
+    /// Registered providers keyed by provider name.
+    pub set: BTreeMap<String, Arc<dyn ToolProvider<C>>>,
+}
+
+impl<C> ToolProviderSet<C>
+where
+    C: BaseContext + Clone + Send + Sync + 'static,
+{
+    /// Creates an empty provider set.
+    pub fn new() -> Self {
+        Self {
+            set: BTreeMap::new(),
+        }
+    }
+
+    /// Returns whether a provider with the given name exists.
+    pub fn contains_provider(&self, name: &str) -> bool {
+        self.set.contains_key(&name.to_ascii_lowercase())
+    }
+
+    /// Registers a new dynamic tool provider.
+    pub fn add<T>(&mut self, provider: Arc<T>) -> Result<(), BoxError>
+    where
+        T: ToolProvider<C> + Send + Sync + 'static,
+    {
+        let name = provider.name().to_ascii_lowercase();
+        validate_function_name(&name)?;
+        if self.set.contains_key(&name) {
+            return Err(format!("tool provider {} already exists", name).into());
+        }
+
+        self.set.insert(name, provider);
+        Ok(())
+    }
+
+    /// Returns whether any provider can currently dispatch the given name.
+    pub fn contains_lowercase(&self, lowercase_name: &str) -> bool {
+        self.set
+            .values()
+            .any(|provider| provider.contains_lowercase(lowercase_name))
+    }
+
+    /// Returns dynamic function definitions for all providers or selected names.
+    pub fn definitions(&self, names: Option<&[String]>) -> Vec<FunctionDefinition> {
+        match names {
+            Some([]) => Vec::new(),
+            _ => {
+                let mut definitions = BTreeMap::new();
+                for provider in self.set.values() {
+                    for definition in provider.definitions(names) {
+                        definitions
+                            .entry(definition.name.to_ascii_lowercase())
+                            .or_insert(definition);
+                    }
+                }
+                definitions.into_values().collect()
+            }
+        }
+    }
+
+    /// Returns function metadata for all provider-backed tools or selected names.
+    pub fn functions(&self, names: Option<&[String]>) -> Vec<Function> {
+        self.definitions(names)
+            .into_iter()
+            .map(|definition| {
+                let supported_resource_tags = self
+                    .set
+                    .values()
+                    .find(|provider| provider.contains_lowercase(&definition.name))
+                    .map(|provider| provider.supported_resource_tags(&definition.name))
+                    .unwrap_or_default();
+                Function {
+                    definition,
+                    supported_resource_tags,
+                }
+            })
+            .collect()
+    }
+
+    /// Removes and returns resources supported by the named provider tool.
+    pub fn select_resources(&self, name: &str, resources: &mut Vec<Resource>) -> Vec<Resource> {
+        let lowercase_name = name.to_ascii_lowercase();
+        self.set
+            .values()
+            .find(|provider| provider.contains_lowercase(&lowercase_name))
+            .map(|provider| provider.select_resources(&lowercase_name, resources))
+            .unwrap_or_default()
+    }
+
+    /// Initializes all providers.
+    pub async fn init_all(&self, ctx: C) -> Result<(), BoxError> {
+        for provider in self.set.values() {
+            provider.init(ctx.clone()).await?;
+        }
+        Ok(())
+    }
+
+    /// Refreshes all providers.
+    pub async fn refresh_all(&self) -> Result<(), BoxError> {
+        for provider in self.set.values() {
+            provider.refresh().await?;
+        }
+        Ok(())
+    }
+
+    /// Executes a dynamic provider-backed tool.
+    pub async fn call(
+        &self,
+        ctx: C,
+        mut input: ToolInput<Json>,
+    ) -> Result<ToolOutput<Json>, BoxError> {
+        input.name.make_ascii_lowercase();
+        let provider = self
+            .set
+            .values()
+            .find(|provider| provider.contains_lowercase(&input.name))
+            .ok_or_else(|| format!("tool {} not found", input.name))?;
+        provider.call(ctx, input).await
+    }
 }
 
 impl<C> ToolSet<C>

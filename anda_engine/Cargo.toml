@@ -51,6 +51,7 @@ log = { workspace = true }
 url = { workspace = true }
 serde-saphyr = { workspace = true }
 glob = { workspace = true }
+rmcp = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }

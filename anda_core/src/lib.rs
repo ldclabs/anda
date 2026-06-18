@@ -37,6 +37,9 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// A type alias for a boxed future that is thread-safe and sendable across threads.
 pub type BoxPinFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
+/// A type alias for a borrowed boxed future that is thread-safe and sendable.
+pub type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
 /// Returns a lowercase copy of an object-store path.
 pub fn path_lowercase(path: &Path) -> Path {
     let mut path = path.to_string();

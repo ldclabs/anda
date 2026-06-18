@@ -4,6 +4,15 @@ All notable changes to the Anda project will be documented in this file.
 
 ## [0.13.5] — 2026-06-18
 
+### Added — anda_core v0.13.5
+
+- **Dynamic tool provider contract** — Added `ToolProvider`, `ToolProviderSet`, and borrowed `BoxFut` support so runtimes can expose tools discovered at runtime while keeping static `Tool`/`ToolSet` behavior intact.
+
+### Added — anda_engine v0.13.5
+
+- **Runtime-discovered tool providers** — Engine builders can now register dynamic tool providers, merge provider-backed functions into tool discovery, route direct and agent-driven tool calls through providers, and initialize providers during engine build.
+- **MCP tools extension** — Added `anda_engine::extension::mcp`, a reusable MCP host/client provider backed by `rmcp` with stdio and Streamable HTTP transports, tool allow/deny filters, legal Anda tool-name mapping, dirty refresh on `tools/list_changed`, audited tool outputs, and explicit exclusion of deprecated Roots/Sampling/Logging control capabilities.
+
 ### Fixed — anda_engine v0.13.5
 
 - **Streaming completion timeout handling** — Model completion clients no longer use HTTP/2 keep-alive PINGs as the liveness detector for long SSE reasoning streams. Completion transport now relies on a per-read body idle timeout plus the existing total request timeout, preventing provider/CDN PING ACK delays from aborting streams that are still producing body chunks.

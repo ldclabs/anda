@@ -53,7 +53,8 @@
 use anda_cloud_cdk::{ChallengeEnvelope, ChallengeRequest, TEEInfo, TEEKind};
 use anda_core::{
     Agent, AgentInput, AgentOutput, AgentSet, BoxError, Function, Json, Path, RequestMeta,
-    Resource, Tool, ToolInput, ToolOutput, ToolSet, validate_function_name,
+    Resource, Tool, ToolInput, ToolOutput, ToolProvider, ToolProviderSet, ToolSet,
+    validate_function_name,
 };
 use candid::Principal;
 use ic_tee_cdk::AttestationRequest;
@@ -195,7 +196,7 @@ impl Engine {
 
         // manager can access any tool
         if (!self.export_tools.contains(&name) && !self.management.is_manager(&caller))
-            || !self.ctx.tools.contains(&name)
+            || !self.ctx.has_tool_lowercase(&name)
         {
             return Err(format!("tool {} not found", name).into());
         }
@@ -273,7 +274,7 @@ impl Engine {
         mut input: ToolInput<Json>,
     ) -> Result<ToolOutput<Json>, BoxError> {
         input.name.make_ascii_lowercase();
-        let meta = input.meta.unwrap_or_default();
+        let meta = input.meta.take().unwrap_or_default();
         if meta.engine.is_some() && meta.engine != Some(self.id) {
             return Err(format!(
                 "invalid engine ID, expected {}, got {:?}",
@@ -294,24 +295,27 @@ impl Engine {
             return Err(format!("tool {} not found", &input.name).into());
         }
 
-        let tool = self
-            .ctx
-            .tools
-            .get(&input.name)
-            .ok_or_else(|| format!("tool {} not found", &input.name))?;
+        if !self.ctx.has_tool_lowercase(&input.name) {
+            return Err(format!("tool {} not found", &input.name).into());
+        }
 
         let visibility = self.management.check_visibility(&caller)?;
         if visibility == Visibility::Protected && !self.management.is_manager(&caller) {
             return Err("caller does not have permission".into());
         }
 
+        let tool_name = input.name.clone();
         let ctx = self
             .ctx
-            .child_base_with(caller, &self.default_agent, &input.name, meta)?;
-        self.hooks.on_tool_start(&ctx, &input.name).await?;
+            .child_base_with(caller, &self.default_agent, &tool_name, meta)?;
+        self.hooks.on_tool_start(&ctx, &tool_name).await?;
 
-        let output = tool.call(ctx.clone(), input.args, input.resources).await?;
-        let res = self.hooks.on_tool_end(&ctx, &input.name, output).await?;
+        let output = if let Some(tool) = self.ctx.tools.get(&tool_name) {
+            tool.call(ctx.clone(), input.args, input.resources).await?
+        } else {
+            self.ctx.tool_providers.call(ctx.clone(), input).await?
+        };
+        let res = self.hooks.on_tool_end(&ctx, &tool_name, output).await?;
         Ok(res)
     }
 
@@ -326,7 +330,18 @@ impl Engine {
     ///
     /// When `names` is `Some`, only matching names are returned.
     pub fn tools(&self, names: Option<&[String]>) -> Vec<Function> {
-        self.ctx.tools.functions(names)
+        let mut functions = self.ctx.tools.functions(names);
+        let mut seen: BTreeSet<String> = BTreeSet::from_iter(
+            functions
+                .iter()
+                .map(|f| f.definition.name.to_ascii_lowercase()),
+        );
+        for function in self.ctx.tool_providers.functions(names) {
+            if seen.insert(function.definition.name.to_ascii_lowercase()) {
+                functions.push(function);
+            }
+        }
+        functions
     }
 
     /// Returns a reference to the subagents manager.
@@ -414,6 +429,7 @@ impl Engine {
 pub struct EngineBuilder {
     info: AgentInfo,
     tools: ToolSet<BaseCtx>,
+    tool_providers: ToolProviderSet<BaseCtx>,
     agents: AgentSet<AgentCtx>,
     subagents: SubAgentSetManager,
     remote: HashMap<String, RemoteEngineArgs>,
@@ -459,6 +475,7 @@ impl EngineBuilder {
                 ..Default::default()
             },
             tools,
+            tool_providers: ToolProviderSet::new(),
             agents,
             subagents,
             remote: HashMap::new(),
@@ -533,6 +550,30 @@ impl EngineBuilder {
                 return Err(format!("tool {} already exists", name).into());
             }
             self.tools.set.insert(name, tool);
+        }
+
+        Ok(self)
+    }
+
+    /// Registers a dynamic tool provider with the engine.
+    pub fn register_tool_provider<T>(mut self, provider: Arc<T>) -> Result<Self, BoxError>
+    where
+        T: ToolProvider<BaseCtx> + Send + Sync + 'static,
+    {
+        self.tool_providers.add(provider)?;
+        Ok(self)
+    }
+
+    /// Registers multiple dynamic tool providers with the engine.
+    pub fn register_tool_providers(
+        mut self,
+        providers: ToolProviderSet<BaseCtx>,
+    ) -> Result<Self, BoxError> {
+        for (name, provider) in providers.set {
+            if self.tool_providers.set.contains_key(&name) {
+                return Err(format!("tool provider {} already exists", name).into());
+            }
+            self.tool_providers.set.insert(name, provider);
         }
 
         Ok(self)
@@ -653,12 +694,14 @@ impl EngineBuilder {
         );
 
         let tools = Arc::new(self.tools);
+        let tool_providers = Arc::new(self.tool_providers);
         let agents = Arc::new(self.agents);
 
         let ctx = AgentCtx::new(
             ctx,
             self.models,
             tools.clone(),
+            tool_providers.clone(),
             agents.clone(),
             Arc::new(self.subagents),
         );
@@ -668,6 +711,8 @@ impl EngineBuilder {
             let ct = ctx.child_base_with(id, "", name, meta.clone())?;
             tool.init(ct).await?;
         }
+
+        tool_providers.init_all(ctx.base.clone()).await?;
 
         for (name, agent) in &agents.set {
             let ct = ctx.child_with(id, name, agent.label(), meta.clone())?;
@@ -737,12 +782,14 @@ impl EngineBuilder {
         );
 
         let tools = Arc::new(self.tools);
+        let tool_providers = Arc::new(self.tool_providers);
         let agents = Arc::new(self.agents);
 
         let ctx = AgentCtx::new(
             ctx,
             self.models,
             tools.clone(),
+            tool_providers.clone(),
             agents.clone(),
             Arc::new(self.subagents),
         );
@@ -752,6 +799,8 @@ impl EngineBuilder {
             let ct = ctx.child_base_with(id, &default_agent, name, meta.clone())?;
             tool.init(ct).await?;
         }
+
+        tool_providers.init_all(ctx.base.clone()).await?;
 
         for (name, agent) in &agents.set {
             let ct = ctx.child_with(id, name, agent.label(), meta.clone())?;
@@ -807,6 +856,7 @@ impl EngineBuilder {
             ctx,
             self.models,
             Arc::new(self.tools),
+            Arc::new(self.tool_providers),
             Arc::new(self.agents),
             Arc::new(self.subagents),
         )
@@ -888,7 +938,7 @@ impl EngineRef {
 mod tests {
     use super::*;
     use crate::ANONYMOUS;
-    use anda_core::FunctionDefinition;
+    use anda_core::{BoxFut, FunctionDefinition, ToolProvider};
     use serde_json::json;
 
     struct EchoAgent;
@@ -984,6 +1034,46 @@ mod tests {
                     "resources": resources.len(),
                 }),
                 ..Default::default()
+            })
+        }
+    }
+
+    struct DynamicToolProvider;
+
+    impl ToolProvider<BaseCtx> for DynamicToolProvider {
+        fn name(&self) -> String {
+            "dynamic_provider".to_string()
+        }
+
+        fn definitions(&self, names: Option<&[String]>) -> Vec<FunctionDefinition> {
+            let definition = FunctionDefinition {
+                name: "dynamic_echo".to_string(),
+                description: "Echoes dynamic provider args".to_string(),
+                parameters: json!({"type": "object"}),
+                strict: Some(false),
+            };
+            match names {
+                Some(names)
+                    if !names
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case(&definition.name)) =>
+                {
+                    Vec::new()
+                }
+                _ => vec![definition],
+            }
+        }
+
+        fn call(
+            &self,
+            _ctx: BaseCtx,
+            input: ToolInput<Json>,
+        ) -> BoxFut<'_, Result<ToolOutput<Json>, BoxError>> {
+            Box::pin(async move {
+                Ok(ToolOutput::new(json!({
+                    "name": input.name,
+                    "args": input.args,
+                })))
             })
         }
     }
@@ -1198,6 +1288,38 @@ mod tests {
             "tool_call with invalid user",
         );
         assert!(err.to_string().contains("invalid user name"));
+    }
+
+    #[tokio::test]
+    async fn dynamic_tool_provider_discovers_and_calls_tools() {
+        let engine = Engine::builder()
+            .with_info(info())
+            .with_management(public_management())
+            .register_tool_provider(Arc::new(DynamicToolProvider))
+            .unwrap()
+            .register_agent(Arc::new(EchoAgent), None)
+            .unwrap()
+            .export_tools(vec!["dynamic_echo".to_string()])
+            .build("echo_agent".to_string())
+            .await
+            .unwrap();
+
+        let tools = engine.tools(None);
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool.definition.name == "dynamic_echo")
+        );
+
+        let output = engine
+            .tool_call(
+                ANONYMOUS,
+                ToolInput::new("dynamic_echo".to_string(), json!({"value": 1})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.output["name"], "dynamic_echo");
+        assert_eq!(output.output["args"], json!({"value": 1}));
     }
 
     #[tokio::test]
