@@ -30,8 +30,8 @@ use anda_core::{
     CacheExpiry, CacheFeatures, CacheStoreFeatures, CancellationToken, CanisterCaller,
     CompletionFeatures, CompletionRequest, ContentPart, FunctionDefinition, HttpFeatures, Json,
     KeysFeatures, Message, ModelEffort, ObjectMeta, Path, PutMode, PutResult, RequestMeta,
-    Resource, StateFeatures, StoreFeatures, ToolCall, ToolInput, ToolOutput, ToolProviderSet,
-    ToolSet, Usage,
+    Resource, StateFeatures, StoreFeatures, ToolCall, ToolGroup, ToolInput, ToolOutput,
+    ToolProviderSet, ToolSet, Usage,
 };
 use bytes::Bytes;
 use candid::{CandidType, Principal, utils::ArgumentEncoder};
@@ -220,6 +220,49 @@ impl AgentCtx {
     pub(crate) fn has_tool_lowercase(&self, lowercase_name: &str) -> bool {
         self.tools.contains_lowercase(lowercase_name)
             || self.tool_providers.contains_lowercase(lowercase_name)
+    }
+
+    /// Returns the capability groups exposed to discovery.
+    ///
+    /// Groups bundle related tools — both static tools that declare a group (for
+    /// example the filesystem or memory tools) and provider-backed tools (for
+    /// example all tools from one MCP server) — so the discovery helpers can
+    /// tell the model the tools are related and how to combine them.
+    pub fn tool_groups(&self) -> Vec<ToolGroup> {
+        let mut groups = BTreeMap::new();
+        let mut visible_names = BTreeSet::new();
+
+        let static_names: BTreeMap<String, String> = self
+            .tools
+            .definitions(None)
+            .into_iter()
+            .map(|definition| {
+                (
+                    definition.name.to_ascii_lowercase(),
+                    definition.name.clone(),
+                )
+            })
+            .collect();
+        visible_names.extend(static_names.keys().cloned());
+        for group in self.tools.groups() {
+            merge_visible_group(&mut groups, group, &static_names);
+        }
+
+        for provider in self.tool_providers.set.values() {
+            let mut provider_names = BTreeMap::new();
+            for definition in provider.definitions(None) {
+                let lowercase = definition.name.to_ascii_lowercase();
+                if visible_names.insert(lowercase.clone()) {
+                    provider_names.insert(lowercase, definition.name);
+                }
+            }
+
+            for group in provider.groups() {
+                merge_visible_group(&mut groups, group, &provider_names);
+            }
+        }
+
+        groups.into_values().collect()
     }
 
     /// Creates a completion runner for iterative processing of completion requests.
@@ -1972,6 +2015,58 @@ impl Stream for CompletionStream {
                 }
             }
             Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+fn merge_visible_group(
+    groups: &mut BTreeMap<String, ToolGroup>,
+    mut group: ToolGroup,
+    visible_names: &BTreeMap<String, String>,
+) {
+    let id = group.id.trim();
+    if id.is_empty() || visible_names.is_empty() {
+        return;
+    }
+
+    let mut seen_members = BTreeSet::new();
+    let mut members = group
+        .members
+        .into_iter()
+        .filter_map(|member| {
+            let lowercase = member.trim().to_ascii_lowercase();
+            if lowercase.is_empty() || !seen_members.insert(lowercase.clone()) {
+                return None;
+            }
+            visible_names.get(&lowercase).cloned()
+        })
+        .collect::<Vec<_>>();
+    if members.is_empty() {
+        return;
+    }
+    members.sort_by_key(|name| name.to_ascii_lowercase());
+
+    let key = id.to_ascii_lowercase();
+    match groups.get_mut(&key) {
+        Some(existing) => {
+            let mut existing_members = existing
+                .members
+                .iter()
+                .map(|member| member.to_ascii_lowercase())
+                .collect::<BTreeSet<_>>();
+            for member in members {
+                if existing_members.insert(member.to_ascii_lowercase()) {
+                    existing.members.push(member);
+                }
+            }
+            existing
+                .members
+                .sort_by_key(|name| name.to_ascii_lowercase());
+        }
+        None => {
+            group.id = id.to_string();
+            group.members = members;
+            groups.insert(key, group);
         }
     }
 }

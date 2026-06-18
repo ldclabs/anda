@@ -31,6 +31,9 @@ The core engine lets developers register agents and tools, route model requests 
 5. **Extensible memory and skills**
    Optional extensions provide conversation storage, KIP-based memory tools, filesystem access, shell execution, fetch, notes, todos, and file-backed skills.
 
+6. **Discovery-aware tool bundles**
+   Static tools, dynamic providers, and MCP servers can expose capability groups so agents can survey related tool bundles with `tools_groups`, then expand a group with `tools_select` only when its schemas are needed.
+
 ## Project
 
 Documents:

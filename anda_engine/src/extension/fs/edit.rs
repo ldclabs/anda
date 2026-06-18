@@ -3,7 +3,9 @@
 //! Edits are applied atomically after validating that the target file is regular
 //! and stays within the filesystem tool size limit.
 
-use anda_core::{BoxError, FunctionDefinition, Resource, StateFeatures, Tool, ToolOutput};
+use anda_core::{
+    BoxError, FunctionDefinition, Resource, StateFeatures, Tool, ToolGroupInfo, ToolOutput,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::PathBuf;
@@ -97,6 +99,10 @@ impl Tool<BaseCtx> for EditFileTool {
 
     fn description(&self) -> String {
         self.description.clone()
+    }
+
+    fn group(&self) -> Option<ToolGroupInfo> {
+        Some(super::fs_tool_group_info())
     }
 
     fn definition(&self) -> FunctionDefinition {

@@ -31,6 +31,9 @@ Anda は、モデル、ツール、メモリ、ほかのエージェントを 1 
 5. **拡張可能なメモリとスキル**
    オプションの extensions は、conversation storage、KIP ベースの memory tools、filesystem、shell、fetch、notes、todos、ファイルベースの skills を提供します。
 
+6. **発見フローに対応したツールバンドル**
+   静的 tools、動的 providers、MCP servers は capability groups を公開できるため、agents は `tools_groups` で関連ツールのまとまりを確認し、schema が必要になった時だけ `tools_select` で group を展開できます。
+
 ## プロジェクト
 
 ドキュメント:

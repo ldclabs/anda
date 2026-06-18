@@ -11,6 +11,7 @@ Source map:
 - [`engine.rs`](../anda_engine/src/engine.rs): top-level `Engine`, `EngineBuilder`, exported APIs, management checks, hooks, challenge signing.
 - [`context/agent.rs`](../anda_engine/src/context/agent.rs): `AgentCtx`, local/remote/subagent routing, `CompletionRunner`, `CompletionStream`.
 - [`context/base.rs`](../anda_engine/src/context/base.rs): `BaseCtx`, scoped state, cache, store, keys, HTTP, signed RPC, cancellation.
+- [`context/tool.rs`](../anda_engine/src/context/tool.rs): built-in discovery agents: `tools_groups`, `tools_search`, and `tools_select`.
 - [`model.rs`](../anda_engine/src/model.rs): `Models` label router, provider adapters, retry and streaming helpers.
 - [`subagent.rs`](../anda_engine/src/subagent.rs): reusable subagents, background sessions, compaction and handoff.
 - [`memory.rs`](../anda_engine/src/memory.rs): conversation/resource storage and KIP/Cognitive Nexus tools.
@@ -80,8 +81,8 @@ Source map:
 <div class="anda-layer registry">
 <div class="anda-layer-title">Callable Registries</div>
 <div class="anda-grid three">
-<div class="anda-box"><strong>AgentSet</strong><small>Local agents, including built-in `tools_search`, `tools_select`, and `subagents_manager`.</small></div>
-<div class="anda-box"><strong>ToolSet</strong><small>Typed `Tool&lt;BaseCtx&gt;` implementations with JSON function definitions and resource tags.</small></div>
+<div class="anda-box"><strong>AgentSet</strong><small>Local agents, including built-in `tools_groups`, `tools_search`, `tools_select`, and `subagents_manager`.</small></div>
+<div class="anda-box"><strong>ToolSet / ToolProviderSet</strong><small>Static tools and runtime-discovered providers with function definitions, resource tags, and capability groups.</small></div>
 <div class="anda-box"><strong>RemoteEngines</strong><small>Remote function metadata routed with `RA_` and `RT_` prefixes.</small></div>
 </div>
 </div>
@@ -219,9 +220,9 @@ Host --> Caller : response
 
 - `Engine` is the public runtime boundary. It enforces exported agent/tool lists for non-manager callers and always exports the default agent.
 - `EngineBuilder` starts with in-memory storage, no implemented Web3 client, no external model, and built-in discovery/subagent control agents.
-- `AgentCtx` is the main scheduling surface. It exposes local tools, local agents, subagents, registered remote engines, and dynamic remote engines from cache.
+- `AgentCtx` is the main scheduling surface. It exposes local tools, dynamic tool providers, local agents, subagents, registered remote engines, and dynamic remote engines from cache.
 - `CompletionRunner` is iterative. A model turn can return tool calls; the runner executes them and feeds tool outputs into the next model turn.
-- `tools_search` and `tools_select` are agents, not side channels. Their outputs can add discovered tool schemas to later requests while compacting repeated schema payloads from conversation context.
+- `tools_groups`, `tools_search`, and `tools_select` are agents, not side channels. `tools_groups` returns a compact directory of visible capability bundles; `tools_select` can expand one group into schemas, and discovered schemas stay in tool-output context while repeated payloads are compacted from conversation context.
 - `BaseCtx` creates namespace-scoped child contexts. Agent paths use `a_<agent>`, tool paths use `t_<tool>`, and all store/cache operations are resolved under that path.
 - `Models` routes by label first and then falls back to the primary/default model. Provider-specific names stay inside adapter configuration.
 - `SubAgentManager` turns persisted or temporary `SubAgent` definitions into callable `SA_<name>` agents. Long-running subagent sessions use hooks to push progress and final output.

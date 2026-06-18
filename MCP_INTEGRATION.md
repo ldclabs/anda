@@ -10,7 +10,9 @@ expansion, and launcher UX, then pass concrete server configs into
 The first implementation supports MCP tools only:
 
 - Transports: stdio child process and Streamable HTTP.
-- Discovery: `tools/list` is cached as a dynamic `ToolProvider` snapshot.
+- Discovery: `tools/list` is cached as a dynamic `ToolProvider` snapshot. The
+  server's `initialize` self-description (title and `instructions`) is captured
+  alongside the tools so each server can be surfaced as a capability group.
 - Invocation: `tools/call` is dispatched through the live MCP client session.
 - Refresh: `notifications/tools/list_changed` marks a session dirty; the next
   async refresh or call refreshes the affected server. Concurrent callers race
@@ -66,12 +68,54 @@ Every segment is lowercased and normalized to `a-z`, `0-9`, and `_`. Names that
 exceed 64 characters or collide after normalization receive a short hash suffix.
 The route keeps both names so calls use the original MCP tool name.
 
+## Capability Groups
+
+A flat tool list hides which tools belong together and how they combine. The
+provider therefore exposes one `ToolGroup` per server through the generic
+`ToolProvider::groups` contract:
+
+```text
+id:           mcp:<server_id>
+title:        server title (falls back to `MCP server `<id>``)
+description:  server description (falls back to a generic line)
+instructions: server `instructions` from the initialize handshake (optional)
+members:      every local tool name for that server
+```
+
+Groups are a *discovery-layer* concept; they are never sent to model providers
+as function-calling schema (the completion API has no group concept). The
+built-in discovery helpers expose them top-down:
+
+- `tools_groups` lists the available groups as a compact directory (`id`,
+  `title`, `description`, `member_count`) — no tool schemas — so the model can
+  scan which bundles exist without flooding its context.
+- `tools_select { group: "<id>" }` expands one group into the full schemas of
+  all its member tools in a single call.
+- `tools_search` / `tools_select` also attach the groups that the returned tools
+  belong to, so discovering one tool reveals the bundle's purpose, the server's
+  usage `instructions`, and the sibling member names.
+
+The typical flow is therefore: `tools_groups` to survey bundles → `tools_select`
+with a `group` id (or specific `tools`) to pull in schemas → call the tools.
+
+The same group machinery also serves static tool bundles: built-in tools that
+declare a `ToolGroupInfo` (for example the filesystem and persistent-memory
+tools) are surfaced through the identical directory and expansion path.
+Before discovery output is returned, group members are normalized against the
+currently visible callable definitions. Stale members are dropped, provider
+tools shadowed by static tools are hidden from the provider group, and duplicate
+group ids are merged so `tools_select { group }` expands the whole visible
+bundle deterministically.
+
 ## Security Boundaries
 
 - MCP servers are never enabled implicitly by this crate.
 - Stdio uses `command` plus `args`; it does not invoke a shell string.
 - Streamable HTTP validates custom headers before connecting.
 - Remote tool descriptions and annotations are treated as untrusted metadata.
+- Server title and `instructions` are likewise untrusted: they are surfaced as
+  group data the model reads, never as system instructions or runtime
+  directives.
 - Calls send only tool arguments and explicitly selected resources, not full
   conversation history.
 - Tool results include `server_id` and the original MCP tool name for audit.

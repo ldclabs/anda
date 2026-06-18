@@ -11,6 +11,7 @@
 - [`engine.rs`](../anda_engine/src/engine.rs)：顶层 `Engine`、`EngineBuilder`、导出 API、管理策略、hooks、challenge 签名。
 - [`context/agent.rs`](../anda_engine/src/context/agent.rs)：`AgentCtx`、本地/远程/subagent 路由、`CompletionRunner`、`CompletionStream`。
 - [`context/base.rs`](../anda_engine/src/context/base.rs)：`BaseCtx`、隔离 state、cache、store、keys、HTTP、signed RPC、cancellation。
+- [`context/tool.rs`](../anda_engine/src/context/tool.rs)：内置发现 agents：`tools_groups`、`tools_search` 和 `tools_select`。
 - [`model.rs`](../anda_engine/src/model.rs)：`Models` 标签路由、provider adapters、重试和 streaming 解析。
 - [`subagent.rs`](../anda_engine/src/subagent.rs)：可复用 subagents、后台 sessions、compaction 和 handoff。
 - [`memory.rs`](../anda_engine/src/memory.rs)：conversation/resource 存储和 KIP/Cognitive Nexus tools。
@@ -80,8 +81,8 @@
 <div class="anda-layer registry">
 <div class="anda-layer-title">可调用对象注册表</div>
 <div class="anda-grid three">
-<div class="anda-box"><strong>AgentSet</strong><small>本地 agents，包括内置 `tools_search`、`tools_select`、`subagents_manager`。</small></div>
-<div class="anda-box"><strong>ToolSet</strong><small>类型化 `Tool&lt;BaseCtx&gt;`，提供 JSON function definitions 和 resource tags。</small></div>
+<div class="anda-box"><strong>AgentSet</strong><small>本地 agents，包括内置 `tools_groups`、`tools_search`、`tools_select`、`subagents_manager`。</small></div>
+<div class="anda-box"><strong>ToolSet / ToolProviderSet</strong><small>静态 tools 和运行时发现的 providers，提供 function definitions、resource tags 和 capability groups。</small></div>
 <div class="anda-box"><strong>RemoteEngines</strong><small>远程函数元数据，通过 `RA_` 和 `RT_` 前缀路由。</small></div>
 </div>
 </div>
@@ -219,9 +220,9 @@ Host --> Caller : response
 
 - `Engine` 是公开运行时边界。它对非 manager 调用者执行 exported agent/tool lists 检查，并自动导出 default agent。
 - `EngineBuilder` 默认使用 in-memory store、not-implemented Web3 client、无外部模型，并注册 discovery/subagent control agents。
-- `AgentCtx` 是主要调度面。它暴露本地 tools、本地 agents、subagents、已注册远程 engines，以及从 cache 动态加载的远程 engines。
+- `AgentCtx` 是主要调度面。它暴露本地 tools、动态 tool providers、本地 agents、subagents、已注册远程 engines，以及从 cache 动态加载的远程 engines。
 - `CompletionRunner` 是迭代式执行器。模型回合可以返回 tool calls；runner 执行它们，再把 tool outputs 回灌到下一轮模型请求。
-- `tools_search` 和 `tools_select` 是 agents，不是旁路机制。它们的输出可以把发现的 tool schemas 合并进后续请求，同时压缩 conversation context 中重复的 schema payload。
+- `tools_groups`、`tools_search` 和 `tools_select` 是 agents，不是旁路机制。`tools_groups` 返回当前可见 capability bundles 的紧凑目录；`tools_select` 可以把一个 group 展开成 schemas，发现到的 schemas 仍保留在 tool-output context 中，并压缩 conversation context 中重复的 schema payload。
 - `BaseCtx` 创建命名空间隔离的 child contexts。Agent 路径使用 `a_<agent>`，tool 路径使用 `t_<tool>`，store/cache 操作都在该 path 下解析。
 - `Models` 先按 label 路由，再回落到 primary/default model。provider 真实模型名留在 adapter 配置内部。
 - `SubAgentManager` 把持久化或临时 `SubAgent` 定义转成可调用的 `SA_<name>` agents。长任务 session 通过 hooks 推送 progress 和 final output。

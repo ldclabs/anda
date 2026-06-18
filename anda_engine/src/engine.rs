@@ -68,8 +68,8 @@ use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
 
 use crate::{
     context::{
-        AgentCtx, BaseCtx, ToolsSearch, ToolsSelect, Web3Client, Web3SDK, agent_context_path,
-        tool_context_path,
+        AgentCtx, BaseCtx, ToolsGroups, ToolsSearch, ToolsSelect, Web3Client, Web3SDK,
+        agent_context_path, tool_context_path,
     },
     hook::{Hook, Hooks},
     management::{BaseManagement, Management, SYSTEM_PATH, Visibility},
@@ -465,6 +465,9 @@ impl EngineBuilder {
             .unwrap();
         agents
             .add(Arc::new(ToolsSelect::new()), Some("flash".to_string()))
+            .unwrap();
+        agents
+            .add(Arc::new(ToolsGroups::new()), Some("flash".to_string()))
             .unwrap();
         EngineBuilder {
             info: AgentInfo {

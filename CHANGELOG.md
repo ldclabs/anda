@@ -4,8 +4,19 @@ All notable changes to the Anda project will be documented in this file.
 
 ## [0.13.6] — 2026-06-18
 
+### Added — anda_core v0.13.6
+
+- **Tool capability groups** — Tools and dynamic providers can now expose `ToolGroupInfo` / `ToolGroup` metadata so related callables are discoverable as bundles without changing model-provider function schemas.
+
+### Added — anda_engine v0.13.6
+
+- **Tool group discovery helpers** — Added `tools_groups` plus `tools_select { group }` expansion and group annotations in `tools_search` / `tools_select` outputs, letting agents survey capability bundles first and then load all member schemas on demand.
+- **Built-in filesystem and memory groups** — Filesystem workspace tools and persistent-memory/conversation tools now advertise shared capability groups with usage guidance and complete member lists.
+- **MCP server capability groups** — MCP tool providers now capture server title, description, and `instructions` from the initialize handshake and surface each server as one discovery-layer tool group.
+
 ### Fixed — anda_engine v0.13.6
 
+- **Tool group discovery normalization** — `tools_groups` / `tools_select` now filter stale or shadowed provider group members and merge duplicate group ids before returning discovery output, so group expansion matches the callable schemas actually visible to the current model turn.
 - **Streaming completion request timeout override** — Streaming model requests now set their own 10-minute total timeout at the request level, so downstream applications that inject a shared HTTP client with a shorter generic timeout do not abort long-but-progressing SSE completions before the model transport budget.
 
 ## [0.13.5] — 2026-06-18

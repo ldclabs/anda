@@ -3,7 +3,9 @@
 //! Relative patterns are evaluated against every configured workspace, while
 //! absolute patterns must remain inside a workspace boundary.
 
-use anda_core::{BoxError, FunctionDefinition, Resource, StateFeatures, Tool, ToolOutput};
+use anda_core::{
+    BoxError, FunctionDefinition, Resource, StateFeatures, Tool, ToolGroupInfo, ToolOutput,
+};
 use glob::{MatchOptions, glob_with};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -102,6 +104,10 @@ impl Tool<BaseCtx> for SearchFileTool {
 
     fn description(&self) -> String {
         self.description.clone()
+    }
+
+    fn group(&self) -> Option<ToolGroupInfo> {
+        Some(super::fs_tool_group_info())
     }
 
     fn definition(&self) -> FunctionDefinition {

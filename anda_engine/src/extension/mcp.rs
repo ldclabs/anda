@@ -2,9 +2,11 @@
 //!
 //! This module makes Anda an MCP host/client for tool execution. It discovers
 //! tools from configured MCP servers, maps them to legal Anda function names,
-//! and dispatches calls back to the original MCP tool name. It intentionally
-//! does not expose deprecated MCP client utility capabilities such as Roots,
-//! Sampling, or Logging control.
+//! and dispatches calls back to the original MCP tool name. Each server is also
+//! exposed as a [`ToolGroup`] (carrying its title and `instructions` from the
+//! initialize handshake) so the discovery layer can present a server's tools as
+//! a coherent capability bundle. It intentionally does not expose deprecated MCP
+//! client utility capabilities such as Roots, Sampling, or Logging control.
 //!
 //! # Example
 //!
@@ -48,16 +50,16 @@
 //! ```
 
 use anda_core::{
-    BoxError, BoxFut, FunctionDefinition, Json, ToolInput, ToolOutput, ToolProvider, Usage,
-    validate_function_name,
+    BoxError, BoxFut, FunctionDefinition, Json, ToolGroup, ToolInput, ToolOutput, ToolProvider,
+    Usage, validate_function_name,
 };
 use http::{HeaderName, HeaderValue};
 use parking_lot::RwLock;
 use rmcp::{
     ClientHandler, ErrorData as McpError, RoleClient,
     model::{
-        CallToolRequestParams, CallToolResult, ClientInfo, Implementation, ListRootsRequestMethod,
-        ListRootsResult, Tool as McpTool,
+        CallToolRequestParams, CallToolResult, ClientInfo, Implementation, InitializeResult,
+        ListRootsRequestMethod, ListRootsResult, Tool as McpTool,
     },
     serve_client,
     service::{RequestContext, RunningService},
@@ -153,15 +155,49 @@ impl McpToolProvider {
             let service = session.service.lock().await;
             service.peer().clone()
         };
+        // Capture the server's self-description (title, instructions) from the
+        // initialize handshake so the discovery layer can present each server as
+        // a coherent capability bundle, not just a flat list of tools.
+        let meta = McpServerMeta::from_peer_info(&config.id, peer.peer_info());
         let tools = peer.list_all_tools().await?;
 
         let routes = self.routes_for_tools(&config.id, tools)?;
-        self.inner
-            .index
-            .write()
-            .replace_server_routes(&config.id, routes);
+        {
+            let mut index = self.inner.index.write();
+            index.replace_server_routes(&config.id, routes);
+            index.metas.insert(config.id.clone(), meta);
+        }
         session.dirty.store(false, Ordering::SeqCst);
         Ok(())
+    }
+
+    /// Returns one [`ToolGroup`] per configured server that currently exposes
+    /// tools, bundling the server's tools together with its title and
+    /// `instructions` from the MCP `initialize` handshake.
+    pub fn tool_groups(&self) -> Vec<ToolGroup> {
+        let index = self.inner.index.read();
+        let mut members: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for route in index.routes.values() {
+            members
+                .entry(route.server_id.clone())
+                .or_default()
+                .push(route.name.clone());
+        }
+
+        members
+            .into_iter()
+            .map(|(server_id, mut names)| {
+                names.sort();
+                let meta = index.metas.get(&server_id).cloned().unwrap_or_default();
+                ToolGroup {
+                    id: format!("{}:{}", self.inner.name, server_id),
+                    title: meta.resolved_title(&server_id),
+                    description: meta.resolved_description(&server_id),
+                    instructions: meta.instructions,
+                    members: names,
+                }
+            })
+            .collect()
     }
 
     /// Returns all currently known MCP routes keyed by Anda-facing tool name.
@@ -475,6 +511,10 @@ impl ToolProvider<BaseCtx> for McpToolProvider {
         self.inner.index.read().routes.contains_key(lowercase_name)
     }
 
+    fn groups(&self) -> Vec<ToolGroup> {
+        self.tool_groups()
+    }
+
     fn init(&self, _ctx: BaseCtx) -> BoxFut<'_, Result<(), BoxError>> {
         // Startup must not fail because a single MCP server is unreachable;
         // failed servers are logged and can be refreshed later, on demand or
@@ -605,6 +645,7 @@ struct McpToolProviderInner {
 struct McpToolIndex {
     routes: BTreeMap<String, McpToolRoute>,
     sessions: BTreeMap<String, Arc<McpSession>>,
+    metas: BTreeMap<String, McpServerMeta>,
 }
 
 impl McpToolIndex {
@@ -618,7 +659,55 @@ impl McpToolIndex {
     fn remove_server(&mut self, server_id: &str) {
         self.routes.retain(|_, route| route.server_id != server_id);
         self.sessions.remove(server_id);
+        self.metas.remove(server_id);
     }
+}
+
+/// Cached self-description of an MCP server captured during the `initialize`
+/// handshake. Powers the per-server [`ToolGroup`] surfaced to the discovery
+/// layer. All fields are untrusted remote metadata.
+#[derive(Debug, Clone, Default)]
+struct McpServerMeta {
+    title: Option<String>,
+    description: Option<String>,
+    instructions: Option<String>,
+}
+
+impl McpServerMeta {
+    fn from_peer_info(server_id: &str, info: Option<&InitializeResult>) -> Self {
+        let Some(info) = info else {
+            return Self::default();
+        };
+        let implementation = &info.server_info;
+        let title = non_empty(implementation.title.as_deref())
+            .or_else(|| non_empty(Some(implementation.name.as_str())))
+            .filter(|title| title != server_id);
+        Self {
+            title,
+            description: non_empty(implementation.description.as_deref()),
+            instructions: non_empty(info.instructions.as_deref()),
+        }
+    }
+
+    fn resolved_title(&self, server_id: &str) -> String {
+        self.title
+            .clone()
+            .unwrap_or_else(|| format!("MCP server `{server_id}`"))
+    }
+
+    fn resolved_description(&self, server_id: &str) -> String {
+        self.description
+            .clone()
+            .unwrap_or_else(|| format!("Tools provided by MCP server `{server_id}`."))
+    }
+}
+
+/// Returns the trimmed string when it carries non-whitespace content.
+fn non_empty(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 /// One Anda-facing route to an MCP tool.
@@ -1024,6 +1113,87 @@ done
         assert_eq!(output.is_error, Some(false));
 
         let _ = std::fs::remove_file(script_path);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn captures_server_metadata_into_a_tool_group() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script_path = std::env::temp_dir().join(format!(
+            "anda_fake_mcp_server_{}_{}",
+            std::process::id(),
+            "group_meta"
+        ));
+        // The initialize result advertises a server title and instructions; the
+        // tools/list response exposes two tools that should bundle into one
+        // group keyed by the configured server id.
+        let script = r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([^,}]*\).*/\1/p')
+  case "$line" in
+    *"initialize"*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{"listChanged":true}},"serverInfo":{"name":"fs","title":"Filesystem","version":"1.0.0"},"instructions":"Call list_dir before read_file."}}\n' "$id"
+      ;;
+    *"tools/list"*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"read_file","description":"Read a file.","inputSchema":{"type":"object","properties":{}}},{"name":"list_dir","description":"List a directory.","inputSchema":{"type":"object","properties":{}}}]}}\n' "$id"
+      ;;
+  esac
+done
+"#;
+        std::fs::write(&script_path, script).unwrap();
+        let mut permissions = std::fs::metadata(&script_path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&script_path, permissions).unwrap();
+
+        let provider = McpToolProvider::new(Vec::new()).unwrap();
+        provider
+            .add_server(McpServerConfig::stdio(
+                "files",
+                script_path.to_string_lossy().to_string(),
+            ))
+            .await
+            .unwrap();
+
+        let groups = provider.tool_groups();
+        assert_eq!(groups.len(), 1);
+        let group = &groups[0];
+        assert_eq!(group.id, "mcp:files");
+        assert_eq!(group.title, "Filesystem");
+        assert_eq!(
+            group.instructions.as_deref(),
+            Some("Call list_dir before read_file.")
+        );
+        // Members list every tool the server exposes so the model can pull in
+        // siblings after discovering one of them.
+        assert_eq!(
+            group.members,
+            vec![
+                "mcp_files_list_dir".to_string(),
+                "mcp_files_read_file".to_string()
+            ]
+        );
+
+        let _ = std::fs::remove_file(script_path);
+    }
+
+    #[test]
+    fn server_meta_falls_back_to_server_id_without_peer_info() {
+        let meta = McpServerMeta::from_peer_info("files", None);
+        assert!(meta.title.is_none());
+        assert!(meta.instructions.is_none());
+        assert_eq!(meta.resolved_title("files"), "MCP server `files`");
+        assert_eq!(
+            meta.resolved_description("files"),
+            "Tools provided by MCP server `files`."
+        );
+    }
+
+    #[test]
+    fn tool_groups_is_empty_without_discovered_routes() {
+        let provider =
+            McpToolProvider::new(vec![McpServerConfig::stdio("files", "server")]).unwrap();
+        assert!(provider.tool_groups().is_empty());
     }
 
     #[test]

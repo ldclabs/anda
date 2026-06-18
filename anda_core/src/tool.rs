@@ -10,7 +10,7 @@
 //! and receive typed arguments after the runtime validates and deserializes a
 //! raw JSON call.
 
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{any::Any, collections::BTreeMap, future::Future, marker::PhantomData, sync::Arc};
 
 use crate::{
@@ -50,6 +50,15 @@ where
     /// # Returns
     /// - `FunctionDefinition`: The schema definition of the tool's parameters and metadata.
     fn definition(&self) -> FunctionDefinition;
+
+    /// Returns the capability group this tool belongs to, if any.
+    ///
+    /// Tools that form a coherent bundle (for example the filesystem workspace
+    /// tools) return the same [`ToolGroupInfo`] so the registry can present them
+    /// as one group in discovery. The default implementation returns `None`.
+    fn group(&self) -> Option<ToolGroupInfo> {
+        None
+    }
 
     /// Returns resource tags this tool can consume.
     ///
@@ -142,6 +151,11 @@ where
     /// Returns the function definition exposed to model providers.
     fn definition(&self) -> FunctionDefinition;
 
+    /// Returns the capability group this tool belongs to, if any.
+    fn group(&self) -> Option<ToolGroupInfo> {
+        None
+    }
+
     /// Returns resource tags this tool can consume.
     fn supported_resource_tags(&self) -> Vec<String>;
 
@@ -155,6 +169,71 @@ where
         args: Json,
         resources: Vec<Resource>,
     ) -> BoxPinFut<Result<ToolOutput<Json>, BoxError>>;
+}
+
+/// Group membership a single [`Tool`] declares for itself.
+///
+/// A static tool uses this to say "I belong to bundle X" without knowing the
+/// other members. The registry ([`ToolSet`]) collects every tool that declares
+/// the same `id` and assembles the full [`ToolGroup`], so the member list always
+/// reflects the tools actually registered (no stale or missing entries).
+///
+/// Share one constructor across a bundle's tools to keep the metadata identical;
+/// when ids collide, the first-registered tool's metadata wins.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ToolGroupInfo {
+    /// Stable group id, unique across the engine (for example `fs_workspace`).
+    pub id: String,
+    /// Human-facing group title.
+    pub title: String,
+    /// Concise summary of what this bundle of tools does.
+    pub description: String,
+    /// Optional usage instructions describing how the member tools work
+    /// together. Reference for the model, never a runtime directive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+}
+
+/// A related set of callables surfaced together from one source.
+///
+/// A group tells the model that a bundle of tools share an origin (for example
+/// a single MCP server, or the built-in filesystem tools) and are meant to be
+/// combined to complete related work. Groups are a *discovery-layer* concept
+/// only: they are never sent to model providers as part of the function-calling
+/// schema. They are returned by the built-in discovery helpers (`tools_search` /
+/// `tools_select`) so the model can understand a bundle's purpose and pull in
+/// sibling tools as needed.
+///
+/// `instructions`, `title`, and `description` may originate from untrusted
+/// remote metadata. They are surfaced as plain data the model reads, never as
+/// system instructions, so they cannot escalate into runtime directives.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ToolGroup {
+    /// Stable group id, unique across providers (for example `mcp:filesystem`).
+    pub id: String,
+    /// Human-facing group title.
+    pub title: String,
+    /// Concise summary of what this bundle of tools does.
+    pub description: String,
+    /// Optional usage instructions describing how the member tools work
+    /// together. Untrusted remote metadata; treat as reference, not directives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+    /// Model-facing names of the tools that belong to this group.
+    pub members: Vec<String>,
+}
+
+impl ToolGroup {
+    /// Builds a group from a per-tool [`ToolGroupInfo`] and resolved members.
+    pub fn from_info(info: ToolGroupInfo, members: Vec<String>) -> Self {
+        Self {
+            id: info.id,
+            title: info.title,
+            description: info.description,
+            instructions: info.instructions,
+            members,
+        }
+    }
 }
 
 /// Dynamic source of callable tools.
@@ -175,6 +254,15 @@ where
 
     /// Returns the current function definitions from this provider.
     fn definitions(&self, names: Option<&[String]>) -> Vec<FunctionDefinition>;
+
+    /// Returns the capability groups exposed by this provider.
+    ///
+    /// Each group bundles related tools (for example all tools from one MCP
+    /// server) so the discovery layer can tell the model the tools are related
+    /// and how to combine them. The default implementation returns no groups.
+    fn groups(&self) -> Vec<ToolGroup> {
+        Vec::new()
+    }
 
     /// Returns whether this provider can currently dispatch the lowercase name.
     fn contains_lowercase(&self, lowercase_name: &str) -> bool {
@@ -261,6 +349,10 @@ where
 
     fn definition(&self) -> FunctionDefinition {
         self.0.definition()
+    }
+
+    fn group(&self) -> Option<ToolGroupInfo> {
+        self.0.group()
     }
 
     fn supported_resource_tags(&self) -> Vec<String> {
@@ -356,6 +448,14 @@ where
         }
     }
 
+    /// Returns the capability groups exposed by every registered provider.
+    pub fn groups(&self) -> Vec<ToolGroup> {
+        self.set
+            .values()
+            .flat_map(|provider| provider.groups())
+            .collect()
+    }
+
     /// Returns function metadata for all provider-backed tools or selected names.
     pub fn functions(&self, names: Option<&[String]>) -> Vec<Function> {
         self.definitions(names)
@@ -441,6 +541,33 @@ where
     /// Returns the names of all registered tools.
     pub fn names(&self) -> Vec<String> {
         self.set.keys().cloned().collect()
+    }
+
+    /// Returns the capability groups assembled from registered tools.
+    ///
+    /// Tools that declare the same [`ToolGroupInfo::id`] are collected into one
+    /// [`ToolGroup`] whose `members` are exactly the registered tool names in
+    /// that group, sorted for determinism. Group metadata is taken from the
+    /// first tool (by lowercase name order) that declares the id.
+    pub fn groups(&self) -> Vec<ToolGroup> {
+        let mut grouped: BTreeMap<String, (ToolGroupInfo, Vec<String>)> = BTreeMap::new();
+        for (name, tool) in &self.set {
+            if let Some(info) = tool.group() {
+                grouped
+                    .entry(info.id.clone())
+                    .or_insert_with(|| (info, Vec::new()))
+                    .1
+                    .push(name.clone());
+            }
+        }
+
+        grouped
+            .into_values()
+            .map(|(info, mut members)| {
+                members.sort();
+                ToolGroup::from_info(info, members)
+            })
+            .collect()
     }
 
     /// Returns the function definition for a specific tool.
@@ -1350,5 +1477,95 @@ mod tests {
                 .is_err()
             );
         });
+    }
+
+    struct GroupedTool {
+        name: &'static str,
+        group: &'static str,
+    }
+
+    impl Tool<TestContext> for GroupedTool {
+        type Args = ();
+        type Output = String;
+
+        fn name(&self) -> String {
+            self.name.to_string()
+        }
+
+        fn description(&self) -> String {
+            "Grouped tool fixture".to_string()
+        }
+
+        fn definition(&self) -> FunctionDefinition {
+            FunctionDefinition {
+                name: self.name(),
+                description: self.description(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                    "additionalProperties": false
+                }),
+                strict: Some(true),
+            }
+        }
+
+        fn group(&self) -> Option<ToolGroupInfo> {
+            Some(ToolGroupInfo {
+                id: self.group.to_string(),
+                title: format!("{} title", self.group),
+                description: format!("{} description", self.group),
+                instructions: Some(format!("{} instructions", self.group)),
+            })
+        }
+
+        async fn call(
+            &self,
+            _ctx: TestContext,
+            _args: Self::Args,
+            _resources: Vec<Resource>,
+        ) -> Result<ToolOutput<Self::Output>, BoxError> {
+            Ok(ToolOutput::new(String::new()))
+        }
+    }
+
+    #[test]
+    fn tool_set_groups_aggregate_members_by_id() {
+        let mut tool_set = ToolSet::<TestContext>::new();
+        tool_set
+            .add(Arc::new(GroupedTool {
+                name: "fs_write",
+                group: "fs",
+            }))
+            .unwrap();
+        tool_set
+            .add(Arc::new(GroupedTool {
+                name: "fs_read",
+                group: "fs",
+            }))
+            .unwrap();
+        tool_set
+            .add(Arc::new(GroupedTool {
+                name: "mem_get",
+                group: "memory",
+            }))
+            .unwrap();
+        // A tool with no group declaration is excluded from every group.
+        tool_set.add(Arc::new(ExampleTool { id: 1 })).unwrap();
+
+        let groups = tool_set.groups();
+        assert_eq!(groups.len(), 2);
+
+        let fs = groups.iter().find(|group| group.id == "fs").unwrap();
+        // Members reflect the registered tools, sorted for determinism.
+        assert_eq!(
+            fs.members,
+            vec!["fs_read".to_string(), "fs_write".to_string()]
+        );
+        assert_eq!(fs.title, "fs title");
+        assert_eq!(fs.instructions.as_deref(), Some("fs instructions"));
+
+        let memory = groups.iter().find(|group| group.id == "memory").unwrap();
+        assert_eq!(memory.members, vec!["mem_get".to_string()]);
     }
 }

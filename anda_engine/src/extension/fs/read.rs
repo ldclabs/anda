@@ -4,7 +4,9 @@
 //! unsupported files are returned as base64. Large inline output is truncated
 //! with paging metadata.
 
-use anda_core::{BoxError, FunctionDefinition, Resource, StateFeatures, Tool, ToolOutput};
+use anda_core::{
+    BoxError, FunctionDefinition, Resource, StateFeatures, Tool, ToolGroupInfo, ToolOutput,
+};
 use ic_auth_types::ByteBufB64;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -108,6 +110,10 @@ impl Tool<BaseCtx> for ReadFileTool {
 
     fn description(&self) -> String {
         self.description.clone()
+    }
+
+    fn group(&self) -> Option<ToolGroupInfo> {
+        Some(super::fs_tool_group_info())
     }
 
     fn definition(&self) -> FunctionDefinition {

@@ -6,7 +6,7 @@
 
 use anda_core::{
     Agent, AgentContext, AgentOutput, BoxError, CompletionFeatures, CompletionRequest,
-    FunctionDefinition, Resource,
+    FunctionDefinition, Resource, ToolGroup,
 };
 use anda_db_tfs::{TokenizerChain, collect_tokens, jieba_tokenizer};
 use serde::{Deserialize, Serialize};
@@ -22,6 +22,8 @@ use crate::context::{
 pub const TOOLS_SEARCH_NAME: &str = "tools_search";
 /// Built-in name for selecting callables by exact name.
 pub const TOOLS_SELECT_NAME: &str = "tools_select";
+/// Built-in name for listing capability groups (the group directory).
+pub const TOOLS_GROUPS_NAME: &str = "tools_groups";
 
 /// Arguments for [`ToolsSearch`].
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -40,6 +42,14 @@ pub struct ToolsOutput {
     ///
     /// These definitions are not dynamically inserted into [`CompletionRequest::tools`].
     pub tools: Vec<FunctionDefinition>,
+    /// Capability groups that the returned tools belong to.
+    ///
+    /// Each group bundles related tools from a single source (for example one
+    /// MCP server) and carries the bundle's purpose and usage instructions plus
+    /// the full list of sibling member names, so the model can understand how
+    /// the tools combine and select additional members it still needs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<ToolGroup>,
     /// Total number of callables to the current model turn.
     #[serde(default)]
     pub total_tools: usize,
@@ -74,7 +84,11 @@ impl ToolsSearch {
 
         let total_tools = tools.len();
         if normalized_query == "*" {
-            return ToolsOutput { tools, total_tools };
+            return ToolsOutput {
+                tools,
+                total_tools,
+                ..Default::default()
+            };
         }
 
         let normalized_tokens: Vec<(String, usize)> =
@@ -86,7 +100,11 @@ impl ToolsSearch {
             rank_search_items(&tools, &normalized_query, &normalized_tokens, false);
         tools_name.truncate(if args.limit == 0 { 10 } else { args.limit });
         let tools = select_requested_definitions(tools, &tools_name);
-        ToolsOutput { tools, total_tools }
+        ToolsOutput {
+            tools,
+            total_tools,
+            ..Default::default()
+        }
     }
 }
 
@@ -96,7 +114,7 @@ impl Agent<AgentCtx> for ToolsSearch {
     }
 
     fn description(&self) -> String {
-        "Search callable tools and agents by keyword. Returns full callable schemas in this tool output; after a schema is returned, call that tool/agent directly instead of searching again."
+        "Search callable tools and agents by keyword. Returns full callable schemas in this tool output; after a schema is returned, call that tool/agent directly instead of searching again. The output may also include `groups`: related tool bundles (for example one MCP server) with their purpose, usage instructions, and sibling member names to help you combine them."
             .to_string()
     }
 
@@ -145,11 +163,13 @@ impl Agent<AgentCtx> for ToolsSearch {
                 content: serde_json::to_string(&ToolsOutput {
                     tools: Vec::new(),
                     total_tools: definitions.len(),
+                    ..Default::default()
                 })?,
                 ..Default::default()
             });
         }
-        let rt = self.search(&definitions, &args);
+        let mut rt = self.search(&definitions, &args);
+        rt.groups = relevant_groups(ctx.tool_groups(), &rt.tools);
         Ok(AgentOutput {
             content: serde_json::to_string(&rt)?,
             ..Default::default()
@@ -166,6 +186,11 @@ pub struct ToolsSelectArgs {
     /// Natural-language intent used to select tools when exact names are unknown.
     #[serde(default)]
     pub query: String,
+    /// Capability group id to expand. When set, every member of that group is
+    /// returned, on top of any names listed in `tools`. Discover group ids with
+    /// `tools_groups`.
+    #[serde(default)]
+    pub group: String,
     /// Maximum number of resolved definitions to return. Defaults to `5`, and is capped at `16` to prevent overloading the next model turn.
     #[serde(default)]
     pub limit: usize,
@@ -274,7 +299,7 @@ impl Agent<AgentCtx> for ToolsSelect {
     }
 
     fn description(&self) -> String {
-        "Select callable tools or agents and return full schemas in this tool output for direct tool calls. Use exact names via `tools`; use `query` only when exact names are unknown. Do not call tools_select again for the same returned tools.".to_string()
+        "Select callable tools or agents and return full schemas in this tool output for direct tool calls. Use exact names via `tools`; use `query` only when exact names are unknown; use `group` to pull in every tool of a capability group at once (discover group ids with `tools_groups`). Do not call tools_select again for the same returned tools. The output may also include `groups`: related tool bundles (for example one MCP server) with their purpose, usage instructions, and sibling member names.".to_string()
     }
 
     fn definition(&self) -> FunctionDefinition {
@@ -295,12 +320,16 @@ impl Agent<AgentCtx> for ToolsSelect {
                         "type": "string",
                         "description": "Natural-language intent for selecting relevant callables when exact names are unknown. Prefer `tools` when exact names are known."
                     },
+                    "group": {
+                        "type": "string",
+                        "description": "Capability group id to expand. Returns every member tool of that group. Use an empty string when not selecting by group."
+                    },
                     "limit": {
                         "type": "integer",
-                        "description": "Maximum number of resolved callables to return. Defaults to `5`, and is capped at `16`."
+                        "description": "Maximum number of resolved callables to return for `query` selection. Defaults to `5`, and is capped at `16`."
                     }
                 },
-                "required": ["tools", "query", "limit"],
+                "required": ["tools", "query", "group", "limit"],
                 "additionalProperties": false
             }),
             strict: Some(true),
@@ -323,26 +352,170 @@ impl Agent<AgentCtx> for ToolsSelect {
             }
         };
 
-        if args.tools.is_empty() && args.query.trim().is_empty() {
+        if args.tools.is_empty() && args.query.trim().is_empty() && args.group.trim().is_empty() {
             return Ok(AgentOutput {
-                content: "Invalid input: either `tools` or `query` must be provided".to_string(),
+                content: "Invalid input: one of `tools`, `query`, or `group` must be provided"
+                    .to_string(),
                 ..Default::default()
             });
         }
 
         let definitions = ctx.definitions(None).await;
         let total_tools = definitions.len();
-        let tool_definitions = if !args.tools.is_empty() {
-            select_requested_definitions(definitions, &args.tools)
+        let all_groups = ctx.tool_groups();
+
+        // Explicit names plus, when a group is named, every member of that group.
+        let mut requested = args.tools.clone();
+        if !args.group.trim().is_empty()
+            && let Some(group) = all_groups
+                .iter()
+                .find(|group| group.id.eq_ignore_ascii_case(args.group.trim()))
+        {
+            requested.extend(group.members.iter().cloned());
+        }
+
+        let tool_definitions = if !requested.is_empty() {
+            select_requested_definitions(definitions, &requested)
         } else {
             self.select_requested_definitions_by_query(&ctx, definitions, &args)
                 .await
         };
 
+        let groups = relevant_groups(all_groups, &tool_definitions);
         Ok(AgentOutput {
             content: serde_json::to_string(&ToolsOutput {
                 tools: tool_definitions,
+                groups,
                 total_tools,
+            })?,
+            ..Default::default()
+        })
+    }
+}
+
+/// Arguments for [`ToolsGroups`].
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ToolsGroupsArgs {
+    /// Optional keyword filter. Empty or `*` lists every group.
+    #[serde(default)]
+    pub query: String,
+}
+
+/// One entry in the capability group directory returned by [`ToolsGroups`].
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ToolGroupSummary {
+    /// Stable group id; pass it to `tools_select`'s `group` to expand the bundle.
+    pub id: String,
+    /// Human-facing group title.
+    pub title: String,
+    /// Concise summary of what this bundle of tools does.
+    pub description: String,
+    /// Number of member tools in the group.
+    pub member_count: usize,
+}
+
+/// Output returned by [`ToolsGroups`].
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ToolGroupsOutput {
+    /// The matching capability groups, without per-tool schemas.
+    pub groups: Vec<ToolGroupSummary>,
+    /// Total number of capability groups available this turn.
+    #[serde(default)]
+    pub total_groups: usize,
+}
+
+/// Lists the capability groups available to the model as a compact directory.
+///
+/// This is the top of the discovery funnel: the model sees which related tool
+/// bundles exist (one MCP server, the filesystem tools, …) without paying for
+/// every tool schema, then expands a chosen bundle with `tools_select`'s `group`
+/// argument. Registered as a built-in agent with label "flash".
+pub struct ToolsGroups;
+
+impl Default for ToolsGroups {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ToolsGroups {
+    /// Function name used when registering the group directory helper.
+    pub const NAME: &'static str = TOOLS_GROUPS_NAME;
+
+    /// Creates a group directory helper.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Agent<AgentCtx> for ToolsGroups {
+    fn name(&self) -> String {
+        Self::NAME.to_string()
+    }
+
+    fn description(&self) -> String {
+        "List the capability groups available this turn as a compact directory (no tool schemas). A group is a related bundle of tools from one source, such as a single MCP server or the filesystem tools. Use this first to see which bundles exist, then call `tools_select` with the `group` id to expand a bundle into its tool schemas.".to_string()
+    }
+
+    fn definition(&self) -> FunctionDefinition {
+        FunctionDefinition {
+            name: self.name(),
+            description: self.description(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Optional keyword to filter groups by id, title, or description. Use an empty string or `*` to list every group."
+                    }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }),
+            strict: Some(true),
+        }
+    }
+
+    async fn run(
+        &self,
+        ctx: AgentCtx,
+        prompt: String,
+        _resources: Vec<Resource>,
+    ) -> Result<AgentOutput, BoxError> {
+        let args: ToolsGroupsArgs = match serde_json::from_str(&prompt) {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(AgentOutput {
+                    content: format!("Invalid input: {e}"),
+                    ..Default::default()
+                });
+            }
+        };
+
+        let groups = ctx.tool_groups();
+        let total_groups = groups.len();
+        let normalized = args.query.trim().to_lowercase();
+        let summaries = groups
+            .into_iter()
+            .filter(|group| {
+                normalized.is_empty()
+                    || normalized == "*"
+                    || group.id.to_lowercase().contains(&normalized)
+                    || group.title.to_lowercase().contains(&normalized)
+                    || group.description.to_lowercase().contains(&normalized)
+            })
+            .map(|group| ToolGroupSummary {
+                id: group.id,
+                title: group.title,
+                description: group.description,
+                member_count: group.members.len(),
+            })
+            .collect();
+
+        Ok(AgentOutput {
+            content: serde_json::to_string(&ToolGroupsOutput {
+                groups: summaries,
+                total_groups,
             })?,
             ..Default::default()
         })
@@ -524,6 +697,31 @@ fn rank_search_items(
     candidates.into_iter().map(|(_, _, name)| name).collect()
 }
 
+/// Returns the capability groups that any of the `selected` definitions belong
+/// to, so the discovery output can explain the bundle a tool came from and list
+/// its sibling members. A group is included when at least one of its members is
+/// among the selected definitions.
+fn relevant_groups(groups: Vec<ToolGroup>, selected: &[FunctionDefinition]) -> Vec<ToolGroup> {
+    if groups.is_empty() || selected.is_empty() {
+        return Vec::new();
+    }
+
+    let selected_names: BTreeSet<String> = selected
+        .iter()
+        .map(|def| def.name.to_ascii_lowercase())
+        .collect();
+
+    groups
+        .into_iter()
+        .filter(|group| {
+            group
+                .members
+                .iter()
+                .any(|member| selected_names.contains(&member.to_ascii_lowercase()))
+        })
+        .collect()
+}
+
 fn select_requested_definitions(
     definitions: Vec<FunctionDefinition>,
     requested: &[String],
@@ -555,8 +753,8 @@ fn select_requested_definitions(
 #[cfg(test)]
 mod tests {
     use anda_core::{
-        Agent, AgentOutput, BoxError, CompletionRequest, FunctionDefinition, Resource, Tool,
-        ToolOutput,
+        Agent, AgentOutput, BoxError, BoxFut, CompletionRequest, FunctionDefinition, Json,
+        Resource, Tool, ToolGroup, ToolInput, ToolOutput, ToolProvider,
     };
     use candid::Principal;
     use serde::Deserialize;
@@ -687,6 +885,182 @@ mod tests {
         }
     }
 
+    /// A tool provider that exposes two tools bundled into one capability group.
+    struct GroupedToolProvider;
+
+    impl GroupedToolProvider {
+        fn defs() -> Vec<FunctionDefinition> {
+            ["grouped_read", "grouped_write"]
+                .into_iter()
+                .map(|name| FunctionDefinition {
+                    name: name.to_string(),
+                    description: format!("{name} from the test bundle"),
+                    parameters: json!({
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": false
+                    }),
+                    strict: Some(false),
+                })
+                .collect()
+        }
+    }
+
+    impl ToolProvider<BaseCtx> for GroupedToolProvider {
+        fn name(&self) -> String {
+            "grouped".to_string()
+        }
+
+        fn definitions(&self, names: Option<&[String]>) -> Vec<FunctionDefinition> {
+            match names {
+                Some([]) => Vec::new(),
+                Some(names) => Self::defs()
+                    .into_iter()
+                    .filter(|def| {
+                        names
+                            .iter()
+                            .any(|name| name.eq_ignore_ascii_case(&def.name))
+                    })
+                    .collect(),
+                None => Self::defs(),
+            }
+        }
+
+        fn groups(&self) -> Vec<ToolGroup> {
+            vec![ToolGroup {
+                id: "grouped:bundle".to_string(),
+                title: "Test bundle".to_string(),
+                description: "A related bundle of tools".to_string(),
+                instructions: Some("Read before write.".to_string()),
+                members: vec!["grouped_read".to_string(), "grouped_write".to_string()],
+            }]
+        }
+
+        fn call(
+            &self,
+            _ctx: BaseCtx,
+            input: ToolInput<Json>,
+        ) -> BoxFut<'_, Result<ToolOutput<Json>, BoxError>> {
+            Box::pin(async move { Ok(ToolOutput::new(json!({ "called": input.name }))) })
+        }
+    }
+
+    /// A provider that advertises a stale group member and a member shadowed by
+    /// a static tool. Discovery should only expose the provider-backed member
+    /// that is actually visible in the current callable set.
+    struct OverlappingToolProvider;
+
+    impl OverlappingToolProvider {
+        fn defs() -> Vec<FunctionDefinition> {
+            ["echo_tool", "provider_only"]
+                .into_iter()
+                .map(|name| FunctionDefinition {
+                    name: name.to_string(),
+                    description: format!("{name} from an overlapping provider"),
+                    parameters: json!({
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": false
+                    }),
+                    strict: Some(false),
+                })
+                .collect()
+        }
+    }
+
+    impl ToolProvider<BaseCtx> for OverlappingToolProvider {
+        fn name(&self) -> String {
+            "overlap".to_string()
+        }
+
+        fn definitions(&self, names: Option<&[String]>) -> Vec<FunctionDefinition> {
+            match names {
+                Some([]) => Vec::new(),
+                Some(names) => Self::defs()
+                    .into_iter()
+                    .filter(|def| {
+                        names
+                            .iter()
+                            .any(|name| name.eq_ignore_ascii_case(&def.name))
+                    })
+                    .collect(),
+                None => Self::defs(),
+            }
+        }
+
+        fn groups(&self) -> Vec<ToolGroup> {
+            vec![ToolGroup {
+                id: "overlap:bundle".to_string(),
+                title: "Overlap bundle".to_string(),
+                description: "Contains visible, stale, and shadowed members".to_string(),
+                members: vec![
+                    "echo_tool".to_string(),
+                    "provider_only".to_string(),
+                    "missing_provider_member".to_string(),
+                ],
+                ..Default::default()
+            }]
+        }
+
+        fn call(
+            &self,
+            _ctx: BaseCtx,
+            input: ToolInput<Json>,
+        ) -> BoxFut<'_, Result<ToolOutput<Json>, BoxError>> {
+            Box::pin(async move { Ok(ToolOutput::new(json!({ "called": input.name }))) })
+        }
+    }
+
+    struct SharedGroupProvider {
+        provider_name: &'static str,
+        tool_name: &'static str,
+    }
+
+    impl ToolProvider<BaseCtx> for SharedGroupProvider {
+        fn name(&self) -> String {
+            self.provider_name.to_string()
+        }
+
+        fn definitions(&self, names: Option<&[String]>) -> Vec<FunctionDefinition> {
+            if names.is_some_and(|names| {
+                !names
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(self.tool_name))
+            }) {
+                return Vec::new();
+            }
+
+            vec![FunctionDefinition {
+                name: self.tool_name.to_string(),
+                description: format!("{} from a duplicate group id provider", self.tool_name),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }),
+                strict: Some(false),
+            }]
+        }
+
+        fn groups(&self) -> Vec<ToolGroup> {
+            vec![ToolGroup {
+                id: "shared:bundle".to_string(),
+                title: "Shared bundle".to_string(),
+                description: "A group id shared across providers".to_string(),
+                members: vec![self.tool_name.to_string()],
+                ..Default::default()
+            }]
+        }
+
+        fn call(
+            &self,
+            _ctx: BaseCtx,
+            input: ToolInput<Json>,
+        ) -> BoxFut<'_, Result<ToolOutput<Json>, BoxError>> {
+            Box::pin(async move { Ok(ToolOutput::new(json!({ "called": input.name }))) })
+        }
+    }
+
     #[derive(Clone, Debug)]
     struct SelectorCompleter {
         content: String,
@@ -728,6 +1102,14 @@ mod tests {
         serde_json::from_str(&output.content).unwrap()
     }
 
+    async fn run_groups(ctx: AgentCtx, args: ToolsGroupsArgs) -> ToolGroupsOutput {
+        let output = ToolsGroups::new()
+            .run(ctx, serde_json::to_string(&args).unwrap(), Vec::new())
+            .await
+            .unwrap();
+        serde_json::from_str(&output.content).unwrap()
+    }
+
     async fn build_engine(builder: EngineBuilder) -> Engine {
         builder.build("echo_agent".to_string()).await.unwrap()
     }
@@ -747,10 +1129,17 @@ mod tests {
         let select_definition = ToolsSelect::new().definition();
         assert_eq!(
             select_definition.parameters["required"],
-            json!(["tools", "query", "limit"])
+            json!(["tools", "query", "group", "limit"])
         );
         assert_eq!(
             select_definition.parameters["additionalProperties"],
+            json!(false)
+        );
+
+        let groups_definition = ToolsGroups::new().definition();
+        assert_eq!(groups_definition.parameters["required"], json!(["query"]));
+        assert_eq!(
+            groups_definition.parameters["additionalProperties"],
             json!(false)
         );
     }
@@ -790,6 +1179,7 @@ mod tests {
                 "echo_tool",
                 "echo_agent",
                 "subagents_manager",
+                "tools_groups",
                 "tools_search",
                 "tools_select"
             ]
@@ -859,6 +1249,7 @@ mod tests {
                     "missing".to_string(),
                 ],
                 query: String::new(),
+                group: String::new(),
                 limit: 0,
             },
         )
@@ -866,6 +1257,278 @@ mod tests {
 
         let names: Vec<&str> = output.tools.iter().map(|tool| tool.name.as_str()).collect();
         assert_eq!(names, vec!["echo_agent", "echo_tool"]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tools_select_attaches_capability_group_for_provider_tools() {
+        let engine = build_engine(
+            EngineBuilder::new()
+                .register_tool_provider(Arc::new(GroupedToolProvider))
+                .unwrap()
+                .register_agent(Arc::new(EchoAgent), None)
+                .unwrap(),
+        )
+        .await;
+        let ctx = engine
+            .ctx_with(
+                Principal::anonymous(),
+                "echo_agent",
+                "echo_agent",
+                Default::default(),
+            )
+            .unwrap();
+
+        // Selecting one bundle member surfaces the group so the model learns the
+        // bundle's purpose, instructions, and the sibling it has not selected.
+        let output = run_select(
+            ctx,
+            ToolsSelectArgs {
+                tools: vec!["grouped_read".to_string()],
+                query: String::new(),
+                group: String::new(),
+                limit: 0,
+            },
+        )
+        .await;
+
+        let names: Vec<&str> = output.tools.iter().map(|tool| tool.name.as_str()).collect();
+        assert_eq!(names, vec!["grouped_read"]);
+        assert_eq!(output.groups.len(), 1);
+        let group = &output.groups[0];
+        assert_eq!(group.id, "grouped:bundle");
+        assert_eq!(group.instructions.as_deref(), Some("Read before write."));
+        assert_eq!(
+            group.members,
+            vec!["grouped_read".to_string(), "grouped_write".to_string()]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tools_select_group_expands_all_members() {
+        let engine = build_engine(
+            EngineBuilder::new()
+                .register_tool_provider(Arc::new(GroupedToolProvider))
+                .unwrap()
+                .register_agent(Arc::new(EchoAgent), None)
+                .unwrap(),
+        )
+        .await;
+        let ctx = engine
+            .ctx_with(
+                Principal::anonymous(),
+                "echo_agent",
+                "echo_agent",
+                Default::default(),
+            )
+            .unwrap();
+
+        // Naming the group expands every member's schema in one call.
+        let output = run_select(
+            ctx,
+            ToolsSelectArgs {
+                tools: Vec::new(),
+                query: String::new(),
+                group: "grouped:bundle".to_string(),
+                limit: 0,
+            },
+        )
+        .await;
+
+        let mut names: Vec<&str> = output.tools.iter().map(|tool| tool.name.as_str()).collect();
+        names.sort();
+        assert_eq!(names, vec!["grouped_read", "grouped_write"]);
+        assert_eq!(output.groups.len(), 1);
+        assert_eq!(output.groups[0].id, "grouped:bundle");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tool_groups_hide_unavailable_provider_members() {
+        let engine = build_engine(
+            EngineBuilder::new()
+                .register_tool(Arc::new(EchoTool))
+                .unwrap()
+                .register_tool_provider(Arc::new(OverlappingToolProvider))
+                .unwrap()
+                .register_agent(Arc::new(EchoAgent), None)
+                .unwrap(),
+        )
+        .await;
+        let ctx = engine
+            .ctx_with(
+                Principal::anonymous(),
+                "echo_agent",
+                "echo_agent",
+                Default::default(),
+            )
+            .unwrap();
+
+        let directory = run_groups(
+            ctx.clone(),
+            ToolsGroupsArgs {
+                query: "overlap".to_string(),
+            },
+        )
+        .await;
+        assert_eq!(directory.groups.len(), 1);
+        assert_eq!(directory.groups[0].member_count, 1);
+
+        let selected = run_select(
+            ctx,
+            ToolsSelectArgs {
+                tools: Vec::new(),
+                query: String::new(),
+                group: "overlap:bundle".to_string(),
+                limit: 0,
+            },
+        )
+        .await;
+
+        let names: Vec<&str> = selected
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["provider_only"]);
+        assert_eq!(selected.groups.len(), 1);
+        assert_eq!(
+            selected.groups[0].members,
+            vec!["provider_only".to_string()]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn duplicate_tool_group_ids_merge_visible_members() {
+        let engine = build_engine(
+            EngineBuilder::new()
+                .register_tool_provider(Arc::new(SharedGroupProvider {
+                    provider_name: "shared_a_provider",
+                    tool_name: "shared_a_tool",
+                }))
+                .unwrap()
+                .register_tool_provider(Arc::new(SharedGroupProvider {
+                    provider_name: "shared_b_provider",
+                    tool_name: "shared_b_tool",
+                }))
+                .unwrap()
+                .register_agent(Arc::new(EchoAgent), None)
+                .unwrap(),
+        )
+        .await;
+        let ctx = engine
+            .ctx_with(
+                Principal::anonymous(),
+                "echo_agent",
+                "echo_agent",
+                Default::default(),
+            )
+            .unwrap();
+
+        let directory = run_groups(
+            ctx.clone(),
+            ToolsGroupsArgs {
+                query: "shared".to_string(),
+            },
+        )
+        .await;
+        assert_eq!(directory.total_groups, 1);
+        assert_eq!(directory.groups.len(), 1);
+        assert_eq!(directory.groups[0].member_count, 2);
+
+        let selected = run_select(
+            ctx,
+            ToolsSelectArgs {
+                tools: Vec::new(),
+                query: String::new(),
+                group: "SHARED:BUNDLE".to_string(),
+                limit: 0,
+            },
+        )
+        .await;
+
+        let names: Vec<&str> = selected
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["shared_a_tool", "shared_b_tool"]);
+        assert_eq!(selected.groups.len(), 1);
+        assert_eq!(
+            selected.groups[0].members,
+            vec!["shared_a_tool".to_string(), "shared_b_tool".to_string()]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tools_groups_lists_capability_group_directory() {
+        let engine = build_engine(
+            EngineBuilder::new()
+                .register_tool_provider(Arc::new(GroupedToolProvider))
+                .unwrap()
+                .register_agent(Arc::new(EchoAgent), None)
+                .unwrap(),
+        )
+        .await;
+        let ctx = engine
+            .ctx_with(
+                Principal::anonymous(),
+                "echo_agent",
+                "echo_agent",
+                Default::default(),
+            )
+            .unwrap();
+
+        // Wildcard lists the bundle as a compact entry without tool schemas.
+        let output = run_groups(
+            ctx.clone(),
+            ToolsGroupsArgs {
+                query: "*".to_string(),
+            },
+        )
+        .await;
+        assert_eq!(output.total_groups, 1);
+        assert_eq!(output.groups.len(), 1);
+        assert_eq!(output.groups[0].id, "grouped:bundle");
+        assert_eq!(output.groups[0].member_count, 2);
+
+        // A keyword that matches nothing filters the directory to empty, while
+        // the total still reflects every available group.
+        let filtered = run_groups(
+            ctx,
+            ToolsGroupsArgs {
+                query: "no_such_group".to_string(),
+            },
+        )
+        .await;
+        assert!(filtered.groups.is_empty());
+        assert_eq!(filtered.total_groups, 1);
+    }
+
+    #[test]
+    fn relevant_groups_filters_by_membership_and_ignores_empty_inputs() {
+        let groups = vec![
+            ToolGroup {
+                id: "a".to_string(),
+                members: vec!["mcp_a_read".to_string(), "mcp_a_write".to_string()],
+                ..Default::default()
+            },
+            ToolGroup {
+                id: "b".to_string(),
+                members: vec!["mcp_b_run".to_string()],
+                ..Default::default()
+            },
+        ];
+        let selected = vec![FunctionDefinition {
+            // Membership matching is case-insensitive.
+            name: "MCP_A_READ".to_string(),
+            ..Default::default()
+        }];
+
+        let relevant = relevant_groups(groups.clone(), &selected);
+        assert_eq!(relevant.len(), 1);
+        assert_eq!(relevant[0].id, "a");
+
+        assert!(relevant_groups(groups, &[]).is_empty());
+        assert!(relevant_groups(Vec::new(), &selected).is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -894,6 +1557,7 @@ mod tests {
             ToolsSelectArgs {
                 tools: vec!["echo_tool".to_string()],
                 query: "mirror my text".to_string(),
+                group: String::new(),
                 limit: 1,
             },
         )
@@ -939,6 +1603,7 @@ mod tests {
             ToolsSelectArgs {
                 tools: Vec::new(),
                 query: "echo".to_string(),
+                group: String::new(),
                 limit: 1,
             },
         )
@@ -1000,7 +1665,11 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(output.content.contains("either `tools` or `query`"));
+        assert!(
+            output
+                .content
+                .contains("one of `tools`, `query`, or `group`")
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

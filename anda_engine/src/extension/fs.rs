@@ -3,10 +3,13 @@
 //! This module contains shared path resolution, text decoding/encoding, size
 //! limits, and atomic write helpers used by the read, write, search, and edit
 //! filesystem tools. Public tool structs are re-exported from the submodules.
+//!
+//! All four tools report the same capability group via [`fs_tool_group_info`],
+//! so the discovery layer presents them to the model as one workspace bundle.
 
 use anda_core::{
-    BoxError, RequestMeta, platform_text_encoding, text_encoding_for_label, text_encoding_label,
-    text_from_bytes_with_encoding,
+    BoxError, RequestMeta, ToolGroupInfo, platform_text_encoding, text_encoding_for_label,
+    text_encoding_label, text_from_bytes_with_encoding,
 };
 use encoding_rs::Encoding;
 use std::{
@@ -26,6 +29,25 @@ pub use edit::*;
 pub use read::*;
 pub use search::*;
 pub use write::*;
+
+/// Stable id of the filesystem workspace capability group.
+pub const FS_TOOL_GROUP_ID: &str = "fs_workspace";
+
+/// Returns the shared [`ToolGroupInfo`] for the filesystem workspace tools.
+///
+/// Every `read_file` / `search_file` / `edit_file` / `write_file` tool reports
+/// this so the registry presents them as one bundle. The registry fills in the
+/// member list from the tools actually registered.
+pub fn fs_tool_group_info() -> ToolGroupInfo {
+    ToolGroupInfo {
+        id: FS_TOOL_GROUP_ID.to_string(),
+        title: "Filesystem workspace".to_string(),
+        description: "Read, search, edit, and write files within the agent's sandboxed workspace directories.".to_string(),
+        instructions: Some(
+            "These tools share one set of sandboxed workspace directories; paths are workspace-relative and access outside the workspace is denied. Typical flow: use `search_file` to locate content and `read_file` to inspect it (paging large files with offset/limit), then `edit_file` for targeted in-place changes or `write_file` to create or replace a whole file.".to_string(),
+        ),
+    }
+}
 
 pub(crate) const MAX_FILE_SIZE_BYTES: u64 = 10 * 1024 * 1024;
 
@@ -717,6 +739,41 @@ mod tests {
 
     fn temp_dir(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("anda-fs-{name}-{:016x}", rand::random::<u64>()))
+    }
+
+    #[test]
+    fn fs_tools_form_one_capability_group() {
+        use crate::context::BaseCtx;
+        use anda_core::ToolSet;
+        use std::sync::Arc;
+
+        let workspace = PathBuf::from("/tmp/anda-fs-group");
+        let mut tools = ToolSet::<BaseCtx>::new();
+        tools
+            .add(Arc::new(ReadFileTool::new(workspace.clone())))
+            .unwrap();
+        tools
+            .add(Arc::new(WriteFileTool::new(workspace.clone())))
+            .unwrap();
+        tools
+            .add(Arc::new(EditFileTool::new(workspace.clone())))
+            .unwrap();
+        tools.add(Arc::new(SearchFileTool::new(workspace))).unwrap();
+
+        let groups = tools.groups();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].id, FS_TOOL_GROUP_ID);
+        // All four registered tools land in the group, sorted by name.
+        assert_eq!(
+            groups[0].members,
+            vec![
+                "edit_file".to_string(),
+                "read_file".to_string(),
+                "search_file".to_string(),
+                "write_file".to_string(),
+            ]
+        );
+        assert!(groups[0].instructions.is_some());
     }
 
     #[test]

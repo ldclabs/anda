@@ -5,11 +5,15 @@
 //! with BTree and BM25 indexes, while higher-level memory operations are exposed
 //! through KIP (Knowledge Interaction Protocol) tools backed by the Cognitive
 //! Nexus.
+//!
+//! The KIP, resource, and conversation tools report the same capability group
+//! via [`memory_tool_group_info`], so the discovery layer presents them to the
+//! model as one persistent-memory bundle.
 
 use anda_cognitive_nexus::{CognitiveNexus, ConceptPK};
 use anda_core::{
     BoxError, ContentPart, Document, Documents, FunctionDefinition, Message, Resource, ResourceRef,
-    StateFeatures, Tool, ToolOutput, Usage, Xid, gen_schema_for,
+    StateFeatures, Tool, ToolGroupInfo, ToolOutput, Usage, Xid, gen_schema_for,
 };
 use anda_db::{
     collection::{Collection, CollectionConfig},
@@ -38,6 +42,25 @@ use std::{
 };
 
 use crate::{context::BaseCtx, extension::fetch::FetchWebResourcesTool, rfc3339_datetime, unix_ms};
+
+/// Stable id of the persistent memory capability group.
+pub const MEMORY_TOOL_GROUP_ID: &str = "memory";
+
+/// Returns the shared [`ToolGroupInfo`] for the persistent memory tools.
+///
+/// The KIP execution, resource, and conversation tools all report this so the
+/// registry presents them as one bundle. The registry fills in the member list
+/// from the tools actually registered.
+pub fn memory_tool_group_info() -> ToolGroupInfo {
+    ToolGroupInfo {
+        id: MEMORY_TOOL_GROUP_ID.to_string(),
+        title: "Persistent memory".to_string(),
+        description: "Store and recall long-term knowledge and past conversations from the agent's persistent memory (Cognitive Nexus + conversation store).".to_string(),
+        instructions: Some(
+            "These tools share one persistent memory backend. Use the KIP execution tool (`execute_kip` / `execute_kip_readonly`) to query or update the Cognitive Nexus knowledge graph; prefer the read-only variant for retrieval. Use `list_previous_conversations` and `search_conversations` to recall past dialogue, `get_resource_content` to fetch a stored resource by id, and `memory_api` for unified conversation management (stop/steer/follow-up/delete, logs). Retrieve context before acting, and write durable facts back so they survive across sessions.".to_string(),
+        ),
+    }
+}
 
 /// Default KIP tool function definition used by [`MemoryManagement`].
 pub static FUNCTION_DEFINITION: LazyLock<FunctionDefinition> = LazyLock::new(|| {
@@ -1040,6 +1063,10 @@ impl Tool<BaseCtx> for MemoryManagement {
         self.kip_function_definitions.description.clone()
     }
 
+    fn group(&self) -> Option<ToolGroupInfo> {
+        Some(memory_tool_group_info())
+    }
+
     fn definition(&self) -> FunctionDefinition {
         self.kip_function_definitions.clone()
     }
@@ -1091,6 +1118,10 @@ impl Tool<BaseCtx> for MemoryReadonly {
 
     fn description(&self) -> String {
         "Executes one or more KIP (Knowledge Interaction Protocol) commands against the Cognitive Nexus to read from your persistent memory. This tool does not allow any modifications to the memory and is safe to use for retrieval operations.".to_string()
+    }
+
+    fn group(&self) -> Option<ToolGroupInfo> {
+        Some(memory_tool_group_info())
     }
 
     fn definition(&self) -> FunctionDefinition {
@@ -1158,6 +1189,10 @@ impl Tool<BaseCtx> for GetResourceContentTool {
 
     fn description(&self) -> String {
         "Retrieves the full content of a stored resource by its ID. Returns the content as plain text if UTF-8 encoded, or as a base64url-encoded string for binary data. If the resource has no local blob but has a URI, it will be fetched from the remote source.".to_string()
+    }
+
+    fn group(&self) -> Option<ToolGroupInfo> {
+        Some(memory_tool_group_info())
     }
 
     fn definition(&self) -> FunctionDefinition {
@@ -1235,6 +1270,10 @@ impl Tool<BaseCtx> for ListConversationsTool {
 
     fn description(&self) -> String {
         self.description.clone()
+    }
+
+    fn group(&self) -> Option<ToolGroupInfo> {
+        Some(memory_tool_group_info())
     }
 
     fn definition(&self) -> FunctionDefinition {
@@ -1333,6 +1372,10 @@ impl Tool<BaseCtx> for SearchConversationsTool {
 
     fn description(&self) -> String {
         self.description.clone()
+    }
+
+    fn group(&self) -> Option<ToolGroupInfo> {
+        Some(memory_tool_group_info())
     }
 
     fn definition(&self) -> FunctionDefinition {
@@ -1546,6 +1589,10 @@ impl Tool<BaseCtx> for MemoryTool {
 
     fn description(&self) -> String {
         "A unified API for managing conversations and memory. Supports retrieving resources and conversation details, stopping or steering in-progress conversations, sending follow-up messages, deleting conversations, listing previous conversations with pagination, searching conversation history by keyword, and listing KIP command logs.".to_string()
+    }
+
+    fn group(&self) -> Option<ToolGroupInfo> {
+        Some(memory_tool_group_info())
     }
 
     fn definition(&self) -> FunctionDefinition {
@@ -2432,6 +2479,52 @@ mod tests {
         assert_eq!(deleted, 1);
         assert!(memory.get_conversation(conversation_id).await.is_err());
         assert!(memory.get_resource(resource_id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn memory_tools_share_one_capability_group() {
+        use anda_core::ToolSet;
+
+        let memory = test_memory().await;
+        let conversations = Conversations {
+            conversations: memory.conversations.clone(),
+        };
+
+        let mut tools = ToolSet::<BaseCtx>::new();
+        tools.add(memory.clone()).unwrap();
+        tools
+            .add(Arc::new(MemoryReadonly::new(memory.clone())))
+            .unwrap();
+        tools
+            .add(Arc::new(GetResourceContentTool::new(memory.clone())))
+            .unwrap();
+        tools
+            .add(Arc::new(ListConversationsTool::new(conversations.clone())))
+            .unwrap();
+        tools
+            .add(Arc::new(SearchConversationsTool::new(conversations)))
+            .unwrap();
+        tools
+            .add(Arc::new(MemoryTool::new(memory.clone())))
+            .unwrap();
+
+        let groups = tools.groups();
+        assert_eq!(groups.len(), 1);
+        let group = &groups[0];
+        assert_eq!(group.id, MEMORY_TOOL_GROUP_ID);
+        assert!(group.instructions.is_some());
+        // Every registered memory tool, including the dynamically named KIP tool,
+        // lands in the one bundle.
+        for name in [
+            memory.name(),
+            MemoryReadonly::NAME.to_string(),
+            GetResourceContentTool::NAME.to_string(),
+            ListConversationsTool::NAME.to_string(),
+            SearchConversationsTool::NAME.to_string(),
+            MemoryTool::NAME.to_string(),
+        ] {
+            assert!(group.members.contains(&name), "missing member {name}");
+        }
     }
 
     #[tokio::test]
