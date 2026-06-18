@@ -1081,6 +1081,11 @@ pub(crate) fn streaming_completion_request(
     request
         .header(reqwest::header::ACCEPT, "text/event-stream")
         .header(reqwest::header::ACCEPT_ENCODING, "identity")
+        // Streaming model completions can run much longer than generic HTTP
+        // calls made with the same client. Set the request-level total timeout
+        // explicitly so downstream clients with shorter shared timeouts do not
+        // abort a progressing SSE body before the model timeout budget.
+        .timeout(COMPLETION_REQUEST_TIMEOUT)
 }
 
 #[cfg(test)]
@@ -1665,6 +1670,20 @@ mod tests {
         assert!(COMPLETION_READ_TIMEOUT > Duration::from_secs(118));
         assert!(COMPLETION_READ_TIMEOUT < COMPLETION_REQUEST_TIMEOUT);
         assert_eq!(COMPLETION_REQUEST_TIMEOUT, Duration::from_secs(600));
+    }
+
+    #[test]
+    fn streaming_completion_request_overrides_short_client_total_timeout() {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let request = streaming_completion_request(client.get("https://example.com"))
+            .build()
+            .unwrap();
+
+        assert_eq!(request.timeout(), Some(&COMPLETION_REQUEST_TIMEOUT));
     }
 
     #[tokio::test]

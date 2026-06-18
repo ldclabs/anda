@@ -93,8 +93,8 @@ pub struct SubAgent {
     ///
     /// When a session has no running background task and receives no new input for this long, its
     /// runner ends and the session is reclaimed. `0` keeps the engine default
-    /// ([`CONVERSATION_IDLE_MS`]); any positive value is clamped to the background-task wait
-    /// ceiling ([`CONVERSATION_WAIT_BACKGROUND_TASK_MS`]) so a session can never outlive it. Only
+    /// (60 seconds); any positive value is clamped to the background-task wait
+    /// ceiling (1 hour) so a session can never outlive it. Only
     /// affects session mode; blocking runs ignore it.
     #[serde(default)]
     pub idle_timeout: u64,

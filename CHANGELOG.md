@@ -2,6 +2,12 @@
 
 All notable changes to the Anda project will be documented in this file.
 
+## [0.13.6] — 2026-06-18
+
+### Fixed — anda_engine v0.13.6
+
+- **Streaming completion request timeout override** — Streaming model requests now set their own 10-minute total timeout at the request level, so downstream applications that inject a shared HTTP client with a shorter generic timeout do not abort long-but-progressing SSE completions before the model transport budget.
+
 ## [0.13.5] — 2026-06-18
 
 ### Added — anda_core v0.13.5
