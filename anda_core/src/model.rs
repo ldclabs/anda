@@ -496,6 +496,40 @@ impl ContentPart {
             Err(Box::new(self))
         }
     }
+
+    /// Estimates the number of tokens in this content part for usage accounting and pruning.
+    pub fn estimated_tokens(&self) -> usize {
+        match self {
+            ContentPart::Text { text } | ContentPart::Reasoning { text } => estimate_tokens(text),
+            ContentPart::FileData {
+                file_uri,
+                mime_type,
+            } => estimate_tokens(file_uri)
+                .saturating_add(mime_type.as_deref().map_or(0, estimate_tokens)),
+            ContentPart::InlineData { mime_type, data } => {
+                estimate_tokens(mime_type).saturating_add((data.len()).saturating_add(3) / 4)
+            }
+            ContentPart::ToolCall {
+                name,
+                args,
+                call_id,
+            } => estimate_tokens(name)
+                .saturating_add(estimate_tokens(&args.to_string()))
+                .saturating_add(call_id.as_deref().map_or(0, estimate_tokens)),
+            ContentPart::ToolOutput {
+                name,
+                output,
+                call_id,
+                ..
+            } => estimate_tokens(name)
+                .saturating_add(estimate_tokens(&output.to_string()))
+                .saturating_add(call_id.as_deref().map_or(0, estimate_tokens)),
+            ContentPart::Action { name, payload, .. } => {
+                estimate_tokens(name).saturating_add(estimate_tokens(&payload.to_string()))
+            }
+            ContentPart::Any(value) => estimate_tokens(&value.to_string()),
+        }
+    }
 }
 
 /// Converts a content part with inline data to a data URL string.
@@ -927,8 +961,8 @@ impl FunctionDefinition {
 }
 
 /// Estimates token count using a small, provider-independent heuristic.
-pub fn estimate_tokens(content: &str) -> usize {
-    content.len() / 3
+pub fn estimate_tokens(text: &str) -> usize {
+    (text.chars().count()).saturating_add(3) / 4
 }
 
 /// A document with metadata and content.

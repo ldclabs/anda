@@ -790,7 +790,9 @@ impl SubSessionRunner {
     /// own request, so it must run *before* the content is attached or the compaction request would
     /// overflow too.
     async fn compact_if_needed(&mut self, pending_tokens: u64) -> Result<(), BoxError> {
-        if self.runner.is_idle() && needs_compaction_with_pending(&self.runner, pending_tokens) {
+        if self.runner.no_pending_tool_calls()
+            && needs_compaction_with_pending(&self.runner, pending_tokens)
+        {
             self.compact().await?;
         }
 
@@ -897,7 +899,19 @@ impl SubSessionRunner {
         // queue it. Running unconditionally also covers the case where the committed history grew
         // over the threshold without any new input this round.
         let pending_tokens = estimated_content_tokens(&follow_up_batch)
-            .saturating_add(estimated_content_tokens(&steer_batch));
+            .saturating_add(estimated_content_tokens(&steer_batch))
+            .saturating_add(
+                self.runner
+                    .steering_message_iter()
+                    .map(|c| c.estimated_tokens() as u64)
+                    .sum(),
+            )
+            .saturating_add(
+                self.runner
+                    .follow_up_message_iter()
+                    .map(|c| c.estimated_tokens() as u64)
+                    .sum(),
+            );
         self.compact_if_needed(pending_tokens).await?;
         if !follow_up_batch.is_empty() {
             self.runner.follow_up_content(follow_up_batch);
@@ -2217,43 +2231,7 @@ fn estimated_message_tokens(message: &Message) -> u64 {
 }
 
 fn estimated_content_tokens(content: &[ContentPart]) -> u64 {
-    content.iter().map(estimated_content_part_tokens).sum()
-}
-
-fn estimated_content_part_tokens(content: &ContentPart) -> u64 {
-    match content {
-        ContentPart::Text { text } | ContentPart::Reasoning { text } => estimated_text_tokens(text),
-        ContentPart::FileData {
-            file_uri,
-            mime_type,
-        } => estimated_text_tokens(file_uri)
-            .saturating_add(mime_type.as_deref().map_or(0, estimated_text_tokens)),
-        ContentPart::InlineData { mime_type, data } => estimated_text_tokens(mime_type)
-            .saturating_add((data.len() as u64).saturating_add(3) / 4),
-        ContentPart::ToolCall {
-            name,
-            args,
-            call_id,
-        } => estimated_text_tokens(name)
-            .saturating_add(estimated_text_tokens(&args.to_string()))
-            .saturating_add(call_id.as_deref().map_or(0, estimated_text_tokens)),
-        ContentPart::ToolOutput {
-            name,
-            output,
-            call_id,
-            ..
-        } => estimated_text_tokens(name)
-            .saturating_add(estimated_text_tokens(&output.to_string()))
-            .saturating_add(call_id.as_deref().map_or(0, estimated_text_tokens)),
-        ContentPart::Action { name, payload, .. } => {
-            estimated_text_tokens(name).saturating_add(estimated_text_tokens(&payload.to_string()))
-        }
-        ContentPart::Any(value) => estimated_text_tokens(&value.to_string()),
-    }
-}
-
-fn estimated_text_tokens(text: &str) -> u64 {
-    (text.chars().count() as u64).saturating_add(3) / 4
+    content.iter().map(|c| c.estimated_tokens() as u64).sum()
 }
 
 #[cfg(test)]

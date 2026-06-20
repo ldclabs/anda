@@ -257,7 +257,7 @@ impl AgentCtx {
                 let lowercase = definition.name.to_ascii_lowercase();
                 visible_names
                     .insert(lowercase.clone())
-                    .then(|| (lowercase, definition.name))
+                    .then_some((lowercase, definition.name))
             })
             .collect();
         for group in self.agents.groups() {
@@ -1142,6 +1142,11 @@ impl CompletionRunner {
             && self.pending_tool_calls.is_empty()
     }
 
+    /// Returns whether there are no pending tool calls.
+    pub fn no_pending_tool_calls(&self) -> bool {
+        self.pending_tool_calls.is_empty()
+    }
+
     /// Returns the number of turns executed.
     pub fn turns(&self) -> usize {
         self.turns
@@ -1239,6 +1244,11 @@ impl CompletionRunner {
         self.steering_message.extend(content);
     }
 
+    /// Returns the iter over the queued steering message content parts.
+    pub fn steering_message_iter(&'_ self) -> core::slice::Iter<'_, ContentPart> {
+        self.steering_message.iter()
+    }
+
     /// Queue a follow-up message for the next safe user turn.
     /// Delivered with the current pending tool-call results when they finish, or at the next idle
     /// boundary when no tools are pending. Steering still takes priority.
@@ -1256,6 +1266,11 @@ impl CompletionRunner {
             return;
         }
         self.follow_up_message.extend(content);
+    }
+
+    /// Returns the iter over the queued follow-up message content parts.
+    pub fn follow_up_message_iter(&'_ self) -> std::collections::vec_deque::Iter<'_, ContentPart> {
+        self.follow_up_message.iter()
     }
 
     /// Drops the current in-flight request after a transport-level model failure.
