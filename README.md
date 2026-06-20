@@ -23,7 +23,7 @@ The core engine lets developers register agents and tools, route model requests 
    The engine can route completion requests through labeled model tiers such as `primary`, `pro`, `flash`, or `lite`, while provider-specific adapters stay behind a common request and output contract.
 
 3. **Runtime orchestration**
-   `CompletionRunner` handles iterative model turns, tool calls, agent calls, usage accounting, artifacts, steering messages, follow-up messages, and cancellation.
+   `CompletionRunner` handles iterative model turns, tool calls, agent calls, usage accounting, artifacts, steering messages, follow-up messages, cancellation, and compact continuation handoffs for long-running sessions.
 
 4. **Scoped execution context**
    `BaseCtx` and `AgentCtx` provide isolated state, cache, object storage, HTTP calls, signed calls, cancellation, and child contexts for each agent or tool.

@@ -2,6 +2,17 @@
 
 All notable changes to the Anda project will be documented in this file.
 
+## [0.13.8] — 2026-06-20
+
+### Added — anda_engine v0.13.8
+
+- **Reusable completion handoffs** — Completion runners can now summarize long conversations into compact continuation handoffs and restart from the resulting summary while preserving base tool configuration and accumulated usage metadata.
+
+### Changed — anda_engine v0.13.8
+
+- **Subagent compaction reuse** — Subagent session compaction now delegates to the shared completion-runner handoff path, reducing duplicated context-reset logic while preserving session artifacts and tool usage.
+- **Model request retries** — Completion model requests now retry up to three times with a longer retry delay cap, improving resilience to transient provider failures.
+
 ## [0.13.7] — 2026-06-20
 
 ### Added — anda_core v0.13.7

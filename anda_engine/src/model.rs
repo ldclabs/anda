@@ -37,9 +37,9 @@ use crate::APP_USER_AGENT;
 
 pub use anda_core::ModelEffort;
 
-const MODEL_REQUEST_MAX_RETRIES: usize = 1;
-const MODEL_RETRY_BACKOFF: Duration = Duration::from_millis(300);
-const MODEL_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(1);
+const MODEL_REQUEST_MAX_RETRIES: usize = 3;
+const MODEL_RETRY_BACKOFF: Duration = Duration::from_secs(1);
+const MODEL_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(300);
 const COMPLETION_HTTP2_KEEP_ALIVE_INTERVAL: Option<Duration> = None;
 const COMPLETION_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const COMPLETION_READ_TIMEOUT: Duration = Duration::from_secs(180);
@@ -772,10 +772,10 @@ where
     unreachable!("completion retry loop always returns before exhausting attempts")
 }
 
-/// Sleeps briefly before the single in-SDK retry so transient overload
-/// (429/5xx/connection flaps) has a chance to clear. The upstream `Retry-After`
-/// hint is honored up to a small cap; longer waits are the responsibility of
-/// upper layers, which receive the hint via [`ModelError::retry_after`].
+/// Sleeps before an in-SDK retry so transient overload (429/5xx/connection
+/// flaps) has a chance to clear. The upstream `Retry-After` hint is honored up
+/// to the configured retry cap; longer waits are the responsibility of upper
+/// layers, which receive the hint via [`ModelError::retry_after`].
 async fn backoff_before_retry(retry_after: Option<Duration>) {
     let delay = retry_after
         .unwrap_or(MODEL_RETRY_BACKOFF)
@@ -1822,9 +1822,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completion_request_retry_once_and_exposes_retry_signal() {
+    async fn completion_request_retries_transient_errors_and_exposes_retry_signal() {
         let mut headers = HeaderMap::new();
-        headers.insert(http::header::RETRY_AFTER, HeaderValue::from_static("60"));
+        headers.insert(http::header::RETRY_AFTER, HeaderValue::from_static("0"));
         let (endpoint, state) = spawn_retry_mock_server(vec![
             MockHttpResponse {
                 status: StatusCode::TOO_MANY_REQUESTS,
@@ -1851,18 +1851,30 @@ mod tests {
         assert_eq!(&body[..], b"ok");
         assert_eq!(retry_count(&state), 2);
 
-        let mut headers = HeaderMap::new();
-        headers.insert(http::header::RETRY_AFTER, HeaderValue::from_static("45"));
+        let mut retry_now = HeaderMap::new();
+        retry_now.insert(http::header::RETRY_AFTER, HeaderValue::from_static("0"));
+        let mut final_headers = HeaderMap::new();
+        final_headers.insert(http::header::RETRY_AFTER, HeaderValue::from_static("45"));
         let (endpoint, state) = spawn_retry_mock_server(vec![
             MockHttpResponse {
                 status: StatusCode::TOO_MANY_REQUESTS,
-                headers: headers.clone(),
+                headers: retry_now.clone(),
                 body: b"first limit".to_vec(),
             },
             MockHttpResponse {
                 status: StatusCode::TOO_MANY_REQUESTS,
-                headers,
+                headers: retry_now.clone(),
                 body: b"still limited".to_vec(),
+            },
+            MockHttpResponse {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                headers: retry_now,
+                body: b"limited again".to_vec(),
+            },
+            MockHttpResponse {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                headers: final_headers,
+                body: b"finally limited".to_vec(),
             },
         ])
         .await;
@@ -1875,7 +1887,7 @@ mod tests {
         .unwrap_err();
         let err_ref = err.as_ref() as &(dyn Error + 'static);
 
-        assert_eq!(retry_count(&state), 2);
+        assert_eq!(retry_count(&state), MODEL_REQUEST_MAX_RETRIES + 1);
         assert!(is_retryable_box_error(&err));
         assert_eq!(
             model_error_status(err_ref),

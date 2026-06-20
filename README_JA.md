@@ -23,7 +23,7 @@ Anda は、モデル、ツール、メモリ、ほかのエージェントを 1 
    エンジンは `primary`、`pro`、`flash`、`lite` などの能力ラベルで completion リクエストをルーティングできます。provider 固有の adapter は共通のリクエスト/出力契約の背後に隠れます。
 
 3. **ランタイムオーケストレーション**
-   `CompletionRunner` は、モデルターンの反復、tool calls、agent calls、usage 集計、artifacts、steering messages、follow-up messages、cancellation を処理します。
+   `CompletionRunner` は、モデルターンの反復、tool calls、agent calls、usage 集計、artifacts、steering messages、follow-up messages、cancellation、長時間セッション向けのコンパクトな continuation handoff を処理します。
 
 4. **分離された実行コンテキスト**
    `BaseCtx` と `AgentCtx` は、各 agent または tool に対して、分離された state、cache、object storage、HTTP calls、signed calls、cancellation、child contexts を提供します。
