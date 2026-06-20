@@ -923,13 +923,6 @@ impl SubSessionRunner {
                     return Ok(false);
                 }
 
-                if needs_compaction(&self.runner) {
-                    // 上下文过长，先进行一次压缩总结，用压缩后的 handoff 替换 runner，再继续后续的处理
-                    // 压缩只在 idle 边界触发：只有 idle 时才没有 pending tool call，中途压缩会丢掉未应答的 tool 要求。
-                    // 但副作用是：一个持续 tool-loop、从不产出非 tool 回复的超长任务，会在到达 idle 前就把 context 撑爆、先撞模型硬上限。
-                    self.compact().await?;
-                }
-
                 Ok(true)
             }
 

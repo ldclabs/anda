@@ -754,7 +754,7 @@ fn select_requested_definitions(
 mod tests {
     use anda_core::{
         Agent, AgentOutput, BoxError, BoxFut, CompletionRequest, FunctionDefinition, Json,
-        Resource, Tool, ToolGroup, ToolInput, ToolOutput, ToolProvider,
+        Resource, Tool, ToolGroup, ToolGroupInfo, ToolInput, ToolOutput, ToolProvider,
     };
     use candid::Principal;
     use serde::Deserialize;
@@ -870,6 +870,72 @@ mod tests {
 
         fn description(&self) -> String {
             "Handles echo tasks as an agent".to_string()
+        }
+
+        async fn run(
+            &self,
+            _ctx: AgentCtx,
+            prompt: String,
+            _resources: Vec<Resource>,
+        ) -> Result<AgentOutput, BoxError> {
+            Ok(AgentOutput {
+                content: prompt,
+                ..Default::default()
+            })
+        }
+    }
+
+    /// Two agents bundled into one capability group via [`Agent::group`].
+    fn grouped_agent_info() -> ToolGroupInfo {
+        ToolGroupInfo {
+            id: "agents:media".to_string(),
+            title: "Media agents".to_string(),
+            description: "Agents that understand media".to_string(),
+            instructions: Some("Pick the agent matching the media kind.".to_string()),
+        }
+    }
+
+    struct GroupedImageAgent;
+
+    impl Agent<AgentCtx> for GroupedImageAgent {
+        fn name(&self) -> String {
+            "grouped_image".to_string()
+        }
+
+        fn description(&self) -> String {
+            "Understands image media".to_string()
+        }
+
+        fn group(&self) -> Option<ToolGroupInfo> {
+            Some(grouped_agent_info())
+        }
+
+        async fn run(
+            &self,
+            _ctx: AgentCtx,
+            prompt: String,
+            _resources: Vec<Resource>,
+        ) -> Result<AgentOutput, BoxError> {
+            Ok(AgentOutput {
+                content: prompt,
+                ..Default::default()
+            })
+        }
+    }
+
+    struct GroupedAudioAgent;
+
+    impl Agent<AgentCtx> for GroupedAudioAgent {
+        fn name(&self) -> String {
+            "grouped_audio".to_string()
+        }
+
+        fn description(&self) -> String {
+            "Understands audio media".to_string()
+        }
+
+        fn group(&self) -> Option<ToolGroupInfo> {
+            Some(grouped_agent_info())
         }
 
         async fn run(
@@ -1300,6 +1366,55 @@ mod tests {
         assert_eq!(
             group.members,
             vec!["grouped_read".to_string(), "grouped_write".to_string()]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tools_select_attaches_capability_group_for_agents() {
+        let engine = build_engine(
+            EngineBuilder::new()
+                .register_agent(Arc::new(EchoAgent), None)
+                .unwrap()
+                .register_agent(Arc::new(GroupedImageAgent), None)
+                .unwrap()
+                .register_agent(Arc::new(GroupedAudioAgent), None)
+                .unwrap(),
+        )
+        .await;
+        let ctx = engine
+            .ctx_with(
+                Principal::anonymous(),
+                "echo_agent",
+                "echo_agent",
+                Default::default(),
+            )
+            .unwrap();
+
+        // Selecting one grouped agent surfaces the agent group so the model
+        // learns the bundle's purpose, instructions, and the sibling agent.
+        let output = run_select(
+            ctx,
+            ToolsSelectArgs {
+                tools: vec!["grouped_image".to_string()],
+                query: String::new(),
+                group: String::new(),
+                limit: 0,
+            },
+        )
+        .await;
+
+        let names: Vec<&str> = output.tools.iter().map(|tool| tool.name.as_str()).collect();
+        assert_eq!(names, vec!["grouped_image"]);
+        assert_eq!(output.groups.len(), 1);
+        let group = &output.groups[0];
+        assert_eq!(group.id, "agents:media");
+        assert_eq!(
+            group.instructions.as_deref(),
+            Some("Pick the agent matching the media kind.")
+        );
+        assert_eq!(
+            group.members,
+            vec!["grouped_audio".to_string(), "grouped_image".to_string()]
         );
     }
 

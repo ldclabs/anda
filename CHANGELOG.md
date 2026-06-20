@@ -2,6 +2,21 @@
 
 All notable changes to the Anda project will be documented in this file.
 
+## [0.13.7] — 2026-06-20
+
+### Added — anda_core v0.13.7
+
+- **Agent capability groups** — Agents can now declare `ToolGroupInfo` metadata so related agent callables are discoverable as coherent bundles alongside tool and provider groups.
+
+### Added — anda_engine v0.13.7
+
+- **Agent group discovery** — Discovery helpers now include grouped agents in `tools_groups` / `tools_select` outputs, preserving bundle instructions and sibling agent member lists when a grouped agent is selected.
+
+### Changed — anda_engine v0.13.7
+
+- **Subagent compaction scheduling** — Removed the extra idle-loop compaction trigger so subagent sessions rely on the pending-input compaction path instead of compacting again at every idle boundary.
+
+
 ## [0.13.6] — 2026-06-18
 
 ### Added — anda_core v0.13.6

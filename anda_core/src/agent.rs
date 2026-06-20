@@ -17,7 +17,7 @@ use serde_json::json;
 use std::{any::Any, collections::BTreeMap, future::Future, marker::PhantomData, sync::Arc};
 
 use crate::{
-    BoxError, BoxPinFut, Function,
+    BoxError, BoxPinFut, Function, ToolGroup, ToolGroupInfo,
     context::AgentContext,
     model::{AgentOutput, FunctionDefinition, Resource},
     select_resources, validate_function_name,
@@ -76,6 +76,16 @@ where
             }),
             strict: Some(true),
         }
+    }
+
+    /// Returns the capability group this agent belongs to, if any.
+    ///
+    /// Agents that form a coherent bundle (for example the media-understanding
+    /// agents) return the same [`ToolGroupInfo`] so the registry can present
+    /// them as one group in discovery, alongside tool groups. The default
+    /// implementation returns `None`.
+    fn group(&self) -> Option<ToolGroupInfo> {
+        None
     }
 
     /// Returns resource tags this agent can consume.
@@ -152,6 +162,9 @@ where
 
     /// Returns tool names required by this agent.
     fn tool_dependencies(&self) -> Vec<String>;
+
+    /// Returns the capability group this agent belongs to, if any.
+    fn group(&self) -> Option<ToolGroupInfo>;
 
     /// Returns resource tags this agent can consume.
     fn supported_resource_tags(&self) -> Vec<String>;
@@ -232,6 +245,10 @@ where
         self.inner.tool_dependencies()
     }
 
+    fn group(&self) -> Option<ToolGroupInfo> {
+        self.inner.group()
+    }
+
     fn supported_resource_tags(&self) -> Vec<String> {
         self.inner.supported_resource_tags()
     }
@@ -286,6 +303,33 @@ where
     /// Returns the names of all agents in the set.
     pub fn names(&self) -> Vec<String> {
         self.set.keys().cloned().collect()
+    }
+
+    /// Returns the capability groups declared by the registered agents.
+    ///
+    /// Agents that declare the same [`ToolGroupInfo::id`] are collected into one
+    /// [`ToolGroup`] whose `members` are exactly the registered agent names in
+    /// that group, sorted for determinism. Group metadata is taken from the
+    /// first agent (by lowercase name order) that declares the id.
+    pub fn groups(&self) -> Vec<ToolGroup> {
+        let mut grouped: BTreeMap<String, (ToolGroupInfo, Vec<String>)> = BTreeMap::new();
+        for (name, agent) in &self.set {
+            if let Some(info) = agent.group() {
+                grouped
+                    .entry(info.id.clone())
+                    .or_insert_with(|| (info, Vec::new()))
+                    .1
+                    .push(name.clone());
+            }
+        }
+
+        grouped
+            .into_values()
+            .map(|(info, mut members)| {
+                members.sort();
+                ToolGroup::from_info(info, members)
+            })
+            .collect()
     }
 
     /// Returns the function definition for a specific agent.
@@ -798,6 +842,15 @@ mod tests {
             "Example agent used for downcast tests".to_string()
         }
 
+        fn group(&self) -> Option<ToolGroupInfo> {
+            Some(ToolGroupInfo {
+                id: "example_bundle".to_string(),
+                title: "Example bundle".to_string(),
+                description: "Agents used together in tests".to_string(),
+                instructions: Some("Combine these agents.".to_string()),
+            })
+        }
+
         async fn run(
             &self,
             _ctx: TestAgentContext,
@@ -818,6 +871,15 @@ mod tests {
 
         fn description(&self) -> String {
             "Other agent used for downcast tests".to_string()
+        }
+
+        fn group(&self) -> Option<ToolGroupInfo> {
+            Some(ToolGroupInfo {
+                id: "example_bundle".to_string(),
+                title: "Example bundle".to_string(),
+                description: "Agents used together in tests".to_string(),
+                instructions: Some("Combine these agents.".to_string()),
+            })
         }
 
         async fn run(
@@ -895,6 +957,30 @@ mod tests {
 
         assert_eq!(concrete.id, 7);
         assert!(dyn_agent.downcast_ref::<OtherAgent>().is_none());
+    }
+
+    #[test]
+    fn agent_set_collects_declared_groups() {
+        let mut agent_set = AgentSet::<TestAgentContext>::new();
+        agent_set
+            .add(Arc::new(ExampleAgent { id: 1 }), None)
+            .unwrap();
+        agent_set.add(Arc::new(OtherAgent), None).unwrap();
+        // TaggedAgent declares no group and must not appear.
+        agent_set.add(Arc::new(TaggedAgent), None).unwrap();
+
+        let groups = agent_set.groups();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].id, "example_bundle");
+        // Both grouped agents land in the group, sorted by name.
+        assert_eq!(
+            groups[0].members,
+            vec!["example_agent".to_string(), "other_agent".to_string()]
+        );
+        assert_eq!(
+            groups[0].instructions.as_deref(),
+            Some("Combine these agents.")
+        );
     }
 
     #[test]

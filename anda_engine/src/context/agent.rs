@@ -224,10 +224,11 @@ impl AgentCtx {
 
     /// Returns the capability groups exposed to discovery.
     ///
-    /// Groups bundle related tools — both static tools that declare a group (for
-    /// example the filesystem or memory tools) and provider-backed tools (for
+    /// Groups bundle related callables — static tools that declare a group (for
+    /// example the filesystem or memory tools), agents that declare a group (for
+    /// example the media-understanding agents), and provider-backed tools (for
     /// example all tools from one MCP server) — so the discovery helpers can
-    /// tell the model the tools are related and how to combine them.
+    /// tell the model the callables are related and how to combine them.
     pub fn tool_groups(&self) -> Vec<ToolGroup> {
         let mut groups = BTreeMap::new();
         let mut visible_names = BTreeSet::new();
@@ -246,6 +247,21 @@ impl AgentCtx {
         visible_names.extend(static_names.keys().cloned());
         for group in self.tools.groups() {
             merge_visible_group(&mut groups, group, &static_names);
+        }
+
+        let agent_names: BTreeMap<String, String> = self
+            .agents
+            .definitions(None)
+            .into_iter()
+            .filter_map(|definition| {
+                let lowercase = definition.name.to_ascii_lowercase();
+                visible_names
+                    .insert(lowercase.clone())
+                    .then(|| (lowercase, definition.name))
+            })
+            .collect();
+        for group in self.agents.groups() {
+            merge_visible_group(&mut groups, group, &agent_names);
         }
 
         for provider in self.tool_providers.set.values() {
