@@ -163,7 +163,9 @@ impl AgentCtx {
     /// * `agent_name` - Name of the agent to create context for.
     pub fn child(&self, agent_name: &str, agent_label: &str) -> Result<Self, BoxError> {
         Ok(Self {
-            base: self.base.child(agent_context_path(agent_name))?,
+            base: self
+                .base
+                .child(agent_name.to_string(), agent_context_path(agent_name))?,
             label: agent_label.to_string(),
             root: self.root.clone(),
             models: self.models.clone(),
@@ -179,7 +181,8 @@ impl AgentCtx {
     /// # Arguments
     /// * `tool_name` - Name of the tool to create context for.
     pub fn child_base(&self, tool_name: &str) -> Result<BaseCtx, BoxError> {
-        self.base.child(tool_context_path(tool_name))
+        self.base
+            .child(self.base.agent.clone(), tool_context_path(tool_name))
     }
 
     /// Creates a child context with caller and meta information.
@@ -2250,6 +2253,30 @@ mod tests {
     }
 
     // ── Helper completers ──
+
+    #[test]
+    fn agent_child_context_switches_agent_namespace_and_preserves_state() {
+        let ctx = EngineBuilder::new().mock_ctx();
+        ctx.base.set_state("parent-state".to_string());
+
+        let child = ctx.child("worker_agent", "Worker").unwrap();
+        assert_eq!(ctx.base.agent, "Mocker");
+        assert_eq!(child.base.agent, "worker_agent");
+        assert_eq!(child.label, "Worker");
+        assert_eq!(child.base.path.as_ref(), "a_worker_agent");
+        assert_eq!(
+            child.base.get_state::<String>().as_deref(),
+            Some("parent-state")
+        );
+
+        let tool_ctx = child.child_base("note").unwrap();
+        assert_eq!(tool_ctx.agent, "worker_agent");
+        assert_eq!(tool_ctx.path.as_ref(), "t_note");
+        assert_eq!(
+            tool_ctx.get_state::<String>().as_deref(),
+            Some("parent-state")
+        );
+    }
 
     #[derive(Clone, Debug)]
     struct AlwaysFailCompleter;

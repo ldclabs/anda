@@ -119,29 +119,23 @@ impl BaseCtx {
         }
     }
 
-    /// Creates a child context with a new path.
-    ///
-    /// This is used to create nested contexts while maintaining the parent's state.
-    /// The child context inherits all properties from the parent but with:
-    /// - A new path;
-    /// - A child cancellation token;
-    /// - Incremented depth.
+    /// Creates a child context for a nested agent while preserving the caller,
+    /// request metadata, and inherited extension state.
     ///
     /// # Arguments
+    /// * `agent` - Agent namespace that owns the child context.
     /// * `path` - New path for the child context.
-    ///
-    /// # Errors
-    /// Returns an error if the context depth exceeds CONTEXT_MAX_DEPTH.
-    pub(crate) fn child(&self, mut path: String) -> Result<Self, BoxError> {
+    pub(crate) fn child(&self, agent: String, mut path: String) -> Result<Self, BoxError> {
         path.make_ascii_lowercase();
         let path = Path::parse(path)?;
         let mut state = Extensions::default();
-        // Inherit state from parent context. Each context has its own state, but they are initialized with the parent's state.
+        // Inherit state from parent context. Each context has its own state, but
+        // it is initialized with the parent's state.
         state.extend(self.state.read().clone());
         let child = Self {
             id: self.id,
             name: self.name.clone(),
-            agent: self.agent.clone(),
+            agent,
             caller: self.caller,
             path,
             cancellation_token: self.cancellation_token.child_token(),
@@ -708,10 +702,18 @@ mod tests {
         assert!(ctx.set_state("root-state".to_string()).is_none());
         assert_eq!(ctx.get_state::<String>().as_deref(), Some("root-state"));
 
-        let child = ctx.child("MiXeD/Path".to_string()).unwrap();
-        assert_eq!(child.path.as_ref(), "mixed/path");
-        assert_eq!(child.depth, 1);
-        assert_eq!(child.get_state::<String>().as_deref(), Some("root-state"));
+        let agent_child = ctx
+            .child("worker_agent".to_string(), "Worker/Path".to_string())
+            .unwrap();
+        assert_eq!(agent_child.path.as_ref(), "worker/path");
+        assert_eq!(agent_child.agent, "worker_agent");
+        assert_eq!(agent_child.caller, Principal::anonymous());
+        assert_eq!(agent_child.depth, 1);
+        assert_eq!(
+            agent_child.get_state::<String>().as_deref(),
+            Some("root-state")
+        );
+        assert!(agent_child.meta.user.is_none());
 
         let caller = Principal::self_authenticating([2; 32]);
         let meta = RequestMeta {
@@ -742,9 +744,11 @@ mod tests {
 
         let mut deep = ctx;
         for _ in 0..41 {
-            deep = deep.child("next".to_string()).unwrap();
+            deep = deep
+                .child("root_agent".to_string(), "next".to_string())
+                .unwrap();
         }
-        let Err(err) = deep.child("too_deep".to_string()) else {
+        let Err(err) = deep.child("root_agent".to_string(), "too_deep".to_string()) else {
             panic!("expected depth limit error");
         };
         assert!(err.to_string().contains("depth"));

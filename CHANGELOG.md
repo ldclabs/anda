@@ -2,6 +2,12 @@
 
 All notable changes to the Anda project will be documented in this file.
 
+## [0.13.9] — 2026-06-20
+
+### Fixed — anda_engine v0.13.9
+
+- **Child agent context namespaces** — Child agent contexts now switch to the child agent namespace while preserving inherited extension state, so nested agent and tool contexts use the correct agent ownership metadata.
+
 ## [0.13.8] — 2026-06-20
 
 ### Added — anda_engine v0.13.8
