@@ -34,7 +34,8 @@ to change.
   per-crate versions unless there is a clear reason.
 - Keep generated schemas and protocol-visible names stable. Agent, tool, and
   provider names must satisfy the function-name rules: lowercase ASCII letters,
-  digits, and underscores, starting with a lowercase letter, max 64 bytes.
+  digits, underscores, and hyphens, starting with a lowercase letter, max 64
+  bytes.
 - When changing model/provider conversion code, preserve raw-history and
   tool/user message boundaries. Do not merge tool outputs into user messages or
   lose provider-specific content unless the existing code explicitly does so.

@@ -81,7 +81,7 @@ pub fn validate_path_part(part: &str) -> Result<(), BoxError> {
 /// - Must not be empty
 /// - Must not exceed 64 characters
 /// - Must start with a lowercase letter
-/// - Can only contain: lowercase letters (a-z), digits (0-9), and underscores (_)
+/// - Can only contain: lowercase letters (a-z), digits (0-9), underscores (_), and hyphens (-)
 pub fn validate_function_name(name: &str) -> Result<(), BoxError> {
     if name.is_empty() {
         return Err("empty string".into());
@@ -97,7 +97,7 @@ pub fn validate_function_name(name: &str) -> Result<(), BoxError> {
     }
 
     for c in iter {
-        if !matches!(c, 'a'..='z' | '0'..='9' | '_' ) {
+        if !matches!(c, 'a'..='z' | '0'..='9' | '_' | '-') {
             return Err(format!("invalid character: {}", c).into());
         }
     }
@@ -123,5 +123,18 @@ mod tests {
         assert!(validate_path_part("/foo").is_err());
         assert!(validate_path_part("foo/bar").is_err());
         assert!(validate_path_part("foo/bar/").is_err());
+    }
+
+    #[test]
+    fn test_validate_function_name() {
+        assert!(validate_function_name("foo").is_ok());
+        assert!(validate_function_name("foo_bar9").is_ok());
+        assert!(validate_function_name("foo-bar").is_ok());
+
+        assert!(validate_function_name("").is_err());
+        assert!(validate_function_name("9foo").is_err());
+        assert!(validate_function_name("foo.bar").is_err());
+        assert!(validate_function_name("foo/bar").is_err());
+        assert!(validate_function_name(&"a".repeat(65)).is_err());
     }
 }

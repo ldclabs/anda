@@ -1780,7 +1780,7 @@ impl SubAgentManager {
                     },
                     "name": {
                         "type": "string",
-                        "description": "For operation=upsert, the unique callable subagent name. Must be lowercase snake_case, start with a letter, contain only letters, digits, or underscores, and be no longer than 64 characters. The subagent becomes callable as SA_<name>. For operation=list or status, optionally set it to a subagent name to report only that worker's sessions, or use an empty string to report all."
+                        "description": "For operation=upsert, the unique callable subagent name. Must start with a lowercase letter, contain only lowercase letters, digits, underscores, or hyphens, and be no longer than 64 characters. The subagent becomes callable as SA_<name>. For operation=list or status, optionally set it to a subagent name to report only that worker's sessions, or use an empty string to report all."
                     },
                     "description": {
                         "type": "string",

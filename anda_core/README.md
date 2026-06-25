@@ -45,7 +45,7 @@ anda_core = "0.11"
 
 An agent implements [`Agent<C>`][agent-trait] for a runtime context `C`. It declares a name, description, function definition, optional tool dependencies, optional supported resource tags, and an async `run` method.
 
-Agent names are registered case-insensitively and must follow the same function-name rules used for LLM function calling: lowercase ASCII letters, digits, and underscores, starting with a lowercase letter.
+Agent names are registered case-insensitively and must follow the same function-name rules used for LLM function calling: lowercase ASCII letters, digits, underscores, and hyphens, starting with a lowercase letter.
 
 ### Tools
 

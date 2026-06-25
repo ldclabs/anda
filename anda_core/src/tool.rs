@@ -38,7 +38,7 @@ where
     /// - Must not be empty;
     /// - Must not exceed 64 characters;
     /// - Must start with a lowercase letter;
-    /// - Can only contain: lowercase letters (a-z), digits (0-9), and underscores (_);
+    /// - Can only contain: lowercase letters (a-z), digits (0-9), underscores (_), and hyphens (-);
     /// - Unique within the engine.
     fn name(&self) -> String;
 
@@ -1117,7 +1117,7 @@ mod tests {
         type Output = String;
 
         fn name(&self) -> String {
-            "bad-tool".to_string()
+            "bad.tool".to_string()
         }
 
         fn description(&self) -> String {
@@ -1206,10 +1206,10 @@ mod tests {
             assert_eq!(output.output, "other");
 
             let invalid = InvalidTool;
-            assert_eq!(invalid.name(), "bad-tool");
+            assert_eq!(invalid.name(), "bad.tool");
             assert_eq!(invalid.description(), "Invalid function name");
             let definition = invalid.definition();
-            assert_eq!(definition.name, "bad-tool");
+            assert_eq!(definition.name, "bad.tool");
             assert_eq!(definition.description, "Invalid function name");
             assert_eq!(definition.parameters["type"], "object");
             let output = invalid

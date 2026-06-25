@@ -46,7 +46,7 @@ where
     /// - Must not be empty;
     /// - Must not exceed 64 characters;
     /// - Must start with a lowercase letter;
-    /// - Can only contain: lowercase letters (a-z), digits (0-9), and underscores (_);
+    /// - Can only contain: lowercase letters (a-z), digits (0-9), underscores (_), and hyphens (-);
     /// - Unique within the engine in lowercase.
     fn name(&self) -> String;
 
@@ -927,7 +927,7 @@ mod tests {
 
     impl Agent<TestAgentContext> for InvalidAgent {
         fn name(&self) -> String {
-            "bad-agent".to_string()
+            "bad.agent".to_string()
         }
 
         fn description(&self) -> String {
@@ -1093,7 +1093,7 @@ mod tests {
             );
 
             let invalid = InvalidAgent;
-            assert_eq!(invalid.name(), "bad-agent");
+            assert_eq!(invalid.name(), "bad.agent");
             assert_eq!(invalid.description(), "Invalid function name");
             assert!(
                 invalid
