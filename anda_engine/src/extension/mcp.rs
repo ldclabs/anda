@@ -158,7 +158,7 @@ impl McpToolProvider {
         // Capture the server's self-description (title, instructions) from the
         // initialize handshake so the discovery layer can present each server as
         // a coherent capability bundle, not just a flat list of tools.
-        let meta = McpServerMeta::from_peer_info(&config.id, peer.peer_info());
+        let meta = McpServerMeta::from_peer_info(&config.id, peer.peer_info().as_deref());
         let tools = peer.list_all_tools().await?;
 
         let routes = self.routes_for_tools(&config.id, tools)?;

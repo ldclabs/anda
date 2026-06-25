@@ -2,6 +2,20 @@
 
 All notable changes to the Anda project will be documented in this file.
 
+## [0.13.10] — 2026-06-25
+
+### Added — anda_core v0.13.10
+
+- **Hyphenated function names** — Agent, tool, and function-name validation now allows hyphens (`-`) in addition to letters, digits, and underscores, with documentation and tests updated to match the accepted naming rules.
+
+### Added — anda_engine v0.13.10
+
+- **Mutable completion chat history access** — `CompletionRunner::chat_history_mut()` exposes ordered mutable access to accumulated chat history messages so callers can update recorded context in place without appending replacement messages.
+
+### Fixed — anda_engine v0.13.10
+
+- **MCP peer metadata compatibility** — MCP tool discovery now handles the current `rmcp` peer-info return shape when capturing server title, description, and instructions for capability groups.
+
 ## [0.13.9] — 2026-06-20
 
 ### Fixed — anda_engine v0.13.9

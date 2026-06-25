@@ -1156,6 +1156,15 @@ impl CompletionRunner {
         self.chat_history.extend(messages);
     }
 
+    /// Returns mutable access to the accumulated chat history messages.
+    ///
+    /// This allows callers to update already recorded messages in place while
+    /// preserving message order. Use [`Self::append_chat_history`] to add new
+    /// messages.
+    pub fn chat_history_mut(&mut self) -> &mut [Message] {
+        &mut self.chat_history
+    }
+
     /// Returns whether the completion has finished.
     pub fn is_done(&self) -> bool {
         self.done
@@ -3324,6 +3333,11 @@ mod tests {
             ..Default::default()
         }]);
         assert_eq!(runner.chat_history().len(), 1);
+        runner.chat_history_mut()[0].content = vec![ContentPart::Text {
+            text: "updated".to_string(),
+        }];
+        assert_eq!(runner.chat_history().len(), 1);
+        assert_eq!(runner.chat_history()[0].text().as_deref(), Some("updated"));
 
         runner.follow_up_content(vec![ContentPart::Text {
             text: "follow".to_string(),
