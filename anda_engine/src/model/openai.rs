@@ -420,7 +420,6 @@ impl<'de> Deserialize<'de> for ServiceTier {
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
     None,
-    Minimal,
     Low,
     Medium,
     High,
@@ -431,7 +430,7 @@ pub enum ReasoningEffort {
 impl From<ModelEffort> for ReasoningEffort {
     fn from(value: ModelEffort) -> Self {
         match value {
-            ModelEffort::Minimal => Self::Minimal,
+            ModelEffort::Minimal => Self::Low,
             ModelEffort::Low => Self::Low,
             ModelEffort::Medium => Self::Medium,
             ModelEffort::High => Self::High,
@@ -443,7 +442,7 @@ impl From<ModelEffort> for ReasoningEffort {
 impl From<ModelEffort> for types::ReasoningEffort {
     fn from(value: ModelEffort) -> Self {
         match value {
-            ModelEffort::Minimal => Self::Minimal,
+            ModelEffort::Minimal => Self::Low,
             ModelEffort::Low => Self::Low,
             ModelEffort::Medium => Self::Medium,
             ModelEffort::High => Self::High,
@@ -2130,7 +2129,7 @@ mod tests {
 
         assert_eq!(
             ReasoningEffort::from(ModelEffort::Minimal),
-            ReasoningEffort::Minimal
+            ReasoningEffort::Low
         );
         assert_eq!(
             ReasoningEffort::from(ModelEffort::Medium),
@@ -2142,7 +2141,7 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_value(types::ReasoningEffort::from(ModelEffort::Minimal)).unwrap(),
-            json!("minimal")
+            json!("low")
         );
         assert_eq!(
             serde_json::to_value(types::ReasoningEffort::from(ModelEffort::Low)).unwrap(),

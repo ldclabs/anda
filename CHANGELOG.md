@@ -2,6 +2,14 @@
 
 All notable changes to the Anda project will be documented in this file.
 
+## [0.13.11] — 2026-06-25
+
+### Fixed — anda_engine v0.13.11
+
+- **Interrupted tool-call history** — Completion runners now append explicit error tool outputs when pending tool calls are discarded, stopped, or interrupted by steering, preventing follow-up requests from carrying dangling tool-call state.
+- **Provider raw-history cleanup** — Raw provider histories now prune unanswered tool calls recursively across nested OpenAI Responses, shell, patch, MCP approval, and Gemini function-call shapes while preserving surrounding text and metadata context.
+- **OpenAI minimal reasoning compatibility** — OpenAI model requests now map `ModelEffort::Minimal` to `low` reasoning effort instead of sending the unsupported `minimal` value.
+
 ## [0.13.10] — 2026-06-25
 
 ### Added — anda_core v0.13.10

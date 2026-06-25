@@ -1313,9 +1313,21 @@ impl CompletionRunner {
     ///
     /// This keeps accumulated chat history, usage, artifacts, and queued follow-up messages, but
     /// removes request content that was already sent to the failed completion. Long-lived callers
-    /// can use this before processing newly queued input, so stale tool results or dangling
-    /// tool-call history are not resent.
+    /// can use this before processing newly queued input, so stale tool results are not resent.
+    /// Pending, unexecuted tool calls are closed in the visible history before their raw provider
+    /// history is pruned.
     pub fn discard_in_flight_request(&mut self) {
+        self.discard_in_flight_request_with_interrupted_tool_outputs("tool call discarded", None);
+    }
+
+    fn discard_in_flight_request_with_interrupted_tool_outputs(
+        &mut self,
+        error: &str,
+        reason: Option<&str>,
+    ) {
+        if !self.pending_tool_calls.is_empty() {
+            self.append_interrupted_tool_outputs(error, reason);
+        }
         self.req.prompt.clear();
         self.req.content.clear();
         self.req.documents.clear();
@@ -1333,7 +1345,10 @@ impl CompletionRunner {
     /// idle-state output and includes accumulated usage/history so observers can account for work
     /// already performed before the stop.
     pub fn stop_current_task(&mut self, mut output: AgentOutput) -> AgentOutput {
-        self.discard_in_flight_request();
+        self.discard_in_flight_request_with_interrupted_tool_outputs(
+            "tool call stopped",
+            Some(&output.content),
+        );
         self.req.chat_history.clear();
         self.steering_message.clear();
         self.follow_up_message.clear();
@@ -1347,6 +1362,35 @@ impl CompletionRunner {
 
         self.last_output = Some(output.clone());
         output
+    }
+
+    fn append_interrupted_tool_outputs(&mut self, error: &str, reason: Option<&str>) {
+        let calls = Self::unanswered_tool_calls(&self.chat_history);
+        if calls.is_empty() {
+            return;
+        }
+
+        let reason = reason.map(str::trim).filter(|reason| !reason.is_empty());
+        let output = match reason {
+            Some(reason) => json!({"error": error, "reason": reason}),
+            None => json!({"error": error}),
+        };
+        let content = calls
+            .into_iter()
+            .map(|call| ContentPart::ToolOutput {
+                name: call.name,
+                output: output.clone(),
+                is_error: Some(true),
+                call_id: call.call_id,
+                remote_id: None,
+            })
+            .collect::<Vec<_>>();
+
+        self.chat_history.push(Message {
+            role: "tool".to_string(),
+            content,
+            ..Default::default()
+        });
     }
 
     /// Set an implicit context message that is automatically included in the next request.
@@ -1542,6 +1586,66 @@ impl CompletionRunner {
             || !self.req.documents.is_empty()
     }
 
+    fn unanswered_tool_calls(messages: &[Message]) -> Vec<ToolCall> {
+        let mut pending: Vec<ToolCall> = Vec::new();
+
+        for message in messages {
+            for part in &message.content {
+                match part {
+                    ContentPart::ToolCall {
+                        name,
+                        args,
+                        call_id,
+                    } => pending.push(ToolCall {
+                        name: name.clone(),
+                        args: args.clone(),
+                        call_id: call_id.clone(),
+                        result: None,
+                        remote_id: None,
+                    }),
+                    ContentPart::ToolOutput { name, call_id, .. } => {
+                        if let Some(pos) =
+                            Self::matching_tool_call_position(&pending, name, call_id.as_deref())
+                        {
+                            pending.remove(pos);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        pending
+    }
+
+    fn matching_tool_call_position(
+        pending: &[ToolCall],
+        output_name: &str,
+        output_call_id: Option<&str>,
+    ) -> Option<usize> {
+        pending.iter().position(|tool| {
+            Self::tool_call_matches_output(
+                &tool.name,
+                tool.call_id.as_deref(),
+                output_name,
+                output_call_id,
+            )
+        })
+    }
+
+    fn tool_call_matches_output(
+        pending_name: &str,
+        pending_call_id: Option<&str>,
+        output_name: &str,
+        output_call_id: Option<&str>,
+    ) -> bool {
+        match (pending_call_id, output_call_id) {
+            (Some(pending), Some(output)) => pending == output,
+            (None, None) => pending_name == output_name,
+            _ => false,
+        }
+    }
+
     fn discard_pending_tool_call_raw_history(&mut self) {
         if let Some(start) = self.pending_tool_call_raw_history_start.take() {
             Self::prune_unanswered_tool_calls_from_raw_history(&mut self.req.raw_history, start);
@@ -1574,23 +1678,28 @@ impl CompletionRunner {
     }
 
     fn prune_nested_tool_calls(value: &mut Json) {
-        let Some(map) = value.as_object_mut() else {
-            return;
-        };
-
-        // OpenAI Chat Completions keeps tool calls as fields on an assistant message. Remove the
-        // unanswered calls, but keep any text/reasoning fields on the same message.
-        map.remove("tool_calls");
-        map.remove("function_call");
-
-        for key in ["content", "parts"] {
-            if let Some(Json::Array(items)) = map.get_mut(key) {
+        match value {
+            Json::Array(items) => {
                 let retained: Vec<Json> = items
                     .drain(..)
                     .filter_map(Self::prune_unanswered_tool_calls_from_raw_item)
                     .collect();
                 *items = retained;
             }
+            Json::Object(map) => {
+                // OpenAI Chat Completions keeps tool calls as fields on an assistant message.
+                // Remove the unanswered calls, but keep any text/reasoning fields on the same
+                // message. Provider raw history may also wrap output items under arbitrary fields,
+                // so recurse through every remaining value instead of only common content arrays.
+                map.remove("tool_calls");
+                map.remove("function_call");
+                map.remove("functionCall");
+
+                for value in map.values_mut() {
+                    Self::prune_nested_tool_calls(value);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1604,6 +1713,12 @@ impl CompletionRunner {
             Some(
                 "function_call"
                     | "custom_tool_call"
+                    | "computer_call"
+                    | "tool_search_call"
+                    | "local_shell_call"
+                    | "shell_call"
+                    | "apply_patch_call"
+                    | "mcp_approval_request"
                     | "tool_call"
                     | "tool_use"
                     | "server_tool_use"
@@ -1614,8 +1729,16 @@ impl CompletionRunner {
             return true;
         }
 
-        // Gemini function-call parts do not use a `type` field.
+        // Gemini function-call parts do not use a `type` field. Treat only the part itself as a
+        // tool call; wrapper objects that also carry text or metadata should be pruned recursively
+        // so their non-tool context survives.
         map.contains_key("functionCall")
+            && map.keys().all(|key| {
+                matches!(
+                    key.as_str(),
+                    "functionCall" | "thought" | "thoughtSignature"
+                )
+            })
     }
 
     fn raw_history_item_has_context(value: &Json) -> bool {
@@ -1627,7 +1750,7 @@ impl CompletionRunner {
             Json::Object(map) => map.iter().any(|(key, value)| {
                 !matches!(
                     key.as_str(),
-                    "role" | "name" | "id" | "status" | "phase" | "timestamp"
+                    "role" | "type" | "name" | "id" | "status" | "phase" | "timestamp"
                 ) && Self::raw_history_item_has_context(value)
             }),
         }
@@ -1779,11 +1902,10 @@ impl CompletionRunner {
         if !self.pending_tool_calls.is_empty()
             && let Some(content) = self.drain_steering_message()
         {
-            // Drop unanswered raw tool-call requests so the redirected round does not inherit an
-            // unfinished tool-call requirement.
-            self.discard_pending_tool_call_raw_history();
-            // Clear pending tool calls since the operator's steering should take priority and interrupt the current flow, even if there are still pending tool calls.
-            self.pending_tool_calls.clear();
+            self.discard_in_flight_request_with_interrupted_tool_outputs(
+                "tool call interrupted by steering",
+                None,
+            );
             self.req.content = content;
             self.req.role = Some("user".to_string());
         } else if !self.has_request_input() {
@@ -2000,6 +2122,7 @@ impl CompletionRunner {
 
         if let Some(content) = self.drain_steering_message() {
             if !output.tool_calls.is_empty() {
+                self.append_interrupted_tool_outputs("tool call interrupted by steering", None);
                 // Drop unanswered raw tool-call requests so the redirected round does not inherit
                 // an unfinished tool-call requirement.
                 Self::prune_unanswered_tool_calls_from_raw_history(
@@ -2658,6 +2781,108 @@ mod tests {
                         }
                     }]
                 })],
+                ..Default::default()
+            })))
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct ToolCallHistoryCompleter {
+        requests: Arc<Mutex<Vec<CompletionRequest>>>,
+    }
+
+    impl CompletionFeaturesDyn for ToolCallHistoryCompleter {
+        fn model_name(&self) -> String {
+            "tool_call_history".to_string()
+        }
+
+        fn completion(
+            &self,
+            req: CompletionRequest,
+        ) -> anda_core::BoxPinFut<Result<AgentOutput, BoxError>> {
+            self.requests.lock().unwrap().push(req.clone());
+            let text = req
+                .content
+                .iter()
+                .filter_map(|part| match part {
+                    ContentPart::Text { text } | ContentPart::Reasoning { text } => {
+                        Some(text.as_str())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            if req.prompt == "start tool" || text.contains("start tool") {
+                let call = ToolCall {
+                    name: "echo_tool".to_string(),
+                    args: json!({"input": "stop"}),
+                    call_id: Some("call_stop_test".to_string()),
+                    result: None,
+                    remote_id: None,
+                };
+                return Box::pin(futures::future::ready(Ok(AgentOutput {
+                    tool_calls: vec![call.clone()],
+                    chat_history: vec![
+                        Message {
+                            role: "user".to_string(),
+                            content: vec![ContentPart::Text {
+                                text: "start tool".to_string(),
+                            }],
+                            ..Default::default()
+                        },
+                        Message {
+                            role: "assistant".to_string(),
+                            content: vec![
+                                ContentPart::Text {
+                                    text: "planning before tool".to_string(),
+                                },
+                                ContentPart::ToolCall {
+                                    name: call.name,
+                                    args: call.args,
+                                    call_id: call.call_id,
+                                },
+                            ],
+                            ..Default::default()
+                        },
+                    ],
+                    raw_history: vec![
+                        json!({
+                            "role": "assistant",
+                            "content": "planning before tool",
+                            "tool_calls": [{
+                                "id": "call_stop_test",
+                                "type": "function",
+                                "function": {
+                                    "name": "echo_tool",
+                                    "arguments": "{\"input\":\"stop\"}"
+                                }
+                            }]
+                        }),
+                        json!({
+                            "type": "function_call",
+                            "call_id": "call_stop_test",
+                            "name": "echo_tool",
+                            "arguments": "{\"input\":\"stop\"}"
+                        }),
+                    ],
+                    usage: Usage {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                        cached_tokens: 0,
+                        requests: 1,
+                    },
+                    ..Default::default()
+                })));
+            }
+
+            Box::pin(futures::future::ready(Ok(AgentOutput {
+                content: "continued".to_string(),
+                usage: Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cached_tokens: 0,
+                    requests: 1,
+                },
                 ..Default::default()
             })))
         }
@@ -3777,6 +4002,71 @@ mod tests {
         assert_eq!(raw_history[1], json!(42));
     }
 
+    #[test]
+    fn runner_prunes_deeply_nested_raw_tool_calls() {
+        let sentinel = json!({"role": "user", "content": "prior"});
+        let mut raw_history = vec![
+            sentinel.clone(),
+            json!({
+                "role": "assistant",
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [
+                            {"type": "output_text", "text": "kept nested text"}
+                        ]
+                    },
+                    {
+                        "type": "function_call",
+                        "call_id": "call_nested_function",
+                        "name": "lookup",
+                        "arguments": "{}"
+                    },
+                    {
+                        "type": "local_shell_call",
+                        "id": "lsh_1",
+                        "action": {"type": "exec", "command": ["pwd"]},
+                        "call_id": "call_nested_shell",
+                        "status": "completed"
+                    },
+                    {
+                        "type": "apply_patch_call",
+                        "id": "ap_1",
+                        "call_id": "call_nested_patch",
+                        "operation": {"type": "update", "path": "src/lib.rs", "diff": "@@"},
+                        "status": "completed"
+                    }
+                ],
+                "metadata": {
+                    "items": [
+                        {
+                            "type": "custom_tool_call",
+                            "call_id": "call_nested_custom",
+                            "input": "select 1",
+                            "name": "sql"
+                        },
+                        {"note": "keep nested metadata"}
+                    ]
+                },
+                "tool_calls": [{"id": "call_nested_chat"}],
+                "function_call": {"name": "legacy"},
+                "functionCall": {"name": "gemini"}
+            }),
+        ];
+
+        CompletionRunner::prune_unanswered_tool_calls_from_raw_history(&mut raw_history, 1);
+
+        assert_eq!(raw_history.len(), 2);
+        assert_eq!(raw_history[0], sentinel);
+        let pruned = serde_json::to_string(&raw_history[1]).unwrap();
+        assert!(pruned.contains("kept nested text"));
+        assert!(pruned.contains("keep nested metadata"));
+        assert!(!pruned.contains("call_nested"));
+        assert!(raw_history[1].get("tool_calls").is_none());
+        assert!(raw_history[1].get("function_call").is_none());
+        assert!(raw_history[1].get("functionCall").is_none());
+    }
+
     // ── CompletionRunner basic tests ──
 
     #[tokio::test(flavor = "current_thread")]
@@ -4024,6 +4314,222 @@ mod tests {
         assert!(runner.req.role.is_none());
         assert!(runner.req.raw_history.is_empty());
         assert!(runner.pending_tool_calls.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_stop_current_task_closes_pending_tool_call_history() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let model = Model::with_completer(Arc::new(ToolCallHistoryCompleter {
+            requests: requests.clone(),
+        }));
+        let ctx = EngineBuilder::new().with_model(model).mock_ctx();
+        let mut runner = ctx.completion_iter(
+            CompletionRequest {
+                prompt: "start tool".to_string(),
+                ..Default::default()
+            },
+            Vec::new(),
+        );
+
+        let step = runner.next().await.unwrap().unwrap();
+        assert_eq!(
+            step.tool_calls[0].call_id.as_deref(),
+            Some("call_stop_test")
+        );
+        assert!(!runner.no_pending_tool_calls());
+        assert!(!CompletionRunner::unanswered_tool_calls(runner.chat_history()).is_empty());
+
+        let stopped = runner.stop_current_task(AgentOutput {
+            content: "operator stopped the task".to_string(),
+            ..Default::default()
+        });
+
+        assert!(runner.no_pending_tool_calls());
+        assert!(CompletionRunner::unanswered_tool_calls(runner.chat_history()).is_empty());
+        assert!(
+            stopped.chat_history.iter().any(|message| {
+                message.content.iter().any(|part| {
+                    matches!(
+                        part,
+                        ContentPart::ToolOutput {
+                            call_id,
+                            is_error: Some(true),
+                            ..
+                        } if call_id.as_deref() == Some("call_stop_test")
+                    )
+                })
+            }),
+            "stopped output should answer the pending tool call"
+        );
+        assert!(
+            stopped.chat_history.iter().any(|message| {
+                message.content.iter().any(|part| {
+                    matches!(
+                        part,
+                        ContentPart::Text { text } if text == "planning before tool"
+                    )
+                })
+            }),
+            "stopped output should preserve assistant text that shared the tool-call message"
+        );
+
+        runner.follow_up("continue after stop".to_string());
+        let continued = runner.next().await.unwrap().unwrap();
+        assert_eq!(continued.content, "continued");
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].raw_history.len(), 1);
+        assert_eq!(
+            requests[1].raw_history[0]["content"],
+            "planning before tool"
+        );
+        assert!(requests[1].raw_history[0].get("tool_calls").is_none());
+        assert!(
+            !serde_json::to_string(&requests[1].raw_history)
+                .unwrap()
+                .contains("call_stop_test"),
+            "follow-up request should not resend the interrupted raw tool call"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_discard_in_flight_request_closes_pending_tool_call_history() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let model = Model::with_completer(Arc::new(ToolCallHistoryCompleter {
+            requests: requests.clone(),
+        }));
+        let ctx = EngineBuilder::new().with_model(model).mock_ctx();
+        let mut runner = ctx.completion_iter(
+            CompletionRequest {
+                prompt: "start tool".to_string(),
+                ..Default::default()
+            },
+            Vec::new(),
+        );
+
+        let step = runner.next().await.unwrap().unwrap();
+        assert_eq!(
+            step.tool_calls[0].call_id.as_deref(),
+            Some("call_stop_test")
+        );
+
+        runner.discard_in_flight_request();
+
+        assert!(runner.no_pending_tool_calls());
+        assert!(CompletionRunner::unanswered_tool_calls(runner.chat_history()).is_empty());
+        assert!(runner.chat_history().iter().any(|message| {
+            message.content.iter().any(|part| {
+                matches!(
+                    part,
+                    ContentPart::ToolOutput {
+                        call_id,
+                        is_error: Some(true),
+                        output,
+                        ..
+                    } if call_id.as_deref() == Some("call_stop_test")
+                        && output.get("error").and_then(Json::as_str)
+                            == Some("tool call discarded")
+                )
+            })
+        }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_queued_steering_closes_skipped_tool_call_history() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let model = Model::with_completer(Arc::new(ToolCallHistoryCompleter {
+            requests: requests.clone(),
+        }));
+        let ctx = EngineBuilder::new().with_model(model).mock_ctx();
+        let mut runner = ctx.completion_iter(
+            CompletionRequest {
+                prompt: "start tool".to_string(),
+                ..Default::default()
+            },
+            Vec::new(),
+        );
+        runner.steer("redirect".to_string());
+
+        let step1 = runner.next().await.unwrap().unwrap();
+        assert_eq!(step1.tool_calls.len(), 1);
+        assert!(CompletionRunner::unanswered_tool_calls(&step1.chat_history).is_empty());
+        assert!(step1.chat_history.iter().any(|message| {
+            message.content.iter().any(|part| {
+                matches!(
+                    part,
+                    ContentPart::ToolOutput {
+                        call_id,
+                        is_error: Some(true),
+                        output,
+                        ..
+                    } if call_id.as_deref() == Some("call_stop_test")
+                        && output.get("error").and_then(Json::as_str)
+                            == Some("tool call interrupted by steering")
+                )
+            })
+        }));
+
+        let step2 = runner.next().await.unwrap().unwrap();
+        assert_eq!(step2.content, "continued");
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            !serde_json::to_string(&requests[1].raw_history)
+                .unwrap()
+                .contains("call_stop_test"),
+            "steered request should not resend the interrupted raw tool call"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_late_steering_closes_pending_tool_call_history() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let model = Model::with_completer(Arc::new(ToolCallHistoryCompleter {
+            requests: requests.clone(),
+        }));
+        let ctx = EngineBuilder::new().with_model(model).mock_ctx();
+        let mut runner = ctx.completion_iter(
+            CompletionRequest {
+                prompt: "start tool".to_string(),
+                ..Default::default()
+            },
+            Vec::new(),
+        );
+
+        let step1 = runner.next().await.unwrap().unwrap();
+        assert_eq!(step1.tool_calls.len(), 1);
+        assert!(!CompletionRunner::unanswered_tool_calls(runner.chat_history()).is_empty());
+
+        runner.steer("redirect".to_string());
+        let step2 = runner.next().await.unwrap().unwrap();
+        assert_eq!(step2.content, "continued");
+        assert!(CompletionRunner::unanswered_tool_calls(&step2.chat_history).is_empty());
+        assert!(step2.chat_history.iter().any(|message| {
+            message.content.iter().any(|part| {
+                matches!(
+                    part,
+                    ContentPart::ToolOutput {
+                        call_id,
+                        is_error: Some(true),
+                        output,
+                        ..
+                    } if call_id.as_deref() == Some("call_stop_test")
+                        && output.get("error").and_then(Json::as_str)
+                            == Some("tool call interrupted by steering")
+                )
+            })
+        }));
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            !serde_json::to_string(&requests[1].raw_history)
+                .unwrap()
+                .contains("call_stop_test"),
+            "late-steered request should not resend the interrupted raw tool call"
+        );
     }
 
     // ── Tool call tests ──

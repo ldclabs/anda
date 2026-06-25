@@ -2925,7 +2925,6 @@ impl<'de> Deserialize<'de> for OpenAIServiceTier {
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
     None,
-    Minimal,
     Low,
     #[default]
     Medium,
