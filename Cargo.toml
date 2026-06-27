@@ -64,7 +64,7 @@ ic_tee_agent = "0.7"
 ic_tee_gateway_sdk = "0.7"
 infer2 = "0.21"
 anda_cloud_cdk = "0.5"
-object_store = { version = "0.13" }
+object_store = { version = "0.14" }
 parking_lot = "0.12"
 tokio-util = "0.7"
 tokio = { version = "1", features = ["full"] }

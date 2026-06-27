@@ -597,6 +597,7 @@ pub fn derivation_path_with(path: &Path, derivation_path: Vec<Vec<u8>>) -> Vec<V
 mod tests {
     use super::*;
     use futures::executor::block_on;
+    use http::Extensions;
     use std::{
         collections::BTreeMap,
         sync::{
@@ -771,6 +772,7 @@ mod tests {
             Ok(PutResult {
                 e_tag: version.e_tag,
                 version: version.version,
+                extensions: Extensions::default(),
             })
         }
 
