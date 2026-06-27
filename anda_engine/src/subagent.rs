@@ -679,8 +679,8 @@ impl SubSessionRunner {
     /// runner seeded with that summary, discarding the bloated history while preserving the
     /// session's accumulated usage, tool usage, and artifacts.
     ///
-    /// Must only be called at an idle boundary (no pending tool calls or queued input), so the
-    /// summarization turn does not strand an unanswered tool-call requirement.
+    /// Pending tool calls are executed before summarization, so the compaction turn does not
+    /// strand an unanswered tool-call requirement.
     async fn compact(&mut self) -> Result<(), BoxError> {
         let (runner, mut output) = match self.runner.handoff(None).await {
             Ok((runner, output)) => (runner, output),
@@ -801,24 +801,22 @@ impl SubSessionRunner {
         // Compact (if needed) before attaching the batch, accounting for its estimated size, then
         // queue it. Running unconditionally also covers the case where the committed history grew
         // over the threshold without any new input this round.
-        if self.runner.no_pending_tool_calls()
-            && self.runner.needs_compaction_with(|| {
-                estimated_content_tokens(&follow_up_batch)
-                    .saturating_add(estimated_content_tokens(&steer_batch))
-                    .saturating_add(
-                        self.runner
-                            .steering_message_iter()
-                            .map(|c| c.estimated_tokens() as u64)
-                            .sum(),
-                    )
-                    .saturating_add(
-                        self.runner
-                            .follow_up_message_iter()
-                            .map(|c| c.estimated_tokens() as u64)
-                            .sum(),
-                    )
-            })
-        {
+        if self.runner.needs_compaction_with(|| {
+            estimated_content_tokens(&follow_up_batch)
+                .saturating_add(estimated_content_tokens(&steer_batch))
+                .saturating_add(
+                    self.runner
+                        .steering_message_iter()
+                        .map(|c| c.estimated_tokens() as u64)
+                        .sum(),
+                )
+                .saturating_add(
+                    self.runner
+                        .follow_up_message_iter()
+                        .map(|c| c.estimated_tokens() as u64)
+                        .sum(),
+                )
+        }) {
             self.compact().await?;
         }
         if !follow_up_batch.is_empty() {
@@ -2094,7 +2092,7 @@ mod tests {
     use crate::context::COMPACTION_PROMPT;
     use crate::engine::EngineBuilder;
     use crate::model::{CompletionFeaturesDyn, Model, Models};
-    use anda_core::{BoxPinFut, Message};
+    use anda_core::{BoxPinFut, Message, Tool};
     use async_trait::async_trait;
     use parking_lot::Mutex;
     use serde_json::json;
@@ -2213,6 +2211,65 @@ mod tests {
     }
 
     #[derive(Clone, Debug)]
+    struct PendingToolCompactionCompleter {
+        requests: Arc<Mutex<Vec<CompletionRequest>>>,
+    }
+
+    impl CompletionFeaturesDyn for PendingToolCompactionCompleter {
+        fn model_name(&self) -> String {
+            "pending-tool-compaction".to_string()
+        }
+
+        fn completion(&self, req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
+            self.requests.lock().push(req.clone());
+
+            let prompt = request_text(&req);
+            let is_compaction = prompt.trim() == COMPACTION_PROMPT.trim();
+            let output = if is_compaction {
+                AgentOutput {
+                    content: "compacted handoff".to_string(),
+                    usage: Usage {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                        cached_tokens: 0,
+                        requests: 1,
+                    },
+                    ..Default::default()
+                }
+            } else {
+                AgentOutput {
+                    content: "looking up".to_string(),
+                    tool_calls: vec![anda_core::ToolCall {
+                        name: "compact_echo".to_string(),
+                        args: json!({"input": "lookup"}),
+                        result: None,
+                        call_id: Some("call-compact".to_string()),
+                        remote_id: None,
+                    }],
+                    chat_history: vec![Message {
+                        role: "assistant".to_string(),
+                        content: vec![ContentPart::ToolCall {
+                            name: "compact_echo".to_string(),
+                            args: json!({"input": "lookup"}),
+                            call_id: Some("call-compact".to_string()),
+                        }],
+                        ..Default::default()
+                    }],
+                    usage: Usage {
+                        input_tokens: 100_000,
+                        output_tokens: 1,
+                        cached_tokens: 0,
+                        requests: 1,
+                    },
+                    ..Default::default()
+                }
+            };
+
+            Box::pin(futures::future::ready(Ok(output)))
+        }
+    }
+
+    #[derive(Clone, Debug)]
     struct EmptyCompactionCompleter;
 
     impl CompletionFeaturesDyn for EmptyCompactionCompleter {
@@ -2275,6 +2332,60 @@ mod tests {
 
         fn completion(&self, _req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
             Box::pin(futures::future::ready(Err("model failed".into())))
+        }
+    }
+
+    struct CompactEchoTool;
+
+    #[derive(Debug, Deserialize)]
+    struct CompactEchoArgs {
+        input: String,
+    }
+
+    impl Tool<BaseCtx> for CompactEchoTool {
+        type Args = CompactEchoArgs;
+        type Output = String;
+
+        fn name(&self) -> String {
+            "compact_echo".to_string()
+        }
+
+        fn description(&self) -> String {
+            "Echoes input during compaction tests".to_string()
+        }
+
+        fn definition(&self) -> FunctionDefinition {
+            FunctionDefinition {
+                name: "compact_echo".to_string(),
+                description: "Echoes input during compaction tests".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "input": {"type": "string"}
+                    },
+                    "required": ["input"],
+                    "additionalProperties": false
+                }),
+                strict: Some(true),
+            }
+        }
+
+        async fn call(
+            &self,
+            _ctx: BaseCtx,
+            args: Self::Args,
+            _resources: Vec<Resource>,
+        ) -> Result<ToolOutput<String>, BoxError> {
+            Ok(ToolOutput {
+                output: format!("echoed:{}", args.input),
+                usage: Usage {
+                    input_tokens: 2,
+                    output_tokens: 3,
+                    cached_tokens: 0,
+                    requests: 1,
+                },
+                ..Default::default()
+            })
         }
     }
 
@@ -3075,6 +3186,84 @@ mod tests {
         assert_eq!(
             request_text(&recorded[1]).matches(chunk.as_str()).count(),
             3
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn subsession_runner_compaction_executes_pending_tool_calls_first() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let model = Model::with_completer(Arc::new(PendingToolCompactionCompleter {
+            requests: requests.clone(),
+        }));
+        let ctx = EngineBuilder::new()
+            .with_model(model)
+            .register_tool(Arc::new(CompactEchoTool))
+            .unwrap()
+            .mock_ctx();
+
+        let (sender, _rx) = tokio::sync::mpsc::channel(4);
+        let session = Arc::new(SubSession::new(
+            "session-tool-compact".to_string(),
+            "compactor".to_string(),
+            sender,
+            0,
+        ));
+
+        let mut runner = SubSessionRunner {
+            session,
+            agent_hook: None,
+            runner: ctx
+                .completion_iter(
+                    CompletionRequest {
+                        prompt: "seed task".to_string(),
+                        ..Default::default()
+                    },
+                    Vec::new(),
+                )
+                .unbound(),
+            last_output: None,
+            carried_artifacts: Vec::new(),
+            closing: false,
+        };
+
+        assert!(runner.run(Vec::new()).await.unwrap());
+        assert!(!runner.runner.no_pending_tool_calls());
+
+        assert!(runner.run(Vec::new()).await.unwrap());
+
+        let recorded = requests.lock().clone();
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(request_text(&recorded[0]), "seed task");
+        assert_eq!(request_text(&recorded[1]).trim(), COMPACTION_PROMPT.trim());
+        assert!(recorded[1].tools.is_empty());
+        assert!(recorded[1].chat_history.iter().any(|message| {
+            message.content.iter().any(|part| {
+                matches!(
+                    part,
+                    ContentPart::ToolOutput {
+                        name,
+                        output,
+                        call_id: Some(call_id),
+                        ..
+                    } if name == "compact_echo"
+                        && call_id == "call-compact"
+                        && output.as_str() == Some("echoed:lookup")
+                )
+            })
+        }));
+
+        assert!(runner.runner.no_pending_tool_calls());
+        assert_eq!(
+            runner.runner.chat_history()[0].text().as_deref(),
+            Some("compacted handoff")
+        );
+        assert_eq!(
+            runner
+                .runner
+                .tools_usage()
+                .get("compact_echo")
+                .map(|usage| usage.requests),
+            Some(1)
         );
     }
 

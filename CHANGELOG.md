@@ -2,6 +2,12 @@
 
 All notable changes to the Anda project will be documented in this file.
 
+## [0.13.13] — 2026-06-27
+
+### Fixed — anda_engine v0.13.13
+
+- **Subagent compaction with pending tool calls** — Subagent session compaction now executes pending tool calls and records their tool outputs before summarizing, preventing compacted histories from stranding unanswered tool-call requirements.
+
 ## [0.13.11] — 2026-06-25
 
 ### Fixed — anda_engine v0.13.11

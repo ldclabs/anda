@@ -1810,16 +1810,45 @@ impl CompletionRunner {
     }
 
     /// Summarizes the current conversation into a single handoff message and swaps in a fresh
-    /// runner seeded with that summary, discarding the bloated history.
+    /// runner seeded with that summary, discarding the bloated history. Pending tool calls are
+    /// executed first unless queued steering interrupts them; interrupted calls are closed before
+    /// compaction so provider tool-call requirements are not stranded. Queued follow-up or
+    /// steering input is preserved and delivered after the handoff so user intent is not folded
+    /// into the compaction prompt.
     pub async fn handoff(
         &mut self,
         compaction_prompt: Option<String>,
     ) -> Result<(Self, AgentOutput), BoxError> {
         let unbound = self.unbound;
+        let prompt = compaction_prompt.unwrap_or_else(|| COMPACTION_PROMPT.to_string());
+
+        if !self.pending_tool_calls.is_empty() {
+            if self.steering_message.is_empty() {
+                if self.has_request_input() {
+                    return Err(
+                        "cannot compact while pending tool calls and request input are both queued"
+                            .into(),
+                    );
+                }
+
+                self.execute_pending_tool_calls_into_request().await?;
+                self.commit_tool_outputs_to_history();
+            } else {
+                self.discard_in_flight_request_with_interrupted_tool_outputs(
+                    "tool call interrupted by steering",
+                    None,
+                );
+            }
+        }
+
         let merge_discovered_tools = self.merge_discovered_tools;
+        let discovered_tools = self.discovered_tools.clone();
+        let discovery_selection_counts = self.discovery_selection_counts.clone();
         // Captured before clearing tools so the replacement runner restores the base toolset.
         let handoff_req = self.req.clone();
-        let prompt = compaction_prompt.unwrap_or_else(|| COMPACTION_PROMPT.to_string());
+        let queued_follow_up = std::mem::take(&mut self.follow_up_message);
+        let queued_steering = std::mem::take(&mut self.steering_message);
+
         self.steer(prompt);
         // Drop tools so the summarization turn cannot spawn more tool calls.
         self.set_tools(Vec::new());
@@ -1859,6 +1888,10 @@ impl CompletionRunner {
             .reserve_chat_history(vec![compaction_msg]);
         runner.set_unbound(unbound);
         runner.set_merge_discovered_tools(merge_discovered_tools);
+        runner.discovered_tools = discovered_tools;
+        runner.discovery_selection_counts = discovery_selection_counts;
+        runner.follow_up_message = queued_follow_up;
+        runner.steering_message = queued_steering;
         Ok((runner, output))
     }
 
@@ -1897,6 +1930,173 @@ impl CompletionRunner {
         last.ok_or_else(|| "completion runner returned no output".into())
     }
 
+    async fn execute_pending_tool_calls_into_request(&mut self) -> Result<bool, BoxError> {
+        let tool_calls = std::mem::take(&mut self.pending_tool_calls);
+        if tool_calls.is_empty() {
+            return Ok(false);
+        }
+
+        let mut tool_call_futs: Vec<BoxPinFut<ToolCall>> = Vec::new();
+        for mut tool in tool_calls.into_iter() {
+            let tool_name = tool.name.to_ascii_lowercase();
+            if self.ctx.has_tool_lowercase(&tool_name)
+                || strip_prefix_ignore_ascii_case(&tool_name, REMOTE_TOOL_PREFIX).is_some()
+            {
+                let ctx = self.ctx.clone();
+                let input = ToolInput {
+                    name: tool.name.clone(),
+                    args: tool.args.clone(),
+                    resources: self
+                        .ctx
+                        .select_tool_resources(&tool.name, &mut self.resources)
+                        .await,
+                    meta: None,
+                };
+                tool_call_futs.push(Box::pin(async move {
+                    match ctx.tool_call(input).await {
+                        Ok((res, remote_id)) => {
+                            tool.remote_id = remote_id;
+                            tool.result = Some(res);
+                        }
+                        Err(err) => {
+                            // 工具调用失败了，但我们不能终止整个对话流程，可以让 LLM 尝试纠正错误并继续对话
+                            tool.result = Some(ToolOutput {
+                                output: json!({ "error": format!(
+                                    "tool call failed: {}",
+                                    err
+                                )}),
+                                is_error: Some(true),
+                                ..Default::default()
+                            });
+                        }
+                    }
+                    tool
+                }));
+            } else if self.ctx.agents.contains_lowercase(&tool_name)
+                || self.ctx.subagents.contains_lowercase(&tool_name)
+                || strip_prefix_ignore_ascii_case(&tool_name, SUB_AGENT_PREFIX).is_some()
+                || strip_prefix_ignore_ascii_case(&tool_name, REMOTE_AGENT_PREFIX).is_some()
+            {
+                // Subagents consume structured controls such as `session`, `model`, and
+                // `effort`, so preserve their full argument object. Plain string args and
+                // normal agents keep the historical prompt behavior.
+                let prompt = if let Some(args) = tool.args.as_str() {
+                    args.to_string()
+                } else if let Some(args) = tool.args.as_object()
+                    && args.len() == 1
+                    && let Some(prompt) = args.get("prompt").and_then(|v| v.as_str())
+                {
+                    prompt.to_string()
+                } else {
+                    serde_json::to_string(&tool.args).unwrap_or_else(|_| tool.args.to_string())
+                };
+
+                let ctx = self.ctx.clone();
+                let input = AgentInput {
+                    name: tool.name.clone(),
+                    prompt,
+                    resources: self
+                        .ctx
+                        .select_agent_resources(&tool.name, &mut self.resources)
+                        .await,
+                    ..Default::default()
+                };
+                tool_call_futs.push(Box::pin(async move {
+                    match ctx.agent_run(input).await {
+                        Ok((res, remote_id)) => {
+                            tool.remote_id = remote_id;
+                            tool.result = Some(res.into_tool_output());
+                        }
+                        Err(err) => {
+                            // agent 调用失败了，但我们不能终止整个对话流程，可以让 LLM 尝试纠正错误并继续对话
+                            tool.result = Some(ToolOutput {
+                                output: json!({ "error": format!(
+                                    "agent run failed: {}",
+                                    err
+                                )}),
+                                is_error: Some(true),
+                                ..Default::default()
+                            });
+                        }
+                    }
+                    tool
+                }));
+            } else {
+                tool_call_futs.push(Box::pin(async move {
+                    tool.result = Some(ToolOutput {
+                        output: json!({ "error": format!(
+                            "tool call failed: {} not found",
+                            tool.name
+                        )}),
+                        is_error: Some(true),
+                        ..Default::default()
+                    });
+                    tool
+                }));
+            }
+        }
+
+        let mut tool_calls: Vec<ToolCall> = Vec::new();
+        let mut tool_calls_continue: Vec<ContentPart> = Vec::new();
+        if !tool_call_futs.is_empty() {
+            let results = futures::future::join_all(tool_call_futs).await;
+
+            for mut tool in results {
+                if let Some(res) = &mut tool.result {
+                    let mut usage = res.usage.clone();
+                    // usage.requests 原值为内部调用次数，这里把它重置为 1 来表示被模型调用了一次，方便后续统计被调用的工具次数
+                    usage.requests = 1;
+                    self.tools_usage
+                        .entry(tool.name.to_ascii_lowercase())
+                        .and_modify(|u| u.accumulate(&usage))
+                        .or_insert(usage);
+                    self.accumulate_tools_usage(&res.tools_usage);
+                    self.accumulate(&res.usage);
+                    self.add_discovered_tools_from_output(&tool.name, &res.output);
+                    self.compact_discovery_tool_output_for_context(&tool.name, &mut res.output);
+
+                    // We can not ignore some tool calls.
+                    // GPT-5: An assistant message with 'tool_calls' must be followed by tool messages responding to each 'tool_call_id'.
+                    tool_calls_continue.push(ContentPart::ToolOutput {
+                        name: tool.name.clone(),
+                        output: res.output.clone(),
+                        is_error: res.is_error,
+                        call_id: tool.call_id.clone(),
+                        remote_id: tool.remote_id,
+                    });
+
+                    self.artifacts.append(&mut res.artifacts);
+                    tool_calls.push(tool);
+                }
+            }
+        }
+
+        // 累计当前轮的 tool_calls
+        self.tool_calls.append(&mut tool_calls);
+        self.req.role = Some("tool".to_string());
+        if !tool_calls_continue.is_empty() {
+            self.req.content.append(&mut tool_calls_continue);
+        }
+
+        Ok(true)
+    }
+
+    fn commit_tool_outputs_to_history(&mut self) {
+        if self.req.role.as_deref() != Some("tool") || self.req.content.is_empty() {
+            return;
+        }
+
+        let msg = Message {
+            role: "tool".to_string(),
+            content: std::mem::take(&mut self.req.content),
+            ..Default::default()
+        };
+
+        self.req.chat_history.push(msg.clone());
+        self.chat_history.push(msg);
+        self.req.role = None;
+    }
+
     async fn inner_next(&mut self) -> Result<Option<AgentOutput>, BoxError> {
         let mut pending_tool_calls = false;
         if !self.pending_tool_calls.is_empty()
@@ -1910,154 +2110,8 @@ impl CompletionRunner {
             self.req.role = Some("user".to_string());
         } else if !self.has_request_input() {
             // 自动执行工具/代理调用
-            let tool_calls = std::mem::take(&mut self.pending_tool_calls);
-            if !tool_calls.is_empty() {
+            if self.execute_pending_tool_calls_into_request().await? {
                 pending_tool_calls = true;
-                let mut tool_call_futs: Vec<BoxPinFut<ToolCall>> = Vec::new();
-                for mut tool in tool_calls.into_iter() {
-                    let tool_name = tool.name.to_ascii_lowercase();
-                    if self.ctx.has_tool_lowercase(&tool_name)
-                        || strip_prefix_ignore_ascii_case(&tool_name, REMOTE_TOOL_PREFIX).is_some()
-                    {
-                        let ctx = self.ctx.clone();
-                        let input = ToolInput {
-                            name: tool.name.clone(),
-                            args: tool.args.clone(),
-                            resources: self
-                                .ctx
-                                .select_tool_resources(&tool.name, &mut self.resources)
-                                .await,
-                            meta: None,
-                        };
-                        tool_call_futs.push(Box::pin(async move {
-                            match ctx.tool_call(input).await {
-                                Ok((res, remote_id)) => {
-                                    tool.remote_id = remote_id;
-                                    tool.result = Some(res);
-                                }
-                                Err(err) => {
-                                    // 工具调用失败了，但我们不能终止整个对话流程，可以让 LLM 尝试纠正错误并继续对话
-                                    tool.result = Some(ToolOutput {
-                                        output: json!({ "error": format!(
-                                            "tool call failed: {}",
-                                            err
-                                        )}),
-                                        is_error: Some(true),
-                                        ..Default::default()
-                                    });
-                                }
-                            }
-                            tool
-                        }));
-                    } else if self.ctx.agents.contains_lowercase(&tool_name)
-                        || self.ctx.subagents.contains_lowercase(&tool_name)
-                        || strip_prefix_ignore_ascii_case(&tool_name, SUB_AGENT_PREFIX).is_some()
-                        || strip_prefix_ignore_ascii_case(&tool_name, REMOTE_AGENT_PREFIX).is_some()
-                    {
-                        // Subagents consume structured controls such as `session`, `model`, and
-                        // `effort`, so preserve their full argument object. Plain string args and
-                        // normal agents keep the historical prompt behavior.
-                        let prompt = if let Some(args) = tool.args.as_str() {
-                            args.to_string()
-                        } else if let Some(args) = tool.args.as_object()
-                            && args.len() == 1
-                            && let Some(prompt) = args.get("prompt").and_then(|v| v.as_str())
-                        {
-                            prompt.to_string()
-                        } else {
-                            serde_json::to_string(&tool.args)
-                                .unwrap_or_else(|_| tool.args.to_string())
-                        };
-
-                        let ctx = self.ctx.clone();
-                        let input = AgentInput {
-                            name: tool.name.clone(),
-                            prompt,
-                            resources: self
-                                .ctx
-                                .select_agent_resources(&tool.name, &mut self.resources)
-                                .await,
-                            ..Default::default()
-                        };
-                        tool_call_futs.push(Box::pin(async move {
-                            match ctx.agent_run(input).await {
-                                Ok((res, remote_id)) => {
-                                    tool.remote_id = remote_id;
-                                    tool.result = Some(res.into_tool_output());
-                                }
-                                Err(err) => {
-                                    // agent 调用失败了，但我们不能终止整个对话流程，可以让 LLM 尝试纠正错误并继续对话
-                                    tool.result = Some(ToolOutput {
-                                        output: json!({ "error": format!(
-                                            "agent run failed: {}",
-                                            err
-                                        )}),
-                                        is_error: Some(true),
-                                        ..Default::default()
-                                    });
-                                }
-                            }
-                            tool
-                        }));
-                    } else {
-                        tool_call_futs.push(Box::pin(async move {
-                            tool.result = Some(ToolOutput {
-                                output: json!({ "error": format!(
-                                    "tool call failed: {} not found",
-                                    tool.name
-                                )}),
-                                is_error: Some(true),
-                                ..Default::default()
-                            });
-                            tool
-                        }));
-                    }
-                }
-
-                let mut tool_calls: Vec<ToolCall> = Vec::new();
-                let mut tool_calls_continue: Vec<ContentPart> = Vec::new();
-                if !tool_call_futs.is_empty() {
-                    let results = futures::future::join_all(tool_call_futs).await;
-
-                    for mut tool in results {
-                        if let Some(res) = &mut tool.result {
-                            let mut usage = res.usage.clone();
-                            // usage.requests 原值为内部调用次数，这里把它重置为 1 来表示被模型调用了一次，方便后续统计被调用的工具次数
-                            usage.requests = 1;
-                            self.tools_usage
-                                .entry(tool.name.to_ascii_lowercase())
-                                .and_modify(|u| u.accumulate(&usage))
-                                .or_insert(usage);
-                            self.accumulate_tools_usage(&res.tools_usage);
-                            self.accumulate(&res.usage);
-                            self.add_discovered_tools_from_output(&tool.name, &res.output);
-                            self.compact_discovery_tool_output_for_context(
-                                &tool.name,
-                                &mut res.output,
-                            );
-
-                            // We can not ignore some tool calls.
-                            // GPT-5: An assistant message with 'tool_calls' must be followed by tool messages responding to each 'tool_call_id'.
-                            tool_calls_continue.push(ContentPart::ToolOutput {
-                                name: tool.name.clone(),
-                                output: res.output.clone(),
-                                is_error: res.is_error,
-                                call_id: tool.call_id.clone(),
-                                remote_id: tool.remote_id,
-                            });
-
-                            self.artifacts.append(&mut res.artifacts);
-                            tool_calls.push(tool);
-                        }
-                    }
-                }
-
-                // 累计当前轮的 tool_calls
-                self.tool_calls.append(&mut tool_calls);
-                self.req.role = Some("tool".to_string());
-                if !tool_calls_continue.is_empty() {
-                    self.req.content.append(&mut tool_calls_continue);
-                }
                 let follow_up_content: Vec<ContentPart> =
                     self.drain_follow_up_message().unwrap_or_default();
 
@@ -2065,15 +2119,8 @@ impl CompletionRunner {
                     if self.req.content.is_empty() {
                         self.set_next_user_content(follow_up_content);
                     } else {
-                        let msg = Message {
-                            role: "tool".to_string(),
-                            content: std::mem::take(&mut self.req.content),
-                            ..Default::default()
-                        };
-
-                        self.req.chat_history.push(msg.clone());
+                        self.commit_tool_outputs_to_history();
                         self.set_next_user_content(follow_up_content);
-                        self.chat_history.push(msg);
                     }
                 }
             } else if let Some(content) = self.drain_queued_message() {
@@ -2644,6 +2691,97 @@ mod tests {
                             "limit": 0
                         }),
                         call_id: Some("select_echo_tool_again".into()),
+                        result: None,
+                        remote_id: None,
+                    }],
+                    usage: Usage {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                        cached_tokens: 0,
+                        requests: 1,
+                    },
+                    ..Default::default()
+                })));
+            }
+
+            Box::pin(futures::future::ready(Ok(AgentOutput {
+                tool_calls: vec![ToolCall {
+                    name: "tools_select".to_string(),
+                    args: json!({
+                        "tools": ["echo_tool"],
+                        "query": "",
+                        "limit": 0
+                    }),
+                    call_id: Some("select_echo_tool".into()),
+                    result: None,
+                    remote_id: None,
+                }],
+                usage: Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cached_tokens: 0,
+                    requests: 1,
+                },
+                ..Default::default()
+            })))
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct DiscoveryCompactionCompleter {
+        requests: Arc<Mutex<Vec<CompletionRequest>>>,
+    }
+
+    impl CompletionFeaturesDyn for DiscoveryCompactionCompleter {
+        fn model_name(&self) -> String {
+            "discovery_compaction".to_string()
+        }
+
+        fn completion(
+            &self,
+            req: CompletionRequest,
+        ) -> anda_core::BoxPinFut<Result<AgentOutput, BoxError>> {
+            self.requests.lock().unwrap().push(req.clone());
+
+            let prompt = if req.prompt.is_empty() {
+                req.content
+                    .iter()
+                    .map(|part| match part {
+                        ContentPart::Text { text } | ContentPart::Reasoning { text } => {
+                            text.clone()
+                        }
+                        _ => String::new(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n\n")
+            } else {
+                req.prompt.clone()
+            };
+
+            if prompt.trim() == super::COMPACTION_PROMPT.trim() {
+                return Box::pin(futures::future::ready(Ok(AgentOutput {
+                    content: "compacted handoff".to_string(),
+                    usage: Usage {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                        cached_tokens: 0,
+                        requests: 1,
+                    },
+                    ..Default::default()
+                })));
+            }
+
+            if req.role.as_deref() != Some("tool")
+                && req
+                    .tools
+                    .iter()
+                    .any(|tool| tool.name.as_str() == "echo_tool")
+            {
+                return Box::pin(futures::future::ready(Ok(AgentOutput {
+                    tool_calls: vec![ToolCall {
+                        name: "echo_tool".to_string(),
+                        args: json!({"input": "after-handoff"}),
+                        call_id: Some("call_echo_after_handoff".into()),
                         result: None,
                         remote_id: None,
                     }],
@@ -3827,6 +3965,57 @@ mod tests {
                 .iter()
                 .all(|tool| tool.name != "echo_tool")
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_handoff_preserves_discovered_tool_state_after_pending_selection() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let model = Model::with_completer(Arc::new(DiscoveryCompactionCompleter {
+            requests: requests.clone(),
+        }));
+        let ctx = EngineBuilder::new()
+            .with_model(model)
+            .register_tool(Arc::new(EchoTool))
+            .unwrap()
+            .mock_ctx();
+        let initial_tools = ctx.definitions(Some(&["tools_select".to_string()])).await;
+        let req = CompletionRequest {
+            prompt: "select echo tool".to_string(),
+            tools: initial_tools,
+            ..Default::default()
+        };
+        let mut runner = ctx.completion_iter(req, Vec::new()).unbound();
+
+        let first = runner.next().await.unwrap().unwrap();
+        assert_eq!(first.tool_calls[0].name, "tools_select");
+
+        let second = runner.next().await.unwrap().unwrap();
+        assert_eq!(second.tool_calls[0].name, "tools_select");
+        assert_eq!(runner.merge_discovered_tools(), None);
+        assert!(!runner.no_pending_tool_calls());
+
+        runner.follow_up("continue after handoff".to_string());
+        let (mut runner, output) = runner.handoff(None).await.unwrap();
+        assert_eq!(output.content, "compacted handoff");
+        assert_eq!(runner.merge_discovered_tools(), Some(true));
+
+        let after_handoff = runner.next().await.unwrap().unwrap();
+        assert_eq!(after_handoff.tool_calls[0].name, "echo_tool");
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        assert!(requests[2].tools.is_empty());
+        let after_handoff_tool_names = requests[3]
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(after_handoff_tool_names.contains(&"tools_select"));
+        assert!(after_handoff_tool_names.contains(&"echo_tool"));
+        assert!(requests[3].content.iter().any(|part| matches!(
+            part,
+            ContentPart::Text { text } if text == "continue after handoff"
+        )));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -5187,6 +5376,120 @@ mod tests {
         assert_eq!(output.content, "queued follow-up\n\nfinal prompt");
         assert_eq!(output.usage.input_tokens, 10);
         assert_eq!(output.usage.output_tokens, 20);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_handoff_preserves_queued_input_for_new_runner() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let model = Model::with_completer(Arc::new(RecordingCompleter {
+            name: "recording".to_string(),
+            requests: requests.clone(),
+        }));
+        let ctx = EngineBuilder::new().with_model(model).mock_ctx();
+
+        let req = CompletionRequest {
+            prompt: "initial".to_string(),
+            ..Default::default()
+        };
+
+        let mut runner = ctx.completion_iter(req, Vec::new()).unbound();
+        let step = runner.next().await.unwrap().unwrap();
+        assert_eq!(step.content, "initial");
+
+        runner.follow_up("queued follow-up".to_string());
+        runner.steer("queued steering".to_string());
+        let (mut runner, output) = runner.handoff(None).await.unwrap();
+        assert_eq!(output.content.trim(), super::COMPACTION_PROMPT.trim());
+
+        let continued = runner.next().await.unwrap().unwrap();
+        assert_eq!(continued.content, "queued follow-up\n\nqueued steering");
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        let compaction_text = requests[1]
+            .content
+            .iter()
+            .filter_map(|part| match part {
+                ContentPart::Text { text } | ContentPart::Reasoning { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        assert_eq!(compaction_text.trim(), super::COMPACTION_PROMPT.trim());
+        assert!(!compaction_text.contains("queued follow-up"));
+        assert!(!compaction_text.contains("queued steering"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_handoff_steering_interrupts_pending_tool_calls() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let model = Model::with_completer(Arc::new(ToolCallHistoryCompleter {
+            requests: requests.clone(),
+        }));
+        let ctx = EngineBuilder::new()
+            .with_model(model)
+            .register_tool(Arc::new(EchoTool))
+            .unwrap()
+            .mock_ctx();
+
+        let mut runner = ctx
+            .completion_iter(
+                CompletionRequest {
+                    prompt: "start tool".to_string(),
+                    ..Default::default()
+                },
+                Vec::new(),
+            )
+            .unbound();
+
+        let step = runner.next().await.unwrap().unwrap();
+        assert_eq!(
+            step.tool_calls[0].call_id.as_deref(),
+            Some("call_stop_test")
+        );
+        assert!(!runner.no_pending_tool_calls());
+
+        runner.steer("redirect before tool".to_string());
+        let (mut runner, output) = runner.handoff(None).await.unwrap();
+        assert_eq!(output.content, "continued");
+        assert!(output.tool_calls.is_empty());
+        assert!(!output.tools_usage.contains_key("echo_tool"));
+        assert!(CompletionRunner::unanswered_tool_calls(&output.chat_history).is_empty());
+        assert!(output.chat_history.iter().any(|message| {
+            message.content.iter().any(|part| {
+                matches!(
+                    part,
+                    ContentPart::ToolOutput {
+                        call_id,
+                        is_error: Some(true),
+                        output,
+                        ..
+                    } if call_id.as_deref() == Some("call_stop_test")
+                        && output.get("error").and_then(Json::as_str)
+                            == Some("tool call interrupted by steering")
+                )
+            })
+        }));
+
+        let continued = runner.next().await.unwrap().unwrap();
+        assert_eq!(continued.content, "continued");
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        let compaction_raw = serde_json::to_string(&requests[1].raw_history).unwrap();
+        assert!(!compaction_raw.contains("call_stop_test"));
+        assert_eq!(
+            requests[1].raw_history[0]["content"],
+            "planning before tool"
+        );
+        assert!(requests[1].content.iter().any(|part| matches!(
+            part,
+            ContentPart::Text { text } if text.trim() == super::COMPACTION_PROMPT.trim()
+        )));
+        assert!(requests[2].content.iter().any(|part| matches!(
+            part,
+            ContentPart::Text { text } if text == "redirect before tool"
+        )));
     }
 
     // ── Cancellation tests ──
