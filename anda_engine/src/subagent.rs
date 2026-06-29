@@ -7,8 +7,8 @@
 
 use anda_core::{
     Agent, AgentContext, AgentOutput, BoxError, CompletionFeatures, CompletionRequest, ContentPart,
-    FunctionDefinition, Json, ModelEffort, Path, PromptCommand, PutMode, Resource, StoreFeatures,
-    ToolOutput, Usage, select_resources, validate_function_name,
+    FunctionDefinition, Json, Message, ModelEffort, Path, PromptCommand, PutMode, Resource,
+    StoreFeatures, ToolOutput, Usage, select_resources, validate_function_name,
 };
 use async_trait::async_trait;
 use cbor2::{from_slice, to_canonical_vec};
@@ -28,6 +28,7 @@ use std::{
 use crate::{
     context::{AgentCtx, BaseCtx, CompletionRunner},
     hook::{AgentHook, DynAgentHook, DynToolJsonHook, PrefixedId, ToolBackgroundHook},
+    memory::{Conversation, ConversationRef, ConversationStatus, Conversations},
     truncate_utf8_to_max_bytes, unix_ms,
 };
 
@@ -173,6 +174,218 @@ fn resolve_idle_timeout_ms(idle_timeout_secs: u64) -> u64 {
             .saturating_mul(1000)
             .clamp(1000, CONVERSATION_WAIT_BACKGROUND_TASK_MS)
     }
+}
+
+/// Persistent conversation recorder used by subagents when installed in context state.
+///
+/// Engines that do not configure this recorder keep the existing in-memory-only subagent
+/// behavior. When configured, each blocking subagent call and each background subagent session is
+/// stored as a [`Conversation`] for operational visibility and later audit.
+#[derive(Clone, Debug)]
+pub struct SubAgentConversationRecorder {
+    conversations: Conversations,
+}
+
+impl SubAgentConversationRecorder {
+    /// Creates a recorder backed by the shared conversation store.
+    pub fn new(conversations: Conversations) -> Self {
+        Self { conversations }
+    }
+
+    async fn start(
+        &self,
+        ctx: &AgentCtx,
+        agent: &SubAgent,
+        mode: &'static str,
+        session: Option<&str>,
+        req: &CompletionRequest,
+        resources: Vec<Resource>,
+    ) -> Result<SubAgentConversationLog, BoxError> {
+        let now_ms = unix_ms();
+        let session = session.map(str::to_string);
+        let mut conversation = Conversation {
+            user: ctx.base.caller,
+            messages: initial_request_messages(req, now_ms),
+            resources,
+            status: ConversationStatus::Working,
+            period: now_ms / 3600 / 1000,
+            created_at: now_ms,
+            updated_at: now_ms,
+            label: Some(format!("subagent:{}", agent.name.to_ascii_lowercase())),
+            extra: Some(json!({
+                "kind": "subagent",
+                "subagent": agent.name.to_ascii_lowercase(),
+                "session": session,
+                "mode": mode,
+                "parent_agent": ctx.root.agent.clone(),
+                "context_agent": ctx.base.agent.clone(),
+                "model": req.model.clone(),
+                "effort": req.effort,
+                "tools": agent.tools.clone(),
+                "tags": agent.tags.clone(),
+                "has_output_schema": agent.output_schema.is_some(),
+            })),
+            ..Default::default()
+        };
+
+        let id = self
+            .conversations
+            .add_conversation(ConversationRef::from(&conversation))
+            .await?;
+        conversation._id = id;
+
+        Ok(SubAgentConversationLog {
+            recorder: self.clone(),
+            conversation,
+            persisted_runner_history_len: 0,
+            replace_initial_input: true,
+        })
+    }
+}
+
+struct SubAgentConversationLog {
+    recorder: SubAgentConversationRecorder,
+    conversation: Conversation,
+    persisted_runner_history_len: usize,
+    replace_initial_input: bool,
+}
+
+impl SubAgentConversationLog {
+    fn id(&self) -> u64 {
+        self.conversation._id
+    }
+
+    fn reset_runner_history_cursor(&mut self) {
+        self.persisted_runner_history_len = 0;
+        self.replace_initial_input = false;
+    }
+
+    async fn mark_status(&mut self, status: ConversationStatus) {
+        if self.conversation.status == status {
+            return;
+        }
+
+        self.conversation.status = status;
+        self.conversation.updated_at = unix_ms();
+        self.persist().await;
+    }
+
+    async fn record_output(&mut self, output: &mut AgentOutput, status: ConversationStatus) {
+        append_runner_history(
+            &mut self.conversation,
+            &output.chat_history,
+            &mut self.persisted_runner_history_len,
+            &mut self.replace_initial_input,
+        );
+        self.conversation.status = status;
+        self.conversation.usage = output.usage.clone();
+        self.conversation.artifacts = output.artifacts.clone();
+        self.conversation.updated_at = unix_ms();
+        self.conversation.failed_reason = output.failed_reason.clone();
+        merge_output_metadata(&mut self.conversation, output);
+        self.persist().await;
+        output.conversation = Some(self.conversation._id);
+    }
+
+    async fn record_failure(&mut self, reason: String) {
+        self.conversation.status = ConversationStatus::Failed;
+        self.conversation.failed_reason = Some(reason);
+        self.conversation.updated_at = unix_ms();
+        self.persist().await;
+    }
+
+    async fn persist(&self) {
+        match self.conversation.to_changes() {
+            Ok(changes) => {
+                if let Err(err) = self
+                    .recorder
+                    .conversations
+                    .update_conversation(self.conversation._id, changes)
+                    .await
+                {
+                    log::warn!(
+                        "failed to update subagent conversation {}: {err}",
+                        self.conversation._id
+                    );
+                }
+            }
+            Err(err) => {
+                log::warn!(
+                    "failed to encode subagent conversation {} changes: {err}",
+                    self.conversation._id
+                );
+            }
+        }
+    }
+}
+
+fn initial_request_messages(req: &CompletionRequest, timestamp: u64) -> Vec<Json> {
+    let mut content = req.content.clone();
+    if !req.prompt.is_empty() {
+        content.insert(0, req.prompt.clone().into());
+    }
+
+    if content.is_empty() {
+        Vec::new()
+    } else {
+        vec![json!(Message {
+            role: req.role.clone().unwrap_or_else(|| "user".to_string()),
+            content,
+            timestamp: Some(timestamp),
+            ..Default::default()
+        })]
+    }
+}
+
+fn append_runner_history(
+    conversation: &mut Conversation,
+    chat_history: &[Message],
+    persisted_runner_history_len: &mut usize,
+    replace_existing: &mut bool,
+) {
+    if chat_history.is_empty() {
+        return;
+    }
+
+    if *replace_existing {
+        conversation.messages.clear();
+        *replace_existing = false;
+    }
+
+    // Runner output is cumulative only for the current runner. After compaction, the replacement
+    // runner starts from the handoff summary, so a shorter incoming history means a new runner's
+    // full visible history should be appended rather than treated as a duplicate prefix.
+    let incoming_len = chat_history.len();
+    let new_messages = if incoming_len >= *persisted_runner_history_len {
+        chat_history[*persisted_runner_history_len..].to_vec()
+    } else {
+        chat_history.to_vec()
+    };
+    conversation.append_messages(new_messages);
+    *persisted_runner_history_len = incoming_len;
+}
+
+fn merge_output_metadata(conversation: &mut Conversation, output: &AgentOutput) {
+    let mut extra = conversation.extra.take().unwrap_or_else(|| json!({}));
+    let Some(map) = extra.as_object_mut() else {
+        conversation.extra = Some(extra);
+        return;
+    };
+
+    if let Some(model) = &output.model {
+        map.insert("model".to_string(), model.clone().into());
+    }
+    if let Some(session) = &output.session {
+        map.insert("session".to_string(), session.clone().into());
+    }
+    if !output.tools_usage.is_empty() {
+        map.insert(
+            "tools_usage".to_string(),
+            serde_json::to_value(&output.tools_usage).unwrap_or_default(),
+        );
+    }
+
+    conversation.extra = Some(extra);
 }
 
 /// Arguments used to run a subagent.
@@ -471,6 +684,8 @@ pub struct SubSession {
     // Live progress snapshot refreshed after each runner step so the parent can poll status
     // without waiting for hook callbacks.
     status: RwLock<SubSessionStatus>,
+    // Persistent conversation record for this session when conversation recording is enabled.
+    conversation: AtomicU64,
 }
 
 fn resources_into_content(resources: Vec<Resource>) -> Vec<ContentPart> {
@@ -519,6 +734,7 @@ struct SubSessionRunner {
     session: Arc<SubSession>,
     agent_hook: Option<DynAgentHook>,
     runner: CompletionRunner,
+    conversation: Option<SubAgentConversationLog>,
     last_output: Option<AgentOutput>,
     /// Artifacts rescued from runners that were replaced during context compaction. They are
     /// merged back into the session's final output.
@@ -663,7 +879,12 @@ impl SubSessionRunner {
             content,
             ..Default::default()
         });
-        let output = self.runner.stop_current_task(output);
+        let mut output = self.runner.stop_current_task(output);
+        if let Some(conversation) = &mut self.conversation {
+            conversation
+                .record_output(&mut output, ConversationStatus::Idle)
+                .await;
+        }
         self.last_output = Some(output.clone());
         self.emit_progress(output).await;
     }
@@ -696,6 +917,9 @@ impl SubSessionRunner {
         self.runner.accumulate(&output.usage);
         self.runner.accumulate_tools_usage(&output.tools_usage);
         self.carried_artifacts.append(&mut output.artifacts);
+        if let Some(conversation) = &mut self.conversation {
+            conversation.reset_runner_history_cursor();
+        }
         // Compaction is real work: refresh the activity clock so the idle-timeout check on the
         // turn that follows does not mistake the session for stale.
         self.session.active_at.store(unix_ms(), Ordering::SeqCst);
@@ -790,6 +1014,13 @@ impl SubSessionRunner {
 
         if let Some(failed_reason) = cancellation_requested {
             let failed_reason = self.record_failed_output(failed_reason);
+            if let Some(conversation) = &mut self.conversation
+                && let Some(output) = &mut self.last_output
+            {
+                conversation
+                    .record_output(output, ConversationStatus::Cancelled)
+                    .await;
+            }
             return Err(failed_reason.into());
         }
 
@@ -817,13 +1048,28 @@ impl SubSessionRunner {
                         .sum(),
                 )
         }) {
-            self.compact().await?;
+            match self.compact().await {
+                Ok(()) => {}
+                Err(err) => {
+                    if let Some(conversation) = &mut self.conversation {
+                        conversation.record_failure(err.to_string()).await;
+                    }
+                    return Err(err);
+                }
+            }
         }
+        let has_queued_work = !follow_up_batch.is_empty() || !steer_batch.is_empty();
         if !follow_up_batch.is_empty() {
             self.runner.follow_up_content(follow_up_batch);
         }
         if !steer_batch.is_empty() {
             self.runner.steer_content(steer_batch);
+        }
+
+        if let Some(conversation) = &mut self.conversation
+            && (has_queued_work || !self.runner.is_idle())
+        {
+            conversation.mark_status(ConversationStatus::Working).await;
         }
 
         match self.runner.next().await {
@@ -843,6 +1089,9 @@ impl SubSessionRunner {
                     return Ok(false);
                 }
 
+                if let Some(conversation) = &mut self.conversation {
+                    conversation.mark_status(ConversationStatus::Idle).await;
+                }
                 Ok(true)
             }
 
@@ -851,6 +1100,16 @@ impl SubSessionRunner {
                 self.session.active_at.store(now_ms, Ordering::SeqCst);
                 res.session = Some(self.session.id.clone());
                 let is_done = self.runner.is_done() || res.failed_reason.is_some();
+                if let Some(conversation) = &mut self.conversation {
+                    let status = if res.failed_reason.is_some() {
+                        ConversationStatus::Failed
+                    } else if is_done {
+                        ConversationStatus::Completed
+                    } else {
+                        ConversationStatus::Working
+                    };
+                    conversation.record_output(&mut res, status).await;
+                }
                 self.last_output = Some(res.clone());
                 if !is_done && Self::has_progress_signal(&res) {
                     self.emit_progress(res).await;
@@ -860,6 +1119,13 @@ impl SubSessionRunner {
 
             Err(err) => {
                 let failed_reason = self.record_failed_output(err.to_string());
+                if let Some(conversation) = &mut self.conversation
+                    && let Some(output) = &mut self.last_output
+                {
+                    conversation
+                        .record_output(output, ConversationStatus::Failed)
+                        .await;
+                }
                 Err(failed_reason.into())
             }
         }
@@ -885,6 +1151,18 @@ impl SubSession {
             created_at: now,
             idle_timeout_ms,
             status: RwLock::new(SubSessionStatus::default()),
+            conversation: AtomicU64::new(0),
+        }
+    }
+
+    fn set_conversation_id(&self, conversation: u64) {
+        self.conversation.store(conversation, Ordering::SeqCst);
+    }
+
+    fn conversation_id(&self) -> Option<u64> {
+        match self.conversation.load(Ordering::SeqCst) {
+            0 => None,
+            id => Some(id),
         }
     }
 
@@ -918,6 +1196,7 @@ impl SubSession {
 
         json!({
             "session": self.id,
+            "conversation": self.conversation_id(),
             "agent": self.agent,
             "active": true,
             "busy": status.busy,
@@ -1278,21 +1557,61 @@ impl Agent<AgentCtx> for SubAgent {
                 return Err("prompt cannot be empty".into());
             }
 
-            let rt = ctx
-                .completion(
-                    CompletionRequest {
-                        instructions: self.instructions.clone(),
-                        prompt: args.prompt,
-                        content: resources_into_content(resources),
-                        tools: ctx.definitions(Some(&self.tools)).await,
-                        output_schema: self.output_schema.clone(),
-                        model,
-                        effort,
-                        ..Default::default()
-                    },
-                    Vec::new(),
-                )
-                .await?;
+            let input_resources = resources.clone();
+            let req = CompletionRequest {
+                instructions: self.instructions.clone(),
+                prompt: args.prompt,
+                content: resources_into_content(resources),
+                tools: ctx.definitions(Some(&self.tools)).await,
+                output_schema: self.output_schema.clone(),
+                model,
+                effort,
+                ..Default::default()
+            };
+
+            let rt = if let Some(recorder) = ctx.base.get_state::<SubAgentConversationRecorder>() {
+                let mut conversation = recorder
+                    .start(&ctx, self, "blocking", None, &req, input_resources)
+                    .await?;
+                let mut runner = ctx.clone().completion_iter(req, Vec::new());
+                let mut last: Option<AgentOutput> = None;
+
+                loop {
+                    match runner.next().await {
+                        Ok(Some(mut output)) => {
+                            let status = if output.failed_reason.is_some() {
+                                ConversationStatus::Failed
+                            } else if runner.is_done() {
+                                ConversationStatus::Completed
+                            } else {
+                                ConversationStatus::Working
+                            };
+                            conversation.record_output(&mut output, status).await;
+                            let terminal = runner.is_done() || output.failed_reason.is_some();
+                            last = Some(output);
+                            if terminal {
+                                break;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(err) => {
+                            conversation.record_failure(err.to_string()).await;
+                            return Err(err);
+                        }
+                    }
+                }
+
+                match last {
+                    Some(output) => output,
+                    None => {
+                        let reason = "completion runner returned no output".to_string();
+                        conversation.record_failure(reason.clone()).await;
+                        return Err(reason.into());
+                    }
+                }
+            } else {
+                ctx.completion(req, Vec::new()).await?
+            };
 
             if let Some(hook) = &agent_hook {
                 return hook.after_agent_run(&ctx, rt).await;
@@ -1320,6 +1639,7 @@ impl Agent<AgentCtx> for SubAgent {
             let rt = match subsessions.get_session(&session_id) {
                 Some(session) => AgentOutput {
                     content: session.detail().to_string(),
+                    conversation: session.conversation_id(),
                     session: Some(session_id.clone()),
                     ..Default::default()
                 },
@@ -1356,6 +1676,7 @@ impl Agent<AgentCtx> for SubAgent {
                                 "prompt queued for subagent {} session {}. Progress and final output will be pushed through the hooks.",
                                 session.agent, session_id
                             ),
+                            conversation: session.conversation_id(),
                             session: Some(session_id.clone()),
                             ..Default::default()
                         };
@@ -1440,15 +1761,7 @@ impl Agent<AgentCtx> for SubAgent {
             PromptCommand::Command { prompt, .. } => prompt,
         };
 
-        let rt = AgentOutput {
-            content: format!(
-                "subagent {} is running in the background with session mode (session: {}). The output will be pushed to you through the hooks.",
-                session.agent, session.id
-            ),
-            session: Some(session.id.clone()),
-            ..Default::default()
-        };
-
+        let input_resources = resources.clone();
         let req = CompletionRequest {
             instructions: self.instructions.clone(),
             prompt,
@@ -1460,10 +1773,49 @@ impl Agent<AgentCtx> for SubAgent {
             ..Default::default()
         };
 
+        let mut conversation =
+            if let Some(recorder) = ctx.base.get_state::<SubAgentConversationRecorder>() {
+                match recorder
+                    .start(
+                        &ctx,
+                        self,
+                        "session",
+                        Some(&session.id),
+                        &req,
+                        input_resources,
+                    )
+                    .await
+                {
+                    Ok(conversation) => {
+                        session.set_conversation_id(conversation.id());
+                        Some(conversation)
+                    }
+                    Err(err) => {
+                        subsessions.remove_session_if(&session);
+                        return Err(err);
+                    }
+                }
+            } else {
+                None
+            };
+
+        let rt = AgentOutput {
+            content: format!(
+                "subagent {} is running in the background with session mode (session: {}). The output will be pushed to you through the hooks.",
+                session.agent, session.id
+            ),
+            conversation: conversation.as_ref().map(SubAgentConversationLog::id),
+            session: Some(session.id.clone()),
+            ..Default::default()
+        };
+
         let rt = if let Some(hook) = &agent_hook {
             match hook.after_agent_run(&ctx, rt).await {
                 Ok(rt) => rt,
                 Err(err) => {
+                    if let Some(conversation) = &mut conversation {
+                        conversation.record_failure(err.to_string()).await;
+                    }
                     // The session never started; release the claimed session ID.
                     subsessions.remove_session_if(&session);
                     return Err(err);
@@ -1486,6 +1838,7 @@ impl Agent<AgentCtx> for SubAgent {
                 session: session.clone(),
                 agent_hook,
                 runner,
+                conversation,
                 last_output: None,
                 carried_artifacts: Vec::new(),
                 closing: false,
@@ -1545,7 +1898,15 @@ impl Agent<AgentCtx> for SubAgent {
                             }
                         }
 
-                        let output = runner.finalize_output().await;
+                        let mut output = runner.finalize_output().await;
+                        if let Some(conversation) = &mut runner.conversation {
+                            let status = if output.failed_reason.is_some() {
+                                ConversationStatus::Failed
+                            } else {
+                                ConversationStatus::Completed
+                            };
+                            conversation.record_output(&mut output, status).await;
+                        }
                         if let Some(hook) = &runner.agent_hook {
                             hook.on_background_end(runner.runner.ctx(), session.id.clone(), output)
                                 .await;
@@ -1555,6 +1916,16 @@ impl Agent<AgentCtx> for SubAgent {
                     Err(err) => {
                         let mut output = runner.latest_output();
                         runner.merge_carried_artifacts(&mut output);
+                        if let Some(conversation) = &mut runner.conversation {
+                            let status = if conversation.conversation.status
+                                == ConversationStatus::Cancelled
+                            {
+                                ConversationStatus::Cancelled
+                            } else {
+                                ConversationStatus::Failed
+                            };
+                            conversation.record_output(&mut output, status).await;
+                        }
                         if let Some(hook) = &runner.agent_hook {
                             hook.on_background_end(runner.runner.ctx(), session.id.clone(), output)
                                 .await;
@@ -2091,11 +2462,50 @@ mod tests {
     use super::*;
     use crate::context::COMPACTION_PROMPT;
     use crate::engine::EngineBuilder;
+    use crate::management::{BaseManagement, Visibility};
+    use crate::memory::Conversations;
     use crate::model::{CompletionFeaturesDyn, Model, Models};
-    use anda_core::{BoxPinFut, Message, Tool};
+    use anda_core::{AgentInput, BoxPinFut, Message, Tool};
+    use anda_db::database::{AndaDB, DBConfig};
     use async_trait::async_trait;
+    use candid::Principal;
+    use object_store::memory::InMemory;
     use parking_lot::Mutex;
     use serde_json::json;
+    use std::collections::BTreeSet;
+
+    async fn test_conversations(name: &str) -> Conversations {
+        let db = Arc::new(
+            AndaDB::connect(Arc::new(InMemory::new()), DBConfig::default())
+                .await
+                .unwrap(),
+        );
+        Conversations::connect(db, name.to_string()).await.unwrap()
+    }
+
+    fn public_management() -> Arc<BaseManagement> {
+        Arc::new(BaseManagement {
+            controller: Principal::management_canister(),
+            managers: BTreeSet::new(),
+            visibility: Visibility::Public,
+        })
+    }
+
+    async fn wait_for_conversation_status(
+        conversations: &Conversations,
+        id: u64,
+        status: ConversationStatus,
+    ) -> Conversation {
+        for _ in 0..40 {
+            let conversation = conversations.get_conversation(id).await.unwrap();
+            if conversation.status == status {
+                return conversation;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        panic!("conversation {id} did not reach status {status}");
+    }
 
     #[derive(Clone, Debug)]
     struct EchoCompleter;
@@ -2112,6 +2522,48 @@ mod tests {
                 usage: Usage {
                     input_tokens: 1,
                     output_tokens: 2,
+                    cached_tokens: 0,
+                    requests: 1,
+                },
+                ..Default::default()
+            })))
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct HistoryCompleter;
+
+    impl CompletionFeaturesDyn for HistoryCompleter {
+        fn model_name(&self) -> String {
+            "history".to_string()
+        }
+
+        fn completion(&self, req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
+            let content = request_text(&req);
+            let timestamp = unix_ms();
+            let mut chat_history = req.chat_history.clone();
+            if !content.is_empty() {
+                chat_history.push(Message {
+                    role: req.role.unwrap_or_else(|| "user".to_string()),
+                    content: vec![content.clone().into()],
+                    timestamp: Some(timestamp),
+                    ..Default::default()
+                });
+            }
+            chat_history.push(Message {
+                role: "assistant".to_string(),
+                content: vec![format!("done: {content}").into()],
+                name: Some("history".to_string()),
+                timestamp: Some(timestamp),
+                ..Default::default()
+            });
+
+            Box::pin(futures::future::ready(Ok(AgentOutput {
+                content: format!("done: {content}"),
+                chat_history,
+                usage: Usage {
+                    input_tokens: 2,
+                    output_tokens: 3,
                     cached_tokens: 0,
                     requests: 1,
                 },
@@ -2927,6 +3379,175 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn subagent_blocking_persists_conversation() {
+        let conversations = test_conversations("subagent_blocking_persists_conversation").await;
+        let ctx = EngineBuilder::new()
+            .with_model(Model::with_completer(Arc::new(HistoryCompleter)))
+            .with_subagent_conversations(conversations.clone())
+            .mock_ctx();
+        let agent = SubAgent {
+            name: "auditor".to_string(),
+            description: "Audits work.".to_string(),
+            instructions: "Return the task result.".to_string(),
+            model: "history".to_string(),
+            ..Default::default()
+        };
+
+        let output =
+            Agent::<AgentCtx>::run(&agent, ctx, "inspect blocking task".to_string(), Vec::new())
+                .await
+                .unwrap();
+
+        let conversation_id = output.conversation.expect("conversation id");
+        assert_eq!(output.content, "done: inspect blocking task");
+        let conversation = conversations
+            .get_conversation(conversation_id)
+            .await
+            .unwrap();
+        assert_eq!(conversation.status, ConversationStatus::Completed);
+        assert_eq!(conversation.label.as_deref(), Some("subagent:auditor"));
+        assert_eq!(conversation.usage.requests, 1);
+        assert_eq!(
+            conversation.extra.as_ref().unwrap()["mode"],
+            json!("blocking")
+        );
+        assert_eq!(
+            conversation.extra.as_ref().unwrap()["subagent"],
+            json!("auditor")
+        );
+        let messages = serde_json::to_string(&conversation.messages).unwrap();
+        assert!(messages.contains("inspect blocking task"));
+        assert!(messages.contains("done: inspect blocking task"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn engine_agent_run_preserves_subagent_conversation_recorder_state() {
+        let conversations = test_conversations("engine_agent_run_subagent_conversation").await;
+        let agent = Arc::new(SubAgent {
+            name: "auditor".to_string(),
+            description: "Audits work.".to_string(),
+            instructions: "Return the task result.".to_string(),
+            model: "history".to_string(),
+            ..Default::default()
+        });
+        let engine = EngineBuilder::new()
+            .with_model(Model::with_completer(Arc::new(HistoryCompleter)))
+            .with_subagent_conversations(conversations.clone())
+            .with_management(public_management())
+            .register_agent(agent, Some("history".to_string()))
+            .unwrap()
+            .export_agents(vec!["auditor".to_string()])
+            .empty()
+            .await
+            .unwrap();
+
+        let output = engine
+            .agent_run(
+                Principal::anonymous(),
+                AgentInput::new("auditor".to_string(), "inspect engine task".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let conversation_id = output.conversation.expect("conversation id");
+        assert_eq!(output.content, "done: inspect engine task");
+        let conversation = conversations
+            .get_conversation(conversation_id)
+            .await
+            .unwrap();
+        assert_eq!(conversation.status, ConversationStatus::Completed);
+        assert_eq!(
+            conversation.extra.as_ref().unwrap()["mode"],
+            json!("blocking")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn subagent_session_persists_conversation_and_reports_status_id() {
+        let conversations = test_conversations("subagent_session_persists_conversation").await;
+        let ctx = EngineBuilder::new()
+            .with_model(Model::with_completer(Arc::new(HistoryCompleter)))
+            .with_subagent_conversations(conversations.clone())
+            .mock_ctx();
+        let agent = SubAgent {
+            name: "worker".to_string(),
+            description: "Runs background work.".to_string(),
+            instructions: "Return the task result.".to_string(),
+            model: "history".to_string(),
+            ..Default::default()
+        };
+
+        let start = Agent::<AgentCtx>::run(
+            &agent,
+            ctx.clone(),
+            serde_json::to_string(&SubAgentArgs {
+                prompt: "session seed".to_string(),
+                session: "AuditJob".to_string(),
+                model: String::new(),
+                effort: None,
+            })
+            .unwrap(),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+        let conversation_id = start.conversation.expect("conversation id");
+        assert_eq!(start.session.as_deref(), Some("auditjob"));
+        let status = Agent::<AgentCtx>::run(
+            &agent,
+            ctx.clone(),
+            serde_json::to_string(&SubAgentArgs {
+                prompt: "/status".to_string(),
+                session: "AuditJob".to_string(),
+                model: String::new(),
+                effort: None,
+            })
+            .unwrap(),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let status_json: Json = serde_json::from_str(&status.content).unwrap();
+        assert_eq!(status_json["conversation"], json!(conversation_id));
+        assert_eq!(status.conversation, Some(conversation_id));
+
+        Agent::<AgentCtx>::run(
+            &agent,
+            ctx,
+            serde_json::to_string(&SubAgentArgs {
+                prompt: "/cancel audit complete".to_string(),
+                session: "AuditJob".to_string(),
+                model: String::new(),
+                effort: None,
+            })
+            .unwrap(),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+        let conversation = wait_for_conversation_status(
+            &conversations,
+            conversation_id,
+            ConversationStatus::Cancelled,
+        )
+        .await;
+        assert_eq!(
+            conversation.failed_reason.as_deref(),
+            Some("audit complete")
+        );
+        assert_eq!(
+            conversation.extra.as_ref().unwrap()["mode"],
+            json!("session")
+        );
+        assert_eq!(
+            conversation.extra.as_ref().unwrap()["session"],
+            json!("auditjob")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn subsession_runner_honors_configured_idle_timeout() {
         let model = Model::with_completer(Arc::new(EchoCompleter));
         let ctx = EngineBuilder::new().with_model(model).mock_ctx();
@@ -2957,6 +3578,7 @@ mod tests {
                         Vec::new(),
                     )
                     .unbound(),
+                conversation: None,
                 last_output: None,
                 carried_artifacts: Vec::new(),
                 closing: false,
@@ -3024,6 +3646,7 @@ mod tests {
             session,
             agent_hook: Some(DynAgentHook::new(hook.clone())),
             runner: ctx.clone().completion_iter(req, Vec::new()).unbound(),
+            conversation: None,
             last_output: None,
             carried_artifacts: Vec::new(),
             closing: false,
@@ -3141,6 +3764,7 @@ mod tests {
             runner: ctx
                 .completion_iter(CompletionRequest::default(), Vec::new())
                 .unbound(),
+            conversation: None,
             last_output: None,
             carried_artifacts: Vec::new(),
             closing: false,
@@ -3221,6 +3845,7 @@ mod tests {
                     Vec::new(),
                 )
                 .unbound(),
+            conversation: None,
             last_output: None,
             carried_artifacts: Vec::new(),
             closing: false,
@@ -3290,6 +3915,7 @@ mod tests {
             session,
             agent_hook: None,
             runner: ctx.completion_iter(req, Vec::new()).unbound(),
+            conversation: None,
             last_output: None, // A previously rescued artifact must survive even when compaction fails.
             carried_artifacts: vec![resource(5, &["artifact"])],
             closing: false,
@@ -3349,6 +3975,7 @@ mod tests {
                     Vec::new(),
                 )
                 .unbound(),
+            conversation: None,
             last_output: None,
             carried_artifacts: Vec::new(),
             closing: false,
@@ -3401,6 +4028,7 @@ mod tests {
                     Vec::new(),
                 )
                 .unbound(),
+            conversation: None,
             last_output: None,
             carried_artifacts: Vec::new(),
             closing: false,
@@ -3445,6 +4073,7 @@ mod tests {
             session,
             agent_hook: None,
             runner: ctx.completion_iter(req, Vec::new()).unbound(),
+            conversation: None,
             last_output: None,
             carried_artifacts: Vec::new(),
             closing: false,
@@ -3508,6 +4137,7 @@ mod tests {
                     Vec::new(),
                 )
                 .unbound(),
+            conversation: None,
             last_output: None,
             carried_artifacts: Vec::new(),
             closing: false,
@@ -3585,6 +4215,7 @@ mod tests {
                     Vec::new(),
                 )
                 .unbound(),
+            conversation: None,
             last_output: None,
             carried_artifacts: Vec::new(),
             closing: false,
@@ -3620,6 +4251,7 @@ mod tests {
             session,
             agent_hook: None,
             runner: ctx.completion_iter(req, Vec::new()).unbound(),
+            conversation: None,
             last_output: None,
             carried_artifacts: Vec::new(),
             closing: false,
@@ -3669,6 +4301,7 @@ mod tests {
             session,
             agent_hook: None,
             runner: ctx.completion_iter(req, Vec::new()).unbound(),
+            conversation: None,
             last_output: None,
             carried_artifacts: Vec::new(),
             closing: false,
@@ -3782,6 +4415,7 @@ mod tests {
                     Vec::new(),
                 )
                 .unbound(),
+            conversation: None,
             last_output: None,
             carried_artifacts: Vec::new(),
             closing: false,
@@ -3822,6 +4456,7 @@ mod tests {
             session,
             agent_hook: None,
             runner: ctx.completion_iter(req, Vec::new()).unbound(),
+            conversation: None,
             last_output: None,
             carried_artifacts: Vec::new(),
             closing: false,
@@ -3879,6 +4514,7 @@ mod tests {
             session,
             agent_hook: Some(DynAgentHook::new(hook.clone())),
             runner: ctx.clone().completion_iter(req, Vec::new()).unbound(),
+            conversation: None,
             last_output: None,
             carried_artifacts: Vec::new(),
             closing: false,
@@ -4810,6 +5446,7 @@ mod tests {
                     Vec::new(),
                 )
                 .unbound(),
+            conversation: None,
             last_output: None,
             carried_artifacts: Vec::new(),
             closing: false,

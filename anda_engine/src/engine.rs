@@ -73,9 +73,10 @@ use crate::{
     },
     hook::{Hook, Hooks},
     management::{BaseManagement, Management, SYSTEM_PATH, Visibility},
+    memory::Conversations,
     model::{Model, Models},
     store::Store,
-    subagent::{SubAgentManager, SubAgentSetManager},
+    subagent::{SubAgentConversationRecorder, SubAgentManager, SubAgentSetManager},
 };
 
 pub use crate::context::{AgentInfo, EngineCard, RemoteEngineArgs, RemoteEngines};
@@ -437,6 +438,7 @@ pub struct EngineBuilder {
     store: Store,
     web3: Arc<Web3SDK>,
     hooks: Arc<Hooks>,
+    subagent_conversation_recorder: Option<SubAgentConversationRecorder>,
     cancellation_token: CancellationToken,
     export_agents: BTreeSet<String>,
     export_tools: BTreeSet<String>,
@@ -486,6 +488,7 @@ impl EngineBuilder {
             store: Store::new(mstore),
             web3: Arc::new(Web3SDK::Web3(Web3Client::not_implemented())),
             hooks: Arc::new(Hooks::new()),
+            subagent_conversation_recorder: None,
             cancellation_token: CancellationToken::new(),
             export_agents: BTreeSet::new(),
             export_tools: BTreeSet::new(),
@@ -666,6 +669,22 @@ impl EngineBuilder {
         self
     }
 
+    /// Enables persistent conversation logging for subagent calls and sessions.
+    pub fn with_subagent_conversations(mut self, conversations: Conversations) -> Self {
+        self.subagent_conversation_recorder =
+            Some(SubAgentConversationRecorder::new(conversations));
+        self
+    }
+
+    /// Enables persistent conversation logging with a prebuilt subagent recorder.
+    pub fn with_subagent_conversation_recorder(
+        mut self,
+        recorder: SubAgentConversationRecorder,
+    ) -> Self {
+        self.subagent_conversation_recorder = Some(recorder);
+        self
+    }
+
     /// Creates an engine without selecting a default agent.
     ///
     /// This is mainly useful for tests or management-only engines. Most
@@ -708,6 +727,9 @@ impl EngineBuilder {
             agents.clone(),
             Arc::new(self.subagents),
         );
+        if let Some(recorder) = &self.subagent_conversation_recorder {
+            ctx.base.set_state(recorder.clone());
+        }
 
         let meta = RequestMeta::default();
         for (name, tool) in &tools.set {
@@ -796,6 +818,9 @@ impl EngineBuilder {
             agents.clone(),
             Arc::new(self.subagents),
         );
+        if let Some(recorder) = &self.subagent_conversation_recorder {
+            ctx.base.set_state(recorder.clone());
+        }
 
         let meta = RequestMeta::default();
         for (name, tool) in &tools.set {
@@ -831,6 +856,7 @@ impl EngineBuilder {
     /// Creates a mock agent context for tests and examples.
     // #[cfg(test)]
     pub fn mock_ctx(self) -> AgentCtx {
+        let subagent_conversation_recorder = self.subagent_conversation_recorder.clone();
         let mut names: BTreeSet<Path> = self
             .tools
             .set
@@ -855,14 +881,18 @@ impl EngineBuilder {
             Arc::new(RemoteEngines::new()),
         );
 
-        AgentCtx::new(
+        let ctx = AgentCtx::new(
             ctx,
             self.models,
             Arc::new(self.tools),
             Arc::new(self.tool_providers),
             Arc::new(self.agents),
             Arc::new(self.subagents),
-        )
+        );
+        if let Some(recorder) = subagent_conversation_recorder {
+            ctx.base.set_state(recorder);
+        }
+        ctx
     }
 }
 

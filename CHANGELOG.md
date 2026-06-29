@@ -2,6 +2,12 @@
 
 All notable changes to the Anda project will be documented in this file.
 
+## [0.13.14] — 2026-06-29
+
+### Added — anda_engine v0.13.14
+
+- **Subagent conversation persistence** — Engine builders can now install a subagent conversation recorder so blocking subagent calls and background sessions are persisted as conversations, expose their conversation IDs, and retain status, usage, artifacts, metadata, and failure information for operational audit.
+
 ## [0.13.13] — 2026-06-27
 
 ### Fixed — anda_engine v0.13.13

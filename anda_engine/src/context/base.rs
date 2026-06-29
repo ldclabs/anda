@@ -158,7 +158,7 @@ impl BaseCtx {
     /// Creates a child context with additional user and caller information.
     ///
     /// Similar to `child()`, but allows specifying user and caller information
-    /// for the new context.
+    /// for the new context while inheriting extension state from the parent.
     ///
     /// # Arguments
     /// * `caller` - caller principal (or ANONYMOUS);
@@ -177,6 +177,8 @@ impl BaseCtx {
     ) -> Result<Self, BoxError> {
         path.make_ascii_lowercase();
         let path = Path::parse(path)?;
+        let mut state = Extensions::default();
+        state.extend(self.state.read().clone());
         let child = Self {
             id: self.id,
             name: self.name.clone(),
@@ -190,7 +192,7 @@ impl BaseCtx {
             web3: self.web3.clone(),
             depth: self.depth + 1,
             remote: self.remote.clone(),
-            state: Arc::new(RwLock::new(Extensions::default())),
+            state: Arc::new(RwLock::new(state)),
             meta,
         };
 
@@ -732,6 +734,10 @@ mod tests {
         assert_eq!(child_with.agent, "AgentName");
         assert_eq!(child_with.path.as_ref(), "tool/path");
         assert_eq!(child_with.meta.user, meta.user);
+        assert_eq!(
+            child_with.get_state::<String>().as_deref(),
+            Some("root-state")
+        );
 
         let cloned = ctx.with_caller(caller);
         assert_eq!(cloned.caller, caller);
