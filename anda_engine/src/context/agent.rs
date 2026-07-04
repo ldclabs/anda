@@ -1959,7 +1959,8 @@ impl CompletionRunner {
                             tool.result = Some(res);
                         }
                         Err(err) => {
-                            // 工具调用失败了，但我们不能终止整个对话流程，可以让 LLM 尝试纠正错误并继续对话
+                            // The tool call failed, but we must not abort the whole conversation:
+                            // surface the error so the LLM can try to correct it and continue.
                             tool.result = Some(ToolOutput {
                                 output: json!({ "error": format!(
                                     "tool call failed: {}",
@@ -2008,7 +2009,8 @@ impl CompletionRunner {
                             tool.result = Some(res.into_tool_output());
                         }
                         Err(err) => {
-                            // agent 调用失败了，但我们不能终止整个对话流程，可以让 LLM 尝试纠正错误并继续对话
+                            // The agent run failed, but we must not abort the whole conversation:
+                            // surface the error so the LLM can try to correct it and continue.
                             tool.result = Some(ToolOutput {
                                 output: json!({ "error": format!(
                                     "agent run failed: {}",
@@ -2044,7 +2046,9 @@ impl CompletionRunner {
             for mut tool in results {
                 if let Some(res) = &mut tool.result {
                     let mut usage = res.usage.clone();
-                    // usage.requests 原值为内部调用次数，这里把它重置为 1 来表示被模型调用了一次，方便后续统计被调用的工具次数
+                    // usage.requests originally counts internal calls; reset it to 1 so it
+                    // represents this single model-triggered invocation, keeping per-tool call
+                    // counts meaningful.
                     usage.requests = 1;
                     self.tools_usage
                         .entry(tool.name.to_ascii_lowercase())
@@ -2071,7 +2075,7 @@ impl CompletionRunner {
             }
         }
 
-        // 累计当前轮的 tool_calls
+        // Accumulate this round's tool calls.
         self.tool_calls.append(&mut tool_calls);
         self.req.role = Some("tool".to_string());
         if !tool_calls_continue.is_empty() {
@@ -2109,7 +2113,7 @@ impl CompletionRunner {
             self.req.content = content;
             self.req.role = Some("user".to_string());
         } else if !self.has_request_input() {
-            // 自动执行工具/代理调用
+            // Automatically execute the pending tool/agent calls.
             if self.execute_pending_tool_calls_into_request().await? {
                 pending_tool_calls = true;
                 let follow_up_content: Vec<ContentPart> =

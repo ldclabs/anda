@@ -32,6 +32,7 @@ use ic_auth_types::ByteBufB64;
 use mime::Mime;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::net::IpAddr;
 
 use crate::context::BaseCtx;
 
@@ -40,6 +41,84 @@ use crate::context::BaseCtx;
 /// Fetched content is buffered in memory and usually ends up in model context,
 /// so anything larger is rejected instead of exhausting engine memory.
 pub const MAX_FETCH_BODY_SIZE: usize = 20 * 1024 * 1024; // 20 MB
+
+/// Validates that `url` targets a public host before a model-controlled fetch.
+///
+/// This reduces SSRF exposure: an agent can otherwise ask the fetch tool to reach cloud
+/// metadata endpoints (e.g. `169.254.169.254`), loopback services, or other internal hosts.
+/// The check rejects non-`http(s)` schemes and any host that resolves to a loopback, private,
+/// link-local, unique-local, or unspecified address.
+///
+/// Note: the host is validated at call time only. HTTP redirect hops are not re-validated, so a
+/// public URL that redirects to an internal address can still bypass this check. Deployments that
+/// need stronger guarantees should also disable redirects on the HTTP client.
+pub async fn validate_public_url(url: &str) -> Result<(), BoxError> {
+    let parsed = reqwest::Url::parse(url).map_err(|err| format!("invalid url {url:?}: {err}"))?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        scheme => {
+            return Err(format!("unsupported url scheme {scheme:?} (url: {url})").into());
+        }
+    }
+
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| format!("url {url:?} has no host"))?;
+
+    // IP literals are checked directly; hostnames are resolved and every resulting address is
+    // checked so a public name that maps to an internal address is rejected too.
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return reject_non_public_ip(ip, url);
+    }
+
+    let port = parsed.port_or_known_default().unwrap_or(0);
+    let addrs: Vec<_> = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|err| format!("failed to resolve host {host:?} (url: {url}): {err}"))?
+        .collect();
+    if addrs.is_empty() {
+        return Err(format!("host {host:?} did not resolve to any address (url: {url})").into());
+    }
+    for addr in addrs {
+        reject_non_public_ip(addr.ip(), url)?;
+    }
+    Ok(())
+}
+
+fn reject_non_public_ip(ip: IpAddr, url: &str) -> Result<(), BoxError> {
+    if is_non_public_ip(&ip) {
+        return Err(
+            format!("access to non-public address {ip} is not allowed (url: {url})").into(),
+        );
+    }
+    Ok(())
+}
+
+/// Returns true for addresses that must not be reachable through a model-controlled fetch.
+fn is_non_public_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local() // includes 169.254.0.0/16 metadata endpoints
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+        }
+        IpAddr::V6(v6) => {
+            if v6.is_loopback() || v6.is_unspecified() {
+                return true;
+            }
+            // IPv4-mapped addresses embed an IPv4 target; validate it as IPv4.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_non_public_ip(&IpAddr::V4(v4));
+            }
+            let first = v6.segments()[0];
+            // Unique-local fc00::/7 or link-local unicast fe80::/10.
+            (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80
+        }
+    }
+}
 
 /// Arguments for fetching resources from a URL
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
@@ -244,6 +323,8 @@ impl Tool<BaseCtx> for FetchWebResourcesTool {
         args: Self::Args,
         _resources: Vec<Resource>,
     ) -> Result<ToolOutput<Self::Output>, BoxError> {
+        // The URL here is model-controlled, so reject internal/metadata targets before fetching.
+        validate_public_url(&args.url).await?;
         let text = FetchWebResourcesTool::fetch_as_text(&ctx, &args.url).await?;
         Ok(ToolOutput::new(text))
     }
@@ -465,12 +546,14 @@ mod tests {
             ]
         );
 
+        // A public IP literal passes SSRF validation without DNS and reaches the mock http layer,
+        // which is not implemented for the mock context.
         let ctx = EngineBuilder::new().mock_ctx().base;
         assert!(
             tool.call(
                 ctx,
                 FetchWebResourcesArgs {
-                    url: "https://example.test/data".to_string(),
+                    url: "https://1.1.1.1/data".to_string(),
                 },
                 Vec::new(),
             )
@@ -479,6 +562,32 @@ mod tests {
             .to_string()
             .contains("not implemented")
         );
+
+        // Model-controlled fetches to internal/metadata targets are rejected before any request.
+        for url in [
+            "https://127.0.0.1/data",
+            "https://169.254.169.254/latest/meta-data/",
+            "https://[::1]/data",
+            "http://10.0.0.1/data",
+            "ftp://example.com/data",
+        ] {
+            let ctx = EngineBuilder::new().mock_ctx().base;
+            let err = tool
+                .call(
+                    ctx,
+                    FetchWebResourcesArgs {
+                        url: url.to_string(),
+                    },
+                    Vec::new(),
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                !err.contains("not implemented"),
+                "expected {url} to be rejected before fetch, got: {err}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

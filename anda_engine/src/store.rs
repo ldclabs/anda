@@ -211,6 +211,17 @@ impl Store {
         val: bytes::Bytes,
     ) -> Result<PutResult, BoxError> {
         let full_path = path_join(namespace, path);
+        // Reject oversized objects early. Some backends (e.g. IC-COSE on ICP) hard-cap object size
+        // near this limit, so enforcing it here yields a clear error instead of a backend failure.
+        if val.len() > MAX_STORE_OBJECT_SIZE {
+            return Err(format!(
+                "object size {} bytes exceeds the {} byte limit (path: {})",
+                val.len(),
+                MAX_STORE_OBJECT_SIZE,
+                full_path
+            )
+            .into());
+        }
         let res = self
             .store
             .put_opts(

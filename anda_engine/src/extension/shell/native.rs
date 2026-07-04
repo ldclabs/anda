@@ -188,7 +188,7 @@ impl NativeRuntime {
         &self,
         ctx: BaseCtx,
         tool_name: &str,
-        command: std::process::Command,
+        mut command: std::process::Command,
         envs: HashMap<String, String>,
         args: Option<ExecArgs>,
     ) -> Result<ExecOutput, BoxError> {
@@ -202,6 +202,15 @@ impl NativeRuntime {
             .unwrap_or_else(|| Cow::Borrowed(&self.workspace));
         let workspace_str = workspace.to_string_lossy().to_string();
 
+        // Put the child in its own process group so a cancellation can signal the whole group,
+        // including any descendants the shell spawns. Without this, killing only the direct child
+        // (`sh -c`) would leave background descendants running.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+
         let mut cmd = Command::from(command);
         if !self.insecure {
             cmd.env_clear();
@@ -212,6 +221,9 @@ impl NativeRuntime {
         cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
+        // Best-effort cleanup when the future is dropped (e.g. the foreground timeout in
+        // `ShellTool::call`). This only reaps the direct child; the process-group kill on the
+        // background cancellation path below is what sweeps descendants.
         cmd.kill_on_drop(true);
 
         let mut child = match cmd.spawn() {
@@ -310,7 +322,9 @@ impl NativeRuntime {
                     tokio::select! {
                         status = child.wait() => break status,
                         _ = cancellation.cancelled() => {
-                            // The engine or request was cancelled; do not leave the process behind.
+                            // The engine or request was cancelled; do not leave the process — or any
+                            // descendants it spawned — behind.
+                            kill_process_group(pid);
                             let _ = child.start_kill();
                             break child.wait().await;
                         }
@@ -416,6 +430,27 @@ impl Executor for NativeRuntime {
             .await
     }
 }
+
+/// Sends `SIGKILL` to the entire process group led by `pid` on Unix.
+///
+/// The child is spawned as its own group leader (`process_group(0)`), so a negative pid targets
+/// the whole group, reaping descendants the shell left behind. This is best-effort: descendants
+/// that started a new session or process group of their own are not reached.
+#[cfg(unix)]
+fn kill_process_group(pid: Option<u32>) {
+    if let Some(pid) = pid
+        && let Ok(pid) = i32::try_from(pid)
+    {
+        // SAFETY: `kill` with a negative pid signals a process group. It has no memory-safety
+        // implications and simply returns an error for unknown groups.
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(_pid: Option<u32>) {}
 
 #[derive(Default)]
 struct ProgressStreamState {

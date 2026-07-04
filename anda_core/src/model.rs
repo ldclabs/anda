@@ -1953,18 +1953,18 @@ mod tests {
 
     #[test]
     fn test_content_part_filedata_serde_optional() {
-        // mime_type = None -> 不序列化
+        // mime_type = None -> not serialized
         let part = ContentPart::FileData {
             file_uri: "gs://bucket/file".into(),
             mime_type: None,
         };
         let v = serde_json::to_value(&part).unwrap();
         assert_eq!(v.get("type").unwrap(), "FileData");
-        // 字段采用 camelCase
+        // fields use camelCase
         assert_eq!(v.get("fileUri").unwrap(), "gs://bucket/file");
         assert!(v.get("mimeType").is_none());
 
-        // mime_type = Some -> 出现
+        // mime_type = Some -> present
         let part2 = ContentPart::FileData {
             file_uri: "gs://bucket/file2".into(),
             mime_type: Some("image/png".into()),
@@ -1974,7 +1974,7 @@ mod tests {
         assert_eq!(v2.get("fileUri").unwrap(), "gs://bucket/file2");
         assert_eq!(v2.get("mimeType").unwrap(), "image/png");
 
-        // 反序列化校验
+        // deserialization check
         let back: ContentPart = serde_json::from_value(v2.clone()).unwrap();
         assert_eq!(back, part2);
         let back: ContentPart = v2.into();
@@ -2149,7 +2149,7 @@ mod tests {
             v_call.get("args").unwrap(),
             &serde_json::json!({"x":1, "y":2})
         );
-        // callId 省略
+        // callId omitted
         assert!(v_call.get("callId").is_none());
         let back_call: ContentPart = serde_json::from_value(v_call.clone()).unwrap();
         assert_eq!(back_call, call);
@@ -2170,7 +2170,7 @@ mod tests {
             v_out.get("output").unwrap(),
             &serde_json::json!({"result":3})
         );
-        // callId 存在
+        // callId present
         assert_eq!(v_out.get("callId").unwrap(), "c1");
         let back_out: ContentPart = serde_json::from_value(v_out.clone()).unwrap();
         assert_eq!(back_out, out);

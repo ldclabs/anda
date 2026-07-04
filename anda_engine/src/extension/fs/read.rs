@@ -595,7 +595,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn reads_files_through_symbolic_link_target() {
+    async fn rejects_reading_through_symbolic_link_leaving_workspace() {
         use std::os::unix::fs::symlink;
 
         let temp_dir = TestTempDir::new().await;
@@ -605,7 +605,8 @@ mod tests {
         tokio::fs::write(&external, "secret").await.unwrap();
         symlink(&external, workspace.join("secret-link.txt")).unwrap();
 
-        let result = read_tool(&workspace)
+        // A workspace-local symlink whose target escapes the workspace must not expose host files.
+        let err = read_tool(&workspace)
             .call(
                 mock_ctx(),
                 ReadFileArgs {
@@ -616,15 +617,14 @@ mod tests {
                 Vec::new(),
             )
             .await
-            .unwrap();
+            .unwrap_err();
 
-        assert_eq!(result.output.content, "secret");
-        assert_eq!(result.output.encoding, "utf8");
+        assert!(err.to_string().contains("outside the workspace"));
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn reads_files_through_symbolic_linked_directory_target() {
+    async fn rejects_reading_through_symbolic_linked_directory_leaving_workspace() {
         use std::os::unix::fs::symlink;
 
         let temp_dir = TestTempDir::new().await;
@@ -637,7 +637,8 @@ mod tests {
             .unwrap();
         symlink(&external, workspace.join("linked-dir")).unwrap();
 
-        let result = read_tool(&workspace)
+        // A symlinked directory that points outside the workspace must not expose its contents.
+        let err = read_tool(&workspace)
             .call(
                 mock_ctx(),
                 ReadFileArgs {
@@ -648,10 +649,9 @@ mod tests {
                 Vec::new(),
             )
             .await
-            .unwrap();
+            .unwrap_err();
 
-        assert_eq!(result.output.content, "secret");
-        assert_eq!(result.output.encoding, "utf8");
+        assert!(err.to_string().contains("outside the workspace"));
     }
 
     #[tokio::test]

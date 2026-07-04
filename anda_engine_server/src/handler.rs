@@ -55,51 +55,75 @@ impl AppState {
     /// Credentials are checked in the following order:
     /// 1. A `Bearer` CWT token signed by one of the trusted `ed25519_pubkeys`.
     ///    Bearer tokens are not bound to a single request, so `expect_target`
-    ///    and `expect_digest` do not apply to this path.
+    ///    and `expect_digest` do not apply to this path. This path is only
+    ///    attempted when at least one trusted key is configured.
     /// 2. A [`SignedEnvelope`] from the `Authorization` header or the
     ///    `ic-auth-*` headers, verified against `expect_target` and
     ///    `expect_digest`.
     ///
-    /// Falls back to the anonymous principal when no credential verifies.
+    /// Returns the anonymous principal only when no credential is present. When a
+    /// credential is present but fails to verify (bad signature, wrong target,
+    /// tampered body, or expired token), an error is returned so the caller can
+    /// reject the request instead of silently downgrading to anonymous access.
     pub fn verify_user(
         &self,
         headers: &http::HeaderMap,
         now_ms: u64,
         expect_target: Option<Principal>,
         expect_digest: Option<&[u8]>,
-    ) -> Principal {
-        if let Some(cwt) = self.verify_cwt(headers, now_ms) {
-            cwt.subject
+    ) -> Result<Principal, String> {
+        // Bearer CWT path, only when trusted keys are configured. A `Bearer ` token present
+        // here is a CWT attempt and must verify.
+        if !self.ed25519_pubkeys.is_empty()
+            && let Some(token) = headers
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.strip_prefix("Bearer "))
+        {
+            let cwt = self
+                .verify_cwt_token(token, now_ms)
+                .ok_or_else(|| "invalid or expired bearer token".to_string())?;
+            return cwt
+                .subject
                 .and_then(|s| Principal::from_text(&s).ok())
-                .unwrap_or(ANONYMOUS_PRINCIPAL)
-        } else if let Some(se) = SignedEnvelope::from_authorization(headers)
+                .ok_or_else(|| "bearer token has no valid subject".to_string());
+        }
+
+        // Signed-envelope path from the `Authorization` header or the `ic-auth-*` headers.
+        if let Some(se) = SignedEnvelope::from_authorization(headers)
             .or_else(|| SignedEnvelope::from_headers(headers))
         {
-            match se.verify(now_ms, expect_target, expect_digest) {
-                Ok(_) => se.sender(),
-                Err(_) => ANONYMOUS_PRINCIPAL,
-            }
-        } else {
-            ANONYMOUS_PRINCIPAL
+            return match se.verify(now_ms, expect_target, expect_digest) {
+                Ok(_) => Ok(se.sender()),
+                Err(err) => Err(format!("invalid request credential: {err}")),
+            };
         }
+
+        // No credential supplied: treat as anonymous.
+        Ok(ANONYMOUS_PRINCIPAL)
     }
 
     /// Verifies a `Bearer` CWT token against the trusted `ed25519_pubkeys`.
     /// Returns `None` when no trusted key is configured, the token is missing,
     /// or verification fails.
     pub fn verify_cwt(&self, headers: &http::HeaderMap, now_ms: u64) -> Option<ClaimsSet> {
-        if !self.ed25519_pubkeys.is_empty()
-            && let Some(token) = headers.get(AUTHORIZATION)
-            && let Ok(token) = token.to_str()
-            && let Some(token) = token.strip_prefix("Bearer ")
-        {
-            let data = ByteBufB64::from_str(token).ok()?;
-            let data = skip_prefix(&SIGN1_TAG, &data);
-            let cs1 = cose_sign1_from(data, &[], &[], &self.ed25519_pubkeys).ok()?;
-            cwt_from(&cs1.payload.unwrap_or_default(), (now_ms / 1000) as i64).ok()
-        } else {
-            None
+        let token = headers
+            .get(AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))?;
+        self.verify_cwt_token(token, now_ms)
+    }
+
+    /// Verifies a raw `Bearer` CWT token string against the trusted `ed25519_pubkeys`.
+    /// Returns `None` when no trusted key is configured or verification fails.
+    fn verify_cwt_token(&self, token: &str, now_ms: u64) -> Option<ClaimsSet> {
+        if self.ed25519_pubkeys.is_empty() {
+            return None;
         }
+        let data = ByteBufB64::from_str(token).ok()?;
+        let data = skip_prefix(&SIGN1_TAG, &data);
+        let cs1 = cose_sign1_from(data, &[], &[], &self.ed25519_pubkeys).ok()?;
+        cwt_from(&cs1.payload.unwrap_or_default(), (now_ms / 1000) as i64).ok()
     }
 }
 
@@ -108,7 +132,10 @@ pub async fn get_information(
     State(app): State<AppState>,
     headers: http::HeaderMap,
 ) -> impl IntoResponse {
-    let caller = app.verify_user(&headers, unix_timestamp().as_millis() as u64, None, None);
+    let caller = match app.verify_user(&headers, unix_timestamp().as_millis() as u64, None, None) {
+        Ok(caller) => caller,
+        Err(err) => return (StatusCode::UNAUTHORIZED, err).into_response(),
+    };
 
     let info = AppInformation {
         engines: app.engines.values().map(|e| e.info().clone()).collect(),
@@ -168,12 +195,15 @@ pub async fn anda_engine(
         ContentWithSHA3::JSON(req, hash) => (Codec::Json, req, hash),
     };
 
-    let caller = app.verify_user(
+    let caller = match app.verify_user(
         &headers,
         unix_timestamp().as_millis() as u64,
         Some(id),
         Some(hash.as_slice()),
-    );
+    ) {
+        Ok(caller) => caller,
+        Err(err) => return (StatusCode::UNAUTHORIZED, err).into_response(),
+    };
 
     let res = engine_run(codec, req, &app, caller, id).await;
     match codec {

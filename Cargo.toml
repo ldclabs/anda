@@ -9,7 +9,8 @@ members = [
 ]
 
 [workspace.package]
-version = "0.13.0"
+# Each member crate is versioned independently and sets its own `version`, so no shared
+# `version` default is declared here to avoid a stale value that matches no published crate.
 description = "Anda is an AI agent framework built with Rust, powered by ICP and TEEs."
 repository = "https://github.com/ldclabs/anda"
 homepage = "https://github.com/ldclabs/anda"
@@ -97,6 +98,7 @@ tower-http = { version = "0.6", features = ["compression-gzip"] }
 glob = "0.3"
 serde-saphyr = "0.0"
 unicode-segmentation = "1"
+libc = "0.2"
 
 [patch.crates-io]
 

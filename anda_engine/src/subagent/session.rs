@@ -330,7 +330,7 @@ impl SubSessionRunner {
         let mut steer_batch: Vec<ContentPart> = Vec::new();
 
         for mut input in inputs {
-            // 累计来自于后台任务的工具使用情况
+            // Accumulate tool usage reported by background tasks.
             self.runner.accumulate(&input.usage);
 
             if input.model.is_some() {
@@ -597,10 +597,12 @@ impl SubSession {
         })
     }
 
-    /// Closes the session input side.
-    pub fn close(self: Arc<Self>) {
-        // no things to do for now
-    }
+    /// Closes the session.
+    ///
+    /// This is a no-op today: the input channel closes on its own once every `sender` clone is
+    /// dropped, and the runner exits at its next idle boundary. The method is kept as the single
+    /// place to hook explicit teardown (e.g. cancelling the runner) if that becomes necessary.
+    pub fn close(self: Arc<Self>) {}
 
     pub(super) fn stop_background_tasks(&self) {
         for info in self.background_tasks.write().values_mut() {

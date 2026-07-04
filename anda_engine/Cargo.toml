@@ -56,6 +56,9 @@ unicode-segmentation = { workspace = true }
 [dev-dependencies]
 axum = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = ["Win32_Globalization"] }
 

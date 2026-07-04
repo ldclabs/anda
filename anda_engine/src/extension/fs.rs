@@ -260,9 +260,9 @@ pub async fn resolve_read_path(workspace: &Path, user_path: &str) -> Result<Path
     if !path_contains_parent_reference(requested_path) {
         ensure_path_in_workspace_namespace(workspace, &resolved_workspace, &path)?;
 
-        return tokio::fs::canonicalize(&path)
+        let resolved_path = tokio::fs::canonicalize(&path)
             .await
-            .map_err(|err| {
+            .map_err(|err| -> BoxError {
                 format!(
                     "Failed to resolve file path (workspace: {}, requested_path: {}, candidate_path: {}): {err}",
                     workspace.display(),
@@ -270,7 +270,14 @@ pub async fn resolve_read_path(workspace: &Path, user_path: &str) -> Result<Path
                     path.display()
                 )
                 .into()
-            });
+            })?;
+
+        // The requested path itself stays inside the workspace, but it may pass through a
+        // symbolic link that resolves outside of it. Re-check the canonicalized target so a
+        // workspace-local symlink cannot be used to read arbitrary host files.
+        ensure_path_in_workspace(&resolved_workspace, &resolved_path)?;
+
+        return Ok(resolved_path);
     }
 
     let resolved_path = tokio::fs::canonicalize(&path)
