@@ -2,6 +2,24 @@
 
 All notable changes to the Anda project will be documented in this file.
 
+## [0.13.15] — 2026-07-05
+
+### Added — anda_engine v0.13.15
+
+- **Provider raw-history pruning** — `prune_req_raw_history()` reclaims context-window budget for long-lived subagent sessions by removing consumed tool calls and results from accumulated provider-native JSON history, operating directly on raw JSON to preserve provider-specific shapes (OpenAI Chat/Responses, Anthropic, Gemini) that a Message round-trip would lose.
+- **SSRF protection for model-controlled HTTP fetches** — `validate_public_url()` blocks requests to loopback, private, link-local, metadata, and unspecified addresses before any outbound connection is made.
+- **Shell process-group cleanup** — Spawned shell children now belong to their own process group; cancellation kills the entire group so background descendants are not left behind.
+
+### Changed — anda_engine v0.13.15
+
+- **anda_db 0.8 → 0.9** — Bumped anda_db, anda_db_tfs, anda_cognitive_nexus, anda_db_schema, and anda_kip dependencies from 0.8 to 0.9, adopting the hardened JSON serialization, KQL pagination, and full-scan capping from anda-db 0.9.0.
+- **Auth failures now return 401** — Bad credentials (wrong signature, tampered body, expired token, wrong target) now return HTTP 401 instead of silently downgrading to anonymous access.
+- **Store size enforcement** — Uploads exceeding `MAX_STORE_OBJECT_SIZE` are now rejected at put time with a clear client error.
+
+### Fixed — anda_engine v0.13.15
+
+- **Symlink escape via workspace** — Filesystem reads now re-verify the canonicalized path resides inside the workspace after resolving symlinks, preventing reads to host files through workspace-local symlinks.
+
 ## [0.13.14] — 2026-06-29
 
 ### Added — anda_engine v0.13.14

@@ -35,11 +35,11 @@ axum = { version = "0.8", features = [
   "query",
 ], default-features = true }
 async-trait = "0.1"
-anda_db = { version = "0.8", features = ["full"] }
-anda_db_tfs = { version = "0.8", features = ["full"] }
-anda_cognitive_nexus = "0.8"
-anda_db_schema = "0.8"
-anda_kip = "0.8"
+anda_db = { version = "0.9", features = ["full"] }
+anda_db_tfs = { version = "0.9", features = ["full"] }
+anda_cognitive_nexus = "0.9"
+anda_db_schema = "0.9"
+anda_kip = "0.9"
 arc-swap = "1.9"
 bytes = "1"
 base64 = "0.22"

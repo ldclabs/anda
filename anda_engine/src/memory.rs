@@ -22,9 +22,7 @@ use anda_db::{
     index::BTree,
     query::{Filter, Query, RangeQuery, Search},
 };
-use anda_db_schema::{
-    AndaDBSchema, FieldEntry, FieldKey, FieldType, Ft, Fv, Json, Schema, SchemaError,
-};
+use anda_db_schema::{AndaDBSchema, Ft, Fv, Json};
 use anda_db_tfs::jieba_tokenizer;
 use anda_kip::{
     DescribeTarget, KipError, META_SYSTEM_NAME, MetaCommand, PERSON_TYPE, Request, Response,
@@ -2413,7 +2411,12 @@ mod tests {
         );
 
         let _ = memory.nexus();
-        assert!(memory.describe_primer().await.is_err());
+        // The bundled genesis capsule has no `$self`, so the primer degrades the
+        // identity layer to null instead of failing the whole request.
+        let primer = memory.describe_primer().await.unwrap();
+        assert_eq!(primer["identity"], json!(null));
+        assert_eq!(primer["search_modes"], json!(["keyword"]));
+        // `$system` is still absent, so describing the system identity errors.
         assert!(memory.describe_system().await.is_err());
         let caller = memory
             .get_or_init_caller(&user, Some("Ada".to_string()))
