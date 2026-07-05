@@ -13,6 +13,24 @@ use parking_lot::Mutex;
 use serde_json::json;
 use std::collections::BTreeSet;
 
+/// Registers a background task in the session's registry, carrying `info` as the handle's
+/// payload with a fresh cancellation token. Mirrors what the hooks do on `on_background_start`.
+fn register_bg_task(session: &SubSession, task_id: &str, info: BackgroundTaskInfo) {
+    session.controls.register(
+        BackgroundHandle::new(task_id, anda_core::CancellationToken::new())
+            .with_data(Mutex::new(info)),
+    );
+}
+
+/// Reads a clone of the [`BackgroundTaskInfo`] payload for `task_id`, if still registered.
+fn bg_task_info(session: &SubSession, task_id: &str) -> Option<BackgroundTaskInfo> {
+    session
+        .controls
+        .get(task_id)
+        .and_then(|handle| handle.data::<Mutex<BackgroundTaskInfo>>())
+        .map(|info| info.lock().clone())
+}
+
 async fn test_conversations(name: &str) -> Conversations {
     let db = Arc::new(
         AndaDB::connect(Arc::new(InMemory::new()), DBConfig::default())
@@ -2059,8 +2077,9 @@ async fn subsession_runner_stop_idles_current_task_without_ending_session() {
     assert!(!runner.runner.is_idle());
     assert_eq!(requests.lock().len(), 1);
 
-    runner.session.background_tasks.write().insert(
-        "child-session".to_string(),
+    register_bg_task(
+        &runner.session,
+        "child-session",
         BackgroundTaskInfo {
             agent_name: "child".to_string(),
             ..Default::default()
@@ -2086,14 +2105,7 @@ async fn subsession_runner_stop_idles_current_task_without_ending_session() {
     assert!(runner.runner.is_idle());
     assert!(!runner.runner.is_done());
     assert_eq!(requests.lock().len(), 1);
-    assert!(
-        runner
-            .session
-            .background_tasks
-            .read()
-            .get("child-session")
-            .is_some_and(|info| info.stopped)
-    );
+    assert!(bg_task_info(&runner.session, "child-session").is_some_and(|info| info.stopped));
 
     let progress = hook.progress_events();
     assert_eq!(progress.len(), 2);
@@ -2119,13 +2131,7 @@ async fn subsession_runner_stop_idles_current_task_without_ending_session() {
         },
     )
     .await;
-    assert!(
-        !runner
-            .session
-            .background_tasks
-            .read()
-            .contains_key("child-session")
-    );
+    assert!(bg_task_info(&runner.session, "child-session").is_none());
     assert!(rx.try_recv().is_err());
 
     assert!(
@@ -2439,12 +2445,7 @@ async fn subsession_background_hooks_forward_outputs_and_manage_registry() {
     )
     .await;
     assert_eq!(
-        session
-            .background_tasks
-            .read()
-            .get("child-session")
-            .unwrap()
-            .agent_name,
+        bg_task_info(&session, "child-session").unwrap().agent_name,
         "Mocker"
     );
 
@@ -2503,12 +2504,7 @@ async fn subsession_background_hooks_forward_outputs_and_manage_registry() {
         },
     )
     .await;
-    assert!(
-        !session
-            .background_tasks
-            .read()
-            .contains_key("child-session")
-    );
+    assert!(bg_task_info(&session, "child-session").is_none());
     assert!(recv_subagent_prompt(&mut rx).await.contains("final output"));
 
     ToolBackgroundHook::on_background_start(
@@ -2519,10 +2515,7 @@ async fn subsession_background_hooks_forward_outputs_and_manage_registry() {
     )
     .await;
     assert_eq!(
-        session
-            .background_tasks
-            .read()
-            .get("fetch:task-1")
+        bg_task_info(&session, "fetch:task-1")
             .unwrap()
             .tool_name
             .as_deref(),
@@ -2537,10 +2530,7 @@ async fn subsession_background_hooks_forward_outputs_and_manage_registry() {
     )
     .await;
     assert_eq!(
-        session
-            .background_tasks
-            .read()
-            .get("fetch:task-1")
+        bg_task_info(&session, "fetch:task-1")
             .unwrap()
             .progress_message
             .as_deref(),
@@ -2555,10 +2545,7 @@ async fn subsession_background_hooks_forward_outputs_and_manage_registry() {
     )
     .await;
     assert!(
-        session
-            .background_tasks
-            .read()
-            .get("unprefixed")
+        bg_task_info(&session, "unprefixed")
             .unwrap()
             .tool_name
             .is_none()
@@ -2579,7 +2566,7 @@ async fn subsession_background_hooks_forward_outputs_and_manage_registry() {
         },
     )
     .await;
-    assert!(!session.background_tasks.read().contains_key("fetch:task-1"));
+    assert!(bg_task_info(&session, "fetch:task-1").is_none());
     let forwarded = rx.recv().await.unwrap();
     assert!(matches!(forwarded.command, PromptCommand::Plain { .. }));
     assert_eq!(forwarded.resources.len(), 1);
@@ -2809,17 +2796,11 @@ async fn stop_background_task_marks_stopped_and_cancels_handle() {
     // producer actually terminates the work (not just suppresses forwarding).
     assert!(session.stop_background_task("fetch:task-1"));
     assert!(token.is_cancelled());
-    assert!(
-        session
-            .background_tasks
-            .read()
-            .get("fetch:task-1")
-            .unwrap()
-            .stopped
-    );
+    assert!(bg_task_info(&session, "fetch:task-1").unwrap().stopped);
 
-    // The handle is consumed once; a second stop finds no live task.
-    assert!(!session.stop_background_task("fetch:task-1"));
+    // The handle stays registered until it is finished (on the task's end callback), so stop is
+    // idempotent and a repeat call still reports the task as found.
+    assert!(session.stop_background_task("fetch:task-1"));
 
     // stop_background_tasks() cancels every remaining registered handle.
     let token2 = anda_core::CancellationToken::new();
@@ -2888,14 +2869,7 @@ async fn stop_task_command_stops_single_background_task_by_id() {
     assert!(rt.content.contains("Stopped background task fetch:task-1"));
     assert!(token1.is_cancelled());
     assert!(!token2.is_cancelled());
-    assert!(
-        session
-            .background_tasks
-            .read()
-            .get("fetch:task-1")
-            .unwrap()
-            .stopped
-    );
+    assert!(bg_task_info(&session, "fetch:task-1").unwrap().stopped);
 
     // Unknown task id reports not-found without disturbing the session.
     let rt = Agent::<AgentCtx>::run(
@@ -3036,7 +3010,7 @@ async fn subsession_agent_hook_forwards_usage_deltas() {
     assert_eq!(input.usage.input_tokens, 50);
     assert_eq!(input.usage.output_tokens, 5);
     assert_eq!(input.usage.requests, 1);
-    assert!(session.background_tasks.read().is_empty());
+    assert!(session.controls.is_empty());
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -3266,8 +3240,9 @@ async fn subagent_status_command_reports_live_session_snapshot() {
         sender,
         0,
     ));
-    session.background_tasks.write().insert(
-        "fetch:task-1".to_string(),
+    register_bg_task(
+        &session,
+        "fetch:task-1",
         BackgroundTaskInfo {
             agent_name: "status_worker".to_string(),
             tool_name: Some("fetch".to_string()),
@@ -3276,8 +3251,9 @@ async fn subagent_status_command_reports_live_session_snapshot() {
         },
     );
     // A stopped task must be excluded from the report.
-    session.background_tasks.write().insert(
-        "fetch:task-2".to_string(),
+    register_bg_task(
+        &session,
+        "fetch:task-2",
         BackgroundTaskInfo {
             agent_name: "status_worker".to_string(),
             stopped: true,
@@ -3329,6 +3305,7 @@ async fn subagent_status_command_reports_live_session_snapshot() {
     assert_eq!(tasks[0]["task_id"], json!("fetch:task-1"));
     assert_eq!(tasks[0]["tool"], json!("fetch"));
     assert_eq!(tasks[0]["progress"], json!("halfway"));
+    assert!(tasks[0]["running_ms"].is_u64());
     assert!(detail["running_ms"].is_u64());
     assert!(detail["idle_ms"].is_u64());
 

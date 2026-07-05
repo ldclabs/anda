@@ -10,6 +10,11 @@ pub(super) struct SubAgentInput {
 }
 
 /// Metadata tracked for a background task running inside a subagent session.
+///
+/// The session carries this as the application payload of the task's
+/// [`BackgroundHandle`](crate::hook::BackgroundHandle), stored behind a
+/// [`Mutex`](parking_lot::Mutex) because progress and stop callbacks mutate it over the
+/// task's lifetime.
 #[derive(Debug, Default, Deserialize, Serialize, Clone)]
 pub struct BackgroundTaskInfo {
     /// Subagent that owns the background task.
@@ -60,8 +65,6 @@ pub struct SubSession {
     pub(super) id: String,
     pub(super) agent: String,
     pub(super) sender: tokio::sync::mpsc::Sender<SubAgentInput>,
-    // task_id -> BackgroundTaskInfo
-    pub(super) background_tasks: Arc<RwLock<HashMap<String, BackgroundTaskInfo>>>,
     pub(super) active_at: AtomicU64,
     // Wall-clock ms when this session's runner started, used to report elapsed run time.
     pub(super) created_at: u64,
@@ -72,9 +75,9 @@ pub struct SubSession {
     pub(super) status: RwLock<SubSessionStatus>,
     // Persistent conversation record for this session when conversation recording is enabled.
     pub(super) conversation: AtomicU64,
-    // Stop handles for the background tasks (nested tools and subagents) running inside this
-    // session, keyed by task_id. Lets the session actively terminate a specific task instead of
-    // only suppressing its output forwarding.
+    // The single registry of background tasks (nested tools and subagents) running inside this
+    // session, keyed by task_id. Each handle carries a [`BackgroundTaskInfo`] payload, so the
+    // session tracks per-task metadata and stop handles together instead of in a parallel map.
     pub(super) controls: BackgroundTaskControls,
 }
 
@@ -471,7 +474,7 @@ impl SubSessionRunner {
                 let now_ms = unix_ms();
 
                 let idle = now_ms.saturating_sub(self.session.active_at.load(Ordering::SeqCst));
-                let has_background_tasks = !self.session.background_tasks.read().is_empty();
+                let has_background_tasks = !self.session.controls.is_empty();
 
                 if (idle > self.session.idle_timeout_ms && !has_background_tasks)
                     || (idle > CONVERSATION_WAIT_BACKGROUND_TASK_MS && has_background_tasks)
@@ -537,7 +540,6 @@ impl SubSession {
             id,
             agent,
             sender,
-            background_tasks: Arc::new(RwLock::new(HashMap::new())),
             active_at: AtomicU64::new(now),
             created_at: now,
             idle_timeout_ms,
@@ -572,17 +574,22 @@ impl SubSession {
         let active_at = self.active_at.load(Ordering::SeqCst);
         let status = self.status.read().clone();
         let background_tasks = self
-            .background_tasks
-            .read()
-            .iter()
-            .filter(|(_, info)| !info.stopped)
-            .map(|(task_id, info)| {
-                json!({
-                    "task_id": task_id,
+            .controls
+            .handles()
+            .into_iter()
+            .filter_map(|handle| {
+                let info = handle.data::<Mutex<BackgroundTaskInfo>>()?;
+                let info = info.lock();
+                if info.stopped {
+                    return None;
+                }
+                Some(json!({
+                    "task_id": handle.task_id(),
                     "agent": info.agent_name,
                     "tool": info.tool_name,
                     "progress": info.progress_message,
-                })
+                    "running_ms": handle.elapsed_ms(),
+                }))
             })
             .collect::<Vec<_>>();
 
@@ -611,11 +618,14 @@ impl SubSession {
     pub fn close(self: Arc<Self>) {}
 
     pub(super) fn stop_background_tasks(&self) {
-        for info in self.background_tasks.write().values_mut() {
-            info.stopped = true;
+        // Mark each task stopped so any late progress/end output is no longer forwarded, and
+        // actually terminate the underlying task rather than only suppressing its forwarding.
+        for handle in self.controls.handles() {
+            if let Some(info) = handle.data::<Mutex<BackgroundTaskInfo>>() {
+                info.lock().stopped = true;
+            }
+            handle.stop();
         }
-        // Actually terminate the underlying tasks, not just suppress their forwarding.
-        self.controls.stop_all();
     }
 
     /// Actively stops a single background task running inside this session.
@@ -625,43 +635,43 @@ impl SubSession {
     /// killed; a nested subagent session receives a graceful `/stop`). Returns `true` if a live
     /// task with `task_id` was found.
     pub fn stop_background_task(&self, task_id: &str) -> bool {
-        if let Some(info) = self.background_tasks.write().get_mut(task_id) {
-            info.stopped = true;
+        match self.controls.get(task_id) {
+            Some(handle) => {
+                if let Some(info) = handle.data::<Mutex<BackgroundTaskInfo>>() {
+                    info.lock().stopped = true;
+                }
+                handle.stop();
+                true
+            }
+            None => false,
         }
-        self.controls.stop_background_task(task_id)
     }
 
     /// Converts the cumulative usage reported by a background agent into a delta against what was
-    /// already forwarded for `task_id`, so the session runner does not double-count usage when it
-    /// accumulates progress and final outputs.
-    pub(super) fn take_usage_delta(
-        &self,
-        task_id: &str,
+    /// already forwarded for the task, so the session runner does not double-count usage when it
+    /// accumulates progress and final outputs. Callers pass the task's [`BackgroundTaskInfo`]
+    /// payload directly, sourced from the registry via `get_data` (progress) or `finish` (end).
+    /// Returns `None` for a stopped task, whose output must not be forwarded.
+    pub(super) fn usage_delta(
+        info: &Mutex<BackgroundTaskInfo>,
         current: &Usage,
         ended: bool,
     ) -> Option<Usage> {
-        let mut tasks = self.background_tasks.write();
-        let reported = if ended {
-            let info = tasks.remove(task_id).unwrap_or_default();
-            if info.stopped {
-                return None;
-            }
-            info.reported_usage
-        } else {
-            let info = tasks.entry(task_id.to_string()).or_default();
-            if info.stopped {
-                return None;
-            }
-            let reported = info.reported_usage.clone();
-            // Keep the watermark monotonic even if a failure output carries empty usage.
+        let mut info = info.lock();
+        if info.stopped {
+            return None;
+        }
+        let reported = info.reported_usage.clone();
+        // On the final output the handle is about to be finished, so there is no watermark to
+        // maintain; otherwise keep it monotonic even if a failure output carries empty usage.
+        if !ended {
             info.reported_usage = Usage {
                 input_tokens: current.input_tokens.max(reported.input_tokens),
                 output_tokens: current.output_tokens.max(reported.output_tokens),
                 cached_tokens: current.cached_tokens.max(reported.cached_tokens),
                 requests: current.requests.max(reported.requests),
             };
-            reported
-        };
+        }
 
         Some(Usage {
             input_tokens: current.input_tokens.saturating_sub(reported.input_tokens),
@@ -680,16 +690,10 @@ impl AgentHook for SubSession {
         handle: BackgroundHandle,
         _req: &CompletionRequest,
     ) {
-        self.background_tasks.write().insert(
-            handle.task_id().to_string(),
-            BackgroundTaskInfo {
-                agent_name: ctx.base.agent.clone(),
-                tool_name: None,
-                progress_message: None,
-                reported_usage: Usage::default(),
-                stopped: false,
-            },
-        );
+        let handle = handle.with_data(Mutex::new(BackgroundTaskInfo {
+            agent_name: ctx.base.agent.clone(),
+            ..Default::default()
+        }));
         self.controls.register(handle);
     }
 
@@ -700,7 +704,11 @@ impl AgentHook for SubSession {
         output: AgentOutput,
     ) {
         // Background agent outputs carry cumulative usage; forward only the delta.
-        let Some(usage) = self.take_usage_delta(&session_id, &output.usage, false) else {
+        let Some(usage) = self
+            .controls
+            .get_data::<Mutex<BackgroundTaskInfo>>(&session_id)
+            .and_then(|info| Self::usage_delta(&info, &output.usage, false))
+        else {
             return;
         };
         let prompt = if !output.content.is_empty() {
@@ -726,8 +734,13 @@ impl AgentHook for SubSession {
     }
 
     async fn on_background_end(&self, _ctx: &AgentCtx, session_id: String, output: AgentOutput) {
-        self.controls.finish(&session_id);
-        let Some(usage) = self.take_usage_delta(&session_id, &output.usage, true) else {
+        // Finishing removes and returns the handle; read its payload one last time for the delta.
+        let Some(usage) = self
+            .controls
+            .finish(&session_id)
+            .and_then(|handle| handle.data::<Mutex<BackgroundTaskInfo>>())
+            .and_then(|info| Self::usage_delta(&info, &output.usage, true))
+        else {
             return;
         };
         let prompt = if !output.content.is_empty() {
@@ -757,16 +770,11 @@ impl AgentHook for SubSession {
 impl ToolBackgroundHook for SubSession {
     async fn on_background_start(&self, ctx: &BaseCtx, handle: BackgroundHandle, _args: Json) {
         let pid = PrefixedId::from_str(handle.task_id()).ok();
-        self.background_tasks.write().insert(
-            handle.task_id().to_string(),
-            BackgroundTaskInfo {
-                agent_name: ctx.agent.clone(),
-                tool_name: pid.map(|p| p.prefix),
-                progress_message: None,
-                reported_usage: Usage::default(),
-                stopped: false,
-            },
-        );
+        let handle = handle.with_data(Mutex::new(BackgroundTaskInfo {
+            agent_name: ctx.agent.clone(),
+            tool_name: pid.map(|p| p.prefix),
+            ..Default::default()
+        }));
         self.controls.register(handle);
     }
 
@@ -776,8 +784,11 @@ impl ToolBackgroundHook for SubSession {
         task_id: String,
         output: ToolOutput<Json>,
     ) {
-        let mut tasks = self.background_tasks.write();
-        if let Some(info) = tasks.get_mut(&task_id) {
+        if let Some(info) = self
+            .controls
+            .get_data::<Mutex<BackgroundTaskInfo>>(&task_id)
+        {
+            let mut info = info.lock();
             if info.stopped {
                 return;
             }
@@ -786,14 +797,13 @@ impl ToolBackgroundHook for SubSession {
     }
 
     async fn on_background_end(&self, _ctx: &BaseCtx, task_id: String, output: ToolOutput<Json>) {
-        self.controls.finish(&task_id);
-        let stopped = {
-            self.background_tasks
-                .write()
-                .remove(&task_id)
-                .map(|info| info.stopped)
-                .unwrap_or(false)
-        };
+        // Finishing removes and returns the handle; read whether the task was stopped from it.
+        let stopped = self
+            .controls
+            .finish(&task_id)
+            .and_then(|handle| handle.data::<Mutex<BackgroundTaskInfo>>())
+            .map(|info| info.lock().stopped)
+            .unwrap_or(false);
         if stopped {
             return;
         }

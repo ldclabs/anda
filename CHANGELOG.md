@@ -27,6 +27,13 @@ All notable changes to the Anda project will be documented in this file.
 
 - **Base64 blob serialization** — Test assertions updated to match `b64:` prefix format for inline data and resource blob encoding.
 
+## [0.14.1] — 2026-07-05
+
+### Changed — anda_engine v0.14.1
+
+- **Background handle typed payload** — `BackgroundHandle` now carries a typed `Arc<dyn Any + Send + Sync>` payload via `with_data()`/`data()` methods, replacing the parallel `background_tasks` map in `SubSession` with data stored directly on the handle. `created_at` and `elapsed_ms()` provide lifecycle observability on the handle itself.
+- **`BackgroundTaskControls` ergonomics** — Internal `Mutex` upgraded to `RwLock`; new `get()` / `get_data()` / `handles()` / `is_empty()` accessors; `finish()` now returns the removed handle; `finish_all()` clears all tasks; `stop_all()` removed with stop logic inlined at call sites.
+
 ## [0.13.15] — 2026-07-05
 
 ### Added — anda_engine v0.13.15

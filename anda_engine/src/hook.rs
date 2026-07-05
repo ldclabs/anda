@@ -12,8 +12,8 @@ use anda_core::{
 };
 use async_trait::async_trait;
 use core::{fmt, str::FromStr};
-use parking_lot::Mutex;
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use parking_lot::RwLock;
+use std::{any::Any, collections::HashMap, sync::Arc, time::Duration};
 use structured_logger::unix_ms;
 
 use crate::context::{AgentCtx, BaseCtx};
@@ -66,24 +66,68 @@ impl FromStr for PrefixedId {
 /// producer's background loop observes the cancellation and terminates the task, while
 /// sibling tasks and the enclosing request keep running. Request-level cancellation still
 /// cascades down, because the per-task token is a child of the request token.
+///
+/// The handle also carries a creation timestamp (for observing run time) and an optional,
+/// type-erased application payload attached with [`with_data`](BackgroundHandle::with_data).
+/// The payload is shared by [`Arc`] across every clone (the subscriber's copy and the one
+/// kept in [`BackgroundTaskControls`]), so a subscriber can keep per-task bookkeeping on the
+/// handle itself instead of maintaining a parallel map. Use interior mutability (e.g.
+/// [`Mutex`]) inside the payload when it must change over the task's lifetime.
 #[derive(Clone)]
 pub struct BackgroundHandle {
     task_id: String,
     token: CancellationToken,
+    created_at: u64,
+    data: Option<Arc<dyn Any + Send + Sync>>,
 }
 
 impl BackgroundHandle {
-    /// Wraps a per-task cancellation token under its task ID.
+    /// Wraps a per-task cancellation token under its task ID. The creation timestamp is
+    /// stamped now and no payload is attached.
     pub fn new(task_id: impl Into<String>, token: CancellationToken) -> Self {
         Self {
             task_id: task_id.into(),
             token,
+            created_at: unix_ms(),
+            data: None,
         }
+    }
+
+    /// Attaches an application-defined payload, wrapping it in an [`Arc`] so every clone of
+    /// the handle observes the same value.
+    pub fn with_data<T: Any + Send + Sync>(mut self, data: T) -> Self {
+        self.data = Some(Arc::new(data));
+        self
+    }
+
+    /// Attaches an already-shared payload, so the producer can keep its own [`Arc`] clone in
+    /// addition to the copy carried by the handle.
+    pub fn with_shared_data<T: Any + Send + Sync>(mut self, data: Arc<T>) -> Self {
+        let data: Arc<dyn Any + Send + Sync> = data;
+        self.data = Some(data);
+        self
+    }
+
+    /// Downcasts the attached payload to `T`, returning a shared handle to it. Returns `None`
+    /// when no payload is attached or it is of another type.
+    pub fn data<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
+        self.data.clone()?.downcast::<T>().ok()
     }
 
     /// The background task's identifier.
     pub fn task_id(&self) -> &str {
         &self.task_id
+    }
+
+    /// Wall-clock time in milliseconds (Unix epoch) when this handle, and thus the task, was
+    /// created.
+    pub fn created_at(&self) -> u64 {
+        self.created_at
+    }
+
+    /// Milliseconds elapsed since the task was created, for observing its run time.
+    pub fn elapsed_ms(&self) -> u64 {
+        unix_ms().saturating_sub(self.created_at)
     }
 
     /// Requests the producer stop this background task. Idempotent and safe to call
@@ -98,15 +142,23 @@ impl BackgroundHandle {
     }
 }
 
-/// Registry that lets a background-task subscriber stop individual tasks by ID.
+/// Registry of the [`BackgroundHandle`]s for a subscriber's live background tasks, keyed by
+/// task ID.
 ///
-/// Producers register a [`BackgroundHandle`] when a task starts and drop it (via
+/// Producers register a handle when a task starts and drop it (via
 /// [`finish`](BackgroundTaskControls::finish)) when the task ends; subscribers call
 /// [`stop_background_task`](BackgroundTaskControls::stop_background_task) to actively
-/// terminate a still-running task. Cloning shares the same underlying registry.
+/// terminate a still-running task, and [`get`](BackgroundTaskControls::get) /
+/// [`handles`](BackgroundTaskControls::handles) to read the handles (and their payloads) for
+/// progress reporting. Cloning shares the same underlying registry.
+///
+/// Stopping a task only signals its cancellation token; the handle stays registered until
+/// [`finish`](BackgroundTaskControls::finish) removes it. This lets a late progress or end
+/// callback — which only carries a task ID — still find the handle and observe that the task
+/// was stopped, so it can suppress duplicate output instead of forwarding it.
 #[derive(Clone, Default)]
 pub struct BackgroundTaskControls {
-    tasks: Arc<Mutex<HashMap<String, BackgroundHandle>>>,
+    tasks: Arc<RwLock<HashMap<String, BackgroundHandle>>>,
 }
 
 impl BackgroundTaskControls {
@@ -115,43 +167,69 @@ impl BackgroundTaskControls {
         Self::default()
     }
 
-    /// Records a stop handle so the task can later be stopped by ID.
+    /// Records a handle so the task can later be observed and stopped by ID.
     pub fn register(&self, handle: BackgroundHandle) {
         self.tasks
-            .lock()
+            .write()
             .insert(handle.task_id().to_string(), handle);
     }
 
-    /// Forgets a task's handle once it has ended, without stopping it.
-    pub fn finish(&self, task_id: &str) {
-        self.tasks.lock().remove(task_id);
+    /// Returns a clone of the handle for `task_id`, if still registered. Gives callers access
+    /// to the handle's application payload for progress and end bookkeeping.
+    pub fn get(&self, task_id: &str) -> Option<BackgroundHandle> {
+        self.tasks.read().get(task_id).cloned()
+    }
+
+    /// Downcasts the payload of the handle for `task_id` to `T` without cloning the whole
+    /// handle. Returns `None` when the task is not registered or its payload is of another type.
+    pub fn get_data<T: Any + Send + Sync>(&self, task_id: &str) -> Option<Arc<T>> {
+        self.tasks.read().get(task_id)?.data::<T>()
+    }
+
+    /// Returns clones of every currently registered handle, for status reporting.
+    pub fn handles(&self) -> Vec<BackgroundHandle> {
+        self.tasks.read().values().cloned().collect()
+    }
+
+    /// Whether any task is still registered.
+    pub fn is_empty(&self) -> bool {
+        self.tasks.read().is_empty()
+    }
+
+    /// Forgets a task's handle once it has ended, without stopping it, returning the removed
+    /// handle so a caller can read its payload one last time. This is the only path that removes
+    /// a handle, so a stopped-but-not-yet-ended task stays observable to late progress and end
+    /// callbacks.
+    pub fn finish(&self, task_id: &str) -> Option<BackgroundHandle> {
+        self.tasks.write().remove(task_id)
+    }
+
+    /// Forgets every registered handle at once, returning the removed handles so a caller can do
+    /// final bookkeeping on their payloads. Like [`finish`](BackgroundTaskControls::finish) but
+    /// for the whole registry; it does not stop the tasks, which a torn-down request cancels on
+    /// its own through the context-token cascade.
+    pub fn finish_all(&self) -> Vec<BackgroundHandle> {
+        self.tasks
+            .write()
+            .drain()
+            .map(|(_, handle)| handle)
+            .collect()
     }
 
     /// Actively stops a single background task by ID.
     ///
-    /// Returns `true` if a live task was found and signalled, `false` if no such task was
-    /// registered (it already ended or never started).
+    /// The handle stays registered so a later progress or end callback can still observe that
+    /// the task was stopped; removal happens through [`finish`](BackgroundTaskControls::finish).
+    /// Returns `true` if a task was found and signalled, `false` if no such task was registered
+    /// (it already ended or never started).
     pub fn stop_background_task(&self, task_id: &str) -> bool {
-        let handle = self.tasks.lock().remove(task_id);
+        let handle = self.tasks.read().get(task_id).cloned();
         match handle {
             Some(handle) => {
                 handle.stop();
                 true
             }
             None => false,
-        }
-    }
-
-    /// Stops every registered background task and clears the registry.
-    pub fn stop_all(&self) {
-        let handles: Vec<_> = self
-            .tasks
-            .lock()
-            .drain()
-            .map(|(_, handle)| handle)
-            .collect();
-        for handle in handles {
-            handle.stop();
         }
     }
 }
@@ -624,31 +702,61 @@ mod tests {
     }
 
     #[test]
-    fn background_task_controls_stop_finish_and_stop_all() {
+    fn background_handle_carries_payload_and_created_at() {
+        let handle =
+            BackgroundHandle::new("shell:1", CancellationToken::new()).with_data(Mutex::new(7u32));
+
+        // The creation timestamp is stamped and elapsed time is observable.
+        assert!(handle.created_at() > 0);
+        let _ = handle.elapsed_ms();
+
+        // The payload is shared across clones: a mutation through one is seen through the other.
+        let clone = handle.clone();
+        *handle.data::<Mutex<u32>>().unwrap().lock() = 42;
+        assert_eq!(*clone.data::<Mutex<u32>>().unwrap().lock(), 42);
+
+        // Downcasting to the wrong type, or reading a handle without payload, returns None.
+        assert!(handle.data::<Mutex<String>>().is_none());
+        let bare = BackgroundHandle::new("shell:2", CancellationToken::new());
+        assert!(bare.data::<Mutex<u32>>().is_none());
+    }
+
+    #[test]
+    fn background_task_controls_stop_finish_and_finish_all() {
         let controls = BackgroundTaskControls::new();
         let token_a = CancellationToken::new();
         let token_b = CancellationToken::new();
         controls.register(BackgroundHandle::new("a", token_a.clone()));
         controls.register(BackgroundHandle::new("b", token_b.clone()));
 
-        // Stopping a live task signals its token and reports it was found.
+        // Stopping a live task signals its token and reports it was found, but keeps the handle
+        // registered so a late progress/end callback can still observe the stop.
         assert!(controls.stop_background_task("a"));
         assert!(token_a.is_cancelled());
-        // A second stop finds nothing (already removed) and does not error.
-        assert!(!controls.stop_background_task("a"));
+        assert!(controls.get("a").is_some());
+        // Stop is idempotent and still reports the task as found until it is finished.
+        assert!(controls.stop_background_task("a"));
         // Unknown task ids report not found.
         assert!(!controls.stop_background_task("missing"));
 
-        // finish() forgets a handle without cancelling it.
+        // finish() forgets a handle and returns it, without cancelling.
+        assert_eq!(controls.finish("a").unwrap().task_id(), "a");
+        assert!(controls.get("a").is_none());
+        assert!(!controls.stop_background_task("a"));
+
         controls.finish("b");
         assert!(!token_b.is_cancelled());
         assert!(!controls.stop_background_task("b"));
 
-        // stop_all() cancels everything still registered.
+        // finish_all() drains every remaining handle without stopping the tasks.
         let token_c = CancellationToken::new();
         controls.register(BackgroundHandle::new("c", token_c.clone()));
-        controls.stop_all();
-        assert!(token_c.is_cancelled());
+        assert!(!controls.is_empty());
+        let drained = controls.finish_all();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].task_id(), "c");
+        assert!(!token_c.is_cancelled());
+        assert!(controls.is_empty());
     }
 
     #[test]

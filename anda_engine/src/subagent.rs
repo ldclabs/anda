@@ -12,7 +12,7 @@ use anda_core::{
 };
 use async_trait::async_trait;
 use cbor2::{from_slice, to_canonical_vec};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
