@@ -478,6 +478,7 @@ impl SubSessionRunner {
                 if let Some(conversation) = &mut self.conversation {
                     conversation.mark_status(ConversationStatus::Idle).await;
                 }
+                self.runner.prune_req_raw_history();
                 Ok(true)
             }
 

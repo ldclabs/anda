@@ -1320,6 +1320,25 @@ impl CompletionRunner {
         self.discard_in_flight_request_with_interrupted_tool_outputs("tool call discarded", None);
     }
 
+    /// Prunes completed tool interactions from the accumulated provider raw history.
+    ///
+    /// `req.raw_history` holds provider-native message JSON (OpenAI, Anthropic, and Gemini
+    /// shapes all differ), so pruning rewrites the raw values in place rather than
+    /// round-tripping through [`Message`], which would drop or corrupt provider-specific
+    /// formats. Tool-call requests, their results, and items left without meaningful
+    /// content are removed; visible text and reasoning stay untouched.
+    ///
+    /// Long-lived callers (for example subagent sessions) can invoke this at an idle
+    /// boundary to reclaim context-window budget from tool payloads the model has already
+    /// consumed. The call is a no-op unless the runner is idle, so an in-flight tool round
+    /// is never left with an orphaned call or result.
+    pub fn prune_req_raw_history(&mut self) {
+        if !self.is_idle() || self.req.raw_history.is_empty() {
+            return;
+        }
+        Self::prune_tool_interactions_from_raw_history(&mut self.req.raw_history);
+    }
+
     fn discard_in_flight_request_with_interrupted_tool_outputs(
         &mut self,
         error: &str,
@@ -1703,6 +1722,67 @@ impl CompletionRunner {
         }
     }
 
+    // Removes completed tool interactions (calls and results) from provider raw history.
+    // Walks backwards so an OpenAI Responses `reasoning` item can see whether the item it
+    // must immediately precede survived; the API rejects a reasoning item whose required
+    // following item is missing, so orphaned reasoning follows its pruned sibling out.
+    fn prune_tool_interactions_from_raw_history(raw_history: &mut Vec<Json>) {
+        let mut retained: Vec<Json> = Vec::with_capacity(raw_history.len());
+        let mut next_kept = true;
+        for value in raw_history.drain(..).rev() {
+            if !next_kept && value.get("type").and_then(|v| v.as_str()) == Some("reasoning") {
+                continue;
+            }
+            match Self::prune_tool_interactions_from_raw_item(value) {
+                Some(value) => {
+                    retained.push(value);
+                    next_kept = true;
+                }
+                None => next_kept = false,
+            }
+        }
+        retained.reverse();
+        *raw_history = retained;
+    }
+
+    fn prune_tool_interactions_from_raw_item(mut value: Json) -> Option<Json> {
+        if Self::is_tool_call_raw_item(&value) || Self::is_tool_output_raw_item(&value) {
+            return None;
+        }
+
+        Self::prune_nested_tool_interactions(&mut value);
+        if Self::raw_history_item_has_context(&value) {
+            Some(value)
+        } else {
+            None
+        }
+    }
+
+    // Like `prune_nested_tool_calls`, but also drops tool results, so a wrapper message
+    // whose content held only a tool interaction loses its remaining context and is
+    // pruned by `raw_history_item_has_context`.
+    fn prune_nested_tool_interactions(value: &mut Json) {
+        match value {
+            Json::Array(items) => {
+                let retained: Vec<Json> = items
+                    .drain(..)
+                    .filter_map(Self::prune_tool_interactions_from_raw_item)
+                    .collect();
+                *items = retained;
+            }
+            Json::Object(map) => {
+                map.remove("tool_calls");
+                map.remove("function_call");
+                map.remove("functionCall");
+
+                for value in map.values_mut() {
+                    Self::prune_nested_tool_interactions(value);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn is_tool_call_raw_item(value: &Json) -> bool {
         let Some(map) = value.as_object() else {
             return false;
@@ -1737,6 +1817,46 @@ impl CompletionRunner {
                 matches!(
                     key.as_str(),
                     "functionCall" | "thought" | "thoughtSignature"
+                )
+            })
+    }
+
+    fn is_tool_output_raw_item(value: &Json) -> bool {
+        let Some(map) = value.as_object() else {
+            return false;
+        };
+
+        // OpenAI Chat Completions carries tool results as whole messages with the "tool" role.
+        if map.get("role").and_then(|v| v.as_str()) == Some("tool") {
+            return true;
+        }
+
+        if matches!(
+            map.get("type").and_then(|v| v.as_str()),
+            Some(
+                "function_call_output"
+                    | "custom_tool_call_output"
+                    | "computer_call_output"
+                    | "local_shell_call_output"
+                    | "shell_call_output"
+                    | "apply_patch_call_output"
+                    | "mcp_approval_response"
+                    | "tool_result"
+                    | "tool_output"
+                    | "ToolOutput"
+                    | "toolOutput"
+            )
+        ) {
+            return true;
+        }
+
+        // Gemini function-response parts do not use a `type` field; mirror the
+        // `is_tool_call_raw_item` handling for `functionCall` parts.
+        map.contains_key("functionResponse")
+            && map.keys().all(|key| {
+                matches!(
+                    key.as_str(),
+                    "functionResponse" | "thought" | "thoughtSignature"
                 )
             })
     }
@@ -4258,6 +4378,77 @@ mod tests {
         assert!(raw_history[1].get("tool_calls").is_none());
         assert!(raw_history[1].get("function_call").is_none());
         assert!(raw_history[1].get("functionCall").is_none());
+    }
+
+    #[test]
+    fn runner_prunes_completed_tool_interactions_from_raw_history() {
+        let mut raw_history = vec![
+            // OpenAI Chat Completions shapes.
+            json!({"role": "user", "content": "question"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{"id": "call_1", "function": {"name": "lookup", "arguments": "{}"}}]
+            }),
+            json!({"role": "tool", "tool_call_id": "call_1", "content": "chat tool result"}),
+            // OpenAI Responses shapes: orphaned reasoning must follow its pruned call out.
+            json!({"type": "reasoning", "id": "rs_orphan", "encrypted_content": "opaque"}),
+            json!({"type": "function_call", "call_id": "call_2", "name": "lookup", "arguments": "{}"}),
+            json!({"type": "function_call_output", "call_id": "call_2", "output": "ok"}),
+            // Anthropic shapes.
+            json!({
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "kept thinking", "signature": "sig"},
+                    {"type": "text", "text": "anthropic text"},
+                    {"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}}
+                ]
+            }),
+            json!({
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "anthropic result"}
+                ]
+            }),
+            // Gemini shapes.
+            json!({
+                "role": "model",
+                "parts": [
+                    {"text": "gemini text"},
+                    {"functionCall": {"name": "lookup", "args": {}}}
+                ]
+            }),
+            json!({
+                "role": "user",
+                "parts": [{"functionResponse": {"name": "lookup", "response": {"ok": true}}}]
+            }),
+            // Reasoning followed by a surviving item stays.
+            json!({"type": "reasoning", "id": "rs_kept", "encrypted_content": "opaque"}),
+            json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "final answer"}]
+            }),
+        ];
+
+        CompletionRunner::prune_tool_interactions_from_raw_history(&mut raw_history);
+
+        let pruned = serde_json::to_string(&raw_history).unwrap();
+        assert_eq!(raw_history.len(), 5);
+        assert_eq!(raw_history[0]["content"], json!("question"));
+        assert!(pruned.contains("kept thinking"));
+        assert!(pruned.contains("anthropic text"));
+        assert!(pruned.contains("gemini text"));
+        assert!(pruned.contains("rs_kept"));
+        assert!(pruned.contains("final answer"));
+        assert!(!pruned.contains("call_1"));
+        assert!(!pruned.contains("call_2"));
+        assert!(!pruned.contains("rs_orphan"));
+        assert!(!pruned.contains("toolu_1"));
+        assert!(!pruned.contains("chat tool result"));
+        assert!(!pruned.contains("anthropic result"));
+        assert!(!pruned.contains("functionCall"));
+        assert!(!pruned.contains("functionResponse"));
     }
 
     // ── CompletionRunner basic tests ──
