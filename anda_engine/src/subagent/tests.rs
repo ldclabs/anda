@@ -542,10 +542,10 @@ impl AgentHook for FailingAfterAgentHook {
     async fn on_background_start(
         &self,
         _ctx: &AgentCtx,
-        session_id: &str,
+        handle: BackgroundHandle,
         _req: &CompletionRequest,
     ) {
-        self.starts.lock().push(session_id.to_string());
+        self.starts.lock().push(handle.task_id().to_string());
     }
 }
 
@@ -2434,7 +2434,7 @@ async fn subsession_background_hooks_forward_outputs_and_manage_registry() {
     AgentHook::on_background_start(
         session.as_ref(),
         &ctx,
-        "child-session",
+        BackgroundHandle::new("child-session", anda_core::CancellationToken::new()),
         &CompletionRequest::default(),
     )
     .await;
@@ -2514,7 +2514,7 @@ async fn subsession_background_hooks_forward_outputs_and_manage_registry() {
     ToolBackgroundHook::on_background_start(
         session.as_ref(),
         &ctx.base,
-        "fetch:task-1",
+        BackgroundHandle::new("fetch:task-1", anda_core::CancellationToken::new()),
         json!({"url": "https://example.test"}),
     )
     .await;
@@ -2547,8 +2547,13 @@ async fn subsession_background_hooks_forward_outputs_and_manage_registry() {
         Some(r#"{"status":"half"}"#)
     );
 
-    ToolBackgroundHook::on_background_start(session.as_ref(), &ctx.base, "unprefixed", Json::Null)
-        .await;
+    ToolBackgroundHook::on_background_start(
+        session.as_ref(),
+        &ctx.base,
+        BackgroundHandle::new("unprefixed", anda_core::CancellationToken::new()),
+        Json::Null,
+    )
+    .await;
     assert!(
         session
             .background_tasks
@@ -2786,6 +2791,161 @@ fn test_session(id: &str) -> (Arc<SubSession>, tokio::sync::mpsc::Receiver<SubAg
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn stop_background_task_marks_stopped_and_cancels_handle() {
+    let (session, _rx) = test_session("parent");
+    let ctx = EngineBuilder::new().mock_ctx();
+
+    let token = anda_core::CancellationToken::new();
+    ToolBackgroundHook::on_background_start(
+        session.as_ref(),
+        &ctx.base,
+        BackgroundHandle::new("fetch:task-1", token.clone()),
+        Json::Null,
+    )
+    .await;
+    assert!(!token.is_cancelled());
+
+    // Stopping a live task reports it was found, marks it stopped, and cancels its token so the
+    // producer actually terminates the work (not just suppresses forwarding).
+    assert!(session.stop_background_task("fetch:task-1"));
+    assert!(token.is_cancelled());
+    assert!(
+        session
+            .background_tasks
+            .read()
+            .get("fetch:task-1")
+            .unwrap()
+            .stopped
+    );
+
+    // The handle is consumed once; a second stop finds no live task.
+    assert!(!session.stop_background_task("fetch:task-1"));
+
+    // stop_background_tasks() cancels every remaining registered handle.
+    let token2 = anda_core::CancellationToken::new();
+    ToolBackgroundHook::on_background_start(
+        session.as_ref(),
+        &ctx.base,
+        BackgroundHandle::new("fetch:task-2", token2.clone()),
+        Json::Null,
+    )
+    .await;
+    session.stop_background_tasks();
+    assert!(token2.is_cancelled());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stop_task_command_stops_single_background_task_by_id() {
+    let ctx = EngineBuilder::new().mock_ctx();
+    let subsessions = Arc::new(SubSessions::default());
+    // Keep `_rx` alive so the session's sender stays open and `get_session` treats it as active.
+    let (session, _rx) = test_session("job");
+    subsessions.insert_session(session.clone());
+
+    // Register two background tasks in the session with known tokens.
+    let token1 = anda_core::CancellationToken::new();
+    let token2 = anda_core::CancellationToken::new();
+    ToolBackgroundHook::on_background_start(
+        session.as_ref(),
+        &ctx.base,
+        BackgroundHandle::new("fetch:task-1", token1.clone()),
+        Json::Null,
+    )
+    .await;
+    ToolBackgroundHook::on_background_start(
+        session.as_ref(),
+        &ctx.base,
+        BackgroundHandle::new("fetch:task-2", token2.clone()),
+        Json::Null,
+    )
+    .await;
+
+    let agent = SubAgent {
+        name: "worker".to_string(),
+        subsessions: subsessions.clone(),
+        ..Default::default()
+    };
+
+    let stop_task = |prompt: &str| {
+        serde_json::to_string(&SubAgentArgs {
+            prompt: prompt.to_string(),
+            session: "job".to_string(),
+            model: String::new(),
+            effort: None,
+        })
+        .unwrap()
+    };
+
+    // Stopping one task by id cancels only its token and leaves the sibling running.
+    let rt = Agent::<AgentCtx>::run(
+        &agent,
+        ctx.clone(),
+        stop_task("/stop_task fetch:task-1"),
+        vec![],
+    )
+    .await
+    .unwrap();
+    assert!(rt.content.contains("Stopped background task fetch:task-1"));
+    assert!(token1.is_cancelled());
+    assert!(!token2.is_cancelled());
+    assert!(
+        session
+            .background_tasks
+            .read()
+            .get("fetch:task-1")
+            .unwrap()
+            .stopped
+    );
+
+    // Unknown task id reports not-found without disturbing the session.
+    let rt = Agent::<AgentCtx>::run(
+        &agent,
+        ctx.clone(),
+        stop_task("/stop_task fetch:missing"),
+        vec![],
+    )
+    .await
+    .unwrap();
+    assert!(
+        rt.content
+            .contains("No active background task fetch:missing")
+    );
+
+    // A missing argument is rejected with guidance.
+    let rt = Agent::<AgentCtx>::run(&agent, ctx.clone(), stop_task("/stop_task"), vec![])
+        .await
+        .unwrap();
+    assert!(rt.content.contains("requires a task_id argument"));
+    // The sibling task is still live.
+    assert!(!token2.is_cancelled());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stop_task_command_reports_inactive_session() {
+    let ctx = EngineBuilder::new().mock_ctx();
+    let agent = SubAgent {
+        name: "worker".to_string(),
+        ..Default::default()
+    };
+
+    let rt = Agent::<AgentCtx>::run(
+        &agent,
+        ctx,
+        serde_json::to_string(&SubAgentArgs {
+            prompt: "/stop_task fetch:task-1".to_string(),
+            session: "ghost".to_string(),
+            model: String::new(),
+            effort: None,
+        })
+        .unwrap(),
+        vec![],
+    )
+    .await
+    .unwrap();
+    assert!(rt.content.contains("is not active"));
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn subsession_agent_hook_forwards_usage_deltas() {
     let (session, mut rx) = test_session("parent");
     let ctx = EngineBuilder::new().mock_ctx();
@@ -2793,7 +2953,7 @@ async fn subsession_agent_hook_forwards_usage_deltas() {
     AgentHook::on_background_start(
         session.as_ref(),
         &ctx,
-        "child",
+        BackgroundHandle::new("child", anda_core::CancellationToken::new()),
         &CompletionRequest::default(),
     )
     .await;

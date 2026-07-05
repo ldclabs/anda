@@ -7,12 +7,13 @@
 //! by specific extensions.
 
 use anda_core::{
-    AgentOutput, BoxError, CacheExpiry, CacheFeatures, CompletionRequest, Json, Resource,
-    StateFeatures, ToolOutput,
+    AgentOutput, BoxError, CacheExpiry, CacheFeatures, CancellationToken, CompletionRequest, Json,
+    Resource, StateFeatures, ToolOutput,
 };
 use async_trait::async_trait;
 use core::{fmt, str::FromStr};
-use std::{sync::Arc, time::Duration};
+use parking_lot::Mutex;
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use structured_logger::unix_ms;
 
 use crate::context::{AgentCtx, BaseCtx};
@@ -54,6 +55,104 @@ impl FromStr for PrefixedId {
             prefix: parts[0].to_string(),
             id: parts[1].to_string(),
         })
+    }
+}
+
+/// A cloneable capability handed to background-task subscribers so they can request
+/// cancellation of a single background task without tearing down the whole request.
+///
+/// The handle wraps a per-task [`CancellationToken`] (a child of the task context's
+/// token). Calling [`stop`](BackgroundHandle::stop) cancels only that task: the
+/// producer's background loop observes the cancellation and terminates the task, while
+/// sibling tasks and the enclosing request keep running. Request-level cancellation still
+/// cascades down, because the per-task token is a child of the request token.
+#[derive(Clone)]
+pub struct BackgroundHandle {
+    task_id: String,
+    token: CancellationToken,
+}
+
+impl BackgroundHandle {
+    /// Wraps a per-task cancellation token under its task ID.
+    pub fn new(task_id: impl Into<String>, token: CancellationToken) -> Self {
+        Self {
+            task_id: task_id.into(),
+            token,
+        }
+    }
+
+    /// The background task's identifier.
+    pub fn task_id(&self) -> &str {
+        &self.task_id
+    }
+
+    /// Requests the producer stop this background task. Idempotent and safe to call
+    /// after the task has already ended.
+    pub fn stop(&self) {
+        self.token.cancel();
+    }
+
+    /// Returns whether a stop has already been requested for this task.
+    pub fn is_stopped(&self) -> bool {
+        self.token.is_cancelled()
+    }
+}
+
+/// Registry that lets a background-task subscriber stop individual tasks by ID.
+///
+/// Producers register a [`BackgroundHandle`] when a task starts and drop it (via
+/// [`finish`](BackgroundTaskControls::finish)) when the task ends; subscribers call
+/// [`stop_background_task`](BackgroundTaskControls::stop_background_task) to actively
+/// terminate a still-running task. Cloning shares the same underlying registry.
+#[derive(Clone, Default)]
+pub struct BackgroundTaskControls {
+    tasks: Arc<Mutex<HashMap<String, BackgroundHandle>>>,
+}
+
+impl BackgroundTaskControls {
+    /// Creates an empty registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records a stop handle so the task can later be stopped by ID.
+    pub fn register(&self, handle: BackgroundHandle) {
+        self.tasks
+            .lock()
+            .insert(handle.task_id().to_string(), handle);
+    }
+
+    /// Forgets a task's handle once it has ended, without stopping it.
+    pub fn finish(&self, task_id: &str) {
+        self.tasks.lock().remove(task_id);
+    }
+
+    /// Actively stops a single background task by ID.
+    ///
+    /// Returns `true` if a live task was found and signalled, `false` if no such task was
+    /// registered (it already ended or never started).
+    pub fn stop_background_task(&self, task_id: &str) -> bool {
+        let handle = self.tasks.lock().remove(task_id);
+        match handle {
+            Some(handle) => {
+                handle.stop();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Stops every registered background task and clears the registry.
+    pub fn stop_all(&self) {
+        let handles: Vec<_> = self
+            .tasks
+            .lock()
+            .drain()
+            .map(|(_, handle)| handle)
+            .collect();
+        for handle in handles {
+            handle.stop();
+        }
     }
 }
 
@@ -120,7 +219,11 @@ where
     }
 
     /// Called when a tool starts a background task.
-    async fn on_background_start(&self, _ctx: &BaseCtx, _task_id: &str, _args: &I) {}
+    ///
+    /// `handle` lets the subscriber later stop this specific task via
+    /// [`BackgroundHandle::stop`]; its [`task_id`](BackgroundHandle::task_id)
+    /// correlates the progress and end callbacks.
+    async fn on_background_start(&self, _ctx: &BaseCtx, _handle: BackgroundHandle, _args: &I) {}
 
     /// Called when a tool reports progress from a background task.
     async fn on_background_progress(
@@ -139,7 +242,11 @@ where
 #[async_trait]
 pub trait ToolBackgroundHook: Send + Sync {
     /// Called when a tool starts a background task.
-    async fn on_background_start(&self, _ctx: &BaseCtx, _task_id: &str, _args: Json) {}
+    ///
+    /// `handle` lets the subscriber later stop this specific task via
+    /// [`BackgroundHandle::stop`]; its [`task_id`](BackgroundHandle::task_id)
+    /// correlates the progress and end callbacks.
+    async fn on_background_start(&self, _ctx: &BaseCtx, _handle: BackgroundHandle, _args: Json) {}
 
     /// Called when a tool reports progress from a background task.
     async fn on_background_progress(
@@ -190,8 +297,8 @@ where
         self.inner.after_tool_call(ctx, output).await
     }
 
-    async fn on_background_start(&self, ctx: &BaseCtx, task_id: &str, args: &I) {
-        self.inner.on_background_start(ctx, task_id, args).await;
+    async fn on_background_start(&self, ctx: &BaseCtx, handle: BackgroundHandle, args: &I) {
+        self.inner.on_background_start(ctx, handle, args).await;
     }
 
     async fn on_background_progress(&self, ctx: &BaseCtx, task_id: String, _output: ToolOutput<O>) {
@@ -220,8 +327,8 @@ impl DynToolJsonHook {
 
 #[async_trait]
 impl ToolBackgroundHook for DynToolJsonHook {
-    async fn on_background_start(&self, ctx: &BaseCtx, task_id: &str, args: Json) {
-        self.inner.on_background_start(ctx, task_id, args).await;
+    async fn on_background_start(&self, ctx: &BaseCtx, handle: BackgroundHandle, args: Json) {
+        self.inner.on_background_start(ctx, handle, args).await;
     }
 
     async fn on_background_progress(
@@ -265,11 +372,15 @@ pub trait AgentHook: Send + Sync {
         Ok(output)
     }
 
-    /// Called when an agent starts in the background. The session ID can be used to correlate progress and final output hooks.
+    /// Called when an agent starts in the background.
+    ///
+    /// `handle` lets the subscriber later stop this specific session via
+    /// [`BackgroundHandle::stop`]; its [`task_id`](BackgroundHandle::task_id) is
+    /// the session ID and correlates the progress and final output hooks.
     async fn on_background_start(
         &self,
         _ctx: &AgentCtx,
-        _session_id: &str,
+        _handle: BackgroundHandle,
         _req: &CompletionRequest,
     ) {
     }
@@ -319,8 +430,13 @@ impl AgentHook for DynAgentHook {
         self.inner.after_agent_run(ctx, output).await
     }
 
-    async fn on_background_start(&self, ctx: &AgentCtx, session_id: &str, req: &CompletionRequest) {
-        self.inner.on_background_start(ctx, session_id, req).await;
+    async fn on_background_start(
+        &self,
+        ctx: &AgentCtx,
+        handle: BackgroundHandle,
+        req: &CompletionRequest,
+    ) {
+        self.inner.on_background_start(ctx, handle, req).await;
     }
 
     async fn on_background_progress(
@@ -489,6 +605,53 @@ mod tests {
     }
 
     #[test]
+    fn background_handle_cancels_only_its_token() {
+        let parent = CancellationToken::new();
+        let task_token = parent.child_token();
+        let handle = BackgroundHandle::new("shell:1", task_token.clone());
+
+        assert_eq!(handle.task_id(), "shell:1");
+        assert!(!handle.is_stopped());
+        assert!(!task_token.is_cancelled());
+
+        handle.stop();
+        assert!(handle.is_stopped());
+        assert!(task_token.is_cancelled());
+        // Stopping one task must not cancel the enclosing request token.
+        assert!(!parent.is_cancelled());
+        // Idempotent.
+        handle.stop();
+    }
+
+    #[test]
+    fn background_task_controls_stop_finish_and_stop_all() {
+        let controls = BackgroundTaskControls::new();
+        let token_a = CancellationToken::new();
+        let token_b = CancellationToken::new();
+        controls.register(BackgroundHandle::new("a", token_a.clone()));
+        controls.register(BackgroundHandle::new("b", token_b.clone()));
+
+        // Stopping a live task signals its token and reports it was found.
+        assert!(controls.stop_background_task("a"));
+        assert!(token_a.is_cancelled());
+        // A second stop finds nothing (already removed) and does not error.
+        assert!(!controls.stop_background_task("a"));
+        // Unknown task ids report not found.
+        assert!(!controls.stop_background_task("missing"));
+
+        // finish() forgets a handle without cancelling it.
+        controls.finish("b");
+        assert!(!token_b.is_cancelled());
+        assert!(!controls.stop_background_task("b"));
+
+        // stop_all() cancels everything still registered.
+        let token_c = CancellationToken::new();
+        controls.register(BackgroundHandle::new("c", token_c.clone()));
+        controls.stop_all();
+        assert!(token_c.is_cancelled());
+    }
+
+    #[test]
     fn prefixed_id_display_and_parse_validate_shape() {
         let id: PrefixedId = "agent:run-1".parse().unwrap();
         assert_eq!(id.prefix, "agent");
@@ -591,8 +754,15 @@ mod tests {
             Ok(output)
         }
 
-        async fn on_background_start(&self, _ctx: &BaseCtx, task_id: &str, _args: &String) {
-            self.events.lock().push(format!("start:{task_id}"));
+        async fn on_background_start(
+            &self,
+            _ctx: &BaseCtx,
+            handle: BackgroundHandle,
+            _args: &String,
+        ) {
+            self.events
+                .lock()
+                .push(format!("start:{}", handle.task_id()));
         }
 
         async fn on_background_progress(
@@ -620,8 +790,10 @@ mod tests {
 
     #[async_trait]
     impl ToolBackgroundHook for JsonBackgroundHook {
-        async fn on_background_start(&self, _ctx: &BaseCtx, task_id: &str, _args: Json) {
-            self.events.lock().push(format!("json-start:{task_id}"));
+        async fn on_background_start(&self, _ctx: &BaseCtx, handle: BackgroundHandle, _args: Json) {
+            self.events
+                .lock()
+                .push(format!("json-start:{}", handle.task_id()));
         }
 
         async fn on_background_progress(
@@ -661,8 +833,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(output.output, "after:value");
-        hook.on_background_start(&ctx, "task", &"args".to_string())
-            .await;
+        hook.on_background_start(
+            &ctx,
+            BackgroundHandle::new("task", CancellationToken::new()),
+            &"args".to_string(),
+        )
+        .await;
         hook.on_background_progress(&ctx, "task".to_string(), ToolOutput::new("p".to_string()))
             .await;
         hook.on_background_end(&ctx, "task".to_string(), ToolOutput::new("e".to_string()))
@@ -677,7 +853,11 @@ mod tests {
             events: json_events.clone(),
         }));
         json_hook
-            .on_background_start(&ctx, "json-task", Json::Null)
+            .on_background_start(
+                &ctx,
+                BackgroundHandle::new("json-task", CancellationToken::new()),
+                Json::Null,
+            )
             .await;
         json_hook
             .on_background_progress(&ctx, "json-task".to_string(), ToolOutput::new(Json::Null))
@@ -727,10 +907,12 @@ mod tests {
         async fn on_background_start(
             &self,
             _ctx: &AgentCtx,
-            session_id: &str,
+            handle: BackgroundHandle,
             _req: &CompletionRequest,
         ) {
-            self.events.lock().push(format!("agent-start:{session_id}"));
+            self.events
+                .lock()
+                .push(format!("agent-start:{}", handle.task_id()));
         }
 
         async fn on_background_progress(
@@ -779,8 +961,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(output.content, "after:value");
-        hook.on_background_start(&ctx, "session", &CompletionRequest::default())
-            .await;
+        hook.on_background_start(
+            &ctx,
+            BackgroundHandle::new("session", CancellationToken::new()),
+            &CompletionRequest::default(),
+        )
+        .await;
         hook.on_background_progress(&ctx, "session".to_string(), AgentOutput::default())
             .await;
         hook.on_background_end(&ctx, "session".to_string(), AgentOutput::default())

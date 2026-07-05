@@ -72,6 +72,10 @@ pub struct SubSession {
     pub(super) status: RwLock<SubSessionStatus>,
     // Persistent conversation record for this session when conversation recording is enabled.
     pub(super) conversation: AtomicU64,
+    // Stop handles for the background tasks (nested tools and subagents) running inside this
+    // session, keyed by task_id. Lets the session actively terminate a specific task instead of
+    // only suppressing its output forwarding.
+    pub(super) controls: BackgroundTaskControls,
 }
 
 pub(super) fn resources_into_content(resources: Vec<Resource>) -> Vec<ContentPart> {
@@ -539,6 +543,7 @@ impl SubSession {
             idle_timeout_ms,
             status: RwLock::new(SubSessionStatus::default()),
             conversation: AtomicU64::new(0),
+            controls: BackgroundTaskControls::new(),
         }
     }
 
@@ -609,6 +614,21 @@ impl SubSession {
         for info in self.background_tasks.write().values_mut() {
             info.stopped = true;
         }
+        // Actually terminate the underlying tasks, not just suppress their forwarding.
+        self.controls.stop_all();
+    }
+
+    /// Actively stops a single background task running inside this session.
+    ///
+    /// Marks the task as stopped so its remaining progress/end output is no longer forwarded, then
+    /// signals the task's stop handle so the producer terminates it (a nested tool process is
+    /// killed; a nested subagent session receives a graceful `/stop`). Returns `true` if a live
+    /// task with `task_id` was found.
+    pub fn stop_background_task(&self, task_id: &str) -> bool {
+        if let Some(info) = self.background_tasks.write().get_mut(task_id) {
+            info.stopped = true;
+        }
+        self.controls.stop_background_task(task_id)
     }
 
     /// Converts the cumulative usage reported by a background agent into a delta against what was
@@ -657,11 +677,11 @@ impl AgentHook for SubSession {
     async fn on_background_start(
         &self,
         ctx: &AgentCtx,
-        session_id: &str,
+        handle: BackgroundHandle,
         _req: &CompletionRequest,
     ) {
         self.background_tasks.write().insert(
-            session_id.to_string(),
+            handle.task_id().to_string(),
             BackgroundTaskInfo {
                 agent_name: ctx.base.agent.clone(),
                 tool_name: None,
@@ -670,6 +690,7 @@ impl AgentHook for SubSession {
                 stopped: false,
             },
         );
+        self.controls.register(handle);
     }
 
     async fn on_background_progress(
@@ -705,6 +726,7 @@ impl AgentHook for SubSession {
     }
 
     async fn on_background_end(&self, _ctx: &AgentCtx, session_id: String, output: AgentOutput) {
+        self.controls.finish(&session_id);
         let Some(usage) = self.take_usage_delta(&session_id, &output.usage, true) else {
             return;
         };
@@ -733,10 +755,10 @@ impl AgentHook for SubSession {
 
 #[async_trait]
 impl ToolBackgroundHook for SubSession {
-    async fn on_background_start(&self, ctx: &BaseCtx, task_id: &str, _args: Json) {
-        let pid = PrefixedId::from_str(task_id).ok();
+    async fn on_background_start(&self, ctx: &BaseCtx, handle: BackgroundHandle, _args: Json) {
+        let pid = PrefixedId::from_str(handle.task_id()).ok();
         self.background_tasks.write().insert(
-            task_id.to_string(),
+            handle.task_id().to_string(),
             BackgroundTaskInfo {
                 agent_name: ctx.agent.clone(),
                 tool_name: pid.map(|p| p.prefix),
@@ -745,6 +767,7 @@ impl ToolBackgroundHook for SubSession {
                 stopped: false,
             },
         );
+        self.controls.register(handle);
     }
 
     async fn on_background_progress(
@@ -763,6 +786,7 @@ impl ToolBackgroundHook for SubSession {
     }
 
     async fn on_background_end(&self, _ctx: &BaseCtx, task_id: String, output: ToolOutput<Json>) {
+        self.controls.finish(&task_id);
         let stopped = {
             self.background_tasks
                 .write()

@@ -27,7 +27,7 @@ use super::{
 };
 use crate::{
     context::BaseCtx,
-    hook::{DynToolJsonHook, ToolBackgroundHook, ToolHook},
+    hook::{BackgroundHandle, DynToolJsonHook, ToolBackgroundHook, ToolHook},
 };
 
 #[cfg(not(test))]
@@ -292,11 +292,15 @@ impl NativeRuntime {
             stdout: Some(start_message),
             ..Default::default()
         };
+        // Per-task cancellation token: a child of the tool-call context token, so a subscriber can
+        // stop just this background command while request-level cancellation still cascades down.
+        let task_token = ctx.cancellation_token().child_token();
+        let handle = BackgroundHandle::new(&task_id, task_token.clone());
         let json_hook = ctx.get_state::<DynToolJsonHook>();
         if let Some(hook) = &json_hook {
-            hook.on_background_start(&ctx, &task_id, json!(&args)).await;
+            hook.on_background_start(&ctx, handle, json!(&args)).await;
         } else if let Some(hook) = &hook {
-            hook.on_background_start(&ctx, &task_id, &args).await;
+            hook.on_background_start(&ctx, handle, &args).await;
         }
 
         {
@@ -316,7 +320,7 @@ impl NativeRuntime {
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 interval.tick().await;
 
-                let cancellation = ctx.cancellation_token();
+                let cancellation = task_token;
                 // `Child::wait` is cancel safe, so a fresh wait future per iteration is fine.
                 let status = loop {
                     tokio::select! {

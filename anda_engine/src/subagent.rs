@@ -8,7 +8,7 @@
 use anda_core::{
     Agent, AgentContext, AgentOutput, BoxError, CompletionFeatures, CompletionRequest, ContentPart,
     FunctionDefinition, Json, Message, ModelEffort, Path, PromptCommand, PutMode, Resource,
-    StoreFeatures, ToolOutput, Usage, select_resources, validate_function_name,
+    StateFeatures, StoreFeatures, ToolOutput, Usage, select_resources, validate_function_name,
 };
 use async_trait::async_trait;
 use cbor2::{from_slice, to_canonical_vec};
@@ -27,7 +27,10 @@ use std::{
 
 use crate::{
     context::{AgentCtx, BaseCtx, CompletionRunner},
-    hook::{AgentHook, DynAgentHook, DynToolJsonHook, PrefixedId, ToolBackgroundHook},
+    hook::{
+        AgentHook, BackgroundHandle, BackgroundTaskControls, DynAgentHook, DynToolJsonHook,
+        PrefixedId, ToolBackgroundHook,
+    },
     memory::{Conversation, ConversationRef, ConversationStatus, Conversations},
     truncate_utf8_to_max_bytes, unix_ms,
 };

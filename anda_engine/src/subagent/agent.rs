@@ -113,7 +113,7 @@ impl Agent<AgentCtx> for SubAgent {
                 "properties": {
                     "prompt": {
                         "type": "string",
-                        "description": "Self-contained task handoff for this subagent. Include objective, context/resources, constraints, dependencies, expected deliverable, success criteria, and what progress/final output should contain. To control or inspect an already-running session, send a control command here instead of a task: `/status` to fetch the session's live progress (elapsed time, token usage, turns, active background tasks) synchronously without disturbing the run, `/steer <guidance>` to adjust course mid-run, `/stop <reason>` to stop the current task and keep the session idle, or `/cancel <reason>` to end the session runner."
+                        "description": "Self-contained task handoff for this subagent. Include objective, context/resources, constraints, dependencies, expected deliverable, success criteria, and what progress/final output should contain. To control or inspect an already-running session, send a control command here instead of a task: `/status` to fetch the session's live progress (elapsed time, token usage, turns, active background tasks) synchronously without disturbing the run, `/steer <guidance>` to adjust course mid-run, `/stop_task <task_id>` to stop one specific background task (a task_id from `/status`) while leaving the session and its other background tasks running, `/stop <reason>` to stop the current task and keep the session idle, or `/cancel <reason>` to end the session runner."
                     },
                     "session": {
                         "type": "string",
@@ -265,6 +265,60 @@ impl Agent<AgentCtx> for SubAgent {
                         "note": "session is not active (it may have finished or expired); call again with a non-empty prompt to start a new session."
                     })
                     .to_string(),
+                    session: Some(session_id.clone()),
+                    ..Default::default()
+                },
+            };
+            if let Some(hook) = &agent_hook {
+                return hook.after_agent_run(&ctx, rt).await;
+            }
+            return Ok(rt);
+        }
+
+        // `/stop_task <task_id>` stops a single background task running inside the session (a nested
+        // tool process or nested subagent) without disturbing the session's own turn or its other
+        // background tasks. Handled synchronously so the parent gets immediate found/not-found
+        // feedback, mirroring `/status`.
+        if let PromptCommand::Command { command, .. } = &input.command
+            && command == "stop_task"
+        {
+            let task_id = input
+                .command
+                .command_argument()
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            let rt = match subsessions.get_session(&session_id) {
+                Some(session) if task_id.is_empty() => AgentOutput {
+                    content: format!(
+                        "subagent {agent} session {session_id}: /stop_task requires a task_id argument (see the session's background_tasks in /status)."
+                    ),
+                    conversation: session.conversation_id(),
+                    session: Some(session_id.clone()),
+                    ..Default::default()
+                },
+                Some(session) => {
+                    let stopped = session.stop_background_task(&task_id);
+                    let content = if stopped {
+                        format!(
+                            "Stopped background task {task_id} in subagent {agent} session {session_id}."
+                        )
+                    } else {
+                        format!(
+                            "No active background task {task_id} in subagent {agent} session {session_id} (it may have finished or the id is unknown)."
+                        )
+                    };
+                    AgentOutput {
+                        content,
+                        conversation: session.conversation_id(),
+                        session: Some(session_id.clone()),
+                        ..Default::default()
+                    }
+                }
+                None => AgentOutput {
+                    content: format!(
+                        "subagent {agent} session {session_id} is not active (it may have finished or expired); nothing to stop."
+                    ),
                     session: Some(session_id.clone()),
                     ..Default::default()
                 },
@@ -442,8 +496,34 @@ impl Agent<AgentCtx> for SubAgent {
         ctx.base.set_state(DynAgentHook::new(session.clone()));
         ctx.base.set_state(DynToolJsonHook::new(session.clone()));
 
+        // Per-session stop token handed to the parent subscriber. It is a child of the session
+        // context token but is NOT the token driving the runner, so cancelling it does not hard
+        // abort an in-flight model request. Instead a bridge task translates cancellation into a
+        // graceful `/stop`, matching the semantics of the `/stop` control command.
+        let session_token = ctx.base.cancellation_token().child_token();
         if let Some(hook) = &agent_hook {
-            hook.on_background_start(&ctx, &session.id, &req).await;
+            let handle = BackgroundHandle::new(&session.id, session_token.clone());
+            hook.on_background_start(&ctx, handle, &req).await;
+        }
+
+        {
+            // Deliver a graceful `/stop` to this session when its stop handle fires. The task is
+            // released when `session_token` is cancelled (either by the parent stopping the task or
+            // by the runner cancelling it on exit), so it never outlives the session.
+            let stop_sender = session.sender.clone();
+            let stop_token = session_token.clone();
+            tokio::spawn(async move {
+                stop_token.cancelled().await;
+                let _ = stop_sender
+                    .send(SubAgentInput {
+                        command: PromptCommand::Command {
+                            command: "stop".to_string(),
+                            prompt: String::new(),
+                        },
+                        ..Default::default()
+                    })
+                    .await;
+            });
         }
 
         let runner = ctx.clone().completion_iter(req, vec![]).unbound();
@@ -550,6 +630,8 @@ impl Agent<AgentCtx> for SubAgent {
                 }
             }
 
+            // Release the stop-bridge task; the session is finished so its stop token is moot.
+            session_token.cancel();
             subsessions.remove_session_if(&session);
         });
 
