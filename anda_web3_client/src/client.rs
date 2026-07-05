@@ -4,6 +4,7 @@
 //! contexts, including canister calls, signed HTTP calls, and deterministic
 //! key derivation.
 
+use crate::crypto;
 use anda_core::{BoxError, BoxPinFut, HttpFeatures, RPCRequestRef, cbor_rpc};
 use anda_engine::context::Web3ClientFeatures;
 use candid::{
@@ -23,7 +24,6 @@ use ic_cose_types::{
         sha3_256,
     },
 };
-use ic_tee_gateway_sdk::crypto;
 use serde::{Serialize, de::DeserializeOwned};
 use std::{sync::Arc, time::Duration};
 
@@ -473,36 +473,6 @@ impl Web3ClientFeatures for Client {
     ) -> BoxPinFut<Result<[u8; 33], BoxError>> {
         let res = crypto::secp256k1_public_key(&self.root_secret, derivation_path);
         Box::pin(futures::future::ready(Ok(res.0)))
-    }
-
-    fn canister_query_raw(
-        &self,
-        canister: Principal,
-        method: String,
-        args: Vec<u8>,
-    ) -> BoxPinFut<Result<Vec<u8>, BoxError>> {
-        let agent = self.agent.clone();
-        Box::pin(async move {
-            let res = agent.query(&canister, method).with_arg(args).call().await?;
-            Ok(res)
-        })
-    }
-
-    fn canister_update_raw(
-        &self,
-        canister: Principal,
-        method: String,
-        args: Vec<u8>,
-    ) -> BoxPinFut<Result<Vec<u8>, BoxError>> {
-        let agent = self.agent.clone();
-        Box::pin(async move {
-            let res = agent
-                .update(&canister, method)
-                .with_arg(args)
-                .call_and_wait()
-                .await?;
-            Ok(res)
-        })
     }
 
     fn https_call(

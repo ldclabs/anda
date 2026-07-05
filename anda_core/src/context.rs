@@ -2,9 +2,8 @@
 //!
 //! This module defines the capability traits that an Anda runtime exposes to
 //! agents and tools. Context implementations provide identity, cancellation,
-//! cryptographic keys, isolated storage, caching, HTTP calls, and canister
-//! access without requiring each agent or tool to know how those services are
-//! implemented.
+//! cryptographic keys, isolated storage, caching, and HTTP calls without
+//! requiring each agent or tool to know how those services are implemented.
 //!
 //! The traits are split by capability so custom runtimes can implement only one
 //! coherent execution surface while still keeping the public API explicit:
@@ -29,7 +28,6 @@ use std::{future::Future, sync::Arc, time::Duration};
 
 pub use anda_db_schema::Json;
 pub use candid::Principal;
-pub use ic_cose_types::CanisterCaller;
 pub use ic_oss_types::object_store::UpdateVersion;
 pub use object_store::{ObjectMeta, PutMode, PutResult, UpdateVersion as OsVersion, path::Path};
 pub use tokio_util::sync::CancellationToken;
@@ -155,10 +153,12 @@ pub trait AgentContext: BaseContext + CompletionFeatures {
 
 /// Core execution environment available to both agents and tools.
 ///
-/// `BaseContext` groups state, cryptographic, storage, caching, HTTP, and ICP
-/// canister capabilities behind a single trait bound.
+/// `BaseContext` groups state, cryptographic, storage, caching, and HTTP
+/// capabilities behind a single trait bound. Canister access is intentionally
+/// not part of this bound: runtimes that need it implement [`CanisterCaller`]
+/// separately on their context type.
 pub trait BaseContext:
-    Sized + StateFeatures + KeysFeatures + StoreFeatures + CacheFeatures + HttpFeatures + CanisterCaller
+    Sized + StateFeatures + KeysFeatures + StoreFeatures + CacheFeatures + HttpFeatures
 {
     /// Executes a remote tool call via HTTP RPC.
     ///

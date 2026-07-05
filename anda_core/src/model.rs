@@ -1990,7 +1990,7 @@ mod tests {
         let v = serde_json::to_value(&part).unwrap();
         assert_eq!(v.get("type").unwrap(), "InlineData");
         assert_eq!(v.get("mimeType").unwrap(), "text/plain");
-        assert_eq!(v.get("data").unwrap(), "aGVsbG8=");
+        assert_eq!(v.get("data").unwrap(), "b64:aGVsbG8=");
 
         let back: ContentPart = serde_json::from_value(v.clone()).unwrap();
         assert_eq!(back, part);
@@ -2103,7 +2103,7 @@ mod tests {
             "description": "A note resource",
             "uri": "file:///tmp/note.txt",
             "mime_type": "text/plain",
-            "blob": "aGVsbG8gd29ybGQ=",
+            "blob": "b64:aGVsbG8gd29ybGQ=",
             "size": 11,
             "metadata": {
                 "source": "upload",

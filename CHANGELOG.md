@@ -2,6 +2,31 @@
 
 All notable changes to the Anda project will be documented in this file.
 
+## [0.14.0] — 2026-07-05
+
+### Removed — anda 0.14.0
+
+- **`CanisterCaller` from `BaseContext`** — The `CanisterCaller` bound is removed from `BaseContext`. Runtimes requiring canister access must implement the trait separately on their context type. All built-in impls (`AgentCtx`, `BaseCtx`) and the `MockCanisterCaller` test helper are removed.
+- **Canister methods from `Web3ClientFeatures`** — `canister_query_raw` and `canister_update_raw` are removed from the Web3 client trait surface. Runtimes needing raw canister access should use their own client directly.
+- **`Web3SDK` enum and `Web3Client` wrapper** — `Web3SDK` is now a plain struct wrapping `Arc<dyn Web3ClientFeatures>` instead of a `Tee`/`Web3` enum. All match-based dispatch is flattened to direct trait-object calls.
+
+### Added — anda 0.14.0
+
+- **Per-task background cancellation** — `BackgroundHandle` + `BackgroundTaskControls` hook primitives with per-task child tokens for shell commands. New `/stop_task <task_id>` subagent control command stops individual background tasks without disturbing sibling tasks or the session.
+- **`tee_attestation()` on `Web3ClientFeatures`** — New trait method (default `Ok(None)`) so TEE-backed clients can attach attestation evidence. Engine's `challenge_response` now uses a single unified path for both TEE and non-TEE flows.
+- **`anda_web3_client` feature flags** — `client` (non-TEE, `ic-agent` + local key derivation), `tee` (TEE gateway), `full` (both). Default build pulls neither `ic-agent` nor `ic_tee_*` crates.
+- **`crypto` + `tee` modules in `anda_web3_client`** — Deterministic key derivation ported from `ic_tee_gateway_sdk::crypto` (byte-for-byte identical), and `TeeClient` adapting `ic_tee_gateway_sdk` to the engine's `Web3ClientFeatures` trait.
+
+### Changed — anda 0.14.0
+
+- **Dependency upgrades**: `ic-agent` 0.47→0.48, `ic_auth_types` 0.9→0.10, `ic_auth_verifier` 0.9→0.10; new: `ic-ed25519` 0.6, `ic-secp256k1` 0.3.
+- **Engine dependency diet** — Removed `ic_cose`, `ic_tee_cdk`, `ic_tee_gateway_sdk` from `anda_engine`; `ic_auth_verifier` feature reduced from `full` to `envelope`.
+- **`rand_bytes` self-implemented** — Uses `rand::fill` directly instead of re-exporting `ic_cose::rand_bytes`, eliminating the last `ic_cose` dependency from `anda_engine`.
+
+### Fixed — anda 0.14.0
+
+- **Base64 blob serialization** — Test assertions updated to match `b64:` prefix format for inline data and resource blob encoding.
+
 ## [0.13.15] — 2026-07-05
 
 ### Added — anda_engine v0.13.15

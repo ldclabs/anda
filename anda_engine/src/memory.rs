@@ -2589,7 +2589,7 @@ mod tests {
             .unwrap();
         match output.output {
             Response::Ok { result, .. } => {
-                assert!(result.as_str().unwrap().starts_with("AJ-S"));
+                assert!(result.as_str().unwrap().starts_with("b64:AJ-Slg"));
             }
             other => panic!("unexpected response: {other:?}"),
         }

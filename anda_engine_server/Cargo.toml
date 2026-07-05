@@ -3,15 +3,15 @@ name = "anda_engine_server"
 description = "A http server to serve multiple Anda engines."
 repository = "https://github.com/ldclabs/anda/tree/main/anda_engine_server"
 publish = true
-version = "0.13.15"
+version = "0.14.0"
 edition.workspace = true
 keywords.workspace = true
 categories.workspace = true
 license.workspace = true
 
 [dependencies]
-anda_core = { path = "../anda_core", version = "0.13" }
-anda_engine = { path = "../anda_engine", version = "0.13" }
+anda_core = { path = "../anda_core", version = "0.14" }
+anda_engine = { path = "../anda_engine", version = "0.14" }
 axum = { workspace = true }
 candid = { workspace = true }
 cbor2 = { workspace = true }
@@ -29,7 +29,7 @@ ic_cose_types = { workspace = true }
 tower-http = { workspace = true }
 
 [dev-dependencies]
-anda_web3_client = { path = "../anda_web3_client" }
+anda_web3_client = { path = "../anda_web3_client", features = ["client"] }
 reqwest = { workspace = true }
 
 [lib]

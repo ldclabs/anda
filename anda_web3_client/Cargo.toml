@@ -3,28 +3,73 @@ name = "anda_web3_client"
 description = "The Rust SDK for Web3 integration in non-TEE environments."
 repository = "https://github.com/ldclabs/anda/tree/main/anda_web3_client"
 publish = true
-version = "0.13.15"
+version = "0.14.0"
 edition.workspace = true
 keywords.workspace = true
 categories.workspace = true
 license.workspace = true
 
 [dependencies]
-anda_core = { path = "../anda_core", version = "0.13" }
-anda_engine = { path = "../anda_engine", version = "0.13" }
-futures = { workspace = true }
-hex = { workspace = true }
-http = { workspace = true }
-candid = { workspace = true }
-cbor2 = { workspace = true }
-serde = { workspace = true }
-ic-agent = { workspace = true }
-ic_cose = { workspace = true }
-ic_cose_types = { workspace = true }
-ic_auth_types = { workspace = true }
-ic_auth_verifier = { workspace = true, features = ["full"] }
-ic_tee_gateway_sdk = { workspace = true }
-reqwest = { workspace = true }
+anda_core = { path = "../anda_core", version = "0.14" }
+anda_engine = { path = "../anda_engine", version = "0.14" }
+
+# Shared by both `client` and `tee` (none pulled in the default build).
+candid = { workspace = true, optional = true }
+cbor2 = { workspace = true, optional = true }
+http = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+ic_auth_types = { workspace = true, optional = true }
+ic_auth_verifier = { workspace = true, optional = true, features = [
+  "envelope",
+] }
+
+# `client` feature: the generic non-TEE Web3 client.
+futures = { workspace = true, optional = true }
+hex = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+ic-agent = { workspace = true, optional = true }
+ic_cose = { workspace = true, optional = true }
+ic_cose_types = { workspace = true, optional = true }
+ic-ed25519 = { workspace = true, optional = true }
+ic-secp256k1 = { workspace = true, optional = true }
+
+# `tee` feature: the TEE gateway-backed Web3 client.
+anda_cloud_cdk = { workspace = true, optional = true }
+ic_tee_cdk = { workspace = true, optional = true }
+ic_tee_gateway_sdk = { workspace = true, optional = true }
+
+[features]
+default = []
+# Internal: dependencies shared by `client` and `tee`.
+_common = [
+  "dep:candid",
+  "dep:cbor2",
+  "dep:http",
+  "dep:reqwest",
+  "dep:ic_auth_types",
+  "dep:ic_auth_verifier",
+]
+# Generic Web3 client backed by `ic-agent`, `ic-cose`, and local key derivation.
+client = [
+  "_common",
+  "ic_auth_verifier/identity",
+  "dep:futures",
+  "dep:hex",
+  "dep:serde",
+  "dep:ic-agent",
+  "dep:ic_cose",
+  "dep:ic_cose_types",
+  "dep:ic-ed25519",
+  "dep:ic-secp256k1",
+]
+# TEE gateway-backed Web3 client (pulls the `ic_tee_*` crates).
+tee = [
+  "_common",
+  "dep:anda_cloud_cdk",
+  "dep:ic_tee_cdk",
+  "dep:ic_tee_gateway_sdk",
+]
+full = ["client", "tee"]
 
 [dev-dependencies]
 axum = { workspace = true }
@@ -33,3 +78,7 @@ tokio = { workspace = true }
 [lib]
 test = false
 doctest = false
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

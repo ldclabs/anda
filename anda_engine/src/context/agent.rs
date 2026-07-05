@@ -19,7 +19,6 @@
 //! - [`KeysFeatures`]: Cryptographic key operations;
 //! - [`StoreFeatures`]: Persistent storage operations;
 //! - [`CacheFeatures`]: Caching mechanisms;
-//! - [`CanisterCaller`]: Canister interaction capabilities;
 //! - [`HttpFeatures`]: HTTPs communication features.
 //!
 //! The context is designed to be hierarchical, allowing creation of child contexts for specific
@@ -27,14 +26,13 @@
 
 use anda_core::{
     Agent, AgentContext, AgentInput, AgentOutput, AgentSet, BaseContext, BoxError, BoxPinFut,
-    CacheExpiry, CacheFeatures, CacheStoreFeatures, CancellationToken, CanisterCaller,
-    CompletionFeatures, CompletionRequest, ContentPart, FunctionDefinition, HttpFeatures, Json,
-    KeysFeatures, Message, ModelEffort, ObjectMeta, Path, PutMode, PutResult, RequestMeta,
-    Resource, StateFeatures, StoreFeatures, ToolCall, ToolGroup, ToolInput, ToolOutput,
-    ToolProviderSet, ToolSet, Usage,
+    CacheExpiry, CacheFeatures, CacheStoreFeatures, CancellationToken, CompletionFeatures,
+    CompletionRequest, ContentPart, FunctionDefinition, HttpFeatures, Json, KeysFeatures, Message,
+    ModelEffort, ObjectMeta, Path, PutMode, PutResult, RequestMeta, Resource, StateFeatures,
+    StoreFeatures, ToolCall, ToolGroup, ToolInput, ToolOutput, ToolProviderSet, ToolSet, Usage,
 };
 use bytes::Bytes;
-use candid::{CandidType, Principal, utils::ArgumentEncoder};
+use candid::Principal;
 use futures_util::Stream;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
@@ -1009,44 +1007,6 @@ impl CacheFeatures for AgentCtx {
         &self,
     ) -> impl Iterator<Item = (Arc<String>, Arc<(Bytes, Option<CacheExpiry>)>)> {
         self.base.cache_raw_iter()
-    }
-}
-
-impl CanisterCaller for AgentCtx {
-    /// Performs a query call to a canister (read-only, no state changes).
-    ///
-    /// # Arguments
-    /// * `canister` - Target canister principal;
-    /// * `method` - Method name to call;
-    /// * `args` - Input arguments encoded in Candid format.
-    async fn canister_query<
-        In: ArgumentEncoder + Send,
-        Out: CandidType + for<'a> candid::Deserialize<'a>,
-    >(
-        &self,
-        canister: &Principal,
-        method: &str,
-        args: In,
-    ) -> Result<Out, BoxError> {
-        self.base.canister_query(canister, method, args).await
-    }
-
-    /// Performs an update call to a canister (may modify state).
-    ///
-    /// # Arguments
-    /// * `canister` - Target canister principal;
-    /// * `method` - Method name to call;
-    /// * `args` - Input arguments encoded in Candid format.
-    async fn canister_update<
-        In: ArgumentEncoder + Send,
-        Out: CandidType + for<'a> candid::Deserialize<'a>,
-    >(
-        &self,
-        canister: &Principal,
-        method: &str,
-        args: In,
-    ) -> Result<Out, BoxError> {
-        self.base.canister_update(canister, method, args).await
     }
 }
 
@@ -2509,10 +2469,10 @@ fn merge_visible_group(
 mod tests {
     use anda_core::{
         Agent, AgentContext as _, AgentInput, AgentOutput, BaseContext as _, BoxError,
-        CacheFeatures as _, CacheStoreFeatures as _, CancellationToken, CanisterCaller as _,
-        CompletionFeatures as _, CompletionRequest, ContentPart, Function, FunctionDefinition,
-        HttpFeatures as _, Json, KeysFeatures as _, Message, ModelEffort, Path, PutMode, Resource,
-        StateFeatures as _, StoreFeatures as _, Tool, ToolCall, ToolInput, ToolOutput, Usage,
+        CacheFeatures as _, CacheStoreFeatures as _, CancellationToken, CompletionFeatures as _,
+        CompletionRequest, ContentPart, Function, FunctionDefinition, HttpFeatures as _, Json,
+        KeysFeatures as _, Message, ModelEffort, Path, PutMode, Resource, StateFeatures as _,
+        StoreFeatures as _, Tool, ToolCall, ToolInput, ToolOutput, Usage,
     };
     use bytes::Bytes;
     use candid::Principal;
@@ -3742,16 +3702,6 @@ mod tests {
         );
         assert!(ctx.secp256k1_public_key(Vec::new()).await.is_err());
 
-        assert!(
-            ctx.canister_query::<_, ()>(&Principal::anonymous(), "status", ())
-                .await
-                .is_err()
-        );
-        assert!(
-            ctx.canister_update::<_, ()>(&Principal::anonymous(), "update", ())
-                .await
-                .is_err()
-        );
         assert!(
             ctx.https_call("https://example.test", http::Method::GET, None, None)
                 .await

@@ -7,7 +7,6 @@
 //! - [`KeysFeatures`]: Cryptographic key operations;
 //! - [`StoreFeatures`]: Persistent storage operations;
 //! - [`CacheFeatures`]: Caching mechanisms;
-//! - [`CanisterCaller`]: Canister interaction capabilities;
 //! - [`HttpFeatures`]: HTTPs communication features.
 //!
 //! The context is designed to be:
@@ -25,11 +24,11 @@
 
 use anda_core::{
     BaseContext, BoxError, CacheExpiry, CacheFeatures, CacheStoreFeatures, CancellationToken,
-    CanisterCaller, HttpFeatures, Json, KeysFeatures, ObjectMeta, Path, PutMode, PutResult,
-    RequestMeta, StateFeatures, StoreFeatures, ToolInput, ToolOutput, derivation_path_with,
+    HttpFeatures, Json, KeysFeatures, ObjectMeta, Path, PutMode, PutResult, RequestMeta,
+    StateFeatures, StoreFeatures, ToolInput, ToolOutput, derivation_path_with,
 };
 use bytes::Bytes;
-use candid::{CandidType, Principal, utils::ArgumentEncoder};
+use candid::Principal;
 use http::Extensions;
 use parking_lot::RwLock;
 use serde::{Serialize, de::DeserializeOwned};
@@ -559,50 +558,6 @@ impl CacheFeatures for BaseCtx {
     }
 }
 
-impl CanisterCaller for BaseCtx {
-    /// Performs a query call to a canister (read-only, no state changes).
-    ///
-    /// # Arguments
-    /// * `canister` - Target canister principal;
-    /// * `method` - Method name to call;
-    /// * `args` - Input arguments encoded in Candid format.
-    async fn canister_query<
-        In: ArgumentEncoder + Send,
-        Out: CandidType + for<'a> candid::Deserialize<'a>,
-    >(
-        &self,
-        canister: &Principal,
-        method: &str,
-        args: In,
-    ) -> Result<Out, BoxError> {
-        self.web3
-            .as_ref()
-            .canister_query(canister, method, args)
-            .await
-    }
-
-    /// Performs an update call to a canister (may modify state).
-    ///
-    /// # Arguments
-    /// * `canister` - Target canister principal;
-    /// * `method` - Method name to call;
-    /// * `args` - Input arguments encoded in Candid format.
-    async fn canister_update<
-        In: ArgumentEncoder + Send,
-        Out: CandidType + for<'a> candid::Deserialize<'a>,
-    >(
-        &self,
-        canister: &Principal,
-        method: &str,
-        args: In,
-    ) -> Result<Out, BoxError> {
-        self.web3
-            .as_ref()
-            .canister_update(canister, method, args)
-            .await
-    }
-}
-
 impl HttpFeatures for BaseCtx {
     /// Makes an HTTPs request.
     ///
@@ -854,14 +809,6 @@ mod tests {
         );
         assert!(ctx.secp256k1_public_key(Vec::new()).await.is_err());
 
-        let query: Result<String, BoxError> = ctx
-            .canister_query(&Principal::anonymous(), "query", ())
-            .await;
-        assert!(query.is_err());
-        let update: Result<String, BoxError> = ctx
-            .canister_update(&Principal::anonymous(), "update", ())
-            .await;
-        assert!(update.is_err());
         assert!(
             ctx.https_call("https://example.test", http::Method::GET, None, None)
                 .await

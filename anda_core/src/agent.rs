@@ -443,13 +443,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candid::{CandidType, Principal, utils::ArgumentEncoder};
+    use candid::Principal;
     use std::time::Duration;
 
     use crate::{
-        AgentInput, BaseContext, CacheExpiry, CacheFeatures, CancellationToken, CanisterCaller,
-        CompletionFeatures, CompletionRequest, HttpFeatures, Json, KeysFeatures, ObjectMeta, Path,
-        PutMode, PutResult, RequestMeta, StateFeatures, StoreFeatures, ToolInput, ToolOutput,
+        AgentInput, BaseContext, CacheExpiry, CacheFeatures, CancellationToken, CompletionFeatures,
+        CompletionRequest, HttpFeatures, Json, KeysFeatures, ObjectMeta, Path, PutMode, PutResult,
+        RequestMeta, StateFeatures, StoreFeatures, ToolInput, ToolOutput,
     };
 
     #[derive(Clone)]
@@ -689,34 +689,6 @@ mod tests {
         ) -> Result<T, BoxError>
         where
             T: serde::de::DeserializeOwned,
-        {
-            Err("not implemented".into())
-        }
-    }
-
-    impl crate::CanisterCaller for TestAgentContext {
-        async fn canister_query<In, Out>(
-            &self,
-            _canister: &Principal,
-            _method: &str,
-            _args: In,
-        ) -> Result<Out, BoxError>
-        where
-            In: ArgumentEncoder + Send,
-            Out: CandidType + for<'a> candid::Deserialize<'a>,
-        {
-            Err("not implemented".into())
-        }
-
-        async fn canister_update<In, Out>(
-            &self,
-            _canister: &Principal,
-            _method: &str,
-            _args: In,
-        ) -> Result<Out, BoxError>
-        where
-            In: ArgumentEncoder + Send,
-            Out: CandidType + for<'a> candid::Deserialize<'a>,
         {
             Err("not implemented".into())
         }
@@ -1306,15 +1278,6 @@ mod tests {
                 .https_signed_rpc("https://example.test", "method", &())
                 .await;
             assert!(rpc.is_err());
-
-            let query: Result<String, BoxError> = ctx
-                .canister_query(&Principal::anonymous(), "query", ())
-                .await;
-            assert!(query.is_err());
-            let update: Result<String, BoxError> = ctx
-                .canister_update(&Principal::anonymous(), "update", ())
-                .await;
-            assert!(update.is_err());
 
             assert!(
                 ctx.remote_tool_call(

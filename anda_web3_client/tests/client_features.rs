@@ -162,27 +162,6 @@ async fn pem_default_builder_and_canister_error_paths_are_exercised() {
     let update: Result<String, _> =
         CanisterCaller::canister_update(&client, &canister, "greet", ("world",)).await;
     assert!(update.is_err());
-
-    assert!(
-        Web3ClientFeatures::canister_query_raw(
-            &client,
-            canister,
-            "raw_query".to_string(),
-            vec![1, 2, 3],
-        )
-        .await
-        .is_err()
-    );
-    assert!(
-        Web3ClientFeatures::canister_update_raw(
-            &client,
-            Principal::anonymous(),
-            "raw_update".to_string(),
-            vec![4, 5, 6],
-        )
-        .await
-        .is_err()
-    );
 }
 
 #[tokio::test(flavor = "current_thread")]

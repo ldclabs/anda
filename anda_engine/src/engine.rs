@@ -50,14 +50,13 @@
 //! # }
 //! ```
 
-use anda_cloud_cdk::{ChallengeEnvelope, ChallengeRequest, TEEInfo, TEEKind};
+use anda_cloud_cdk::{ChallengeEnvelope, ChallengeRequest};
 use anda_core::{
     Agent, AgentInput, AgentOutput, AgentSet, BoxError, Function, Json, Path, RequestMeta,
     Resource, Tool, ToolInput, ToolOutput, ToolProvider, ToolProviderSet, ToolSet,
     validate_function_name,
 };
 use candid::Principal;
-use ic_tee_cdk::AttestationRequest;
 use object_store::memory::InMemory;
 use std::{
     collections::{BTreeSet, HashMap},
@@ -68,8 +67,8 @@ use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
 
 use crate::{
     context::{
-        AgentCtx, BaseCtx, ToolsGroups, ToolsSearch, ToolsSelect, Web3Client, Web3SDK,
-        agent_context_path, tool_context_path,
+        AgentCtx, BaseCtx, ToolsGroups, ToolsSearch, ToolsSelect, Web3SDK, agent_context_path,
+        tool_context_path,
     },
     hook::{Hook, Hooks},
     management::{BaseManagement, Management, SYSTEM_PATH, Visibility},
@@ -360,40 +359,16 @@ impl Engine {
         let now_ms = unix_ms();
         request.verify(now_ms, request.registry)?;
         let message_digest = request.digest();
-        let res = match self.ctx.base.web3.as_ref() {
-            Web3SDK::Tee(cli) => {
-                let authentication = cli.sign_envelope(message_digest).await?;
-                let tee = cli
-                    .sign_attestation(AttestationRequest {
-                        public_key: Some(authentication.pubkey.clone()),
-                        user_data: None,
-                        nonce: Some(request.code.to_vec().into()),
-                    })
-                    .await?;
-                let info = cli
-                    .tee_info()
-                    .ok_or_else(|| "TEE not available".to_string())?;
-                ChallengeEnvelope {
-                    request,
-                    authentication,
-                    tee: Some(TEEInfo {
-                        id: info.id,
-                        kind: TEEKind::try_from(tee.kind.as_str())?,
-                        url: info.url,
-                        attestation: Some(tee.attestation),
-                    }),
-                }
-            }
-            Web3SDK::Web3(Web3Client { client: cli }) => {
-                let authentication = cli.sign_envelope(message_digest).await?;
-                ChallengeEnvelope {
-                    request,
-                    authentication,
-                    tee: None,
-                }
-            }
-        };
-        Ok(res)
+        let web3 = self.ctx.base.web3.as_ref();
+        let authentication = web3.sign_envelope(message_digest).await?;
+        let tee = web3
+            .tee_attestation(authentication.pubkey.clone(), request.code.to_vec())
+            .await?;
+        Ok(ChallengeEnvelope {
+            request,
+            authentication,
+            tee,
+        })
     }
 
     /// Returns the public engine card used by remote engines for discovery.
@@ -486,7 +461,7 @@ impl EngineBuilder {
             remote: HashMap::new(),
             models: Arc::new(Models::default()),
             store: Store::new(mstore),
-            web3: Arc::new(Web3SDK::Web3(Web3Client::not_implemented())),
+            web3: Arc::new(Web3SDK::not_implemented()),
             hooks: Arc::new(Hooks::new()),
             subagent_conversation_recorder: None,
             cancellation_token: CancellationToken::new(),
@@ -1534,7 +1509,7 @@ mod tests {
 
         let engine = Engine::builder()
             .with_cancellation_token(CancellationToken::new())
-            .with_web3_client(Arc::new(Web3SDK::Web3(Web3Client::not_implemented())))
+            .with_web3_client(Arc::new(Web3SDK::not_implemented()))
             .with_model(Model::mock_implemented())
             .with_models(Arc::new(Models::default()))
             .with_store(Store::new(Arc::new(InMemory::new())))

@@ -37,7 +37,11 @@ pub mod subagent;
 pub use structured_logger::unix_ms;
 
 /// Generates cryptographically secure random bytes.
-pub use ic_cose::rand_bytes;
+pub fn rand_bytes<const N: usize>() -> [u8; N] {
+    let mut bytes = [0u8; N];
+    rand::fill(&mut bytes);
+    bytes
+}
 
 /// This is used to represent unauthenticated or anonymous users in the system.
 pub const ANONYMOUS: Principal = Principal::anonymous();
