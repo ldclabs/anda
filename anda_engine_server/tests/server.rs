@@ -285,6 +285,51 @@ async fn signed_requests_identify_the_caller() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn signed_rpc_rejects_envelope_without_digest() {
+    use ic_auth_verifier::envelope::SignedEnvelope;
+
+    let (endpoint, _id) = spawn_default_server().await;
+    let client = http_client();
+
+    // An envelope that carries no committed digest must be rejected on the RPC
+    // path (before signature verification), so a signature can never be bound
+    // to a server-computed body hash instead of the body the client signed.
+    let envelope = SignedEnvelope {
+        pubkey: ByteBufB64::from(vec![1u8; 32]),
+        signature: ByteBufB64::from(vec![2u8; 64]),
+        digest: None,
+        delegation: None,
+    };
+    let mut auth_headers = http::HeaderMap::new();
+    envelope.to_authorization(&mut auth_headers).unwrap();
+    let auth = auth_headers
+        .get(http::header::AUTHORIZATION)
+        .unwrap()
+        .clone();
+
+    let body = cbor2::to_canonical_vec(&RPCRequest {
+        method: "information".to_string(),
+        params: ByteBufB64::default(),
+    })
+    .unwrap();
+    let res = client
+        .post(format!("{endpoint}/default"))
+        .header(http::header::CONTENT_TYPE, CONTENT_TYPE_CBOR)
+        .header(http::header::AUTHORIZATION, auth)
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 401);
+    assert!(
+        res.text()
+            .await
+            .unwrap()
+            .contains("missing the content digest")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn api_key_middleware_guards_requests() {
     let engine = build_engine().await;
     let id = engine.id();
@@ -319,4 +364,36 @@ async fn api_key_middleware_guards_requests() {
         .await
         .unwrap();
     assert_eq!(res.status(), 200);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn api_key_middleware_exempts_prefix() {
+    let engine = build_engine().await;
+    let id = engine.id();
+    let endpoint = spawn_server(
+        ServerBuilder::new()
+            .with_engines(BTreeMap::from([(id, engine)]), None)
+            .with_middleware(ApiKeyMiddleware::new("secret-key").exempt_prefix("/.well-known/")),
+    )
+    .await;
+    let client = http_client();
+
+    // Both the static and the dynamic-segment discovery routes under the
+    // exempt prefix bypass the key.
+    for path in [
+        "/.well-known/information".to_string(),
+        "/.well-known/agents".to_string(),
+        format!("/.well-known/agents/{}", id.to_text()),
+    ] {
+        let res = client
+            .get(format!("{endpoint}{path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200, "path {path} should be exempt");
+    }
+
+    // A path outside the prefix is still guarded.
+    let res = client.get(format!("{endpoint}/")).send().await.unwrap();
+    assert_eq!(res.status(), 401);
 }

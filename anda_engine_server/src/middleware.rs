@@ -89,10 +89,15 @@ impl HttpMiddleware for CompressionMiddleware {
 /// Keys are compared in constant time to avoid leaking the expected key
 /// through a timing side channel.
 ///
-/// Use `exempt_path` to allow unauthenticated endpoints (e.g. health/info routes).
+/// Use [`exempt_path`](Self::exempt_path) to allow specific unauthenticated
+/// endpoints (e.g. `/` or `/.well-known/information`), or
+/// [`exempt_prefix`](Self::exempt_prefix) to exempt a whole subtree such as
+/// `/.well-known/` whose members include dynamic segments
+/// (e.g. `/.well-known/agents/{id}`) that cannot be enumerated exactly.
 pub struct ApiKeyMiddleware {
     expected_key: String,
     exempt_paths: Vec<String>,
+    exempt_prefixes: Vec<String>,
 }
 
 impl ApiKeyMiddleware {
@@ -101,12 +106,23 @@ impl ApiKeyMiddleware {
         Self {
             expected_key: expected_key.into(),
             exempt_paths: Vec::new(),
+            exempt_prefixes: Vec::new(),
         }
     }
 
-    /// Adds a path that bypasses API-key validation.
+    /// Adds a path that bypasses API-key validation, matched exactly.
     pub fn exempt_path(mut self, path: impl Into<String>) -> Self {
         self.exempt_paths.push(path.into());
+        self
+    }
+
+    /// Adds a path prefix that bypasses API-key validation.
+    ///
+    /// Any request whose path starts with `prefix` is exempt. Use this for
+    /// discovery subtrees with dynamic segments, e.g. `exempt_prefix("/.well-known/")`
+    /// to cover both `/.well-known/information` and `/.well-known/agents/{id}`.
+    pub fn exempt_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.exempt_prefixes.push(prefix.into());
         self
     }
 }
@@ -124,15 +140,19 @@ impl HttpMiddleware for ApiKeyMiddleware {
     fn apply(&self, router: AppRouter) -> AppRouter {
         let expected_key: Arc<str> = Arc::from(self.expected_key.as_str());
         let exempt_paths: Arc<[String]> = Arc::from(self.exempt_paths.as_slice());
+        let exempt_prefixes: Arc<[String]> = Arc::from(self.exempt_prefixes.as_slice());
 
         router.layer(axum::middleware::from_fn(
             move |req: Request, next: Next| {
                 let expected_key = expected_key.clone();
                 let exempt_paths = exempt_paths.clone();
+                let exempt_prefixes = exempt_prefixes.clone();
 
                 async move {
                     let path = req.uri().path();
-                    if exempt_paths.iter().any(|p| p == path) {
+                    if exempt_paths.iter().any(|p| p == path)
+                        || exempt_prefixes.iter().any(|p| path.starts_with(p.as_str()))
+                    {
                         return next.run(req).await;
                     }
 

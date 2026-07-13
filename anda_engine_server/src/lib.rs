@@ -32,7 +32,6 @@ pub struct ServerBuilder {
     app_name: String,
     app_version: String,
     addr: String,
-    origin: String,
     engines: BTreeMap<Principal, Arc<Engine>>,
     default_engine: Option<Principal>,
     middlewares: Vec<Arc<dyn HttpMiddleware>>,
@@ -56,7 +55,6 @@ impl ServerBuilder {
             app_name: APP_NAME.to_string(),
             app_version: APP_VERSION.to_string(),
             addr: "127.0.0.1:8042".to_string(),
-            origin: "https://localhost:8443".to_string(),
             engines: BTreeMap::new(),
             default_engine: None,
             middlewares: Vec::new(),
@@ -80,12 +78,6 @@ impl ServerBuilder {
     /// Sets the TCP bind address, for example `127.0.0.1:8042`.
     pub fn with_addr(mut self, addr: String) -> Self {
         self.addr = addr;
-        self
-    }
-
-    /// Sets the public origin used by clients for discovery.
-    pub fn with_origin(mut self, origin: String) -> Self {
-        self.origin = origin;
         self
     }
 

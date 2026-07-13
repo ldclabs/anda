@@ -61,10 +61,27 @@ impl AppState {
     ///    `ic-auth-*` headers, verified against `expect_target` and
     ///    `expect_digest`.
     ///
+    /// On the signed-RPC path (`expect_digest` is `Some`) the envelope must
+    /// carry its own `digest`; a digest-less envelope is rejected instead of
+    /// letting [`SignedEnvelope::verify`] fall back to the server-computed body
+    /// hash. This is a fail-closed hygiene check: it forces the client to
+    /// explicitly commit to a body hash so the server always exercises the
+    /// `digest == body_hash` equality path.
+    ///
+    /// It is **not**, on its own, a cryptographic defense. The signature is
+    /// verified over the same 32-byte body hash whether or not `digest` is
+    /// present, and the anda RPC payload (`{method, params}`) binds neither the
+    /// target engine nor a domain tag. An attacker able to obtain a signature
+    /// over that hash (e.g. a signing oracle sharing the key) can still pass by
+    /// echoing the hash as `digest`. Genuine cross-protocol / oracle resistance
+    /// requires domain separation in the signature scheme (`ic_auth_verifier`),
+    /// which is out of scope for this crate.
+    ///
     /// Returns the anonymous principal only when no credential is present. When a
     /// credential is present but fails to verify (bad signature, wrong target,
-    /// tampered body, or expired token), an error is returned so the caller can
-    /// reject the request instead of silently downgrading to anonymous access.
+    /// missing or tampered body digest, or expired token), an error is returned
+    /// so the caller can reject the request instead of silently downgrading to
+    /// anonymous access.
     pub fn verify_user(
         &self,
         headers: &http::HeaderMap,
@@ -93,6 +110,14 @@ impl AppState {
         if let Some(se) = SignedEnvelope::from_authorization(headers)
             .or_else(|| SignedEnvelope::from_headers(headers))
         {
+            // Fail-closed on a body-bound RPC: require the client to present its
+            // own committed digest rather than leaning on the server-computed
+            // body hash. This is hygiene, not a standalone crypto defense — see
+            // the `verify_user` docs for why the signing scheme must add domain
+            // separation to actually resist an oracle sharing the key.
+            if expect_digest.is_some() && se.digest.is_none() {
+                return Err("signed request is missing the content digest".to_string());
+            }
             return match se.verify(now_ms, expect_target, expect_digest) {
                 Ok(_) => Ok(se.sender()),
                 Err(err) => Err(format!("invalid request credential: {err}")),
@@ -101,17 +126,6 @@ impl AppState {
 
         // No credential supplied: treat as anonymous.
         Ok(ANONYMOUS_PRINCIPAL)
-    }
-
-    /// Verifies a `Bearer` CWT token against the trusted `ed25519_pubkeys`.
-    /// Returns `None` when no trusted key is configured, the token is missing,
-    /// or verification fails.
-    pub fn verify_cwt(&self, headers: &http::HeaderMap, now_ms: u64) -> Option<ClaimsSet> {
-        let token = headers
-            .get(AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.strip_prefix("Bearer "))?;
-        self.verify_cwt_token(token, now_ms)
     }
 
     /// Verifies a raw `Bearer` CWT token string against the trusted `ed25519_pubkeys`.
@@ -128,6 +142,11 @@ impl AppState {
 }
 
 /// GET /.well-known/information
+///
+/// Server-level discovery endpoint. Open to anonymous callers by design; it
+/// verifies any supplied credential only to echo the resolved `caller`, and
+/// exposes each engine's public [`AgentInfo`](anda_engine::engine::AgentInfo)
+/// summary rather than any private capability.
 pub async fn get_information(
     State(app): State<AppState>,
     headers: http::HeaderMap,
@@ -152,6 +171,13 @@ pub async fn get_information(
 }
 
 /// GET /.well-known/agents/{id}
+///
+/// Discovery endpoint. Following the RFC 8615 `.well-known` convention, it is
+/// intentionally open to anonymous callers and does not run `check_visibility`.
+/// It returns only the engine's public [`EngineCard`](anda_engine::engine::EngineCard),
+/// which exposes exported agents/tools (see [`Engine::information`]); private,
+/// non-exported capabilities are never included. Enforcement of per-caller
+/// access happens on the RPC path (`agent_run`/`tool_call`) inside the engine.
 pub async fn get_engine_information(
     State(app): State<AppState>,
     headers: http::HeaderMap,
@@ -231,12 +257,14 @@ enum Codec {
 
 impl Codec {
     fn decode_params<T: DeserializeOwned>(self, params: &[u8]) -> Result<T, String> {
+        // Use `Display` (not `Debug`) so decode errors report the parser's own
+        // message without echoing raw request bytes back to the caller.
         match self {
             Codec::Cbor => {
-                from_slice(params).map_err(|err| format!("failed to decode params: {err:?}"))
+                from_slice(params).map_err(|err| format!("failed to decode params: {err}"))
             }
             Codec::Json => serde_json::from_slice(params)
-                .map_err(|err| format!("failed to decode params: {err:?}")),
+                .map_err(|err| format!("failed to decode params: {err}")),
         }
     }
 
@@ -321,6 +349,10 @@ async fn engine_run(
 
             codec.encode_result(&res?)
         }
+        // Discovery method: like the `.well-known` routes, it is intentionally
+        // open to anonymous callers and returns only the public `EngineCard`
+        // (exported agents/tools). Per-caller access is enforced by `agent_run`
+        // and `tool_call` below via the engine's `check_visibility`.
         "information" => codec.encode_result(&engine.information()),
         method => Err(format!(
             "{method} on engine {} not implemented",

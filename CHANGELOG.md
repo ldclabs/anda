@@ -76,6 +76,18 @@ All notable changes to the Anda project will be documented in this file.
 - **`cache_store_delete` ordering** — Store is now deleted before cache to prevent a concurrent `cache_store_get` from repopulating a ghost cache entry that survives the delete.
 - **Inline data token estimation** — Switched from `(len + 3) / 4` to `len.div_ceil(3)` to match base64 expansion ratio (~4/3 chars per byte, not 3/4).
 
+### Added — anda_engine_server v0.14.2
+
+- **Signed envelope digest required on RPC** — `verify_user` now rejects a `SignedEnvelope` that omits its committed `digest` on body-bound RPC paths, instead of falling back to the server-computed body hash. This is a fail-closed hygiene check (the client must explicitly commit to the body hash); it is *not* a standalone defense against a signing oracle sharing the key — the signature is still verified over the same hash, and genuine resistance requires domain separation in the signature scheme.
+- **`ApiKeyMiddleware::exempt_prefix`** — Prefix-based exemption for discovery subtrees with dynamic segments (e.g. `/.well-known/` covers both `/information` and `/agents/{id}`) that cannot be enumerated exactly with `exempt_path`.
+
+### Changed — anda_engine_server v0.14.2
+
+- **README rewritten** — Accurately describes the server as a thin, stateless forwarder; session management, tool integrations, and access control belong to `anda_engine`.
+- **Removed unused `origin`** — Builder field and `with_origin` method removed (no consumer used it).
+- **Removed unused public `verify_cwt`** — Only the internal `verify_cwt_token` is needed.
+- **Decode error hygiene** — Param decode failures now use `Display` (not `Debug`) so the client sees the parser's error message without the raw request bytes.
+
 ## [0.14.0] — 2026-07-05
 
 ### Removed — anda 0.14.0
