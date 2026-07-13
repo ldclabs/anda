@@ -32,6 +32,26 @@ pub const CONTENT_TYPE_JSON: &str = "application/json";
 /// MIME type used for plain text HTTP response bodies.
 pub const CONTENT_TYPE_TEXT: &str = "text/plain";
 
+/// Maximum size, in bytes, accepted for a CBOR RPC success response body.
+///
+/// `reqwest` does not bound response bodies by default, so this cap protects the
+/// calling process (including memory-constrained TEEs) against a hostile or
+/// misbehaving remote returning an unbounded payload.
+pub const MAX_RPC_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Maximum number of bytes retained from a remote error response body.
+const MAX_RPC_ERROR_BYTES: usize = 8 * 1024;
+
+/// Upper bound on the buffer capacity pre-reserved from a remote's (untrusted)
+/// `Content-Length` before any body bytes are read.
+///
+/// Capping this well below [`MAX_RPC_RESPONSE_BYTES`] stops a hostile or
+/// misbehaving remote from forcing a large up-front allocation by advertising a
+/// big `Content-Length` and then sending little or nothing (e.g. holding the
+/// connection open). The buffer still grows as real data arrives, so legitimate
+/// large responses are unaffected apart from a few amortized reallocations.
+const MAX_RPC_PREALLOC_BYTES: usize = 256 * 1024;
+
 /// Owned RPC request with a method name and CBOR-encoded parameters.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RPCRequest {
@@ -83,13 +103,6 @@ pub struct CanisterRequestRef<'a> {
 /// remote error message.
 pub type RPCResponse = Result<ByteBufB64, String>;
 
-// #[derive(Debug, Deserialize, Serialize)]
-// pub struct ListPagination {
-//     pub id: String,
-//     pub page_token: Option<String>,
-//     pub page_size: Option<u16>,
-// }
-
 /// Paginated list response.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ListObject<T> {
@@ -129,6 +142,20 @@ pub enum HttpRPCError {
         /// HTTP status code returned by the remote endpoint.
         status: u16,
         /// Response body or status parsing error.
+        error: String,
+    },
+
+    /// The remote endpoint returned an application-level error result.
+    ///
+    /// This is distinct from [`HttpRPCError::ResultError`]: the transport and
+    /// decoding succeeded, but the remote reported a failure in its payload.
+    #[error("http_rpc({endpoint:?}, {path:?}): remote error: {error}")]
+    RemoteError {
+        /// Remote endpoint URL used for the RPC request.
+        endpoint: String,
+        /// RPC path, method, or canister identifier associated with the request.
+        path: String,
+        /// Error message reported by the remote endpoint.
         error: String,
     },
 
@@ -219,7 +246,7 @@ where
         params: &ByteBufB64::from(args),
     })
     .map_err(|e| HttpRPCError::RequestError {
-        endpoint: endpoint.to_string(),
+        endpoint: format!("{endpoint}/{canister}"),
         path: method.to_string(),
         error: format!("{e:?}"),
     })?;
@@ -233,6 +260,11 @@ where
 }
 
 /// Sends a raw CBOR RPC request and returns the remote payload.
+///
+/// Only HTTP `200 OK` is treated as success; any other status (including other
+/// `2xx` codes) is reported as [`HttpRPCError::ResponseError`]. The success body
+/// is streamed with a [`MAX_RPC_RESPONSE_BYTES`] cap so an oversized response is
+/// rejected before it is fully buffered.
 ///
 /// # Arguments
 /// * `client` - HTTP client to use for the request.
@@ -271,25 +303,75 @@ pub async fn cbor_rpc(
             endpoint: endpoint.to_string(),
             path: path.to_string(),
             status,
-            error: res.text().await.unwrap_or_default(),
+            error: read_error_body(res).await,
         });
     }
 
-    let data = res.bytes().await.map_err(|e| HttpRPCError::ResultError {
-        endpoint: endpoint.to_string(),
-        path: path.to_string(),
-        error: format!("{e:?}"),
-    })?;
+    let data = read_body_capped(res)
+        .await
+        .map_err(|error| HttpRPCError::ResultError {
+            endpoint: endpoint.to_string(),
+            path: path.to_string(),
+            error,
+        })?;
     let res: RPCResponse = from_slice(&data[..]).map_err(|e| HttpRPCError::ResultError {
         endpoint: endpoint.to_string(),
         path: path.to_string(),
         error: format!("{e:?}"),
     })?;
-    res.map_err(|e| HttpRPCError::ResultError {
+    res.map_err(|error| HttpRPCError::RemoteError {
         endpoint: endpoint.to_string(),
         path: path.to_string(),
-        error: format!("{e:?}"),
+        error,
     })
+}
+
+/// Reads a response body into memory while enforcing [`MAX_RPC_RESPONSE_BYTES`].
+///
+/// The body is streamed in chunks so an oversized response is rejected before it
+/// is fully buffered, even when the remote omits or misreports `Content-Length`.
+async fn read_body_capped(mut res: reqwest::Response) -> Result<Vec<u8>, String> {
+    let content_length = res.content_length();
+    if let Some(len) = content_length
+        && len > MAX_RPC_RESPONSE_BYTES as u64
+    {
+        return Err(format!(
+            "response body too large: {len} bytes exceeds limit {MAX_RPC_RESPONSE_BYTES} bytes"
+        ));
+    }
+
+    // Only pre-reserve a bounded amount: `Content-Length` is remote-controlled,
+    // so honoring it up to the full cap would let a remote force a large
+    // allocation without sending a matching body.
+    let mut data: Vec<u8> = Vec::with_capacity(
+        content_length
+            .map(|len| (len as usize).min(MAX_RPC_PREALLOC_BYTES))
+            .unwrap_or(0),
+    );
+    while let Some(chunk) = res.chunk().await.map_err(|e| format!("{e:?}"))? {
+        if data.len().saturating_add(chunk.len()) > MAX_RPC_RESPONSE_BYTES {
+            return Err(format!(
+                "response body too large: exceeds limit {MAX_RPC_RESPONSE_BYTES} bytes"
+            ));
+        }
+        data.extend_from_slice(&chunk);
+    }
+    Ok(data)
+}
+
+/// Reads a remote error body, truncating it to [`MAX_RPC_ERROR_BYTES`] for
+/// diagnostics so a large error payload cannot exhaust memory either.
+async fn read_error_body(mut res: reqwest::Response) -> String {
+    let mut data: Vec<u8> = Vec::new();
+    while let Ok(Some(chunk)) = res.chunk().await {
+        let remaining = MAX_RPC_ERROR_BYTES.saturating_sub(data.len());
+        if remaining == 0 {
+            break;
+        }
+        let take = chunk.len().min(remaining);
+        data.extend_from_slice(&chunk[..take]);
+    }
+    String::from_utf8_lossy(&data).into_owned()
 }
 
 #[cfg(test)]
@@ -384,6 +466,26 @@ mod tests {
         format!("http://{addr}")
     }
 
+    /// Advertises a `Content-Length` larger than the cap so the body-size guard
+    /// can reject the response without buffering it.
+    async fn spawn_oversized_content_length_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut req = [0_u8; 1024];
+            let _ = stream.read(&mut req).await;
+            let header = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/cbor\r\ncontent-length: {}\r\n\r\n",
+                MAX_RPC_RESPONSE_BYTES as u64 + 1
+            );
+            let _ = stream.write_all(header.as_bytes()).await;
+            let _ = stream.write_all(b"partial").await;
+            let _ = stream.shutdown().await;
+        });
+        format!("http://{addr}")
+    }
+
     fn rpc_response(result: RPCResponse) -> Vec<u8> {
         to_canonical_vec(&result).unwrap()
     }
@@ -465,7 +567,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            HttpRPCError::ResultError { error, .. } if error.contains("remote failed")
+            HttpRPCError::RemoteError { error, .. } if error == "remote failed"
         ));
 
         let (endpoint, _) = spawn_server(StatusCode::OK, b"not cbor".to_vec()).await;
@@ -537,6 +639,19 @@ mod tests {
         assert!(matches!(
             err,
             HttpRPCError::ResultError { ref path, .. } if path == "body"
+        ));
+    }
+
+    #[tokio::test]
+    async fn cbor_rpc_rejects_oversized_response_body() {
+        let endpoint = spawn_oversized_content_length_server().await;
+        let err = cbor_rpc(&client(), &endpoint, "big", None, Vec::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            HttpRPCError::ResultError { ref path, ref error, .. }
+                if path == "big" && error.contains("too large")
         ));
     }
 

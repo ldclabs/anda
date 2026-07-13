@@ -18,6 +18,29 @@ All notable changes to the Anda project will be documented in this file.
 - **rmcp 1.7→2.2** — Upgraded with the `auth` feature, replacing the static bearer-token path with `AuthClient`-based transport when `McpOAuthConfig` is present. Transport config split into `base_transport_config` (for auth client injection) and `transport_config` (static bearer, preserved for backward compat).
 - **`list_roots` removed** — The deprecated `list_roots` client handler is removed to match rmcp 2.x.
 
+### Added — anda_core v0.14.2
+
+- **CBOR RPC response body cap** — `MAX_RPC_RESPONSE_BYTES` (16 MiB) enforced with streaming chunk-by-chunk guard; oversized responses are rejected before full buffering, protecting memory-constrained TEE runtimes.
+- **`RemoteError` error variant** — Split from `ResultError` so callers can distinguish transport-level decode failures from application-level remote errors.
+- **Documents closing-tag injection guard** — `Documents::Display` neutralizes literal `</tag>` delimiters inside untrusted attachment content (case-insensitive), preventing document content from closing the block early.
+
+### Changed — anda_core v0.14.2
+
+- **Serde buffering replaces `serde_json::Value` for `ContentPart`** — Deserialization now uses serde's untagged/type-tagged machinery directly, preserving CBOR byte strings (`InlineData.data`, `Principal`, `Action.signature`) across RPC round-trips that previously lost them through the JSON intermediate.
+- **Path encoding hardened** — `path_lowercase` and `path_join` no longer double-encode `%` in already-encoded object-store keys. Re-joining a namespace with a `store_list` key is idempotent.
+- **Definitions/functions deduplicated by lowercase name** — `AgentSet` and `ToolSet` suppress duplicate schemas when the same tool/agent is requested multiple times (some model providers reject repeated definition names).
+- **`/ping` with arguments accepted** — `/ping now` resolves to `Ping` instead of being treated as an unknown command; bare `/` and `/ arg` are plain prompts rather than empty commands.
+- **Blank `failed_reason` treated as success** — An all-whitespace failure reason is normalized to `None` in `AgentOutput::into_tool_output`.
+- **MCP secrets redacted from `Debug`** — Custom `Debug` impls on `McpStreamableHttpTransport` and `OAuthClientCredentialsConfig` replace bearer tokens and client secrets with `[REDACTED]`.
+- **`validate_function_name`: characters → bytes** — Name length is now checked in bytes rather than characters.
+- **Dependency cleanup** — Removed unused `futures` and `serde_bytes` from `anda_core` production dependencies (`futures` kept for dev-dependencies).
+
+### Fixed — anda_core v0.14.2
+
+- **`%` double-encoding in object-store paths** — `From<String>` re-encodes `%` to `%25`, so `path_lowercase` and `path_join` switched to `Path::parse` / `Path::from_iter` to preserve already-encoded segments.
+- **`cache_store_delete` ordering** — Store is now deleted before cache to prevent a concurrent `cache_store_get` from repopulating a ghost cache entry that survives the delete.
+- **Inline data token estimation** — Switched from `(len + 3) / 4` to `len.div_ceil(3)` to match base64 expansion ratio (~4/3 chars per byte, not 3/4).
+
 ## [0.14.0] — 2026-07-05
 
 ### Removed — anda 0.14.0

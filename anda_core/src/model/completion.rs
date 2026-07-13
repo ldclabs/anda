@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, fmt};
+use std::fmt;
 
 use crate::{
     AgentOutput, BoxError, ContentPart, Document, Documents, FunctionDefinition, Json, Message,
@@ -108,10 +108,7 @@ pub struct CompletionRequest {
 impl CompletionRequest {
     /// Adds a document to the request.
     pub fn context(mut self, id: String, text: String) -> Self {
-        self.documents.docs.push(Document {
-            content: text.into(),
-            metadata: BTreeMap::from([("id".to_string(), id.into())]),
-        });
+        self.documents.docs.push(Document::from_text(&id, &text));
         self
     }
 

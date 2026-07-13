@@ -42,6 +42,20 @@ pub fn gen_schema_for<T: JsonSchema>() -> serde_json::Value {
 /// For every object schema, `additionalProperties` defaults to `false` and
 /// `required` is rewritten to contain all property keys. Object schemas without
 /// explicit properties are normalized to empty closed objects.
+///
+/// # Scope and caveats
+///
+/// This targets schemas shaped like the ones [`gen_schema_for`] produces from
+/// `schemars`, where every declared property is genuinely required. For a
+/// hand-written schema, rewriting `required` to all property keys is a **silent
+/// semantic change**: a property that was intended to be optional (and not
+/// nullable) becomes mandatory. Make such properties nullable (e.g.
+/// `"type": ["string", "null"]`) if they must stay optional under strict mode.
+///
+/// Recursion covers `properties`, `$defs`, `definitions`, `patternProperties`,
+/// `items`, `additionalProperties`, `not`, `if`/`then`/`else`, and the
+/// `allOf`/`anyOf`/`oneOf`/`prefixItems` arrays. It does **not** descend into
+/// `contains`, `propertyNames`, or `dependentSchemas`.
 pub fn normalize_strict_schema(mut schema: Value) -> Value {
     normalize_schema_value(&mut schema);
     schema

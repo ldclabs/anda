@@ -14,7 +14,13 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::{any::Any, collections::BTreeMap, future::Future, marker::PhantomData, sync::Arc};
+use std::{
+    any::Any,
+    collections::{BTreeMap, BTreeSet},
+    future::Future,
+    marker::PhantomData,
+    sync::Arc,
+};
 
 use crate::{
     BoxError, BoxPinFut, Function, ToolGroup, ToolGroupInfo,
@@ -44,7 +50,7 @@ where
     ///
     /// # Rules
     /// - Must not be empty;
-    /// - Must not exceed 64 characters;
+    /// - Must not exceed 64 bytes;
     /// - Must start with a lowercase letter;
     /// - Can only contain: lowercase letters (a-z), digits (0-9), underscores (_), and hyphens (-);
     /// - Unique within the engine in lowercase.
@@ -110,7 +116,7 @@ where
     ///
     /// Runtimes call this once while building the engine.
     fn init(&self, _ctx: C) -> impl Future<Output = Result<(), BoxError>> + Send {
-        futures::future::ready(Ok(()))
+        std::future::ready(Ok(()))
     }
 
     /// Returns tool names required by this agent.
@@ -151,7 +157,12 @@ where
     /// Converts the shared agent into [`Any`] for downcasting.
     fn into_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync>;
 
-    /// Returns the registry label used for name-based lookup.
+    /// Returns the agent's context label.
+    ///
+    /// The label seeds the child-context path and the default model label when
+    /// the runtime executes this agent (see `Engine::ctx_with`). It defaults to
+    /// the lowercase agent name and is not used for name-based lookup, which
+    /// always keys on [`DynAgent::name`].
     fn label(&self) -> &str;
 
     /// Returns the unique agent name.
@@ -276,6 +287,12 @@ where
 #[derive(Default)]
 pub struct AgentSet<C: AgentContext> {
     /// Registered agents keyed by their lowercase function names.
+    ///
+    /// # Invariant
+    /// Keys must be lowercase names satisfying [`validate_function_name`] and
+    /// must equal the agent's own lowercased name. [`AgentSet::add`] enforces
+    /// this; code that mutates this map directly is responsible for upholding it,
+    /// since lookup and dispatch assume lowercase keys.
     pub set: BTreeMap<String, Arc<dyn DynAgent<C>>>,
 }
 
@@ -349,14 +366,20 @@ where
     pub fn definitions(&self, names: Option<&[String]>) -> Vec<FunctionDefinition> {
         match names {
             None => self.set.values().map(|agent| agent.definition()).collect(),
-            Some(names) => names
-                .iter()
-                .filter_map(|name| {
-                    self.set
-                        .get(&name.to_ascii_lowercase())
-                        .map(|agent| agent.definition())
-                })
-                .collect(),
+            Some(names) => {
+                // Deduplicate by lowercase name so repeated requested names do
+                // not emit duplicate schemas (some providers reject those).
+                let mut seen = BTreeSet::new();
+                names
+                    .iter()
+                    .filter_map(|name| {
+                        let key = name.to_ascii_lowercase();
+                        self.set
+                            .get(&key)
+                            .and_then(|agent| seen.insert(key).then(|| agent.definition()))
+                    })
+                    .collect()
+            }
         }
     }
 
@@ -377,17 +400,22 @@ where
                     supported_resource_tags: agent.supported_resource_tags(),
                 })
                 .collect(),
-            Some(names) => names
-                .iter()
-                .filter_map(|name| {
-                    self.set
-                        .get(&name.to_ascii_lowercase())
-                        .map(|agent| Function {
-                            definition: agent.definition(),
-                            supported_resource_tags: agent.supported_resource_tags(),
+            Some(names) => {
+                // Deduplicate by lowercase name (see `definitions`).
+                let mut seen = BTreeSet::new();
+                names
+                    .iter()
+                    .filter_map(|name| {
+                        let key = name.to_ascii_lowercase();
+                        self.set.get(&key).and_then(|agent| {
+                            seen.insert(key).then(|| Function {
+                                definition: agent.definition(),
+                                supported_resource_tags: agent.supported_resource_tags(),
+                            })
                         })
-                })
-                .collect(),
+                    })
+                    .collect()
+            }
         }
     }
 

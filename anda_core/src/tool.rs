@@ -11,7 +11,13 @@
 //! raw JSON call.
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::{any::Any, collections::BTreeMap, future::Future, marker::PhantomData, sync::Arc};
+use std::{
+    any::Any,
+    collections::{BTreeMap, BTreeSet},
+    future::Future,
+    marker::PhantomData,
+    sync::Arc,
+};
 
 use crate::{
     BoxError, BoxFut, BoxPinFut, Function, Json, Resource, ToolInput, ToolOutput,
@@ -36,7 +42,7 @@ where
     ///
     /// # Rules
     /// - Must not be empty;
-    /// - Must not exceed 64 characters;
+    /// - Must not exceed 64 bytes;
     /// - Must start with a lowercase letter;
     /// - Can only contain: lowercase letters (a-z), digits (0-9), underscores (_), and hyphens (-);
     /// - Unique within the engine.
@@ -82,7 +88,7 @@ where
     ///
     /// Runtimes call this once while building the engine.
     fn init(&self, _ctx: C) -> impl Future<Output = Result<(), BoxError>> + Send {
-        futures::future::ready(Ok(()))
+        std::future::ready(Ok(()))
     }
 
     /// Executes the tool with typed arguments and selected resources.
@@ -253,6 +259,11 @@ where
     fn name(&self) -> String;
 
     /// Returns the current function definitions from this provider.
+    ///
+    /// Definition names must satisfy [`validate_function_name`] (lowercase ASCII
+    /// letters, digits, `_`, and `-`, starting with a lowercase letter). The
+    /// registry lowercases names defensively, but providers should return
+    /// already-legal local names so dispatch and discovery stay consistent.
     fn definitions(&self, names: Option<&[String]>) -> Vec<FunctionDefinition>;
 
     /// Returns the capability groups exposed by this provider.
@@ -265,6 +276,10 @@ where
     }
 
     /// Returns whether this provider can currently dispatch the lowercase name.
+    ///
+    /// The default implementation allocates and materializes a definition
+    /// snapshot on every call. Providers on hot dispatch paths should override it
+    /// with a direct lookup (as the MCP provider does).
     fn contains_lowercase(&self, lowercase_name: &str) -> bool {
         self.definitions(Some(&[lowercase_name.to_string()]))
             .iter()
@@ -382,6 +397,12 @@ where
 #[derive(Default)]
 pub struct ToolSet<C: BaseContext> {
     /// Registered tools keyed by their lowercase function names.
+    ///
+    /// # Invariant
+    /// Keys must be lowercase names satisfying [`validate_function_name`] and
+    /// must equal the tool's own lowercased name. [`ToolSet::add`] enforces this;
+    /// code that mutates this map directly is responsible for upholding it, since
+    /// lookup and dispatch assume lowercase keys.
     pub set: BTreeMap<String, Arc<dyn DynTool<C>>>,
 }
 
@@ -389,6 +410,10 @@ pub struct ToolSet<C: BaseContext> {
 #[derive(Default)]
 pub struct ToolProviderSet<C: BaseContext> {
     /// Registered providers keyed by provider name.
+    ///
+    /// # Invariant
+    /// Keys must be lowercase names satisfying [`validate_function_name`].
+    /// [`ToolProviderSet::add`] enforces this; direct mutation must uphold it.
     pub set: BTreeMap<String, Arc<dyn ToolProvider<C>>>,
 }
 
@@ -431,15 +456,21 @@ where
     }
 
     /// Returns dynamic function definitions for all providers or selected names.
+    ///
+    /// Definition names are normalized to lowercase so downstream lookups
+    /// (dispatch, `supported_resource_tags`) stay consistent even if a provider
+    /// returns a mixed-case name, and so duplicate names across providers are
+    /// deduplicated by their canonical lowercase form.
     pub fn definitions(&self, names: Option<&[String]>) -> Vec<FunctionDefinition> {
         match names {
             Some([]) => Vec::new(),
             _ => {
                 let mut definitions = BTreeMap::new();
                 for provider in self.set.values() {
-                    for definition in provider.definitions(names) {
+                    for mut definition in provider.definitions(names) {
+                        definition.name.make_ascii_lowercase();
                         definitions
-                            .entry(definition.name.to_ascii_lowercase())
+                            .entry(definition.name.clone())
                             .or_insert(definition);
                     }
                 }
@@ -477,6 +508,10 @@ where
 
     /// Removes and returns resources supported by the named provider tool.
     pub fn select_resources(&self, name: &str, resources: &mut Vec<Resource>) -> Vec<Resource> {
+        if resources.is_empty() {
+            return Vec::new();
+        }
+
         let lowercase_name = name.to_ascii_lowercase();
         self.set
             .values()
@@ -587,14 +622,20 @@ where
     pub fn definitions(&self, names: Option<&[String]>) -> Vec<FunctionDefinition> {
         match names {
             None => self.set.values().map(|tool| tool.definition()).collect(),
-            Some(names) => names
-                .iter()
-                .filter_map(|name| {
-                    self.set
-                        .get(&name.to_ascii_lowercase())
-                        .map(|tool| tool.definition())
-                })
-                .collect(),
+            Some(names) => {
+                // Deduplicate by lowercase name so repeated requested names do
+                // not emit duplicate schemas (some providers reject those).
+                let mut seen = BTreeSet::new();
+                names
+                    .iter()
+                    .filter_map(|name| {
+                        let key = name.to_ascii_lowercase();
+                        self.set
+                            .get(&key)
+                            .and_then(|tool| seen.insert(key).then(|| tool.definition()))
+                    })
+                    .collect()
+            }
         }
     }
 
@@ -615,22 +656,31 @@ where
                     supported_resource_tags: tool.supported_resource_tags(),
                 })
                 .collect(),
-            Some(names) => names
-                .iter()
-                .filter_map(|name| {
-                    self.set
-                        .get(&name.to_ascii_lowercase())
-                        .map(|tool| Function {
-                            definition: tool.definition(),
-                            supported_resource_tags: tool.supported_resource_tags(),
+            Some(names) => {
+                // Deduplicate by lowercase name (see `definitions`).
+                let mut seen = BTreeSet::new();
+                names
+                    .iter()
+                    .filter_map(|name| {
+                        let key = name.to_ascii_lowercase();
+                        self.set.get(&key).and_then(|tool| {
+                            seen.insert(key).then(|| Function {
+                                definition: tool.definition(),
+                                supported_resource_tags: tool.supported_resource_tags(),
+                            })
                         })
-                })
-                .collect(),
+                    })
+                    .collect()
+            }
         }
     }
 
     /// Removes and returns resources supported by the named tool.
     pub fn select_resources(&self, name: &str, resources: &mut Vec<Resource>) -> Vec<Resource> {
+        if resources.is_empty() {
+            return Vec::new();
+        }
+
         self.set
             .get(&name.to_ascii_lowercase())
             .map(|tool| {
@@ -1257,6 +1307,15 @@ mod tests {
             assert_eq!(selected_definitions.len(), 1);
             assert_eq!(selected_definitions[0].name, "tagged_tool");
             assert_eq!(tool_set.definitions(None).len(), 2);
+
+            // Repeated (case-insensitive) requested names are deduplicated.
+            let duplicate_names = vec![
+                "tagged_tool".to_string(),
+                "TAGGED_TOOL".to_string(),
+                "tagged_tool".to_string(),
+            ];
+            assert_eq!(tool_set.definitions(Some(&duplicate_names)).len(), 1);
+            assert_eq!(tool_set.functions(Some(&duplicate_names)).len(), 1);
 
             let selected_functions = tool_set.functions(Some(&selected_names));
             assert_eq!(selected_functions.len(), 1);

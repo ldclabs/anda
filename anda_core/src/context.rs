@@ -155,8 +155,9 @@ pub trait AgentContext: BaseContext + CompletionFeatures {
 ///
 /// `BaseContext` groups state, cryptographic, storage, caching, and HTTP
 /// capabilities behind a single trait bound. Canister access is intentionally
-/// not part of this bound: runtimes that need it implement [`CanisterCaller`]
-/// separately on their context type.
+/// not part of this bound: runtimes that need it implement
+/// [`CanisterCaller`](ic_cose_types::CanisterCaller) separately on their context
+/// type.
 pub trait BaseContext:
     Sized + StateFeatures + KeysFeatures + StoreFeatures + CacheFeatures + HttpFeatures
 {
@@ -455,6 +456,17 @@ pub trait HttpFeatures: Sized {
 struct CacheStoreValue<T>(T, UpdateVersion);
 
 /// Convenience methods for values backed by both cache and object storage.
+///
+/// # Consistency
+///
+/// These helpers coordinate a cache and a store as two separate operations and
+/// do **not** provide cross-task linearizability. Concurrent writers to the same
+/// key can interleave and leave the cache holding a stale or rolled-back value
+/// until the entry is refreshed or the process restarts. Cache entries written
+/// here never expire on their own. Callers that need last-writer-wins semantics
+/// under concurrency should use the versioned write path
+/// ([`CacheStoreFeatures::cache_store_set`] with a version), whose
+/// compare-and-swap against the store guards the cache update.
 #[async_trait]
 pub trait CacheStoreFeatures: StoreFeatures + CacheFeatures + Send + Sync + 'static {
     /// Initializes a cached value from storage, or creates it with `init` if missing.
@@ -531,9 +543,12 @@ pub trait CacheStoreFeatures: StoreFeatures + CacheFeatures + Send + Sync + 'sta
 
     /// Persists a value to storage and updates the cache on success.
     ///
-    /// When `version` is provided, the write uses an atomic update against that
-    /// storage version. Without a version, the value is written with overwrite
-    /// semantics.
+    /// When `version` is provided, the write uses an atomic compare-and-swap
+    /// against that storage version, so the subsequent cache update reflects a
+    /// linearized write. Without a version, the value is written with overwrite
+    /// semantics: the store write and cache update are not atomic, so concurrent
+    /// unversioned writers may leave the cache on an older value (see the trait's
+    /// consistency notes). Prefer the versioned path for contended keys.
     async fn cache_store_set<T>(
         &self,
         key: &str,
@@ -578,10 +593,17 @@ pub trait CacheStoreFeatures: StoreFeatures + CacheFeatures + Send + Sync + 'sta
     }
 
     /// Deletes a value from both cache and storage.
+    ///
+    /// The store is deleted first, then the cache. Evicting the cache first would
+    /// let a concurrent [`CacheStoreFeatures::cache_store_get`] miss, read the
+    /// still-present store value, and repopulate a ghost cache entry that
+    /// survives the store deletion. Deleting the store first bounds the race to a
+    /// brief stale read that self-heals once the cache entry is removed.
     async fn cache_store_delete(&self, key: &str) -> Result<(), BoxError> {
         let p = Path::from(key);
+        self.store_delete(&p).await?;
         self.cache_delete(key).await;
-        self.store_delete(&p).await
+        Ok(())
     }
 }
 

@@ -72,7 +72,7 @@ impl FromStr for PrefixedId {
 /// The payload is shared by [`Arc`] across every clone (the subscriber's copy and the one
 /// kept in [`BackgroundTaskControls`]), so a subscriber can keep per-task bookkeeping on the
 /// handle itself instead of maintaining a parallel map. Use interior mutability (e.g.
-/// [`Mutex`]) inside the payload when it must change over the task's lifetime.
+/// [`Mutex`](std::sync::Mutex)) inside the payload when it must change over the task's lifetime.
 #[derive(Clone)]
 pub struct BackgroundHandle {
     task_id: String,

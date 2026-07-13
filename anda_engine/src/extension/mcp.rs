@@ -181,6 +181,10 @@ impl McpToolProvider {
 
     /// Removes a server along with its session, routes, and any pending
     /// authorization state. Returns whether the server had been registered.
+    ///
+    /// Persisted OAuth credentials in the [`McpCredentialStore`] are left intact;
+    /// clear them separately (`store.clear(server_id)`) if removal should also
+    /// drop stored access and refresh tokens.
     pub fn remove_server(&self, server_id: &str) -> bool {
         let existed = self.contains_server(server_id);
         self.remove_server_state(server_id);
@@ -1140,12 +1144,12 @@ impl McpStdioTransport {
 }
 
 /// Streamable HTTP transport configuration.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 pub struct McpStreamableHttpTransport {
     /// MCP endpoint URL.
     pub url: String,
-    /// Bearer token value, without the `Bearer ` prefix. Ignored when [`auth`]
-    /// is set.
+    /// Bearer token value, without the `Bearer ` prefix. Mutually exclusive with
+    /// [`auth`]: setting both is a validation error.
     ///
     /// [`auth`]: Self::auth
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1154,12 +1158,29 @@ pub struct McpStreamableHttpTransport {
     /// requests.
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
-    /// Optional OAuth 2.1 authorization. When set, [`bearer_token`] is ignored
-    /// and access tokens are obtained/refreshed through the configured flow.
+    /// Optional OAuth 2.1 authorization. Mutually exclusive with [`bearer_token`]
+    /// (setting both is a validation error); access tokens are obtained and
+    /// refreshed through the configured flow.
     ///
     /// [`bearer_token`]: Self::bearer_token
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<McpOAuthConfig>,
+}
+
+// Custom `Debug` to keep the static bearer token out of logs and error output.
+// The `auth` field redacts its own secrets (see `OAuthClientCredentialsConfig`).
+impl std::fmt::Debug for McpStreamableHttpTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpStreamableHttpTransport")
+            .field("url", &self.url)
+            .field(
+                "bearer_token",
+                &self.bearer_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("headers", &self.headers)
+            .field("auth", &self.auth)
+            .finish()
+    }
 }
 
 impl McpStreamableHttpTransport {
@@ -1271,7 +1292,7 @@ impl OAuthAuthorizationCodeConfig {
 }
 
 /// Configuration for the headless OAuth Client Credentials flow.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct OAuthClientCredentialsConfig {
     /// Confidential client id.
     pub client_id: String,
@@ -1283,6 +1304,19 @@ pub struct OAuthClientCredentialsConfig {
     /// Optional explicit resource indicator (RFC 8707).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource: Option<String>,
+}
+
+// Custom `Debug` to keep the client secret out of logs and error output, matching
+// how `rmcp` redacts its own credential types.
+impl std::fmt::Debug for OAuthClientCredentialsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OAuthClientCredentialsConfig")
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"[REDACTED]")
+            .field("scopes", &self.scopes)
+            .field("resource", &self.resource)
+            .finish()
+    }
 }
 
 impl OAuthClientCredentialsConfig {
@@ -1796,12 +1830,44 @@ done
     }
 
     #[test]
+    fn debug_output_redacts_secrets() {
+        // A client secret must never appear in `Debug` output.
+        let cfg = OAuthClientCredentialsConfig {
+            client_id: "cid".to_string(),
+            client_secret: "super-secret-value".to_string(),
+            scopes: vec![],
+            resource: None,
+        };
+        let rendered = format!("{cfg:?}");
+        assert!(!rendered.contains("super-secret-value"), "{rendered}");
+        assert!(rendered.contains("cid"), "{rendered}");
+        assert!(rendered.contains("[REDACTED]"), "{rendered}");
+
+        // Neither a static bearer token nor an embedded client secret must leak
+        // through the full `McpServerConfig` -> transport `Debug` chain.
+        let mut server = McpServerConfig::streamable_http("svc", "https://example.com/mcp");
+        if let McpTransportConfig::StreamableHttp(http) = &mut server.transport {
+            http.bearer_token = Some("super-secret-token".to_string());
+        }
+        let rendered = format!("{server:?}");
+        assert!(!rendered.contains("super-secret-token"), "{rendered}");
+        assert!(rendered.contains("[REDACTED]"), "{rendered}");
+
+        let mut server = McpServerConfig::streamable_http("svc", "https://example.com/mcp");
+        if let McpTransportConfig::StreamableHttp(http) = &mut server.transport {
+            http.auth = Some(McpOAuthConfig::ClientCredentials(cfg));
+        }
+        let rendered = format!("{server:?}");
+        assert!(!rendered.contains("super-secret-value"), "{rendered}");
+    }
+
+    #[test]
     fn validate_rejects_incomplete_oauth_configs() {
         let mut server = http_auth_code_server("gh", None);
-        if let McpTransportConfig::StreamableHttp(http) = &mut server.transport {
-            if let Some(McpOAuthConfig::AuthorizationCode(ac)) = &mut http.auth {
-                ac.redirect_uri = "  ".to_string();
-            }
+        if let McpTransportConfig::StreamableHttp(http) = &mut server.transport
+            && let Some(McpOAuthConfig::AuthorizationCode(ac)) = &mut http.auth
+        {
+            ac.redirect_uri = "  ".to_string();
         }
         assert!(server.validate().is_err());
 
