@@ -458,7 +458,14 @@ impl StoreFeatures for BaseCtx {
         prefix: Option<&Path>,
         offset: &Path,
     ) -> Result<Vec<ObjectMeta>, BoxError> {
-        self.store.store_list(&self.path, prefix, offset).await
+        // Strip the ctx namespace prefix from `prefix`/`offset` the same way
+        // get/put/rename/delete do, so a returned `ObjectMeta.location` can be
+        // fed back as `offset` for pagination on a non-root ctx without
+        // acquiring a doubled namespace prefix.
+        let prefix = prefix.map(|p| self.try_strip_prefix_path(p));
+        self.store
+            .store_list(&self.path, prefix.as_deref(), &self.try_strip_prefix_path(offset))
+            .await
     }
 
     /// Stores data at the specified path with a given write mode.

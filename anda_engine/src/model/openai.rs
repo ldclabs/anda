@@ -14,7 +14,8 @@
 
 use anda_core::{
     AgentOutput, BoxError, BoxPinFut, CompletionRequest, ContentPart, FunctionDefinition, Json,
-    Message, Usage as ModelUsage, inline_data_from_data_url, part_to_data_url,
+    Message, Usage as ModelUsage, inline_data_from_data_url, normalize_strict_schema,
+    part_to_data_url,
 };
 use log::{Level::Debug, log_enabled};
 use serde::{Deserialize, Serialize};
@@ -1682,7 +1683,20 @@ impl CompletionFeaturesDyn for CompletionModel {
                 r.reasoning_effort = Some(effort.into());
             }
 
-            if let Some(json_schema) = req.output_schema {
+            if let Some(output_schema) = req.output_schema {
+                // The Chat Completions API requires the `json_schema` field to be
+                // a `{name, schema, strict?}` wrapper, not a bare JSON schema.
+                // Mirror the v2 (Responses) path so structured-output requests are
+                // well-formed on the Chat path too.
+                let json_schema = serde_json::to_value(JsonSchemaResponseFormat {
+                    name: "structured_output".to_string(),
+                    description: None,
+                    schema: normalize_strict_schema(output_schema)
+                        .as_object()
+                        .cloned()
+                        .unwrap_or_default(),
+                    strict: Some(true),
+                })?;
                 r.response_format = Some(ResponseFormat::JsonSchema { json_schema });
             }
 
@@ -1704,6 +1718,15 @@ impl CompletionFeaturesDyn for CompletionModel {
                     });
                 }
             };
+
+            // Real OpenAI streaming omits usage unless `stream_options.include_usage`
+            // is requested, which would leave billing and context budgeting at 0.
+            if r.stream == Some(true) && r.stream_options.is_none() {
+                r.stream_options = Some(ChatCompletionStreamOptions {
+                    include_usage: Some(true),
+                    ..Default::default()
+                });
+            }
 
             if log_enabled!(Debug)
                 && let Ok(val) = serde_json::to_string(&r)
@@ -2418,6 +2441,16 @@ mod tests {
         assert_eq!(sent["stop"], json!(["END"]));
         assert_eq!(sent["reasoning_effort"], "low");
         assert_eq!(sent["response_format"]["type"], "json_schema");
+        // The Chat path must wrap the schema as `{name, schema, strict}`.
+        assert_eq!(
+            sent["response_format"]["json_schema"]["name"],
+            "structured_output"
+        );
+        assert_eq!(sent["response_format"]["json_schema"]["strict"], true);
+        assert_eq!(
+            sent["response_format"]["json_schema"]["schema"]["type"],
+            "object"
+        );
         assert_eq!(sent["tool_choice"], "required");
         assert_eq!(sent["tools"][0]["function"]["name"], "lookup");
     }

@@ -45,8 +45,18 @@ const COMPLETION_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const COMPLETION_READ_TIMEOUT: Duration = Duration::from_secs(180);
 const COMPLETION_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// Upper bound on the number of bytes buffered from a completion response.
+///
+/// Guards against a runaway or malicious provider streaming an unbounded body
+/// and exhausting memory. Text completion responses are far smaller than this
+/// in practice.
+const MAX_COMPLETION_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
 /// Serializable configuration for constructing a model adapter.
-#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+///
+/// [`Debug`] is implemented manually so the `api_key` is redacted and never
+/// leaks through `{:?}` logging.
+#[derive(Default, Clone, Deserialize, Serialize)]
 pub struct ModelConfig {
     /// Provider family, such as `gemini`, `anthropic`, or `openai`.
     pub family: String,
@@ -94,6 +104,31 @@ pub struct ModelConfig {
     #[serde(default)]
     /// Whether to request streaming completions from this model.
     pub stream: bool,
+}
+
+impl std::fmt::Debug for ModelConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModelConfig")
+            .field("family", &self.family)
+            .field("model", &self.model)
+            .field("api_base", &self.api_base)
+            .field(
+                "api_key",
+                &if self.api_key.is_empty() {
+                    ""
+                } else {
+                    "[REDACTED]"
+                },
+            )
+            .field("labels", &self.labels)
+            .field("context_window", &self.context_window)
+            .field("max_output", &self.max_output)
+            .field("effort", &self.effort)
+            .field("disabled", &self.disabled)
+            .field("bearer_auth", &self.bearer_auth)
+            .field("stream", &self.stream)
+            .finish()
+    }
 }
 
 impl ModelConfig {
@@ -222,11 +257,31 @@ impl Models {
     }
 
     /// Builds a registry from model configs by registering every resolved label.
+    ///
+    /// Configs explicitly marked `disabled` are skipped quietly (info level);
+    /// configs that fail to build because of a misconfiguration are skipped with
+    /// a warning so the problem is not lost silently.
     pub fn from_configs(configs: &[ModelConfig], http_client: reqwest::Client) -> Self {
         let models = Self::default();
         for config in configs {
-            if let Ok(model) = config.model(http_client.clone()) {
-                models.inner_set(model.labels.clone(), model);
+            if config.disabled {
+                log::info!(
+                    "skipping disabled model: family={}, model={}",
+                    config.family,
+                    config.model
+                );
+                continue;
+            }
+            match config.model(http_client.clone()) {
+                Ok(model) => models.inner_set(model.labels.clone(), model),
+                Err(err) => {
+                    log::warn!(
+                        "skipping misconfigured model: family={}, model={}, error={}",
+                        config.family,
+                        config.model,
+                        err
+                    );
+                }
             }
         }
         models
@@ -667,13 +722,50 @@ pub(crate) async fn read_completion_response_bytes(
     model: &str,
 ) -> Result<bytes::Bytes, BoxError> {
     let request_id = upstream_request_id(response.headers());
-    response.bytes().await.map_err(|err| {
-        let action = format!(
-            "Failed to read completion response (request_id: {})",
-            request_id.as_deref().unwrap_or("-")
-        );
-        completion_transport_error(model, &action, err)
-    })
+    // Reject up front when the declared length already exceeds the cap.
+    if let Some(len) = response.content_length()
+        && len > MAX_COMPLETION_RESPONSE_BYTES as u64
+    {
+        return Err(completion_response_too_large(model, request_id.as_deref(), len as usize));
+    }
+
+    // Stream the body so the size cap is enforced even when no `Content-Length`
+    // is provided.
+    let mut stream = response.bytes_stream();
+    let mut body: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|err| {
+            let action = format!(
+                "Failed to read completion response (request_id: {})",
+                request_id.as_deref().unwrap_or("-")
+            );
+            completion_transport_error(model, &action, err)
+        })?;
+        if body.len() + chunk.len() > MAX_COMPLETION_RESPONSE_BYTES {
+            return Err(completion_response_too_large(
+                model,
+                request_id.as_deref(),
+                body.len() + chunk.len(),
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body.into())
+}
+
+/// Builds the error returned when a completion response exceeds the size cap.
+fn completion_response_too_large(
+    model: &str,
+    request_id: Option<&str>,
+    received: usize,
+) -> BoxError {
+    Box::new(ModelError::new(format!(
+        "Completion response too large (model: {}, request_id: {}, received: {} bytes, limit: {} bytes)",
+        model,
+        request_id.unwrap_or("-"),
+        received,
+        MAX_COMPLETION_RESPONSE_BYTES,
+    )))
 }
 
 pub(crate) async fn execute_completion_request_with_retry<T, BuildRequest, HandleResponse, Fut>(
@@ -910,6 +1002,13 @@ where
             );
             completion_transport_error(model, &action, err)
         })?;
+        if body.len() + chunk.len() > MAX_COMPLETION_RESPONSE_BYTES {
+            return Err(completion_response_too_large(
+                model,
+                request_id.as_deref(),
+                body.len() + chunk.len(),
+            ));
+        }
         body.extend_from_slice(&chunk);
         // Only scan the unscanned tail (with marker-sized overlap), so long
         // streams are not rescanned from the start on every chunk.

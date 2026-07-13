@@ -319,6 +319,13 @@ fn finalize_content_block(
     let Some(partial_json) = json_buffers.remove(&index) else {
         return;
     };
+    // An empty (or whitespace-only) buffer means a no-argument tool call. Keep
+    // the block's existing `input` (initialized to `{}` by `content_block_start`)
+    // instead of overwriting it with an empty string, mirroring the official
+    // SDK's `JSON.parse(buf || "{}")` guard.
+    if partial_json.trim().is_empty() {
+        return;
+    }
     let input = serde_json::from_str::<Value>(&partial_json).unwrap_or(Value::String(partial_json));
     if let Some(Some(
         types::ContentBlock::ToolUse { input: target, .. }

@@ -926,7 +926,48 @@ struct McpToolIndex {
 impl McpToolIndex {
     fn replace_server_routes(&mut self, server_id: &str, routes: Vec<McpToolRoute>) {
         self.routes.retain(|_, route| route.server_id != server_id);
-        for route in routes {
+        for mut route in routes {
+            // Cross-server local-name collision: another server already owns
+            // this local name. Intra-server dedup in `routes_for_tools` cannot
+            // see other servers, so disambiguate the newcomer here with a stable
+            // hash suffix. Without this, a compromised server could publish a
+            // tool whose local name shadows another server's, hijacking calls.
+            if self
+                .routes
+                .get(&route.name)
+                .is_some_and(|existing| existing.server_id != route.server_id)
+            {
+                let disambiguated = shorten_with_hash(
+                    &route.name,
+                    &format!("{}:{}", route.server_id, route.remote_name),
+                );
+                log::warn!(
+                    "MCP local tool name collision on {:?}; remapping server {:?} tool {:?} to {:?}",
+                    route.name,
+                    route.server_id,
+                    route.remote_name,
+                    disambiguated
+                );
+                route.name = disambiguated.clone();
+                route.definition.name = disambiguated;
+            }
+
+            // If the disambiguated name still collides with a different server,
+            // drop the tool rather than silently hijack an existing route.
+            if self
+                .routes
+                .get(&route.name)
+                .is_some_and(|existing| existing.server_id != route.server_id)
+            {
+                log::error!(
+                    "MCP tool {:?} from server {:?} dropped: local name {:?} still collides",
+                    route.remote_name,
+                    route.server_id,
+                    route.name
+                );
+                continue;
+            }
+
             self.routes.insert(route.name.clone(), route);
         }
     }
@@ -1763,6 +1804,48 @@ done
         assert_eq!(routes[0].remote_name, "issues/get");
         assert!(routes[0].definition.description.contains("Fetch an issue"));
         assert_eq!(routes[0].definition.strict, Some(false));
+    }
+
+    #[test]
+    fn cross_server_local_name_collision_is_disambiguated() {
+        let provider = McpToolProvider::new(vec![
+            McpServerConfig::stdio("github", "server"),
+            McpServerConfig::stdio("github_prod", "server"),
+        ])
+        .unwrap();
+
+        // Both resolve to the same local name `mcp_github_prod_list_issues`.
+        let a = provider
+            .routes_for_tools("github", vec![tool("prod_list_issues", "A")])
+            .unwrap();
+        let b = provider
+            .routes_for_tools("github_prod", vec![tool("list_issues", "B")])
+            .unwrap();
+        assert_eq!(a[0].name, "mcp_github_prod_list_issues");
+        assert_eq!(a[0].name, b[0].name, "the two servers' local names collide");
+
+        {
+            let mut index = provider.inner.index.write();
+            index.replace_server_routes("github", a);
+            index.replace_server_routes("github_prod", b);
+        }
+
+        let routes = provider.routes();
+        let github = routes
+            .iter()
+            .find(|route| route.server_id == "github")
+            .expect("github route retained");
+        let github_prod = routes
+            .iter()
+            .find(|route| route.server_id == "github_prod")
+            .expect("github_prod route retained");
+
+        // The first server keeps the un-suffixed name; the colliding newcomer is
+        // remapped so its calls are never routed to the other server's tool.
+        assert_eq!(github.name, "mcp_github_prod_list_issues");
+        assert_ne!(github_prod.name, github.name);
+        assert_eq!(github_prod.remote_name, "list_issues");
+        assert_eq!(github_prod.definition.name, github_prod.name);
     }
 
     fn http_auth_code_server(id: &str, client_id: Option<&str>) -> McpServerConfig {

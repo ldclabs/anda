@@ -57,6 +57,7 @@ use anda_core::{
     validate_function_name,
 };
 use candid::Principal;
+use ic_auth_types::deterministic_cbor_into_vec;
 use object_store::memory::InMemory;
 use std::{
     collections::{BTreeSet, HashMap},
@@ -170,6 +171,14 @@ impl Engine {
     ) -> Result<AgentCtx, BoxError> {
         let name = agent_name.to_ascii_lowercase();
 
+        // Enforce the same visibility rules as `agent_run`; this public entry
+        // point must not let a caller bypass the anonymous/private/protected
+        // checks and obtain a caller-scoped context.
+        let visibility = self.management.check_visibility(&caller)?;
+        if visibility == Visibility::Protected && !self.management.is_manager(&caller) {
+            return Err("caller does not have permission".into());
+        }
+
         // manager can access any agent
         if (!self.export_agents.contains(&name) && !self.management.is_manager(&caller))
             || !self.ctx.agents.contains(&name)
@@ -193,6 +202,22 @@ impl Engine {
         meta: RequestMeta,
     ) -> Result<BaseCtx, BoxError> {
         let name = tool_name.to_ascii_lowercase();
+        let agent = agent_name.to_ascii_lowercase();
+
+        // Enforce the same visibility rules as `tool_call`; this public entry
+        // point must not let a caller bypass the anonymous/private/protected
+        // checks and obtain a caller-scoped context.
+        let visibility = self.management.check_visibility(&caller)?;
+        if visibility == Visibility::Protected && !self.management.is_manager(&caller) {
+            return Err("caller does not have permission".into());
+        }
+
+        // The agent name scopes per-agent storage (e.g. notes/todos). Reject an
+        // unregistered name so a caller cannot forge a namespace and read or
+        // write another agent's data.
+        if !self.ctx.agents.contains(&agent) {
+            return Err(format!("agent {} not found", agent).into());
+        }
 
         // manager can access any tool
         if (!self.export_tools.contains(&name) && !self.management.is_manager(&caller))
@@ -201,12 +226,7 @@ impl Engine {
             return Err(format!("tool {} not found", name).into());
         }
 
-        self.ctx.child_base_with(
-            caller,
-            agent_name.to_ascii_lowercase().as_str(),
-            &name,
-            meta,
-        )
+        self.ctx.child_base_with(caller, &agent, &name, meta)
     }
 
     /// Executes an agent request.
@@ -241,26 +261,44 @@ impl Engine {
         } else {
             input.name.to_ascii_lowercase()
         };
+
+        // Run the caller/visibility checks before looking up the agent so an
+        // unauthorized caller cannot tell a registered-but-not-exported agent
+        // apart from a non-existent one via differing error messages.
+        let visibility = self.management.check_visibility(&caller)?;
+        if visibility == Visibility::Protected && !self.management.is_manager(&caller) {
+            return Err("caller does not have permission".into());
+        }
+
         let agent = self
             .ctx
             .agents
             .get(&input.name)
             .ok_or_else(|| format!("agent {} not found", input.name))?;
 
-        let visibility = self.management.check_visibility(&caller)?;
-        if visibility == Visibility::Protected && !self.management.is_manager(&caller) {
-            return Err("caller does not have permission".into());
-        }
-
         let ctx = self.ctx_with(caller, &input.name, agent.label(), meta)?;
         self.hooks.on_agent_start(&ctx, &input.name).await?;
 
-        let output = agent
-            .run(ctx.clone(), input.prompt, input.resources)
-            .await?;
-        let mut output = self.hooks.on_agent_end(&ctx, &input.name, output).await?;
-        output.raw_history.clear(); // clear raw history
-        Ok(output)
+        // Always run `on_agent_end` so start/end-paired hooks (e.g. the
+        // per-caller lease in `SingleThreadHook`) are released even when the
+        // agent fails. On the error path the end hooks receive a placeholder
+        // output that carries the failure reason and the original error is
+        // returned to the caller.
+        match agent.run(ctx.clone(), input.prompt, input.resources).await {
+            Ok(output) => {
+                let mut output = self.hooks.on_agent_end(&ctx, &input.name, output).await?;
+                output.raw_history.clear(); // clear raw history
+                Ok(output)
+            }
+            Err(err) => {
+                let placeholder = AgentOutput {
+                    failed_reason: Some(err.to_string()),
+                    ..Default::default()
+                };
+                let _ = self.hooks.on_agent_end(&ctx, &input.name, placeholder).await;
+                Err(err)
+            }
+        }
     }
 
     /// Calls a registered tool directly.
@@ -310,13 +348,25 @@ impl Engine {
             .child_base_with(caller, &self.default_agent, &tool_name, meta)?;
         self.hooks.on_tool_start(&ctx, &tool_name).await?;
 
-        let output = if let Some(tool) = self.ctx.tools.get(&tool_name) {
-            tool.call(ctx.clone(), input.args, input.resources).await?
+        // Always run `on_tool_end` so start/end-paired hooks release their
+        // accounting even when the tool call fails.
+        let result = if let Some(tool) = self.ctx.tools.get(&tool_name) {
+            tool.call(ctx.clone(), input.args, input.resources).await
         } else {
-            self.ctx.tool_providers.call(ctx.clone(), input).await?
+            self.ctx.tool_providers.call(ctx.clone(), input).await
         };
-        let res = self.hooks.on_tool_end(&ctx, &tool_name, output).await?;
-        Ok(res)
+        match result {
+            Ok(output) => Ok(self.hooks.on_tool_end(&ctx, &tool_name, output).await?),
+            Err(err) => {
+                let placeholder = ToolOutput {
+                    output: Json::Null,
+                    is_error: Some(true),
+                    ..Default::default()
+                };
+                let _ = self.hooks.on_tool_end(&ctx, &tool_name, placeholder).await;
+                Err(err)
+            }
+        }
     }
 
     /// Returns metadata for registered agents.
@@ -352,12 +402,35 @@ impl Engine {
     /// Signs a challenge request with the configured Web3 or TEE identity.
     ///
     /// TEE-backed engines include attestation data in the returned envelope.
+    ///
+    /// # Security
+    /// The engine only endorses a challenge whose [`AgentInfo`] matches its own
+    /// published [`Engine::information`] payload. Without this check the engine
+    /// would sign, with its on-chain identity, an attacker-supplied `AgentInfo`
+    /// carrying a forged handle/endpoint that could then be submitted to the
+    /// registry to hijack the engine's registry entry. Challenge-code freshness
+    /// only guards against replay, not against endorsing content the engine
+    /// never authored. This method performs no caller authorization; hosts that
+    /// expose it should still verify the challenger belongs to the registry the
+    /// engine intends to register with.
     pub async fn challenge(
         &self,
         request: ChallengeRequest,
     ) -> Result<ChallengeEnvelope, BoxError> {
         let now_ms = unix_ms();
         request.verify(now_ms, request.registry)?;
+
+        // Endorse only agent info identical to this engine's own info.
+        // `AgentInfo` does not implement `PartialEq`, so compare deterministic
+        // CBOR encodings.
+        let expected = deterministic_cbor_into_vec(&self.info)
+            .map_err(|err| format!("failed to serialize engine info: {err}"))?;
+        let got = deterministic_cbor_into_vec(&request.agent)
+            .map_err(|err| format!("failed to serialize challenge agent info: {err}"))?;
+        if expected != got {
+            return Err("challenge agent info does not match this engine".into());
+        }
+
         let message_digest = request.digest();
         let web3 = self.ctx.base.web3.as_ref();
         let authentication = web3.sign_envelope(message_digest).await?;
@@ -638,6 +711,28 @@ impl EngineBuilder {
         self
     }
 
+    /// Validates that exported names resolve to registered functions so a
+    /// misspelled export is not silently ignored.
+    ///
+    /// Agents are fully known at build time, so an unknown exported agent is a
+    /// hard error. Tools may be supplied by dynamic providers that load lazily,
+    /// so an unresolved exported tool is only a warning.
+    fn check_exports(&self) -> Result<(), BoxError> {
+        for name in &self.export_agents {
+            if !self.agents.contains(name) {
+                return Err(format!("exported agent {} not found", name).into());
+            }
+        }
+        for name in &self.export_tools {
+            if !self.tools.contains_lowercase(name)
+                && !self.tool_providers.contains_lowercase(name)
+            {
+                log::warn!("exported tool {name} is not registered (possible typo)");
+            }
+        }
+        Ok(())
+    }
+
     /// Sets the hooks for the engine.
     pub fn with_hooks(mut self, hooks: Arc<Hooks>) -> Self {
         self.hooks = hooks;
@@ -665,6 +760,7 @@ impl EngineBuilder {
     /// This is mainly useful for tests or management-only engines. Most
     /// production engines should use [`EngineBuilder::build`].
     pub async fn empty(self) -> Result<Engine, BoxError> {
+        self.check_exports()?;
         let id = self.web3.as_ref().get_principal();
         let mut names: BTreeSet<Path> = self
             .tools
@@ -679,6 +775,10 @@ impl EngineBuilder {
             )
             .collect();
         names.insert(Path::from(SYSTEM_PATH));
+        // The root `BaseCtx` uses the empty path; register it so root-level
+        // cache lookups (e.g. dynamic remote-engine resolution) can hit memory
+        // instead of always falling through to the store backend.
+        names.insert(Path::default());
         let ctx = BaseCtx::new(
             id,
             self.info.name.clone(),
@@ -750,6 +850,7 @@ impl EngineBuilder {
         self.export_agents.insert(default_agent.clone());
 
         self.info.validate()?;
+        self.check_exports()?;
         let id = self.web3.as_ref().get_principal();
         let mut names: BTreeSet<Path> = self
             .tools
@@ -764,6 +865,10 @@ impl EngineBuilder {
             )
             .collect();
         names.insert(Path::from(SYSTEM_PATH));
+        // The root `BaseCtx` uses the empty path; register it so root-level
+        // cache lookups (e.g. dynamic remote-engine resolution) can hit memory
+        // instead of always falling through to the store backend.
+        names.insert(Path::default());
 
         let mut remote = RemoteEngines::new();
         for (_, engine) in self.remote {
@@ -845,6 +950,10 @@ impl EngineBuilder {
             )
             .collect();
         names.insert(Path::from(SYSTEM_PATH));
+        // The root `BaseCtx` uses the empty path; register it so root-level
+        // cache lookups (e.g. dynamic remote-engine resolution) can hit memory
+        // instead of always falling through to the store backend.
+        names.insert(Path::default());
         let ctx = BaseCtx::new(
             Principal::anonymous(),
             "Mocker".to_string(),

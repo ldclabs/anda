@@ -24,6 +24,41 @@ All notable changes to the Anda project will be documented in this file.
 - **`RemoteError` error variant** — Split from `ResultError` so callers can distinguish transport-level decode failures from application-level remote errors.
 - **Documents closing-tag injection guard** — `Documents::Display` neutralizes literal `</tag>` delimiters inside untrusted attachment content (case-insensitive), preventing document content from closing the block early.
 
+### Added — anda_engine v0.14.2 (continued)
+
+- **Subagent execution-time tool allowlist** — `CompletionRunner::set_allowed_callables` enforces the subagent's tool whitelist at dispatch time, not just in the definitions sent to the model. An empty allowlist rejects every call; discovered tools (from allowed discovery tools) are granted implicitly.
+- **Completion response body cap** — `MAX_COMPLETION_RESPONSE_BYTES` (64 MiB) guards against a runaway or malicious provider streaming unbounded body. Enforced with streaming chunk-by-chunk guard; `Content-Length` is pre-checked before the first byte.
+- **ModelConfig api_key redacted from Debug** — Custom `Debug` impl replaces the `api_key` field with `[REDACTED]` so a `{:?}` log line never leaks a credential.
+- **Export name validation** — `EngineBuilder::check_exports` rejects misspelled agent names (hard error) and warns on unresolved tool names before the engine starts.
+- **Root-level cache namespace** — `Path::default()` is registered on every engine so root-context `cache_get_with` calls (e.g. dynamic remote-engine resolution) hit memory instead of always falling through to the store.
+
+### Changed — anda_engine v0.14.2 (continued)
+
+- **RemoteTool / RemoteAgent cleanup** — Removed the stale `engine: Principal` field; the target engine is resolved from `endpoint` at call time. `RemoteAgent` no longer lowercases a caller-provided name (the caller is expected to supply an already-valid lowercase name, consistent with `RemoteTool`).
+- **Resource selection fixed for remote tools/agents** — `select_tool_resources` / `select_agent_resources` now use the same longest-handle + exact-name resolution as endpoint routing, so resources always match the engine/tool the call is routed to even with overlapping handle prefixes.
+- **Engine visibility checks hardened** — `ctx_with` and `ctx_with_base` now enforce anonymous/private/protected rules (previously only `agent_run` and `tool_call` did). `ctx_with_base` also validates the agent name before creating the context.
+- **Anonymous principal excluded from management** — `is_controller` and `is_manager` reject the anonymous principal even when the engine was built without a Web3 identity and `controller` defaults to anonymous.
+- **Agent/tool end hooks always paired with start** — `agent_run` and `tool_call` now invoke `on_agent_end` / `on_tool_end` on the failure path (with a placeholder output) so hooks that track leases (e.g. `SingleThreadHook`) release their accounting.
+- **Challenge endorsement guard** — `Engine::challenge` validates that the request's `AgentInfo` matches the engine's own info (deterministic CBOR comparison) before signing, preventing registry entry hijacking via forged agent-info payloads.
+- **File search always canonicalizes** — Every path match is now canonicalized and re-checked against the workspace root, closing the symlink escape: a workspace-internal directory symlink pointing outside can no longer enumerate external filenames.
+- **ToolsSearch wildcard returns names only** — The `*` query now enumerates name + description (no parameter schema) and is capped at 64 results, keeping listing cheap and preventing context-window blowout.
+- **Store list strips namespace prefix** — `store_list` strips the context namespace from `prefix`/`offset` so a returned `ObjectMeta.location` can be fed back as pagination `offset` on a non-root context without a doubled namespace.
+- **Cache `get_with` preserves error source chain** — `CacheInitError` wraps the initializer error instead of flattening it to a string, so downstream code can downcast for retryable/status signals.
+- **Models::from_configs** — Disabled models are skipped with `info!`; misconfigured models that fail to build are skipped with `warn!` instead of being swallowed silently.
+- **OpenAI Chat Completions** — `response_format.json_schema` now wraps the schema in the required `{name, schema, strict}` envelope; streaming requests request `stream_options.include_usage` for billing tracking; `CompletionResponse` populates the `model` field.
+- **Gemini** — `tool_choice_required` is honored via `FunctionCallingMode::Any`; `tool_use_prompt_token_count` moved from `output_tokens` to `input_tokens` (it is an input-side count, distinct from `prompt_token_count`).
+- **Anthropic** — Empty/whitespace-only partial JSON in a tool-use block finalization now preserves the existing `{}` default instead of overwriting with an empty string, matching the official SDK's `JSON.parse(buf || \"{}\")` guard.
+
+### Fixed — anda_engine v0.14.2
+
+- **Context compaction recovery** — A transport failure during the summarization turn now restores the runner's tools, discovered tools, queued input, and unbound flag; a retry finds a usable runner instead of a permanently tool-less one.
+- **Subagent allowlist survives compaction** — `handoff` now carries `allowed_callables` into the replacement runner. Without this the subagent tool whitelist was silently dropped on the first context compaction, letting the subagent call any callable in the engine afterwards.
+- **Unanswered tool calls flushed in discard** — `discard_in_flight_request` now unconditionally closes unanswered tool calls in the visible history, fixing the case where the tool round executed but the follow-up model call failed (pending calls drained, but visible history still held a `ToolCall` with no result — unreplayable by providers).
+- **MCP cross-server local-name collision** — When two MCP servers produce the same local tool name, the newcomer is disambiguated with a stable hash suffix. If the disambiguated name still collides, the tool is dropped with an error log instead of silently hijacking another server's route.
+- **File search symlink escape** — Previously a workspace-internal directory symlink pointing outside let a plain pattern enumerate external filenames. All matches are now canonicalized against the workspace root.
+- **Memory expiry no longer deletes shared resources** — `delete_expired_conversations` now leaves resources intact because they are content-deduplicated and may be shared by other active conversations; reclaiming orphans requires a dedicated reference-counted GC pass.
+- **Gemini token miscount** — `tool_use_prompt_token_count` was incorrectly added to `output_tokens` instead of `input_tokens`, inflating the output count and undercounting input.
+
 ### Changed — anda_core v0.14.2
 
 - **Serde buffering replaces `serde_json::Value` for `ContentPart`** — Deserialization now uses serde's untagged/type-tagged machinery directly, preserving CBOR byte strings (`InlineData.data`, `Principal`, `Action.signature`) across RPC round-trips that previously lost them through the JSON intermediate.

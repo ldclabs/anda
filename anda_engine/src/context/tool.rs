@@ -84,6 +84,19 @@ impl ToolsSearch {
 
         let total_tools = tools.len();
         if normalized_query == "*" {
+            // Wildcard enumerates names only (name + description, no schema) so
+            // listing everything stays cheap; the model calls a specific tool or
+            // a keyword search to obtain the full schema. Capped like any search.
+            let tools: Vec<FunctionDefinition> = tools
+                .into_iter()
+                .take(MAX_SEARCH_RESULTS)
+                .map(|definition| FunctionDefinition {
+                    name: definition.name,
+                    description: definition.description,
+                    parameters: json!({}),
+                    strict: None,
+                })
+                .collect();
             return ToolsOutput {
                 tools,
                 total_tools,
@@ -98,7 +111,12 @@ impl ToolsSearch {
 
         let mut tools_name =
             rank_search_items(&tools, &normalized_query, &normalized_tokens, false);
-        tools_name.truncate(if args.limit == 0 { 10 } else { args.limit });
+        let limit = if args.limit == 0 {
+            10
+        } else {
+            args.limit.min(MAX_SEARCH_RESULTS)
+        };
+        tools_name.truncate(limit);
         let tools = select_requested_definitions(tools, &tools_name);
         ToolsOutput {
             tools,
@@ -216,6 +234,9 @@ impl Default for ToolsSelect {
 
 const MAX_SELECTOR_LIMIT: usize = 16;
 const MAX_SELECTOR_CANDIDATE_LIMIT: usize = 1000;
+/// Upper bound on the number of matches [`ToolsSearch`] returns, so a single
+/// search (including the `*` wildcard) cannot blow up the context window.
+const MAX_SEARCH_RESULTS: usize = 64;
 
 impl ToolsSelect {
     /// Function name used when registering the selection helper.
@@ -765,8 +786,10 @@ mod tests {
     use crate::{
         context::BaseCtx,
         engine::{Engine, EngineBuilder},
+        management::{BaseManagement, Visibility},
         model::{CompletionFeaturesDyn, Model, Models},
     };
+    use std::collections::BTreeSet;
 
     struct EchoTool;
 
@@ -1177,7 +1200,17 @@ mod tests {
     }
 
     async fn build_engine(builder: EngineBuilder) -> Engine {
-        builder.build("echo_agent".to_string()).await.unwrap()
+        // Use a public engine so the anonymous test caller passes the
+        // visibility checks now enforced by `ctx_with`.
+        builder
+            .with_management(Arc::new(BaseManagement {
+                controller: Principal::management_canister(),
+                managers: BTreeSet::new(),
+                visibility: Visibility::Public,
+            }))
+            .build("echo_agent".to_string())
+            .await
+            .unwrap()
     }
 
     #[test]
@@ -1249,6 +1282,14 @@ mod tests {
                 "tools_search",
                 "tools_select"
             ]
+        );
+        // Wildcard enumerates names only: the full parameter schema is omitted.
+        assert!(
+            output
+                .tools
+                .iter()
+                .all(|tool| tool.parameters == json!({})),
+            "wildcard search must not return full schemas"
         );
     }
 

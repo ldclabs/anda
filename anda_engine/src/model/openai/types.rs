@@ -367,6 +367,9 @@ impl CompletionResponse {
         let mut output = AgentOutput {
             raw_history,
             chat_history,
+            // Report the responding model, consistent with the v1/Anthropic/Gemini
+            // adapters; otherwise a caller bypassing the runner sees `model: None`.
+            model: Some(self.model.clone()),
             usage: ModelUsage {
                 input_tokens: self.usage.input_tokens,
                 output_tokens: self.usage.output_tokens,

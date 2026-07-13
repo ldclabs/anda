@@ -368,7 +368,19 @@ impl CompletionFeaturesDyn for CompletionModel {
 
             if !req.tools.is_empty() {
                 r.tools = vec![req.tools.into()];
-                r.tool_config = Some(types::ToolConfig::default());
+                // Honor forced tool choice: `Any` constrains the model to emit a
+                // function call, matching the OpenAI/Anthropic adapters.
+                let mode = if req.tool_choice_required {
+                    types::FunctionCallingMode::Any
+                } else {
+                    types::FunctionCallingMode::Auto
+                };
+                r.tool_config = Some(types::ToolConfig {
+                    function_calling_config: types::FunctionCallingConfig {
+                        mode,
+                        allowed_function_names: None,
+                    },
+                });
             };
 
             if log_enabled!(Debug)

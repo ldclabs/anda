@@ -160,7 +160,12 @@ impl CacheService {
             .await
         {
             Ok(val) => from_slice(&val.0[..]).map_err(|e| e.into()),
-            Err(err) => Err(format!("key {} init failed: {}", key, err).into()),
+            // Preserve the underlying error (and its `source()` chain / retryable
+            // / status signals) instead of flattening it to a string.
+            Err(err) => Err(Box::new(CacheInitError {
+                key: key.to_string(),
+                source: err,
+            })),
         }
     }
 
@@ -175,6 +180,7 @@ impl CacheService {
         T: Sized + Serialize + Send,
     {
         let Some(cache) = self.cache(path) else {
+            log::warn!("CacheService set on unregistered namespace, path: {path}, key: {key}");
             return;
         };
         let data = match to_canonical_vec(&value.0) {
@@ -205,6 +211,9 @@ impl CacheService {
         T: Sized + Serialize + Send,
     {
         let Some(cache) = self.cache(path) else {
+            log::warn!(
+                "CacheService set_if_not_exists on unregistered namespace, path: {path}, key: {key}"
+            );
             return false;
         };
         let data = match to_canonical_vec(&value.0) {
@@ -242,6 +251,28 @@ impl CacheService {
         path: &Path,
     ) -> impl Iterator<Item = (Arc<String>, Arc<(Bytes, Option<CacheExpiry>)>)> {
         self.cache(path).into_iter().flat_map(|cache| cache.iter())
+    }
+}
+
+/// Error returned when a [`CacheService::get_with`] initializer fails.
+///
+/// Wrapping the initializer error preserves its `source()` chain and any
+/// downcastable status/retryable signals that a plain string would lose.
+#[derive(Debug)]
+struct CacheInitError {
+    key: String,
+    source: Arc<BoxError>,
+}
+
+impl std::fmt::Display for CacheInitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "key {} init failed: {}", self.key, self.source)
+    }
+}
+
+impl std::error::Error for CacheInitError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&**self.source)
     }
 }
 

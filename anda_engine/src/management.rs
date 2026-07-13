@@ -55,13 +55,22 @@ pub enum Visibility {
 #[async_trait]
 impl Management for BaseManagement {
     /// Returns true if the caller is the controller of the engine.
+    ///
+    /// The anonymous principal is never treated as an administrator, even when
+    /// the engine was built without a Web3 identity and `controller` defaults to
+    /// the anonymous principal.
     fn is_controller(&self, caller: &Principal) -> bool {
-        caller == &self.controller
+        caller != &ANONYMOUS_PRINCIPAL && caller == &self.controller
     }
 
     /// Returns true if the caller is the controller or a manager of the engine.
+    ///
+    /// The anonymous principal is never treated as a manager, even when the
+    /// engine was built without a Web3 identity and `controller` defaults to the
+    /// anonymous principal.
     fn is_manager(&self, caller: &Principal) -> bool {
-        caller == &self.controller || self.managers.contains(caller)
+        caller != &ANONYMOUS_PRINCIPAL
+            && (caller == &self.controller || self.managers.contains(caller))
     }
 
     /// Checks anonymous access and private visibility rules.

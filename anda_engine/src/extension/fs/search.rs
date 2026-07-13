@@ -181,23 +181,29 @@ impl Tool<BaseCtx> for SearchFileTool {
                     continue;
                 };
 
-                // Canonicalizing every match is only needed to verify parent-traversal
-                // patterns; plain patterns are already confined to the workspace
-                // namespace, which also keeps dangling symlink matches listable.
-                let resolved_path = if restrict_to_workspace_targets {
-                    match tokio::fs::canonicalize(&path).await {
-                        // A match escaping the workspace (via symlinks) is skipped, not fatal.
-                        Ok(resolved) => {
-                            if ensure_path_in_workspace(&resolved_workspace, &resolved).is_err() {
-                                continue;
-                            }
-                            Some(resolved)
+                // Every match is canonicalized and re-checked against the
+                // workspace root. A workspace-internal directory symlink pointing
+                // outside the workspace would otherwise let a plain pattern (no
+                // `..`) enumerate external filenames, violating the workspace
+                // scope invariant.
+                let resolved_path = match tokio::fs::canonicalize(&path).await {
+                    // A match that resolves outside the workspace (via a symlinked
+                    // directory component) is skipped, not fatal.
+                    Ok(resolved) => {
+                        if ensure_path_in_workspace(&resolved_workspace, &resolved).is_err() {
+                            continue;
                         }
-                        // Dangling symlink or removed mid-scan.
-                        Err(_) => continue,
+                        Some(resolved)
                     }
-                } else {
-                    None
+                    // Dangling symlink or entry removed mid-scan. Parent-traversal
+                    // patterns skip it; plain patterns list it as-is, since a
+                    // dangling link cannot leak an external path.
+                    Err(_) => {
+                        if restrict_to_workspace_targets {
+                            continue;
+                        }
+                        None
+                    }
                 };
 
                 let relative = match relative_match_path(&path, workspace, &resolved_workspace) {
@@ -661,7 +667,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn matches_files_through_symbolic_link_target() {
+    async fn skips_file_symlink_escaping_workspace() {
         use std::os::unix::fs::symlink;
 
         let temp_dir = TestTempDir::new().await;
@@ -683,13 +689,14 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.output.paths, ["secret-link.txt"]);
-        assert_eq!(result.output.total_matches, 1);
+        // The symlink resolves outside the workspace, so it must not be listed.
+        assert!(result.output.paths.is_empty());
+        assert_eq!(result.output.total_matches, 0);
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn matches_files_through_symbolic_linked_directory_target() {
+    async fn skips_files_through_symbolic_linked_directory_escaping_workspace() {
         use std::os::unix::fs::symlink;
 
         let temp_dir = TestTempDir::new().await;
@@ -714,8 +721,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.output.paths, ["escape/secret.txt"]);
-        assert_eq!(result.output.total_matches, 1);
+        // A workspace-internal directory symlink pointing outside must not let
+        // the search enumerate external filenames.
+        assert!(result.output.paths.is_empty());
+        assert_eq!(result.output.total_matches, 0);
     }
 
     #[cfg(unix)]

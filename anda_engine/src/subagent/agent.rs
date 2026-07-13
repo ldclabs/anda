@@ -46,6 +46,19 @@ pub struct SubAgent {
 }
 
 impl SubAgent {
+    /// Lowercased set of callables this subagent is permitted to execute.
+    ///
+    /// This is enforced by the completion runner (see
+    /// [`CompletionRunner::set_allowed_callables`]), not just used to filter the
+    /// definitions sent to the model. An empty `tools` list means the subagent
+    /// may not call any tool or agent.
+    fn allowed_callables(&self) -> BTreeSet<String> {
+        self.tools
+            .iter()
+            .map(|tool| tool.to_ascii_lowercase())
+            .collect()
+    }
+
     fn definition_description(&self) -> String {
         let mut parts = vec![self.description.trim().to_string()];
         if parts[0].is_empty() {
@@ -183,11 +196,15 @@ impl Agent<AgentCtx> for SubAgent {
                 ..Default::default()
             };
 
+            // Enforce the subagent's tool whitelist at execution time, not just
+            // in the definitions sent to the model.
+            let allowed = self.allowed_callables();
             let rt = if let Some(recorder) = ctx.base.get_state::<SubAgentConversationRecorder>() {
                 let mut conversation = recorder
                     .start(&ctx, self, "blocking", None, &req, input_resources)
                     .await?;
                 let mut runner = ctx.clone().completion_iter(req, Vec::new());
+                runner.set_allowed_callables(Some(allowed));
                 let mut last: Option<AgentOutput> = None;
 
                 loop {
@@ -224,7 +241,17 @@ impl Agent<AgentCtx> for SubAgent {
                     }
                 }
             } else {
-                ctx.completion(req, Vec::new()).await?
+                let mut runner = ctx.clone().completion_iter(req, Vec::new());
+                runner.set_allowed_callables(Some(allowed));
+                let mut last: Option<AgentOutput> = None;
+                while let Some(step) = runner.next().await? {
+                    let terminal = step.failed_reason.is_some();
+                    last = Some(step);
+                    if terminal {
+                        break;
+                    }
+                }
+                last.ok_or_else(|| -> BoxError { "completion runner returned no output".into() })?
             };
 
             if let Some(hook) = &agent_hook {
@@ -526,7 +553,13 @@ impl Agent<AgentCtx> for SubAgent {
             });
         }
 
-        let runner = ctx.clone().completion_iter(req, vec![]).unbound();
+        // Enforce the subagent's tool whitelist at execution time for the
+        // long-running session runner, mirroring the blocking path.
+        let runner = ctx
+            .clone()
+            .completion_iter(req, vec![])
+            .unbound()
+            .with_allowed_callables(Some(self.allowed_callables()));
         tokio::spawn(async move {
             let mut runner = SubSessionRunner {
                 session: session.clone(),

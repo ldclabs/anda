@@ -51,6 +51,7 @@ use super::{
     tool::{TOOLS_SEARCH_NAME, TOOLS_SELECT_NAME, ToolsOutput},
 };
 use crate::{
+    extension::todo::TodoSession,
     model::{Model, Models},
     subagent::{SubAgentSet, SubAgentSetManager},
     unix_ms,
@@ -317,6 +318,13 @@ impl AgentCtx {
             .models
             .resolve(label)
             .unwrap_or_else(Model::not_implemented);
+        // Seed a session-scoped todo store on the long-lived runner context so
+        // per-tool-call child contexts (which snapshot-copy parent state) share
+        // one list across the whole conversation. Seed only when absent so a
+        // nested runner inherits the parent's list instead of resetting it.
+        if self.base.get_state::<TodoSession>().is_none() {
+            self.base.set_state(TodoSession::new());
+        }
         CompletionRunner {
             ctx: self,
             req,
@@ -337,6 +345,7 @@ impl AgentCtx {
             discovered_tools: BTreeMap::new(),
             discovery_selection_counts: BTreeMap::new(),
             merge_discovered_tools: None,
+            allowed_callables: None,
             done: false,
             unbound: false,
             turns: 0,
@@ -1089,6 +1098,7 @@ pub struct CompletionRunner {
     discovered_tools: BTreeMap<String, FunctionDefinition>,
     discovery_selection_counts: BTreeMap<String, usize>,
     merge_discovered_tools: Option<bool>,
+    allowed_callables: Option<BTreeSet<String>>,
     done: bool,
     unbound: bool,
     turns: usize,
@@ -1222,6 +1232,39 @@ impl CompletionRunner {
         self.merge_discovered_tools = merge_discovered_tools;
     }
 
+    /// Restricts which callables (tools, agents, subagents) the runner may
+    /// execute, regardless of the names the model emits.
+    ///
+    /// `None` (the default) allows any registered callable. `Some(set)` permits
+    /// only the lowercased names in `set`, plus any tool the model legitimately
+    /// discovered through an allowed discovery tool (tracked in
+    /// `discovered_tools`). An empty set therefore rejects every tool/agent call.
+    ///
+    /// This is the enforcement point for subagent tool whitelists: constraining
+    /// the definitions sent to the model is not sufficient, because the runner
+    /// dispatches by name against the whole engine.
+    pub fn set_allowed_callables(&mut self, allowed: Option<BTreeSet<String>>) {
+        self.allowed_callables =
+            allowed.map(|set| set.into_iter().map(|n| n.to_ascii_lowercase()).collect());
+    }
+
+    /// Builder variant of [`Self::set_allowed_callables`].
+    pub fn with_allowed_callables(mut self, allowed: Option<BTreeSet<String>>) -> Self {
+        self.set_allowed_callables(allowed);
+        self
+    }
+
+    /// Returns whether the runner may execute the lowercased callable `name`.
+    fn is_callable_allowed(&self, name_lowercase: &str) -> bool {
+        match &self.allowed_callables {
+            None => true,
+            Some(allowed) => {
+                allowed.contains(name_lowercase)
+                    || self.discovered_tools.contains_key(name_lowercase)
+            }
+        }
+    }
+
     /// Queue a steering message to interrupt the agent mid-run.
     /// Delivered after current tool execution, skips remaining tools.
     /// No effect if the completion has finished.
@@ -1304,9 +1347,16 @@ impl CompletionRunner {
         error: &str,
         reason: Option<&str>,
     ) {
-        if !self.pending_tool_calls.is_empty() {
-            self.append_interrupted_tool_outputs(error, reason);
-        }
+        // Always close unanswered tool calls in the visible history, not only
+        // when `pending_tool_calls` is non-empty. In the primary recovery
+        // scenario (a tool round was executed and the model's follow-up transport
+        // failed) `pending_tool_calls` has already been drained, yet the visible
+        // `chat_history` still carries a `ToolCall` with no matching result.
+        // Leaving it would make the persisted history unreplayable (providers
+        // reject a tool call without a result). `append_interrupted_tool_outputs`
+        // is a no-op when every call already has a result, so this is safe
+        // unconditionally.
+        self.append_interrupted_tool_outputs(error, reason);
         self.req.prompt.clear();
         self.req.content.clear();
         self.req.documents.clear();
@@ -1857,6 +1907,7 @@ impl CompletionRunner {
             discovered_tools: BTreeMap::new(),
             discovery_selection_counts: BTreeMap::new(),
             merge_discovered_tools: None,
+            allowed_callables: self.allowed_callables.clone(),
             done: true,
             unbound: self.unbound,
             turns: self.turns,
@@ -1932,15 +1983,40 @@ impl CompletionRunner {
         self.steer(prompt);
         // Drop tools so the summarization turn cannot spawn more tool calls.
         self.set_tools(Vec::new());
-        let output = self.finalize(None).await?;
-        if let Some(failed_reason) = output.failed_reason.clone() {
-            return Err(failed_reason.into());
-        }
+
+        // Summarize. On EVERY failure path restore a usable runner: put back the
+        // base toolset, discovered tools, queued user input, and the unbound
+        // flag, and drop the residual compaction prompt from the request.
+        // Without this, a failed handoff would silently drop queued
+        // follow-up/steering messages and leave a permanently tool-less runner
+        // that a retry cannot recover.
+        let outcome = match self.finalize(None).await {
+            Err(err) => Err(err),
+            Ok(output) => {
+                if let Some(reason) = output.failed_reason.clone() {
+                    Err(reason.into())
+                } else if output.content.trim().is_empty() {
+                    Err(BoxError::from("context compaction produced an empty summary"))
+                } else {
+                    Ok(output)
+                }
+            }
+        };
+        let output = match outcome {
+            Ok(output) => output,
+            Err(err) => {
+                self.req.tools = handoff_req.tools;
+                self.discovered_tools = discovered_tools;
+                self.discovery_selection_counts = discovery_selection_counts;
+                self.follow_up_message = queued_follow_up;
+                self.steering_message = queued_steering;
+                self.unbound = unbound;
+                self.req.content.clear();
+                return Err(err);
+            }
+        };
 
         let summary = output.content.trim().to_string();
-        if summary.is_empty() {
-            return Err("context compaction produced an empty summary".into());
-        }
 
         // The summary seeds the next conversation as its first message. It lives in `chat_history`
         // for the first request and migrates into the runner's raw history on later turns.
@@ -1972,6 +2048,11 @@ impl CompletionRunner {
         runner.discovery_selection_counts = discovery_selection_counts;
         runner.follow_up_message = queued_follow_up;
         runner.steering_message = queued_steering;
+        // Carry the execution-time tool allowlist across the handoff. Without this
+        // a subagent's whitelist (set on the session runner) would be silently
+        // dropped after the first context compaction, letting the subagent call
+        // any callable in the engine. Already lowercased, so assign directly.
+        runner.allowed_callables = self.allowed_callables.clone();
         Ok((runner, output))
     }
 
@@ -2019,6 +2100,24 @@ impl CompletionRunner {
         let mut tool_call_futs: Vec<BoxPinFut<ToolCall>> = Vec::new();
         for mut tool in tool_calls.into_iter() {
             let tool_name = tool.name.to_ascii_lowercase();
+
+            // Enforce the execution-time allowlist before dispatching. The model
+            // can emit any name (including one injected via untrusted tool
+            // output); without this check the runner would route it to any
+            // registered callable, bypassing a subagent's tool whitelist.
+            if !self.is_callable_allowed(&tool_name) {
+                tool.result = Some(ToolOutput {
+                    output: json!({ "error": format!(
+                        "tool {} is not permitted for this agent",
+                        tool.name
+                    )}),
+                    is_error: Some(true),
+                    ..Default::default()
+                });
+                tool_call_futs.push(Box::pin(async move { tool }));
+                continue;
+            }
+
             if self.ctx.has_tool_lowercase(&tool_name)
                 || strip_prefix_ignore_ascii_case(&tool_name, REMOTE_TOOL_PREFIX).is_some()
             {
@@ -2482,7 +2581,7 @@ mod tests {
     use serde::Deserialize;
     use serde_json::json;
     use std::{
-        collections::{BTreeMap, HashMap},
+        collections::{BTreeMap, BTreeSet, HashMap},
         sync::{Arc, Mutex},
     };
 
@@ -2991,6 +3090,60 @@ mod tests {
                     call_id: Some("call_1".into()),
                     result: None,
                     remote_id: None,
+                }],
+                raw_history: vec![json!({
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "echo_tool",
+                            "arguments": "{\"input\":\"hello\"}"
+                        }
+                    }]
+                })],
+                ..Default::default()
+            })))
+        }
+    }
+
+    /// Like [`ToolResultErrorCompleter`] but the first turn also populates the
+    /// normalized `chat_history` with the assistant tool call, as real provider
+    /// adapters do. This exercises variant A of the discard bug: after the tool
+    /// round executes and the follow-up model call fails, the visible history
+    /// holds an unanswered `ToolCall`.
+    #[derive(Clone, Debug)]
+    struct ToolResultErrorWithHistoryCompleter;
+
+    impl CompletionFeaturesDyn for ToolResultErrorWithHistoryCompleter {
+        fn model_name(&self) -> String {
+            "tool_result_error_with_history".to_string()
+        }
+
+        fn completion(
+            &self,
+            req: CompletionRequest,
+        ) -> anda_core::BoxPinFut<Result<AgentOutput, BoxError>> {
+            if req.role.as_deref() == Some("tool") {
+                return Box::pin(futures::future::ready(Err("model error".into())));
+            }
+
+            Box::pin(futures::future::ready(Ok(AgentOutput {
+                tool_calls: vec![ToolCall {
+                    name: "echo_tool".to_string(),
+                    args: json!({"input": "hello"}),
+                    call_id: Some("call_1".into()),
+                    result: None,
+                    remote_id: None,
+                }],
+                chat_history: vec![Message {
+                    role: "assistant".to_string(),
+                    content: vec![ContentPart::ToolCall {
+                        name: "echo_tool".to_string(),
+                        args: json!({"input": "hello"}),
+                        call_id: Some("call_1".into()),
+                    }],
+                    ..Default::default()
                 }],
                 raw_history: vec![json!({
                     "role": "assistant",
@@ -3638,15 +3791,16 @@ mod tests {
         ctx.store_delete(&renamed).await.unwrap();
         assert!(ctx.store_get(&renamed).await.is_err());
 
-        assert!(
-            ctx.cache_get_with("missing_path", async {
+        // The root ctx now has a registered cache namespace (the engine
+        // builders register `Path::default()`), so root-level cache access
+        // succeeds instead of failing with "cache path not found".
+        let created: String = ctx
+            .cache_get_with("root_key", async {
                 Ok::<_, BoxError>(("created".to_string(), None))
             })
             .await
-            .unwrap_err()
-            .to_string()
-            .contains("cache path")
-        );
+            .unwrap();
+        assert_eq!(created, "created");
 
         let cache_ctx = ctx.child("tools_search", "Tools Search").unwrap();
         assert!(!cache_ctx.cache_contains("number"));
@@ -3872,6 +4026,76 @@ mod tests {
                 .to_string()
                 .contains("agent run failed: agent execution failed")
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_allowlist_blocks_non_whitelisted_callables() {
+        // The model names a registered tool that is NOT on the allowlist. It
+        // must be rejected before dispatch instead of executed.
+        let model = Model::with_completer(Arc::new(ToolCallCompleter {
+            tool_calls: vec![ToolCall {
+                name: "echo_tool".to_string(),
+                args: json!({ "input": "hi" }),
+                call_id: Some("echo_call".into()),
+                result: None,
+                remote_id: None,
+            }],
+        }));
+        let ctx = EngineBuilder::new()
+            .with_model(model)
+            .register_tool(Arc::new(EchoTool))
+            .unwrap()
+            .mock_ctx();
+        let req = CompletionRequest {
+            prompt: "call echo".to_string(),
+            ..Default::default()
+        };
+        // Empty allowlist: no callable is permitted.
+        let mut runner = ctx
+            .completion_iter(req, Vec::new())
+            .with_allowed_callables(Some(BTreeSet::new()));
+        runner.next().await.unwrap().unwrap();
+        let output = runner.next().await.unwrap().unwrap();
+        let result = output.tool_calls[0].result.as_ref().unwrap();
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            result
+                .output
+                .to_string()
+                .contains("not permitted"),
+            "unexpected output: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_allowlist_permits_whitelisted_callable() {
+        let model = Model::with_completer(Arc::new(ToolCallCompleter {
+            tool_calls: vec![ToolCall {
+                name: "echo_tool".to_string(),
+                args: json!({ "input": "hi" }),
+                call_id: Some("echo_call".into()),
+                result: None,
+                remote_id: None,
+            }],
+        }));
+        let ctx = EngineBuilder::new()
+            .with_model(model)
+            .register_tool(Arc::new(EchoTool))
+            .unwrap()
+            .mock_ctx();
+        let req = CompletionRequest {
+            prompt: "call echo".to_string(),
+            ..Default::default()
+        };
+        let mut runner = ctx
+            .completion_iter(req, Vec::new())
+            .with_allowed_callables(Some(BTreeSet::from(["echo_tool".to_string()])));
+        runner.next().await.unwrap().unwrap();
+        let output = runner.next().await.unwrap().unwrap();
+        let result = output.tool_calls[0].result.as_ref().unwrap();
+        assert_ne!(result.is_error, Some(true));
+        assert!(result.output.to_string().contains("echoed:hi"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -4648,6 +4872,136 @@ mod tests {
         assert!(runner.req.role.is_none());
         assert!(runner.req.raw_history.is_empty());
         assert!(runner.pending_tool_calls.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handoff_failure_restores_tools_queued_input_and_unbound() {
+        // A transport error during the compaction turn is the recoverable case:
+        // the runner is not marked done, so a retry must find its tools and
+        // queued input intact.
+        let model = Model::with_completer(Arc::new(ErrorCompleter));
+        let ctx = EngineBuilder::new()
+            .with_model(model)
+            .register_tool(Arc::new(EchoTool))
+            .unwrap()
+            .mock_ctx();
+        let tools = ctx.definitions(Some(&["echo_tool".to_string()])).await;
+        assert!(!tools.is_empty());
+
+        let mut runner = ctx.completion_iter(
+            CompletionRequest {
+                tools: tools.clone(),
+                ..Default::default()
+            },
+            Vec::new(),
+        );
+        runner.set_unbound(true);
+        runner.follow_up("please continue".to_string());
+        runner.steer("adjust course".to_string());
+
+        // The compaction turn fails; the runner must be restored to a usable
+        // state instead of being left tool-less with queued input dropped.
+        let err = match runner.handoff(None).await {
+            Ok(_) => panic!("handoff should fail on a transport error"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("model error"));
+
+        assert_eq!(
+            runner.req.tools.len(),
+            tools.len(),
+            "tools must be restored after a failed handoff"
+        );
+        assert!(runner.unbound, "unbound flag must be restored");
+        assert!(
+            runner.req.content.is_empty(),
+            "residual compaction prompt must be cleared"
+        );
+        assert_eq!(
+            runner.follow_up_message_iter().count(),
+            1,
+            "queued follow-up must be restored"
+        );
+        assert_eq!(
+            runner.steering_message_iter().count(),
+            1,
+            "queued steering must be restored (compaction prompt dropped)"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handoff_preserves_allowlist_for_replacement_runner() {
+        // The subagent tool allowlist is enforced by the runner. A context
+        // compaction (`handoff`) swaps in a fresh runner; the allowlist must
+        // carry over, or a subagent could call any callable in the engine after
+        // its first compaction, defeating the whitelist entirely.
+        let model = Model::with_completer(Arc::new(EchoCompleter));
+        let ctx = EngineBuilder::new()
+            .with_model(model)
+            .register_tool(Arc::new(EchoTool))
+            .unwrap()
+            .mock_ctx();
+
+        // An empty allowlist permits no callable at all.
+        let mut runner = ctx
+            .completion_iter(CompletionRequest::default(), Vec::new())
+            .with_allowed_callables(Some(BTreeSet::new()));
+
+        let (new_runner, _output) = runner
+            .handoff(None)
+            .await
+            .expect("handoff should succeed with a non-empty summary");
+
+        assert_eq!(
+            new_runner.allowed_callables,
+            Some(BTreeSet::new()),
+            "the empty allowlist must survive the handoff"
+        );
+        assert!(
+            !new_runner.is_callable_allowed("echo_tool"),
+            "a non-whitelisted callable must stay blocked after compaction"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_discard_closes_unanswered_tool_call_in_visible_history() {
+        let model = Model::with_completer(Arc::new(ToolResultErrorWithHistoryCompleter));
+        let ctx = EngineBuilder::new()
+            .with_model(model)
+            .register_tool(Arc::new(EchoTool))
+            .unwrap()
+            .mock_ctx();
+
+        let mut runner = ctx.completion_iter(
+            CompletionRequest {
+                prompt: "call tool".to_string(),
+                ..Default::default()
+            },
+            Vec::new(),
+        );
+
+        // Turn 1: the model emits a tool call (recorded in visible history).
+        runner.next().await.unwrap().unwrap();
+        // Turn 2: the tool executes and the follow-up model call fails.
+        let err = runner.next().await.unwrap_err();
+        assert!(err.to_string().contains("model error"));
+
+        // Variant A: pending calls were drained by execution, yet the visible
+        // history still holds an unanswered `ToolCall`.
+        assert!(runner.pending_tool_calls.is_empty());
+        assert!(
+            !CompletionRunner::unanswered_tool_calls(runner.chat_history()).is_empty(),
+            "precondition: unanswered tool call present before discard"
+        );
+
+        runner.discard_in_flight_request();
+
+        // The unanswered tool call must be closed so the persisted history is
+        // replayable by the provider.
+        assert!(
+            CompletionRunner::unanswered_tool_calls(runner.chat_history()).is_empty(),
+            "discard must close the unanswered tool call in visible history"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

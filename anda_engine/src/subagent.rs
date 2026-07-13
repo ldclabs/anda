@@ -6,9 +6,9 @@
 //! session compaction and background progress forwarding for those workers.
 
 use anda_core::{
-    Agent, AgentContext, AgentOutput, BoxError, CompletionFeatures, CompletionRequest, ContentPart,
-    FunctionDefinition, Json, Message, ModelEffort, Path, PromptCommand, PutMode, Resource,
-    StateFeatures, StoreFeatures, ToolOutput, Usage, select_resources, validate_function_name,
+    Agent, AgentContext, AgentOutput, BoxError, CompletionRequest, ContentPart, FunctionDefinition,
+    Json, Message, ModelEffort, Path, PromptCommand, PutMode, Resource, StateFeatures,
+    StoreFeatures, ToolOutput, Usage, select_resources, validate_function_name,
 };
 use async_trait::async_trait;
 use cbor2::{from_slice, to_canonical_vec};
@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
     any::{Any, TypeId},
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     str::FromStr,
     sync::{
         Arc,

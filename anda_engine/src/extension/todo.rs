@@ -652,6 +652,55 @@ mod tests {
         assert_eq!(fourth.output.items[0].content, "plan carefully");
     }
 
+    #[tokio::test]
+    async fn session_state_persists_across_per_call_child_contexts() {
+        // Mirror how the completion runner drives tools: a long-lived parent
+        // context seeds the session, and each tool invocation runs on a fresh
+        // `child_base` context that snapshot-copies parent state. Without the
+        // seeded session each child would create its own empty store and writes
+        // would be lost between calls.
+        let parent = EngineBuilder::new().mock_ctx();
+        parent.base.set_state(TodoSession::new());
+        let tool = TodoTool::new();
+
+        let write_ctx = parent.child_base("todo").unwrap();
+        let first = tool
+            .call(
+                write_ctx,
+                TodoArgs {
+                    op: Some(TODO_OP_SET.to_string()),
+                    items: Some(vec![input("1", Some("plan"), Some(TODO_STATUS_PENDING))]),
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.output.summary.total, 1);
+
+        // A distinct child context (as produced by a later tool call) must
+        // observe the write performed by the previous one.
+        let read_ctx = parent.child_base("todo").unwrap();
+        let second = tool
+            .call(
+                read_ctx,
+                TodoArgs {
+                    op: Some(TODO_OP_READ.to_string()),
+                    items: None,
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            second.output.items,
+            vec![TodoItem {
+                id: "1".to_string(),
+                content: "plan".to_string(),
+                status: TODO_STATUS_PENDING.to_string(),
+            }]
+        );
+    }
+
     #[test]
     fn definition_schema_avoids_anyof() {
         let definition = TodoTool::new().definition();

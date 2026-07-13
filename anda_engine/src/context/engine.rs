@@ -111,7 +111,13 @@ impl RemoteEngines {
             engine.tools = tools;
         }
 
-        self.engines.insert(handle, engine);
+        if let Some(existing) = self.engines.insert(handle.clone(), engine) {
+            log::warn!(
+                "remote engine handle {:?} overwritten: previous endpoint {:?} replaced",
+                handle,
+                existing.info.endpoint
+            );
+        }
         Ok(())
     }
 
@@ -226,22 +232,34 @@ impl RemoteEngines {
     }
 
     /// Extracts resources from the provided list based on the tool's supported tags.
+    ///
+    /// Uses the same longest-handle + exact-name resolution as
+    /// [`RemoteEngines::get_tool_endpoint`] so the resources selected here always
+    /// match the engine/tool the call is routed to, even when handle prefixes
+    /// overlap.
     pub fn select_tool_resources(
         &self,
         prefixed_name: &str,
         resources: &mut Vec<Resource>,
     ) -> Vec<Resource> {
-        for (handle, engine) in self.engines.iter() {
-            if let Some(name) = Self::strip_handle_prefix(prefixed_name, handle) {
-                for tool in engine.tools.iter() {
-                    if tool.definition.name.eq_ignore_ascii_case(name) {
-                        return select_resources(resources, &tool.supported_resource_tags);
-                    }
-                }
-            }
-        }
+        let tags = self
+            .engines
+            .iter()
+            .filter_map(|(handle, engine)| {
+                let tool_name = Self::strip_handle_prefix(prefixed_name, handle)?;
+                let tool = engine
+                    .tools
+                    .iter()
+                    .find(|tool| tool.definition.name == tool_name)?;
+                Some((handle.len(), &tool.supported_resource_tags))
+            })
+            .max_by_key(|(handle_len, _)| *handle_len)
+            .map(|(_, tags)| tags);
 
-        Vec::new()
+        match tags {
+            Some(tags) => select_resources(resources, tags),
+            None => Vec::new(),
+        }
     }
 
     /// Retrieves definitions for available agents in the remote engines.
@@ -275,29 +293,40 @@ impl RemoteEngines {
     }
 
     /// Extracts resources from the provided list based on the agent's supported tags.
+    ///
+    /// Uses the same longest-handle + exact-name resolution as
+    /// [`RemoteEngines::get_agent_endpoint`] so the resources selected here always
+    /// match the engine/agent the call is routed to, even when handle prefixes
+    /// overlap.
     pub fn select_agent_resources(
         &self,
         name: &str,
         resources: &mut Vec<Resource>,
     ) -> Vec<Resource> {
-        for (handle, engine) in self.engines.iter() {
-            if let Some(name) = Self::strip_handle_prefix(name, handle) {
-                for agent in engine.agents.iter() {
-                    if agent.definition.name.eq_ignore_ascii_case(name) {
-                        return select_resources(resources, &agent.supported_resource_tags);
-                    }
-                }
-            }
-        }
+        let tags = self
+            .engines
+            .iter()
+            .filter_map(|(handle, engine)| {
+                let agent_name = Self::strip_handle_prefix(name, handle)?;
+                let agent = engine
+                    .agents
+                    .iter()
+                    .find(|agent| agent.definition.name == agent_name)?;
+                Some((handle.len(), &agent.supported_resource_tags))
+            })
+            .max_by_key(|(handle_len, _)| *handle_len)
+            .map(|(_, tags)| tags);
 
-        Vec::new()
+        match tags {
+            Some(tags) => select_resources(resources, tags),
+            None => Vec::new(),
+        }
     }
 }
 
 /// Wraps a remote tool as a local tool.
 #[derive(Debug, Clone)]
 pub struct RemoteTool {
-    engine: Principal,
     endpoint: String,
     function: Function,
     name: String,
@@ -305,8 +334,10 @@ pub struct RemoteTool {
 
 impl RemoteTool {
     /// Creates a local wrapper around a tool exported by a remote engine.
+    ///
+    /// The target engine is resolved from `endpoint` at call time, so no engine
+    /// principal is stored here.
     pub fn new(
-        engine: Principal,
         endpoint: String,
         function: Function,
         name: Option<String>,
@@ -319,7 +350,6 @@ impl RemoteTool {
         };
 
         Ok(Self {
-            engine,
             endpoint,
             function,
             name,
@@ -361,7 +391,9 @@ impl Tool<BaseCtx> for RemoteTool {
                 name: self.function.definition.name.clone(),
                 args,
                 resources,
-                meta: Some(ctx.self_meta(self.engine)),
+                // `meta` is overwritten by `remote_tool_call`, which resolves the
+                // target engine from `endpoint`; leave it unset here.
+                meta: None,
             },
         )
         .await
@@ -371,7 +403,6 @@ impl Tool<BaseCtx> for RemoteTool {
 /// Wraps a remote agent as a local agent.
 #[derive(Debug, Clone)]
 pub struct RemoteAgent {
-    engine: Principal,
     endpoint: String,
     function: Function,
     name: String,
@@ -379,21 +410,24 @@ pub struct RemoteAgent {
 
 impl RemoteAgent {
     /// Creates a local wrapper around an agent exported by a remote engine.
+    ///
+    /// The target engine is resolved from `endpoint` at call time, so no engine
+    /// principal is stored here. The name is validated as provided (function
+    /// names are already required to be lowercase) so that [`RemoteAgent::name`]
+    /// and [`RemoteAgent::definition`] always agree, matching [`RemoteTool`].
     pub fn new(
-        engine: Principal,
         endpoint: String,
         function: Function,
         name: Option<String>,
     ) -> Result<Self, BoxError> {
         let name = if let Some(name) = name {
-            validate_function_name(&name.to_ascii_lowercase())?;
+            validate_function_name(&name)?;
             name
         } else {
             function.definition.name.clone()
         };
 
         Ok(Self {
-            engine,
             endpoint,
             function,
             name,
@@ -412,7 +446,7 @@ impl Agent<AgentCtx> for RemoteAgent {
 
     fn definition(&self) -> FunctionDefinition {
         let mut definition = self.function.definition.clone();
-        definition.name = self.name.to_ascii_lowercase();
+        definition.name = self.name.clone();
         definition
     }
 
@@ -432,7 +466,9 @@ impl Agent<AgentCtx> for RemoteAgent {
                 name: self.function.definition.name.clone(),
                 prompt,
                 resources,
-                meta: Some(ctx.base.self_meta(self.engine)),
+                // `meta` is overwritten by `remote_agent_run`, which resolves the
+                // target engine from `endpoint`; leave it unset here.
+                meta: None,
                 ..Default::default()
             },
         )
@@ -770,7 +806,6 @@ mod tests {
     fn remote_tool_and_agent_wrap_definitions_and_validate_names() {
         let tool_function = tagged_function("lookup", "Lookup docs", &["text"]);
         let default_tool = RemoteTool::new(
-            Principal::anonymous(),
             "https://remote.example".to_string(),
             tool_function.clone(),
             None,
@@ -780,7 +815,6 @@ mod tests {
         assert_eq!(default_tool.definition().name, "lookup");
 
         let tool = RemoteTool::new(
-            Principal::anonymous(),
             "https://remote.example".to_string(),
             tool_function.clone(),
             Some("remote_lookup".to_string()),
@@ -792,7 +826,6 @@ mod tests {
         assert_eq!(tool.supported_resource_tags(), vec!["text"]);
         assert!(
             RemoteTool::new(
-                Principal::anonymous(),
                 "https://remote.example".to_string(),
                 tool_function,
                 Some("bad name".to_string()),
@@ -802,7 +835,6 @@ mod tests {
 
         let agent_function = tagged_function("chat", "Chat remotely", &["md"]);
         let default_agent = RemoteAgent::new(
-            Principal::anonymous(),
             "https://remote.example".to_string(),
             agent_function.clone(),
             None,
@@ -812,19 +844,28 @@ mod tests {
         assert_eq!(default_agent.definition().name, "chat");
 
         let agent = RemoteAgent::new(
-            Principal::anonymous(),
             "https://remote.example".to_string(),
             agent_function.clone(),
-            Some("RemoteChat".to_string()),
+            Some("remote_chat".to_string()),
         )
         .unwrap();
-        assert_eq!(agent.name(), "RemoteChat");
+        // `name()` and `definition().name` must agree.
+        assert_eq!(agent.name(), "remote_chat");
         assert_eq!(agent.description(), "Chat remotely");
-        assert_eq!(agent.definition().name, "remotechat");
+        assert_eq!(agent.definition().name, "remote_chat");
         assert_eq!(agent.supported_resource_tags(), vec!["md"]);
+        // Mixed-case names are rejected (function names must be lowercase),
+        // consistent with `RemoteTool`.
         assert!(
             RemoteAgent::new(
-                Principal::anonymous(),
+                "https://remote.example".to_string(),
+                agent_function.clone(),
+                Some("RemoteChat".to_string()),
+            )
+            .is_err()
+        );
+        assert!(
+            RemoteAgent::new(
                 "https://remote.example".to_string(),
                 agent_function,
                 Some("bad name".to_string()),
@@ -838,7 +879,6 @@ mod tests {
         let ctx = crate::engine::EngineBuilder::new().mock_ctx();
 
         let tool = RemoteTool::new(
-            Principal::anonymous(),
             "https://remote.example".to_string(),
             tagged_function("lookup", "Lookup docs", &["text"]),
             Some("remote_lookup".to_string()),
@@ -855,10 +895,9 @@ mod tests {
         assert!(err.to_string().contains("remote engine endpoint"));
 
         let agent = RemoteAgent::new(
-            Principal::anonymous(),
             "https://remote.example".to_string(),
             tagged_function("chat", "Chat remotely", &["md"]),
-            Some("RemoteChat".to_string()),
+            Some("remote_chat".to_string()),
         )
         .unwrap();
         let err =

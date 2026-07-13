@@ -1006,8 +1006,16 @@ impl MemoryManagement {
             .await
     }
 
-    /// Deletes all conversations created before `timestamp` (in milliseconds), together with the
-    /// resources and artifacts they reference.
+    /// Deletes all conversations created before `timestamp` (in milliseconds).
+    ///
+    /// Referenced resources are intentionally **not** deleted here. Resources are
+    /// content-deduplicated (see [`Memory::try_add_resources`]): a single
+    /// resource `_id` can be shared by several conversations, and resources carry
+    /// no owner or reference count. Deleting a resource when one referencing
+    /// conversation expires would break every other (possibly still-active)
+    /// conversation that shares it, and there is no reverse index to check for
+    /// remaining references. Reclaiming orphaned resources therefore requires a
+    /// dedicated reference-counted GC pass and is left to callers.
     pub async fn delete_expired_conversations(&self, timestamp: u64) -> Result<u64, BoxError> {
         let period = timestamp / 3600 / 1000;
         let mut count = 0u64;
@@ -1019,19 +1027,8 @@ impl MemoryManagement {
 
             let mut removed = 0u64;
             for id in ids {
-                if let Ok(Some(doc)) = self.conversations.remove(id).await {
+                if matches!(self.conversations.remove(id).await, Ok(Some(_))) {
                     removed += 1;
-                    if let Ok(conversation) = doc.try_into::<Conversation>() {
-                        for resource in conversation
-                            .resources
-                            .into_iter()
-                            .chain(conversation.artifacts)
-                        {
-                            if resource._id > 0 {
-                                let _ = self.resources.remove(resource._id).await;
-                            }
-                        }
-                    }
                 }
             }
             count += removed;
@@ -1041,9 +1038,7 @@ impl MemoryManagement {
             }
         }
 
-        let now_ms = unix_ms();
-        self.conversations.flush(now_ms).await?;
-        self.resources.flush(now_ms).await?;
+        self.conversations.flush(unix_ms()).await?;
         Ok(count)
     }
 }
@@ -2481,7 +2476,9 @@ mod tests {
             .unwrap();
         assert_eq!(deleted, 1);
         assert!(memory.get_conversation(conversation_id).await.is_err());
-        assert!(memory.get_resource(resource_id).await.is_err());
+        // Resources are content-deduplicated and may be shared across
+        // conversations, so expiring a conversation must not delete them.
+        assert!(memory.get_resource(resource_id).await.is_ok());
     }
 
     #[tokio::test]

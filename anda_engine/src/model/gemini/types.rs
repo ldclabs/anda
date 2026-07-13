@@ -145,10 +145,15 @@ impl GenerateContentResponse {
             chat_history,
             model: self.model_version.clone(),
             usage: ModelUsage {
-                input_tokens: self.usage_metadata.prompt_token_count as u64,
-                output_tokens: (self.usage_metadata.candidates_token_count
-                    + self.usage_metadata.thoughts_token_count
+                // `tool_use_prompt_token_count` is an input-side count that Gemini
+                // reports separately from `prompt_token_count` (both are distinct
+                // components of `total_token_count`), so it belongs in
+                // `input_tokens`, not `output_tokens`.
+                input_tokens: (self.usage_metadata.prompt_token_count
                     + self.usage_metadata.tool_use_prompt_token_count)
+                    as u64,
+                output_tokens: (self.usage_metadata.candidates_token_count
+                    + self.usage_metadata.thoughts_token_count)
                     as u64,
                 cached_tokens: self.usage_metadata.cached_content_token_count as u64,
                 requests: 1,
@@ -2302,8 +2307,9 @@ mod tests {
         assert_eq!(output.content, "visible");
         assert_eq!(output.thoughts.as_deref(), Some("hidden"));
         assert_eq!(output.model.as_deref(), Some("gemini-test"));
-        assert_eq!(output.usage.input_tokens, 7);
-        assert_eq!(output.usage.output_tokens, 10);
+        // input = prompt(7) + tool_use_prompt(3); output = candidates(5) + thoughts(2)
+        assert_eq!(output.usage.input_tokens, 10);
+        assert_eq!(output.usage.output_tokens, 7);
         assert_eq!(output.usage.cached_tokens, 4);
         assert_eq!(output.usage.requests, 1);
         assert_eq!(output.raw_history.len(), 2);
