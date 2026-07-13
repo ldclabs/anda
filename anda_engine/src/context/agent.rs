@@ -1996,7 +1996,9 @@ impl CompletionRunner {
                 if let Some(reason) = output.failed_reason.clone() {
                     Err(reason.into())
                 } else if output.content.trim().is_empty() {
-                    Err(BoxError::from("context compaction produced an empty summary"))
+                    Err(BoxError::from(
+                        "context compaction produced an empty summary",
+                    ))
                 } else {
                     Ok(output)
                 }
@@ -4059,10 +4061,7 @@ mod tests {
         let result = output.tool_calls[0].result.as_ref().unwrap();
         assert_eq!(result.is_error, Some(true));
         assert!(
-            result
-                .output
-                .to_string()
-                .contains("not permitted"),
+            result.output.to_string().contains("not permitted"),
             "unexpected output: {}",
             result.output
         );

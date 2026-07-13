@@ -299,6 +299,29 @@ async fn http_guards_local_calls_and_signed_rpc_paths_are_exercised() {
         HttpFeatures::https_signed_rpc(&guarded, "http://example.test/rpc", "ping", &()).await;
     assert!(guarded_rpc.unwrap_err().to_string().contains("Invalid url"));
 
+    // Non-http(s) schemes and malformed URLs are rejected even when
+    // `allow_http` is enabled, so an attacker cannot smuggle `file://` /
+    // `data:` / metadata-style targets through a signed call. `allow_http` only
+    // opens the plain `http` scheme.
+    let permissive = client_with_identity(true).await;
+    for bad in [
+        "file:///etc/passwd",
+        "ftp://example.test/x",
+        "data:text/plain,hello",
+        "ws://example.test/socket",
+        "not-a-url",
+        "https://",
+    ] {
+        let err = HttpFeatures::https_call(&permissive, bad, http::Method::GET, None, None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Invalid url"),
+            "expected {bad:?} to be rejected, got: {err}"
+        );
+    }
+
     assert!(
         Web3ClientFeatures::https_call(
             &guarded,

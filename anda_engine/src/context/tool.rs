@@ -1285,10 +1285,7 @@ mod tests {
         );
         // Wildcard enumerates names only: the full parameter schema is omitted.
         assert!(
-            output
-                .tools
-                .iter()
-                .all(|tool| tool.parameters == json!({})),
+            output.tools.iter().all(|tool| tool.parameters == json!({})),
             "wildcard search must not return full schemas"
         );
     }

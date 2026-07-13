@@ -88,6 +88,19 @@ All notable changes to the Anda project will be documented in this file.
 - **Removed unused public `verify_cwt`** — Only the internal `verify_cwt_token` is needed.
 - **Decode error hygiene** — Param decode failures now use `Display` (not `Debug`) so the client sees the parser's error message without the raw request bytes.
 
+### Added — anda_web3_client v0.14.2
+
+- **URL smuggling guard** — `check_url` now parses with `reqwest::Url` instead of a string-prefix check, rejecting non-http(s) schemes (`file`, `ftp`, `data`, `ws`), bare strings, and URLs with no host. Previously a `file:///etc/passwd`-style target would pass the prefix guard and attempt a connection.
+- **All-zero root secret warning** — `ClientBuilder::build` logs a `warn!` when the default all-zero secret is used; the derived identity and all sub-keys are public and predictable.
+- **Identity load improvements** — `load_identity` detects existing file paths before falling back to hex decoding, so a PEM file with `Secp256k1Identity` errors now surfaces the real parse failure instead of being misinterpreted as a hex string. `identity_from_pem` no longer masks the Ed25519 parse error when a Secp256k1 parse fails.
+
+### Changed — anda_web3_client v0.14.2
+
+- **Root secret zeroized** — `root_secret` field wrapped in `Zeroizing<[u8; 48]>`; the long-lived copy is wiped from memory on `Drop`, reducing the exposure window.
+- **Dependencies** — Added `zeroize` to workspace dependencies; `log` and `zeroize` are now optional dependencies gated behind the `client` feature.
+- **Query-signature verification (clarified, not changed)** — Documented that the default `Agent` does not request node keys or verify query signatures — the behavior since 0.14.0, now spelled out in a code comment: a non-TEE client reads canister state through a trusted boundary node. Pass your own `Agent` via `with_agent` to enable verification.
+- **README rewritten** — Accurate feature descriptions (ICP canister calls, signed HTTP/CBOR-RPC, deterministic key derivation), feature-flag documentation, and security caveats (endpoints passed to signed calls must be trusted).
+
 ## [0.14.0] — 2026-07-05
 
 ### Removed — anda 0.14.0

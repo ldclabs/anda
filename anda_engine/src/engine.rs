@@ -295,7 +295,10 @@ impl Engine {
                     failed_reason: Some(err.to_string()),
                     ..Default::default()
                 };
-                let _ = self.hooks.on_agent_end(&ctx, &input.name, placeholder).await;
+                let _ = self
+                    .hooks
+                    .on_agent_end(&ctx, &input.name, placeholder)
+                    .await;
                 Err(err)
             }
         }
@@ -724,8 +727,7 @@ impl EngineBuilder {
             }
         }
         for name in &self.export_tools {
-            if !self.tools.contains_lowercase(name)
-                && !self.tool_providers.contains_lowercase(name)
+            if !self.tools.contains_lowercase(name) && !self.tool_providers.contains_lowercase(name)
             {
                 log::warn!("exported tool {name} is not registered (possible typo)");
             }

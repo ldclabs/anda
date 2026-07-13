@@ -127,6 +127,14 @@ pub fn secp256k1_public_key(
 ///
 /// Equivalent to feeding each segment sequentially into a SHA3-256 hasher, which
 /// is what the TEE gateway does, so the resulting salt matches byte-for-byte.
+///
+/// Note: segment boundaries are **not** encoded into the salt — the segments are
+/// concatenated with no length prefix or separator, so `[b"ab", b"c"]` and
+/// `[b"a", b"bc"]` hash to the same salt (and thus the same AES-GCM key). This is
+/// intentional, to stay byte-for-byte compatible with the TEE gateway. Callers
+/// that need distinct keys for distinct paths must not rely on a variable-length
+/// segment boundary alone to separate them. (Ed25519/secp256k1 derivation is
+/// unaffected: it preserves segment boundaries via `DerivationPath`.)
 fn derivation_path_to_context(derivation_path: &[Vec<u8>]) -> Vec<u8> {
     let mut data = Vec::new();
     for path in derivation_path {

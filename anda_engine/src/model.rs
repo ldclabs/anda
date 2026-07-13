@@ -726,7 +726,11 @@ pub(crate) async fn read_completion_response_bytes(
     if let Some(len) = response.content_length()
         && len > MAX_COMPLETION_RESPONSE_BYTES as u64
     {
-        return Err(completion_response_too_large(model, request_id.as_deref(), len as usize));
+        return Err(completion_response_too_large(
+            model,
+            request_id.as_deref(),
+            len as usize,
+        ));
     }
 
     // Stream the body so the size cap is enforced even when no `Content-Length`

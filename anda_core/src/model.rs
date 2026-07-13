@@ -757,8 +757,7 @@ impl<'de> Deserialize<'de> for ContentPart {
                 } => ContentPart::Action {
                     name,
                     payload,
-                    recipients: recipients
-                        .map(|list| list.into_iter().map(|p| p.0).collect()),
+                    recipients: recipients.map(|list| list.into_iter().map(|p| p.0).collect()),
                     signature,
                 },
             },
@@ -1543,9 +1542,7 @@ mod tests {
         // A slash with no command name is a plain prompt, not an empty command.
         assert_eq!(
             PromptCommand::from("/".to_string()),
-            PromptCommand::Plain {
-                prompt: "/".into(),
-            }
+            PromptCommand::Plain { prompt: "/".into() }
         );
         assert_eq!(
             PromptCommand::from("/ arg".to_string()),
@@ -1642,10 +1639,7 @@ mod tests {
         }
         .into_tool_output();
         assert_eq!(output.is_error, Some(true));
-        assert_eq!(
-            output.output.get("failed_reason").unwrap(),
-            &json!("boom")
-        );
+        assert_eq!(output.output.get("failed_reason").unwrap(), &json!("boom"));
     }
 
     #[test]
@@ -1998,7 +1992,13 @@ mod tests {
 
         // Exactly one opening and one closing delimiter remain (the wrapper's).
         assert_eq!(rendered.matches("<attachments>").count(), 1);
-        assert_eq!(rendered.to_ascii_lowercase().matches("</attachments>").count(), 1);
+        assert_eq!(
+            rendered
+                .to_ascii_lowercase()
+                .matches("</attachments>")
+                .count(),
+            1
+        );
         // The neutralized form is present and still readable.
         assert!(rendered.contains("< /attachments>"));
     }
@@ -2348,9 +2348,7 @@ mod tests {
         let message = Message {
             role: "assistant".into(),
             content: vec![
-                ContentPart::Text {
-                    text: "hi".into(),
-                },
+                ContentPart::Text { text: "hi".into() },
                 ContentPart::InlineData {
                     mime_type: "image/png".into(),
                     data: vec![0u8, 159, 146, 150, 255].into(),
@@ -2395,7 +2393,10 @@ mod tests {
         let malformed = json!({"type": "InlineData", "mimeType": "image/png"});
         let part: ContentPart = serde_json::from_value(malformed.clone()).unwrap();
         assert_eq!(part, ContentPart::Any(malformed.clone()));
-        assert_eq!(ContentPart::from(malformed.clone()), ContentPart::Any(malformed));
+        assert_eq!(
+            ContentPart::from(malformed.clone()),
+            ContentPart::Any(malformed)
+        );
 
         // Unknown tag: preserved as `Any`.
         let unknown = json!({"type": "Custom", "x": 1});

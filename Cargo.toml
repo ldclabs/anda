@@ -102,6 +102,7 @@ glob = "0.3"
 serde-saphyr = "0.0"
 unicode-segmentation = "1"
 libc = "0.2"
+zeroize = "1"
 
 [patch.crates-io]
 

@@ -464,7 +464,11 @@ impl StoreFeatures for BaseCtx {
         // acquiring a doubled namespace prefix.
         let prefix = prefix.map(|p| self.try_strip_prefix_path(p));
         self.store
-            .store_list(&self.path, prefix.as_deref(), &self.try_strip_prefix_path(offset))
+            .store_list(
+                &self.path,
+                prefix.as_deref(),
+                &self.try_strip_prefix_path(offset),
+            )
             .await
     }
 
