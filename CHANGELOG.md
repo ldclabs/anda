@@ -2,6 +2,22 @@
 
 All notable changes to the Anda project will be documented in this file.
 
+## [0.14.2] — 2026-07-13
+
+### Added — anda_engine v0.14.2
+
+- **MCP OAuth 2.1 authorization** — `McpOAuthConfig` supports two flows for Streamable HTTP MCP servers: interactive Authorization Code with PKCE (`begin_authorization` / `complete_authorization` / `cancel_authorization`) and headless Client Credentials (SEP-1046). The library drives the protocol but the consuming application owns the browser, redirect callback, and credential store.
+- **Pluggable credential persistence** — `McpCredentialStore` trait with `load`/`save`/`clear` lets applications back OAuth tokens with an encrypted store. `InMemoryMcpCredentialStore` is the default for development.
+- **`McpAuthorizationRequired` error** — Typed error returned when a session needs interactive auth; consumers downcast to trigger the authorization flow.
+- **`discover_http_oauth`** — Static method probes an HTTP MCP endpoint for OAuth capabilities (scopes, DCR support) without connecting.
+- **`register_server` / `remove_server`** — Register an auth-requiring server without connecting, for deferred connection after the interactive OAuth flow completes.
+- **Validation: no `bearer_token` + `auth` mixing** — `McpStreamableHttpTransport` rejects configs that set both.
+
+### Changed — anda_engine v0.14.2
+
+- **rmcp 1.7→2.2** — Upgraded with the `auth` feature, replacing the static bearer-token path with `AuthClient`-based transport when `McpOAuthConfig` is present. Transport config split into `base_transport_config` (for auth client injection) and `transport_config` (static bearer, preserved for backward compat).
+- **`list_roots` removed** — The deprecated `list_roots` client handler is removed to match rmcp 2.x.
+
 ## [0.14.0] — 2026-07-05
 
 ### Removed — anda 0.14.0

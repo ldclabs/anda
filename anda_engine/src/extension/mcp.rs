@@ -8,6 +8,21 @@
 //! a coherent capability bundle. It intentionally does not expose deprecated MCP
 //! client utility capabilities such as Roots, Sampling, or Logging control.
 //!
+//! # Authentication
+//!
+//! Streamable HTTP servers can authenticate with a static bearer token
+//! ([`McpStreamableHttpTransport::bearer_token`]) or via OAuth 2.1
+//! ([`McpOAuthConfig`]). Two OAuth flows are supported side by side:
+//!
+//! - [`McpOAuthConfig::ClientCredentials`] — headless server-to-server auth,
+//!   obtained automatically when a session is established.
+//! - [`McpOAuthConfig::AuthorizationCode`] — interactive, browser-based auth.
+//!   As a library, this module only drives the protocol: it returns the
+//!   authorization URL from [`McpToolProvider::begin_authorization`] and
+//!   consumes the redirect via [`McpToolProvider::complete_authorization`]. The
+//!   consuming application owns the browser, the redirect callback, and — via
+//!   [`McpCredentialStore`] — where tokens are persisted.
+//!
 //! # Example
 //!
 //! Register an MCP provider with the engine, then dynamically add an MCP server
@@ -53,23 +68,32 @@ use anda_core::{
     BoxError, BoxFut, FunctionDefinition, Json, ToolGroup, ToolInput, ToolOutput, ToolProvider,
     Usage, validate_function_name,
 };
+use async_trait::async_trait;
 use http::{HeaderName, HeaderValue};
-use parking_lot::RwLock;
+use parking_lot::{Mutex as SyncMutex, RwLock};
+use reqwest::Client as ReqwestClient;
 use rmcp::{
-    ClientHandler, ErrorData as McpError, RoleClient,
+    ClientHandler, RoleClient,
     model::{
         CallToolRequestParams, CallToolResult, ClientInfo, Implementation, InitializeResult,
-        ListRootsRequestMethod, ListRootsResult, Tool as McpTool,
+        Tool as McpTool,
     },
     serve_client,
-    service::{RequestContext, RunningService},
+    service::RunningService,
     transport::{
+        AuthClient, AuthError, AuthorizationManager, ClientCredentialsConfig, CredentialStore,
         StreamableHttpClientTransport, TokioChildProcess,
+        auth::{AuthorizationCallback, OAuthClientConfig, OAuthState},
         streamable_http_client::StreamableHttpClientTransportConfig,
     },
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, json};
+
+/// Re-exported from `rmcp`: the OAuth credentials an [`McpCredentialStore`]
+/// persists on behalf of a server. Carries the (possibly dynamically
+/// registered) `client_id` and the token response including the refresh token.
+pub use rmcp::transport::StoredCredentials;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, hash_map::DefaultHasher},
     future::Future,
@@ -135,6 +159,32 @@ impl McpToolProvider {
         }
 
         Ok(())
+    }
+
+    /// Registers a server configuration without connecting to it.
+    ///
+    /// This is the entry point for the interactive OAuth Authorization Code
+    /// flow, where a session cannot be established until authorization has
+    /// completed. The usual sequence is: `register_server` →
+    /// [`begin_authorization`] → (user authorizes) →
+    /// [`complete_authorization`] → [`refresh_server`]. For servers that need no
+    /// interactive authorization (stdio, static bearer, or client credentials),
+    /// prefer [`add_server`], which registers *and* connects in one step.
+    ///
+    /// [`add_server`]: Self::add_server
+    /// [`begin_authorization`]: Self::begin_authorization
+    /// [`complete_authorization`]: Self::complete_authorization
+    /// [`refresh_server`]: Self::refresh_server
+    pub fn register_server(&self, server: McpServerConfig) -> Result<(), BoxError> {
+        self.insert_server(server)
+    }
+
+    /// Removes a server along with its session, routes, and any pending
+    /// authorization state. Returns whether the server had been registered.
+    pub fn remove_server(&self, server_id: &str) -> bool {
+        let existed = self.contains_server(server_id);
+        self.remove_server_state(server_id);
+        existed
     }
 
     /// Returns whether a server id is currently registered.
@@ -279,11 +329,32 @@ impl McpToolProvider {
                 let transport = TokioChildProcess::new(stdio.command())?;
                 serve_client(handler, transport).await?
             }
-            McpTransportConfig::StreamableHttp(http) => {
-                let transport =
-                    StreamableHttpClientTransport::from_config(http.transport_config()?);
-                serve_client(handler, transport).await?
-            }
+            McpTransportConfig::StreamableHttp(http) => match &http.auth {
+                None => {
+                    let transport =
+                        StreamableHttpClientTransport::from_config(http.transport_config()?);
+                    serve_client(handler, transport).await?
+                }
+                Some(McpOAuthConfig::ClientCredentials(cc)) => {
+                    // Headless: obtain a token at connection time, no human loop.
+                    let manager = self.authorize_client_credentials(http, cc).await?;
+                    let transport = StreamableHttpClientTransport::with_client(
+                        AuthClient::new(ReqwestClient::new(), manager),
+                        http.base_transport_config()?,
+                    );
+                    serve_client(handler, transport).await?
+                }
+                Some(McpOAuthConfig::AuthorizationCode(_)) => {
+                    // Interactive: reuse credentials persisted by a prior
+                    // begin/complete_authorization; refresh happens on demand.
+                    let manager = self.authorize_from_store(&config.id, http).await?;
+                    let transport = StreamableHttpClientTransport::with_client(
+                        AuthClient::new(ReqwestClient::new(), manager),
+                        http.base_transport_config()?,
+                    );
+                    serve_client(handler, transport).await?
+                }
+            },
         };
 
         let session = Arc::new(McpSession {
@@ -296,6 +367,173 @@ impl McpToolProvider {
             .sessions
             .insert(config.id.clone(), session.clone());
         Ok(session)
+    }
+
+    /// Probes an HTTP MCP endpoint to determine whether it requires OAuth.
+    ///
+    /// Performs RFC 9728 protected-resource / RFC 8414 authorization-server
+    /// discovery against `url`. Returns `None` when the endpoint advertises no
+    /// OAuth support (it uses a static bearer token or no auth), or `Some` with
+    /// the discovered metadata otherwise. A consuming application can use this to
+    /// decide, from a bare URL, whether to connect directly or run the
+    /// authorization flow.
+    pub async fn discover_http_oauth(url: &str) -> Result<Option<McpOAuthMetadata>, BoxError> {
+        let manager = AuthorizationManager::new(url).await?;
+        match manager.discover_metadata().await {
+            Ok(metadata) => Ok(Some(McpOAuthMetadata {
+                scopes_supported: metadata.scopes_supported.unwrap_or_default(),
+                registration_supported: metadata.registration_endpoint.is_some(),
+            })),
+            Err(AuthError::NoAuthorizationSupport) => Ok(None),
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    /// Starts the interactive OAuth Authorization Code flow for `server_id` and
+    /// returns the authorization URL to open in a browser.
+    ///
+    /// `anda_engine` is a library: it does not open the browser or receive the
+    /// redirect. The consuming application presents the URL however it likes
+    /// (loopback server, a route it hosts, or manual paste), then hands the
+    /// resulting redirect URL to [`Self::complete_authorization`]. The
+    /// intermediate PKCE/CSRF state is kept in memory on this provider instance,
+    /// so both calls must run against the same instance in the same process.
+    ///
+    /// The server must be registered and configured with
+    /// [`McpOAuthConfig::AuthorizationCode`]; otherwise this returns an error.
+    pub async fn begin_authorization(&self, server_id: &str) -> Result<String, BoxError> {
+        let config = self.server_config(server_id)?;
+        let McpTransportConfig::StreamableHttp(http) = &config.transport else {
+            return Err(format!("MCP server {server_id} does not use the HTTP transport").into());
+        };
+        let Some(McpOAuthConfig::AuthorizationCode(ac)) = &http.auth else {
+            return Err(format!(
+                "MCP server {server_id} is not configured for the OAuth authorization_code flow"
+            )
+            .into());
+        };
+
+        let mut manager = AuthorizationManager::new(http.url.as_str()).await?;
+        manager.set_credential_store(self.scoped_store(server_id));
+        let metadata = manager.discover_metadata().await?;
+        manager.set_metadata(metadata);
+
+        let scope_refs: Vec<&str> = ac.scopes.iter().map(String::as_str).collect();
+        let client_config = match &ac.client_id {
+            // Pre-registered public client.
+            Some(client_id) => {
+                let mut cfg = OAuthClientConfig::new(client_id.clone(), ac.redirect_uri.clone());
+                if !ac.scopes.is_empty() {
+                    cfg = cfg.with_scopes(ac.scopes.clone());
+                }
+                cfg
+            }
+            // Dynamic client registration (RFC 7591).
+            None => {
+                manager
+                    .register_client(
+                        ac.client_name.as_deref().unwrap_or("Anda Engine MCP Host"),
+                        &ac.redirect_uri,
+                        &scope_refs,
+                    )
+                    .await?
+            }
+        };
+        manager.configure_client(client_config)?;
+        let auth_url = manager.get_authorization_url(&scope_refs).await?;
+
+        self.inner
+            .pending_auth
+            .lock()
+            .insert(server_id.to_string(), manager);
+        Ok(auth_url)
+    }
+
+    /// Completes the interactive OAuth Authorization Code flow started by
+    /// [`Self::begin_authorization`], using the full redirect URL the
+    /// authorization server sent back (carrying `code`, `state`, and optionally
+    /// RFC 9207 `iss`).
+    ///
+    /// On success the resulting credentials — including the refresh token — are
+    /// persisted through the configured [`McpCredentialStore`], so subsequent
+    /// sessions establish without further interaction. The pending in-memory
+    /// state is consumed whether or not the exchange succeeds; on failure, call
+    /// [`Self::begin_authorization`] again.
+    pub async fn complete_authorization(
+        &self,
+        server_id: &str,
+        redirect_url: &str,
+    ) -> Result<(), BoxError> {
+        let manager = self
+            .inner
+            .pending_auth
+            .lock()
+            .remove(server_id)
+            .ok_or_else(|| format!("no pending OAuth authorization for MCP server {server_id}"))?;
+
+        let callback = AuthorizationCallback::from_redirect_url(redirect_url)?;
+        manager
+            .exchange_code_for_token_with_issuer(
+                &callback.code,
+                &callback.csrf_token,
+                callback.issuer.as_deref(),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Discards any pending interactive-authorization state for `server_id`.
+    ///
+    /// Returns whether a pending flow was actually cancelled.
+    pub fn cancel_authorization(&self, server_id: &str) -> bool {
+        self.inner.pending_auth.lock().remove(server_id).is_some()
+    }
+
+    fn scoped_store(&self, server_id: &str) -> ScopedCredentialStore {
+        ScopedCredentialStore {
+            server_id: server_id.to_string(),
+            inner: self.inner.credential_store.clone(),
+        }
+    }
+
+    /// Rebuilds an authorized manager from persisted Authorization Code
+    /// credentials, refreshing on demand. Errors with [`McpAuthorizationRequired`]
+    /// when no usable credentials exist yet, so the caller can trigger the
+    /// interactive flow.
+    async fn authorize_from_store(
+        &self,
+        server_id: &str,
+        http: &McpStreamableHttpTransport,
+    ) -> Result<AuthorizationManager, BoxError> {
+        let mut manager = AuthorizationManager::new(http.url.as_str()).await?;
+        manager.set_credential_store(self.scoped_store(server_id));
+        if !manager.initialize_from_store().await? {
+            return Err(McpAuthorizationRequired {
+                server_id: server_id.to_string(),
+            }
+            .into());
+        }
+        Ok(manager)
+    }
+
+    /// Obtains an authorized manager via the headless Client Credentials flow.
+    async fn authorize_client_credentials(
+        &self,
+        http: &McpStreamableHttpTransport,
+        config: &OAuthClientCredentialsConfig,
+    ) -> Result<AuthorizationManager, BoxError> {
+        let mut state = OAuthState::new(http.url.as_str(), Some(ReqwestClient::new())).await?;
+        state
+            .authenticate_client_credentials(ClientCredentialsConfig::ClientSecret {
+                client_id: config.client_id.clone(),
+                client_secret: config.client_secret.clone(),
+                scopes: config.scopes.clone(),
+                resource: config.resource.clone(),
+            })
+            .await?;
+        state
+            .into_authorization_manager()
+            .ok_or_else(|| "MCP client_credentials authorization did not complete".into())
     }
 
     async fn refresh_if_dirty(&self, server_id: &str) -> Result<(), BoxError> {
@@ -478,6 +716,7 @@ impl McpToolProvider {
         self.inner.servers.write().remove(server_id);
         self.inner.connect_locks.write().remove(server_id);
         self.inner.index.write().remove_server(server_id);
+        self.inner.pending_auth.lock().remove(server_id);
     }
 }
 
@@ -548,11 +787,12 @@ impl ToolProvider<BaseCtx> for McpToolProvider {
 }
 
 /// Builder for [`McpToolProvider`].
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct McpToolProviderBuilder {
     name: Option<String>,
     tool_prefix: Option<String>,
     servers: Vec<McpServerConfig>,
+    credential_store: Option<Arc<dyn McpCredentialStore>>,
 }
 
 impl McpToolProviderBuilder {
@@ -577,6 +817,14 @@ impl McpToolProviderBuilder {
     /// Replaces the MCP server list.
     pub fn servers(mut self, servers: Vec<McpServerConfig>) -> Self {
         self.servers = servers;
+        self
+    }
+
+    /// Sets the persistence backend for OAuth credentials. Defaults to an
+    /// in-memory store ([`InMemoryMcpCredentialStore`]) that does not survive a
+    /// process restart.
+    pub fn credential_store(mut self, store: Arc<dyn McpCredentialStore>) -> Self {
+        self.credential_store = Some(store);
         self
     }
 
@@ -619,6 +867,10 @@ impl McpToolProviderBuilder {
             .map(|id| (id.clone(), Arc::new(Mutex::new(()))))
             .collect();
 
+        let credential_store = self
+            .credential_store
+            .unwrap_or_else(|| Arc::new(InMemoryMcpCredentialStore::new()));
+
         Ok(McpToolProvider {
             inner: Arc::new(McpToolProviderInner {
                 name,
@@ -626,8 +878,21 @@ impl McpToolProviderBuilder {
                 servers: RwLock::new(servers),
                 connect_locks: RwLock::new(connect_locks),
                 index: RwLock::new(McpToolIndex::default()),
+                credential_store,
+                pending_auth: SyncMutex::new(HashMap::new()),
             }),
         })
+    }
+}
+
+impl std::fmt::Debug for McpToolProviderBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpToolProviderBuilder")
+            .field("name", &self.name)
+            .field("tool_prefix", &self.tool_prefix)
+            .field("servers", &self.servers)
+            .field("credential_store", &self.credential_store.is_some())
+            .finish()
     }
 }
 
@@ -639,6 +904,12 @@ struct McpToolProviderInner {
     /// callers racing to (re)connect a server don't spawn duplicate sessions.
     connect_locks: RwLock<BTreeMap<String, Arc<Mutex<()>>>>,
     index: RwLock<McpToolIndex>,
+    /// Application-supplied persistence for OAuth credentials, keyed by server.
+    credential_store: Arc<dyn McpCredentialStore>,
+    /// In-memory Authorization Code flow state (PKCE verifier + CSRF) held
+    /// between `begin_authorization` and `complete_authorization`. This lives in
+    /// the process only, so both calls must target the same provider instance.
+    pending_auth: SyncMutex<HashMap<String, AuthorizationManager>>,
 }
 
 #[derive(Default)]
@@ -752,13 +1023,6 @@ impl AndaMcpClient {
 impl ClientHandler for AndaMcpClient {
     fn get_info(&self) -> ClientInfo {
         self.info.clone()
-    }
-
-    fn list_roots(
-        &self,
-        _context: RequestContext<RoleClient>,
-    ) -> impl Future<Output = Result<ListRootsResult, McpError>> + Send + '_ {
-        std::future::ready(Err(McpError::method_not_found::<ListRootsRequestMethod>()))
     }
 
     fn on_tool_list_changed(
@@ -880,12 +1144,22 @@ impl McpStdioTransport {
 pub struct McpStreamableHttpTransport {
     /// MCP endpoint URL.
     pub url: String,
-    /// Bearer token value, without the `Bearer ` prefix.
+    /// Bearer token value, without the `Bearer ` prefix. Ignored when [`auth`]
+    /// is set.
+    ///
+    /// [`auth`]: Self::auth
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bearer_token: Option<String>,
-    /// Custom HTTP headers sent with every request.
+    /// Custom HTTP headers sent with every request, including OAuth-authorized
+    /// requests.
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
+    /// Optional OAuth 2.1 authorization. When set, [`bearer_token`] is ignored
+    /// and access tokens are obtained/refreshed through the configured flow.
+    ///
+    /// [`bearer_token`]: Self::bearer_token
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<McpOAuthConfig>,
 }
 
 impl McpStreamableHttpTransport {
@@ -893,10 +1167,17 @@ impl McpStreamableHttpTransport {
         if self.url.trim().is_empty() {
             return Err("MCP HTTP URL must not be empty".into());
         }
+        if let Some(auth) = &self.auth {
+            if self.bearer_token.is_some() {
+                return Err("MCP HTTP transport cannot set both `bearer_token` and `auth`".into());
+            }
+            auth.validate()?;
+        }
         Ok(())
     }
 
-    fn transport_config(&self) -> Result<StreamableHttpClientTransportConfig, BoxError> {
+    /// Custom headers applied to every request regardless of auth mode.
+    fn custom_headers(&self) -> Result<HashMap<HeaderName, HeaderValue>, BoxError> {
         let mut headers = HashMap::new();
         for (name, value) in &self.headers {
             headers.insert(
@@ -904,8 +1185,22 @@ impl McpStreamableHttpTransport {
                 HeaderValue::from_str(value)?,
             );
         }
-        let mut config =
-            StreamableHttpClientTransportConfig::with_uri(self.url.clone()).custom_headers(headers);
+        Ok(headers)
+    }
+
+    /// Base transport config (URI + custom headers) without a static bearer
+    /// header, so an [`AuthClient`] can inject the OAuth access token instead.
+    fn base_transport_config(&self) -> Result<StreamableHttpClientTransportConfig, BoxError> {
+        Ok(
+            StreamableHttpClientTransportConfig::with_uri(self.url.clone())
+                .custom_headers(self.custom_headers()?),
+        )
+    }
+
+    /// Transport config for the static (non-OAuth) path, attaching the optional
+    /// bearer token as the `Authorization` header.
+    fn transport_config(&self) -> Result<StreamableHttpClientTransportConfig, BoxError> {
+        let mut config = self.base_transport_config()?;
         if let Some(token) = self
             .bearer_token
             .as_ref()
@@ -917,6 +1212,205 @@ impl McpStreamableHttpTransport {
         Ok(config)
     }
 }
+
+/// OAuth 2.1 authorization for a Streamable HTTP MCP server.
+///
+/// `anda_engine` is a library: it drives the OAuth *protocol* and exposes the
+/// seams, but never opens a browser, runs a callback server, or decides where
+/// tokens live. The consuming application owns those concerns (see
+/// [`McpToolProvider::begin_authorization`] and [`McpCredentialStore`]).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "flow", rename_all = "snake_case")]
+pub enum McpOAuthConfig {
+    /// Interactive Authorization Code flow with PKCE. Requires a one-time,
+    /// out-of-band browser authorization that persists credentials; afterwards
+    /// sessions are established from the stored refresh token with no human in
+    /// the loop.
+    AuthorizationCode(OAuthAuthorizationCodeConfig),
+    /// Server-to-server Client Credentials flow (SEP-1046). Fully headless:
+    /// tokens are obtained at connection time with no human interaction.
+    ClientCredentials(OAuthClientCredentialsConfig),
+}
+
+impl McpOAuthConfig {
+    fn validate(&self) -> Result<(), BoxError> {
+        match self {
+            Self::AuthorizationCode(config) => config.validate(),
+            Self::ClientCredentials(config) => config.validate(),
+        }
+    }
+}
+
+/// Configuration for the interactive OAuth Authorization Code flow.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct OAuthAuthorizationCodeConfig {
+    /// Redirect URI registered/used for the authorization request. The consuming
+    /// application decides how the redirect is received (loopback, a server
+    /// route, or manual paste) and passes the resulting URL back through
+    /// [`McpToolProvider::complete_authorization`].
+    pub redirect_uri: String,
+    /// Requested OAuth scopes.
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    /// Client name advertised during dynamic client registration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_name: Option<String>,
+    /// Pre-registered public `client_id`. When omitted, the client is registered
+    /// dynamically (RFC 7591 DCR) at authorization time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+}
+
+impl OAuthAuthorizationCodeConfig {
+    fn validate(&self) -> Result<(), BoxError> {
+        if self.redirect_uri.trim().is_empty() {
+            return Err("MCP OAuth authorization_code redirect_uri must not be empty".into());
+        }
+        Ok(())
+    }
+}
+
+/// Configuration for the headless OAuth Client Credentials flow.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct OAuthClientCredentialsConfig {
+    /// Confidential client id.
+    pub client_id: String,
+    /// Confidential client secret.
+    pub client_secret: String,
+    /// Requested OAuth scopes.
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    /// Optional explicit resource indicator (RFC 8707).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<String>,
+}
+
+impl OAuthClientCredentialsConfig {
+    fn validate(&self) -> Result<(), BoxError> {
+        if self.client_id.trim().is_empty() {
+            return Err("MCP OAuth client_credentials client_id must not be empty".into());
+        }
+        if self.client_secret.trim().is_empty() {
+            return Err("MCP OAuth client_credentials client_secret must not be empty".into());
+        }
+        Ok(())
+    }
+}
+
+/// Outcome of [`McpToolProvider::discover_http_oauth`]: the OAuth capabilities
+/// an HTTP MCP endpoint advertises.
+#[derive(Debug, Clone)]
+pub struct McpOAuthMetadata {
+    /// Scopes the authorization server advertises (may be empty).
+    pub scopes_supported: Vec<String>,
+    /// Whether the server supports dynamic client registration (RFC 7591).
+    pub registration_supported: bool,
+}
+
+/// Pluggable persistence for MCP OAuth credentials, keyed by server id.
+///
+/// The library never decides where tokens live; the consuming application
+/// supplies an implementation (e.g. backed by an encrypted store) through
+/// [`McpToolProviderBuilder::credential_store`]. Refresh tokens are secrets and
+/// must be persisted securely.
+#[async_trait]
+pub trait McpCredentialStore: Send + Sync {
+    /// Loads the stored credentials for `server_id`, if any.
+    async fn load(&self, server_id: &str) -> Result<Option<StoredCredentials>, BoxError>;
+    /// Persists credentials for `server_id`, replacing any previous value.
+    async fn save(&self, server_id: &str, credentials: StoredCredentials) -> Result<(), BoxError>;
+    /// Removes any stored credentials for `server_id`.
+    async fn clear(&self, server_id: &str) -> Result<(), BoxError>;
+}
+
+/// Default in-memory [`McpCredentialStore`]. Credentials do not survive a
+/// process restart; supply a persistent implementation in production.
+#[derive(Debug, Default)]
+pub struct InMemoryMcpCredentialStore {
+    credentials: RwLock<HashMap<String, StoredCredentials>>,
+}
+
+impl InMemoryMcpCredentialStore {
+    /// Creates an empty in-memory credential store.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[async_trait]
+impl McpCredentialStore for InMemoryMcpCredentialStore {
+    async fn load(&self, server_id: &str) -> Result<Option<StoredCredentials>, BoxError> {
+        Ok(self.credentials.read().get(server_id).cloned())
+    }
+
+    async fn save(&self, server_id: &str, credentials: StoredCredentials) -> Result<(), BoxError> {
+        self.credentials
+            .write()
+            .insert(server_id.to_string(), credentials);
+        Ok(())
+    }
+
+    async fn clear(&self, server_id: &str) -> Result<(), BoxError> {
+        self.credentials.write().remove(server_id);
+        Ok(())
+    }
+}
+
+/// Adapts a keyed [`McpCredentialStore`] to rmcp's per-manager (keyless)
+/// `CredentialStore`, bound to a single server id.
+struct ScopedCredentialStore {
+    server_id: String,
+    inner: Arc<dyn McpCredentialStore>,
+}
+
+#[async_trait]
+impl CredentialStore for ScopedCredentialStore {
+    async fn load(&self) -> Result<Option<StoredCredentials>, AuthError> {
+        self.inner
+            .load(&self.server_id)
+            .await
+            .map_err(|err| AuthError::InternalError(err.to_string()))
+    }
+
+    async fn save(&self, credentials: StoredCredentials) -> Result<(), AuthError> {
+        self.inner
+            .save(&self.server_id, credentials)
+            .await
+            .map_err(|err| AuthError::InternalError(err.to_string()))
+    }
+
+    async fn clear(&self) -> Result<(), AuthError> {
+        self.inner
+            .clear(&self.server_id)
+            .await
+            .map_err(|err| AuthError::InternalError(err.to_string()))
+    }
+}
+
+/// Error returned when establishing a session for a server configured with the
+/// OAuth Authorization Code flow, but no usable stored credentials exist yet.
+///
+/// The consuming application should catch this (via [`BoxError`] downcast) and
+/// run [`McpToolProvider::begin_authorization`] /
+/// [`McpToolProvider::complete_authorization`] before retrying.
+#[derive(Debug, Clone)]
+pub struct McpAuthorizationRequired {
+    /// The MCP server id that needs interactive authorization.
+    pub server_id: String,
+}
+
+impl std::fmt::Display for McpAuthorizationRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "MCP server {} requires interactive OAuth authorization; \
+             call begin_authorization/complete_authorization first",
+            self.server_id
+        )
+    }
+}
+
+impl std::error::Error for McpAuthorizationRequired {}
 
 fn mcp_result_to_tool_output(route: &McpToolRoute, result: CallToolResult) -> ToolOutput<Json> {
     let mut output = ToolOutput::new(json!({
@@ -1235,6 +1729,170 @@ done
         assert_eq!(routes[0].remote_name, "issues/get");
         assert!(routes[0].definition.description.contains("Fetch an issue"));
         assert_eq!(routes[0].definition.strict, Some(false));
+    }
+
+    fn http_auth_code_server(id: &str, client_id: Option<&str>) -> McpServerConfig {
+        let mut server = McpServerConfig::streamable_http(id, "https://example.com/mcp");
+        if let McpTransportConfig::StreamableHttp(http) = &mut server.transport {
+            http.auth = Some(McpOAuthConfig::AuthorizationCode(
+                OAuthAuthorizationCodeConfig {
+                    redirect_uri: "http://127.0.0.1:8080/callback".to_string(),
+                    scopes: vec!["mcp:tools".to_string()],
+                    client_name: Some("test".to_string()),
+                    client_id: client_id.map(str::to_string),
+                },
+            ));
+        }
+        server
+    }
+
+    #[test]
+    fn oauth_config_round_trips_through_serde() {
+        let server = http_auth_code_server("gh", None);
+        let json = serde_json::to_value(&server).unwrap();
+        assert_eq!(json["transport"]["auth"]["flow"], "authorization_code");
+
+        let parsed: McpServerConfig = serde_json::from_value(json).unwrap();
+        let McpTransportConfig::StreamableHttp(http) = &parsed.transport else {
+            panic!("expected streamable http transport");
+        };
+        match &http.auth {
+            Some(McpOAuthConfig::AuthorizationCode(ac)) => {
+                assert_eq!(ac.redirect_uri, "http://127.0.0.1:8080/callback");
+                assert_eq!(ac.scopes, vec!["mcp:tools".to_string()]);
+                assert!(ac.client_id.is_none());
+            }
+            other => panic!("unexpected auth config: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn client_credentials_config_round_trips_through_serde() {
+        let mut server = McpServerConfig::streamable_http("svc", "https://example.com/mcp");
+        if let McpTransportConfig::StreamableHttp(http) = &mut server.transport {
+            http.auth = Some(McpOAuthConfig::ClientCredentials(
+                OAuthClientCredentialsConfig {
+                    client_id: "cid".to_string(),
+                    client_secret: "secret".to_string(),
+                    scopes: vec!["a".to_string()],
+                    resource: Some("https://api.example.com".to_string()),
+                },
+            ));
+        }
+        let json = serde_json::to_value(&server).unwrap();
+        assert_eq!(json["transport"]["auth"]["flow"], "client_credentials");
+        let parsed: McpServerConfig = serde_json::from_value(json).unwrap();
+        assert!(parsed.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_bearer_token_combined_with_oauth() {
+        let mut server = http_auth_code_server("gh", None);
+        if let McpTransportConfig::StreamableHttp(http) = &mut server.transport {
+            http.bearer_token = Some("tok".to_string());
+        }
+        let err = server.validate().unwrap_err().to_string();
+        assert!(err.contains("cannot set both"), "{err}");
+    }
+
+    #[test]
+    fn validate_rejects_incomplete_oauth_configs() {
+        let mut server = http_auth_code_server("gh", None);
+        if let McpTransportConfig::StreamableHttp(http) = &mut server.transport {
+            if let Some(McpOAuthConfig::AuthorizationCode(ac)) = &mut http.auth {
+                ac.redirect_uri = "  ".to_string();
+            }
+        }
+        assert!(server.validate().is_err());
+
+        let mut creds = McpServerConfig::streamable_http("svc", "https://example.com/mcp");
+        if let McpTransportConfig::StreamableHttp(http) = &mut creds.transport {
+            http.auth = Some(McpOAuthConfig::ClientCredentials(
+                OAuthClientCredentialsConfig {
+                    client_id: "cid".to_string(),
+                    client_secret: String::new(),
+                    scopes: vec![],
+                    resource: None,
+                },
+            ));
+        }
+        assert!(creds.validate().is_err());
+    }
+
+    #[tokio::test]
+    async fn begin_authorization_rejects_non_oauth_servers() {
+        let provider = McpToolProvider::new(vec![
+            McpServerConfig::stdio("cli", "server"),
+            McpServerConfig::streamable_http("plain", "https://example.com/mcp"),
+        ])
+        .unwrap();
+
+        let err = provider.begin_authorization("cli").await.unwrap_err();
+        assert!(err.to_string().contains("does not use the HTTP transport"));
+
+        let err = provider.begin_authorization("plain").await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("not configured for the OAuth authorization_code flow")
+        );
+    }
+
+    #[tokio::test]
+    async fn authorization_code_without_credentials_reports_auth_required() {
+        // No network: an empty credential store short-circuits before discovery.
+        let provider = McpToolProvider::new(vec![http_auth_code_server("gh", None)]).unwrap();
+        let err = provider.refresh_server("gh").await.unwrap_err();
+        let required = err
+            .downcast_ref::<McpAuthorizationRequired>()
+            .expect("expected McpAuthorizationRequired");
+        assert_eq!(required.server_id, "gh");
+    }
+
+    #[tokio::test]
+    async fn register_server_registers_without_connecting() {
+        let provider = McpToolProvider::new(Vec::new()).unwrap();
+        provider
+            .register_server(http_auth_code_server("gh", None))
+            .unwrap();
+        assert!(provider.contains_server("gh"));
+        // No connection attempted, so no routes are discovered yet.
+        assert!(provider.routes().is_empty());
+
+        // Duplicate registration is rejected.
+        assert!(
+            provider
+                .register_server(http_auth_code_server("gh", None))
+                .is_err()
+        );
+
+        assert!(provider.remove_server("gh"));
+        assert!(!provider.contains_server("gh"));
+        assert!(!provider.remove_server("gh"));
+    }
+
+    #[tokio::test]
+    async fn complete_and_cancel_authorization_without_pending_state() {
+        let provider = McpToolProvider::new(vec![http_auth_code_server("gh", None)]).unwrap();
+        assert!(!provider.cancel_authorization("gh"));
+        let err = provider
+            .complete_authorization("gh", "http://127.0.0.1:8080/callback?code=x&state=y")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no pending OAuth authorization"));
+    }
+
+    #[tokio::test]
+    async fn in_memory_credential_store_round_trip() {
+        let store = InMemoryMcpCredentialStore::new();
+        assert!(store.load("gh").await.unwrap().is_none());
+
+        let creds = StoredCredentials::new("client".to_string(), None, vec!["a".to_string()], None);
+        store.save("gh", creds).await.unwrap();
+        let loaded = store.load("gh").await.unwrap().expect("stored");
+        assert_eq!(loaded.client_id, "client");
+
+        store.clear("gh").await.unwrap();
+        assert!(store.load("gh").await.unwrap().is_none());
     }
 
     #[test]

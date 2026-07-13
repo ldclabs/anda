@@ -81,9 +81,10 @@ reqwest = { version = "0.13", features = [
   "http2",
   # "hickory-dns",
 ], default-features = true }
-rmcp = { version = "1.7", default-features = false, features = [
+rmcp = { version = "2.2", default-features = false, features = [
   "client",
   "reqwest",
+  "auth",
   "transport-child-process",
   "transport-streamable-http-client-reqwest",
 ] }
