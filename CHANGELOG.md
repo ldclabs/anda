@@ -2,6 +2,12 @@
 
 All notable changes to the Anda project will be documented in this file.
 
+## [0.14.3] — 2026-07-16
+
+### Changed — anda_core v0.14.3, anda_engine v0.14.3, anda_engine_server v0.14.3, anda_web3_client v0.14.3
+
+- **anda_db 0.9→0.10** — Upgraded `anda_db`, `anda_db_tfs`, `anda_cognitive_nexus`, `anda_db_schema`, and `anda_kip` to 0.10. No API changes required in this workspace.
+
 ## [0.14.2] — 2026-07-13
 
 ### Added — anda_engine v0.14.2
