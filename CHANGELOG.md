@@ -2,6 +2,20 @@
 
 All notable changes to the Anda project will be documented in this file.
 
+## [0.14.4] — 2026-07-17
+
+### Fixed — anda_engine v0.14.4
+
+- **Anthropic structured output** — `output_schema` was silently dropped for Anthropic models; now mapped to `output_config.format` with `json_schema` type, so structured output requests work across all three model families.
+
+### Changed — anda_engine v0.14.4
+
+- **SSE deserialization zero-copy** — Wire enums in Anthropic, OpenAI, and Gemini type layers now deserialize by reference (`&str`) instead of cloning the buffered `Value`, removing per-event deep copies on SSE streaming hot paths.
+- **Reduced per-request cloning** — The full conversation is no longer cloned per request; request-log clones now live inside the log branch, raw history is built before converting content blocks, and v2 `output`/`parsed_output` are filled in a single pass.
+- **Shared model helpers** — `null_default`, `resolve_endpoint`, and `string_enum_serde!` (now with input aliases) hoisted to `model.rs`; applied to five hand-written open string enums.
+- **Consolidated test scaffolding** — Triplicated HTTP mock scaffolding merged into `model/test_support.rs`.
+- **Deduplicated model infrastructure** — Model constructors, `Models::clone`/`replace`, error-chain walkers, and the OpenAI media content-part mapping are now de-duplicated.
+
 ## [0.14.3] — 2026-07-16
 
 ### Changed — anda_core v0.14.3, anda_engine v0.14.3, anda_engine_server v0.14.3, anda_web3_client v0.14.3
