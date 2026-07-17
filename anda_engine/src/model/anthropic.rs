@@ -9,7 +9,7 @@ use anda_core::{
     AgentOutput, BoxError, BoxPinFut, CompletionFeatures, CompletionRequest, Message, Resource,
 };
 use log::{Level::Debug, log_enabled};
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::collections::BTreeMap;
 
 use super::{
@@ -62,14 +62,8 @@ impl Client {
     /// # Returns
     /// Configured Anthropic client instance
     pub fn new(api_key: &str, endpoint: Option<String>) -> Self {
-        let endpoint = endpoint.unwrap_or_else(|| API_BASE_URL.to_string());
-        let endpoint = if endpoint.is_empty() {
-            API_BASE_URL.to_string()
-        } else {
-            endpoint
-        };
         Self {
-            endpoint,
+            endpoint: super::resolve_endpoint(endpoint, API_BASE_URL),
             bearer_auth: false,
             api_key: api_key.to_string(),
             api_version: API_VERSION.to_string(),
@@ -166,14 +160,10 @@ impl CompletionModel {
     /// Sets the default reasoning effort for compatible models
     pub fn with_effort(mut self, effort: Option<ModelEffort>) -> Self {
         if let Some(effort) = effort {
-            let output_config =
-                self.default_request
-                    .output_config
-                    .get_or_insert(types::OutputConfig {
-                        effort: None,
-                        format: None,
-                    });
-            output_config.effort = Some(effort.into());
+            self.default_request
+                .output_config
+                .get_or_insert_default()
+                .effort = Some(effort.into());
         }
         self
     }
@@ -182,19 +172,6 @@ impl CompletionModel {
     pub fn with_default_request(mut self, req: types::CreateMessageParams) -> Self {
         self.default_request = req;
         self
-    }
-}
-
-fn empty_usage() -> types::Usage {
-    types::Usage {
-        input_tokens: 0,
-        cache_creation: None,
-        cache_creation_input_tokens: 0,
-        cache_read_input_tokens: 0,
-        inference_geo: None,
-        output_tokens: 0,
-        server_tool_use: None,
-        service_tier: None,
     }
 }
 
@@ -345,7 +322,7 @@ fn response_from_stream_events(
     let mut model = String::new();
     let mut stop_reason = None;
     let mut stop_sequence = None;
-    let mut usage = empty_usage();
+    let mut usage = types::Usage::default();
     let mut content = Vec::<Option<types::ContentBlock>>::new();
     let mut json_buffers = BTreeMap::<usize, String>::new();
     let mut saw_message = false;
@@ -505,11 +482,14 @@ impl CompletionFeaturesDyn for CompletionModel {
             }
 
             if let Some(effort) = req.effort {
-                let output_config = r.output_config.get_or_insert(types::OutputConfig {
-                    effort: None,
-                    format: None,
+                r.output_config.get_or_insert_default().effort = Some(effort.into());
+            }
+
+            if let Some(output_schema) = req.output_schema {
+                r.output_config.get_or_insert_default().format = Some(types::JsonOutputFormat {
+                    schema: output_schema,
+                    r#type: types::JsonOutputFormatType::JsonSchema,
                 });
-                output_config.effort = Some(effort.into());
             }
 
             if let Some(stop) = req.stop {
@@ -562,9 +542,7 @@ impl CompletionFeaturesDyn for CompletionModel {
                         };
                         assistant_raw_message = types::assistant_raw_history_message(&raw_response);
 
-                        match serde_json::from_value::<types::CreateMessageResponse>(
-                            raw_response.clone(),
-                        ) {
+                        match serde_json::from_value::<types::CreateMessageResponse>(raw_response) {
                             Ok(res) => res,
                             Err(err) => {
                                 return Err(format!(
@@ -582,30 +560,28 @@ impl CompletionFeaturesDyn for CompletionModel {
             )
             .await?;
 
-            let mut logged_request = r.clone();
-            logged_request.system = None;
-            if log_enabled!(Debug) {
-                log::debug!(
-                    model = model,
-                    request:serde = logged_request,
-                    response:serde = res;
-                    "Completion response");
-            } else if res.maybe_failed() {
-                log::warn!(
-                    model = model,
-                    request:serde = logged_request,
-                    response:serde = res;
-                    "Completion maybe failed");
+            if log_enabled!(Debug) || res.maybe_failed() {
+                let mut logged_request = r.clone();
+                logged_request.system = None;
+                if log_enabled!(Debug) {
+                    log::debug!(
+                        model = model,
+                        request:serde = logged_request,
+                        response:serde = res;
+                        "Completion response");
+                } else {
+                    log::warn!(
+                        model = model,
+                        request:serde = logged_request,
+                        response:serde = res;
+                        "Completion maybe failed");
+                }
             }
             if skip_raw > 0 {
                 r.messages.drain(0..skip_raw);
             }
 
-            res.try_into_with_raw(
-                r.messages.into_iter().map(|v| json!(v)).collect(),
-                chat_history,
-                assistant_raw_message,
-            )
+            res.try_into_with_raw(r.messages, chat_history, assistant_raw_message)
         })
     }
 }
@@ -613,90 +589,11 @@ impl CompletionFeaturesDyn for CompletionModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::test_support::{no_proxy_client, recorded, spawn_mock_server, sse_headers};
     use anda_core::{ContentPart, FunctionDefinition};
-    use axum::{Router, body::Bytes, extract::State, response::IntoResponse, routing::any};
-    use http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
+    use http::{HeaderMap, Method, StatusCode};
     use reqwest::header::ACCEPT;
-    use std::sync::{Arc, Mutex};
-
-    #[derive(Clone)]
-    struct MockResponse {
-        status: StatusCode,
-        headers: HeaderMap,
-        body: Vec<u8>,
-    }
-
-    #[derive(Clone, Debug)]
-    struct RecordedRequest {
-        method: Method,
-        uri: Uri,
-        headers: HeaderMap,
-        body: Vec<u8>,
-    }
-
-    type MockState = Arc<Mutex<(MockResponse, Option<RecordedRequest>)>>;
-
-    async fn mock_handler(
-        State(state): State<MockState>,
-        method: Method,
-        uri: Uri,
-        headers: HeaderMap,
-        body: Bytes,
-    ) -> impl IntoResponse {
-        let mut state = state.lock().unwrap();
-        state.1 = Some(RecordedRequest {
-            method,
-            uri,
-            headers,
-            body: body.to_vec(),
-        });
-        let mut response = (state.0.status, state.0.body.clone()).into_response();
-        for (name, value) in state.0.headers.iter() {
-            response.headers_mut().insert(name, value.clone());
-        }
-        response
-    }
-
-    async fn spawn_mock_server(
-        status: StatusCode,
-        headers: HeaderMap,
-        body: impl Into<Vec<u8>>,
-    ) -> (String, MockState) {
-        let state = Arc::new(Mutex::new((
-            MockResponse {
-                status,
-                headers,
-                body: body.into(),
-            },
-            None,
-        )));
-        let app = Router::new()
-            .fallback(any(mock_handler))
-            .with_state(state.clone());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        (format!("http://{addr}"), state)
-    }
-
-    fn no_proxy_client() -> reqwest::Client {
-        reqwest::Client::builder().no_proxy().build().unwrap()
-    }
-
-    fn recorded(state: &MockState) -> RecordedRequest {
-        state.lock().unwrap().1.clone().unwrap()
-    }
-
-    fn sse_headers() -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            http::header::CONTENT_TYPE,
-            HeaderValue::from_static("text/event-stream"),
-        );
-        headers
-    }
+    use serde_json::json;
 
     async fn complete(
         model: &CompletionModel,
@@ -972,6 +869,12 @@ mod tests {
                 max_output_tokens: Some(256),
                 stop: Some(vec!["END".into()]),
                 effort: Some(ModelEffort::High),
+                output_schema: Some(json!({
+                    "type": "object",
+                    "properties": {"answer": {"type": "string"}},
+                    "required": ["answer"],
+                    "additionalProperties": false
+                })),
                 tool_choice_required: true,
                 tools: vec![FunctionDefinition {
                     name: "lookup".into(),
@@ -1010,6 +913,16 @@ mod tests {
         assert_eq!(sent["tools"][0]["name"], "lookup");
         assert_eq!(sent["tool_choice"]["type"], "any");
         assert_eq!(sent["output_config"]["effort"], "xhigh");
+        assert_eq!(sent["output_config"]["format"]["type"], "json_schema");
+        assert_eq!(
+            sent["output_config"]["format"]["schema"],
+            json!({
+                "type": "object",
+                "properties": {"answer": {"type": "string"}},
+                "required": ["answer"],
+                "additionalProperties": false
+            })
+        );
     }
 
     #[tokio::test]

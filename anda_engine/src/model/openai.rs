@@ -39,13 +39,7 @@ const API_BASE_URL: &str = "https://api.openai.com/v1";
 /// Default completion model to use if not specified
 pub const DEFAULT_COMPLETION_MODEL: &str = "gpt-5.4-mini";
 
-fn null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: Default + Deserialize<'de>,
-{
-    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
-}
+use super::{null_default, string_enum_serde};
 
 fn is_json_null(value: &Json) -> bool {
     value.is_null()
@@ -87,14 +81,8 @@ impl Client {
     /// # Arguments
     /// * `api_key` - OpenAI API key for authentication
     pub fn new(api_key: &str, endpoint: Option<String>) -> Self {
-        let endpoint = endpoint.unwrap_or_else(|| API_BASE_URL.to_string());
-        let endpoint = if endpoint.is_empty() {
-            API_BASE_URL.to_string()
-        } else {
-            endpoint
-        };
         Self {
-            endpoint,
+            endpoint: super::resolve_endpoint(endpoint, API_BASE_URL),
             api_key: api_key.to_string(),
             http: request_client_builder()
                 .build()
@@ -211,7 +199,7 @@ pub struct CompletionResponse {
 impl CompletionResponse {
     pub fn parse_output(&mut self) {
         for choice in self.choices.iter_mut() {
-            if let Ok(msg) = serde_json::from_value::<MessageOutput>(choice.message.clone()) {
+            if let Ok(msg) = MessageOutput::deserialize(&choice.message) {
                 choice.parsed_message = Some(msg);
             }
         }
@@ -378,44 +366,13 @@ pub enum ServiceTier {
     Other(String),
 }
 
-impl ServiceTier {
-    fn as_str(&self) -> &str {
-        match self {
-            Self::Auto => "auto",
-            Self::Default => "default",
-            Self::Flex => "flex",
-            Self::Scale => "scale",
-            Self::Priority => "priority",
-            Self::Other(value) => value.as_str(),
-        }
-    }
-}
-
-impl Serialize for ServiceTier {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(self.as_str())
-    }
-}
-
-impl<'de> Deserialize<'de> for ServiceTier {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        Ok(match value.as_str() {
-            "auto" => Self::Auto,
-            "default" => Self::Default,
-            "flex" => Self::Flex,
-            "scale" => Self::Scale,
-            "priority" => Self::Priority,
-            _ => Self::Other(value),
-        })
-    }
-}
+string_enum_serde!(ServiceTier, {
+    "auto" => Auto,
+    "default" => Default,
+    "flex" => Flex,
+    "scale" => Scale,
+    "priority" => Priority,
+}, Other);
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -669,38 +626,28 @@ impl<'de> Deserialize<'de> for ChatCompletionContentPart {
         D: serde::Deserializer<'de>,
     {
         let value = Json::deserialize(deserializer)?;
-        match &value {
-            Json::Object(map)
-                if matches!(
-                    map.get("type").and_then(|t| t.as_str()),
-                    Some("text" | "image_url" | "input_audio" | "file" | "refusal")
-                ) =>
-            {
-                #[derive(Deserialize)]
-                #[serde(tag = "type")]
-                enum Helper {
-                    #[serde(rename = "text")]
-                    Text { text: String },
-                    #[serde(rename = "image_url")]
-                    ImageUrl { image_url: ImageUrl },
-                    #[serde(rename = "input_audio")]
-                    InputAudio { input_audio: InputAudio },
-                    #[serde(rename = "file")]
-                    File { file: FileContent },
-                    #[serde(rename = "refusal")]
-                    Refusal { refusal: String },
-                }
+        #[derive(Deserialize)]
+        #[serde(tag = "type")]
+        enum Helper {
+            #[serde(rename = "text")]
+            Text { text: String },
+            #[serde(rename = "image_url")]
+            ImageUrl { image_url: ImageUrl },
+            #[serde(rename = "input_audio")]
+            InputAudio { input_audio: InputAudio },
+            #[serde(rename = "file")]
+            File { file: FileContent },
+            #[serde(rename = "refusal")]
+            Refusal { refusal: String },
+        }
 
-                match serde_json::from_value::<Helper>(value.clone()) {
-                    Ok(Helper::Text { text }) => Ok(Self::Text { text }),
-                    Ok(Helper::ImageUrl { image_url }) => Ok(Self::ImageUrl { image_url }),
-                    Ok(Helper::InputAudio { input_audio }) => Ok(Self::InputAudio { input_audio }),
-                    Ok(Helper::File { file }) => Ok(Self::File { file }),
-                    Ok(Helper::Refusal { refusal }) => Ok(Self::Refusal { refusal }),
-                    Err(_) => Ok(Self::Any(value)),
-                }
-            }
-            _ => Ok(Self::Any(value)),
+        match Helper::deserialize(&value) {
+            Ok(Helper::Text { text }) => Ok(Self::Text { text }),
+            Ok(Helper::ImageUrl { image_url }) => Ok(Self::ImageUrl { image_url }),
+            Ok(Helper::InputAudio { input_audio }) => Ok(Self::InputAudio { input_audio }),
+            Ok(Helper::File { file }) => Ok(Self::File { file }),
+            Ok(Helper::Refusal { refusal }) => Ok(Self::Refusal { refusal }),
+            Err(_) => Ok(Self::Any(value)),
         }
     }
 }
@@ -777,6 +724,43 @@ fn tool_output_to_string(output: &Json) -> String {
     serde_json::to_string(output).unwrap_or_default()
 }
 
+/// Builds the Chat Completions content part for a media or file payload:
+/// media mime types use the lazily built URL, anything else falls back to a
+/// `file` part with the lazily built raw payload.
+fn media_content_part(
+    mime_type: &str,
+    url: impl FnOnce() -> Json,
+    file_data: impl FnOnce() -> Json,
+) -> Json {
+    match mime_type {
+        mt if mt.starts_with("image") => json!({
+            "type": "image_url",
+            "image_url": {
+                "url": url(),
+            },
+        }),
+        mt if mt.starts_with("video") => json!({
+            "type": "video_url",
+            "video_url": {
+                "url": url(),
+            },
+        }),
+        mt if mt.starts_with("audio") => json!({
+            "type": "input_audio",
+            "input_audio": {
+                "data": url(),
+                "format": if mt.contains("wav") { "wav" } else { "mp3" },
+            },
+        }),
+        _ => json!({
+            "type": "file",
+            "file": {
+                "file_data": file_data(),
+            },
+        }),
+    }
+}
+
 fn chat_completion_text_content_part_from_json(value: &Json) -> Json {
     json!({
         "type": "text",
@@ -785,7 +769,7 @@ fn chat_completion_text_content_part_from_json(value: &Json) -> Json {
 }
 
 fn chat_completion_content_part_from_any(value: &Json) -> Json {
-    match serde_json::from_value::<ChatCompletionContentPart>(value.clone()) {
+    match ChatCompletionContentPart::deserialize(value) {
         Ok(part) if !matches!(&part, ChatCompletionContentPart::Any(_)) => {
             serde_json::to_value(part)
                 .unwrap_or_else(|_| chat_completion_text_content_part_from_json(value))
@@ -833,72 +817,18 @@ fn to_message_inputs(msg: &Message) -> Vec<MessageInput> {
                 file_uri,
                 mime_type,
             } if file_uri.starts_with("data:") || file_uri.starts_with("https://") => {
-                match mime_type.clone().unwrap_or_default().as_str() {
-                    mt if mt.starts_with("image") => content.push(json!({
-                        "type": "image_url",
-                        "image_url":  {
-                            "url": file_uri,
-                        },
-                    })),
-                    mt if mt.starts_with("video") => {
-                        content.push(json!({
-                            "type": "video_url",
-                            "video_url": {
-                                "url": file_uri,
-                            },
-                        }));
-                    }
-                    mt if mt.starts_with("audio") => {
-                        content.push(json!({
-                            "type": "input_audio",
-                            "input_audio": {
-                                "data": file_uri,
-                                "format": if mt.contains("wav") { "wav" } else { "mp3" },
-                            },
-                        }));
-                    }
-                    _ => content.push(json!({
-                        "type": "file",
-                        "file":  {
-                            "file_data": file_uri,
-                        },
-                    })),
-                }
+                content.push(media_content_part(
+                    mime_type.as_deref().unwrap_or_default(),
+                    || json!(file_uri),
+                    || json!(file_uri),
+                ));
             }
             ContentPart::InlineData { data, mime_type } => {
-                match mime_type.as_str() {
-                    mt if mt.starts_with("image") => {
-                        content.push(json!({
-                            "type": "image_url",
-                            "image_url": {
-                                "url": part_to_data_url(data, Some(mime_type)),
-                            },
-                        }));
-                    }
-                    mt if mt.starts_with("video") => {
-                        content.push(json!({
-                            "type": "video_url",
-                            "video_url": {
-                                "url": part_to_data_url(data, Some(mime_type)),
-                            },
-                        }));
-                    }
-                    mt if mt.starts_with("audio") => {
-                        content.push(json!({
-                            "type": "input_audio",
-                            "input_audio": {
-                                "data": part_to_data_url(data, Some(mime_type)),
-                                "format": if mt.contains("wav") { "wav" } else { "mp3" },
-                            },
-                        }));
-                    }
-                    _ => content.push(json!({
-                        "type": "file",
-                        "file":  {
-                            "file_data": data,
-                        },
-                    })),
-                };
+                content.push(media_content_part(
+                    mime_type,
+                    || json!(part_to_data_url(data, Some(mime_type))),
+                    || json!(data),
+                ));
             }
             ContentPart::Any(json) => content.push(chat_completion_content_part_from_any(json)),
             v => content.push(json!({
@@ -1275,12 +1205,17 @@ fn responses_response_from_stream_events(
 
     let mut response = last_response.ok_or("No streamed completion response")?;
     if response.output.is_empty() && !output_items.is_empty() {
-        response.output = output_items
-            .into_values()
-            .map(|item| serde_json::to_value(item).unwrap_or(Json::Null))
-            .collect();
+        // Fill both representations in one pass instead of serializing the
+        // typed items and re-parsing them right back in `parse_output`.
+        for item in output_items.into_values() {
+            response
+                .output
+                .push(serde_json::to_value(&item).unwrap_or(Json::Null));
+            response.parsed_output.push(item);
+        }
+    } else {
+        response.parse_output();
     }
-    response.parse_output();
     Ok(response)
 }
 
@@ -2013,6 +1948,7 @@ impl CompletionFeaturesDyn for CompletionModelV2 {
                         "Completion response");
             } else if res.maybe_failed() {
                 log::warn!(
+                        model = r.model,
                         request:serde = r,
                         response:serde = res;
                         "Completion maybe failed");
@@ -2032,91 +1968,10 @@ impl CompletionFeaturesDyn for CompletionModelV2 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{Router, body::Bytes, extract::State, response::IntoResponse, routing::any};
-    use http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
+    use crate::model::test_support::{no_proxy_client, recorded, spawn_mock_server, sse_headers};
+    use http::{HeaderMap, Method, StatusCode};
     use reqwest::header::ACCEPT;
     use serde_json::{Map, json};
-    use std::sync::{Arc, Mutex};
-
-    #[derive(Clone)]
-    struct MockResponse {
-        status: StatusCode,
-        headers: HeaderMap,
-        body: Vec<u8>,
-    }
-
-    #[derive(Clone, Debug)]
-    struct RecordedRequest {
-        method: Method,
-        uri: Uri,
-        headers: HeaderMap,
-        body: Vec<u8>,
-    }
-
-    type MockState = Arc<Mutex<(MockResponse, Option<RecordedRequest>)>>;
-
-    async fn mock_handler(
-        State(state): State<MockState>,
-        method: Method,
-        uri: Uri,
-        headers: HeaderMap,
-        body: Bytes,
-    ) -> impl IntoResponse {
-        let mut state = state.lock().unwrap();
-        state.1 = Some(RecordedRequest {
-            method,
-            uri,
-            headers,
-            body: body.to_vec(),
-        });
-
-        let mut response = (state.0.status, state.0.body.clone()).into_response();
-        for (name, value) in state.0.headers.iter() {
-            response.headers_mut().insert(name, value.clone());
-        }
-        response
-    }
-
-    async fn spawn_mock_server(
-        status: StatusCode,
-        headers: HeaderMap,
-        body: impl Into<Vec<u8>>,
-    ) -> (String, MockState) {
-        let state = Arc::new(Mutex::new((
-            MockResponse {
-                status,
-                headers,
-                body: body.into(),
-            },
-            None,
-        )));
-        let app = Router::new()
-            .fallback(any(mock_handler))
-            .with_state(state.clone());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        (format!("http://{addr}"), state)
-    }
-
-    fn no_proxy_client() -> reqwest::Client {
-        reqwest::Client::builder().no_proxy().build().unwrap()
-    }
-
-    fn recorded(state: &MockState) -> RecordedRequest {
-        state.lock().unwrap().1.clone().unwrap()
-    }
-
-    fn sse_headers() -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            http::header::CONTENT_TYPE,
-            HeaderValue::from_static("text/event-stream"),
-        );
-        headers
-    }
 
     #[test]
     fn client_defaults_usage_display_service_tier_and_effort_mappings() {

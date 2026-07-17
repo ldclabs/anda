@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{collections::HashMap, str::FromStr};
 
+use crate::model::string_enum_serde;
 use crate::unix_ms;
 
 // https://platform.claude.com/docs/en/api/messages/create
@@ -144,7 +145,7 @@ impl From<RequiredMessageParams> for CreateMessageParams {
 }
 
 /// Configuration options for model output.
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Deserialize, Serialize, Clone, PartialEq, Eq)]
 pub struct OutputConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<OutputEffort>,
@@ -503,297 +504,268 @@ impl<'de> Deserialize<'de> for ContentBlock {
         D: serde::Deserializer<'de>,
     {
         let value = Value::deserialize(deserializer)?;
-        match &value {
-            Value::Object(map)
-                if matches!(
-                    map.get("type").and_then(|t| t.as_str()),
-                    Some(
-                        "text"
-                            | "image"
-                            | "document"
-                            | "search_result"
-                            | "tool_use"
-                            | "tool_result"
-                            | "thinking"
-                            | "redacted_thinking"
-                            | "server_tool_use"
-                            | "web_search_tool_result"
-                            | "web_fetch_tool_result"
-                            | "code_execution_tool_result"
-                            | "bash_code_execution_tool_result"
-                            | "text_editor_code_execution_tool_result"
-                            | "tool_search_tool_result"
-                            | "container_upload"
-                    )
-                ) =>
-            {
-                #[derive(Deserialize)]
-                #[serde(tag = "type")]
-                enum Helper {
-                    #[serde(rename = "text")]
-                    Text {
-                        text: String,
-                        cache_control: Option<CacheControlEphemeral>,
-                        citations: Option<Vec<TextCitation>>,
-                    },
-                    #[serde(rename = "image")]
-                    Image {
-                        source: ImageSource,
-                        cache_control: Option<CacheControlEphemeral>,
-                    },
-                    #[serde(rename = "document")]
-                    Document {
-                        source: DocumentSource,
-                        cache_control: Option<CacheControlEphemeral>,
-                        citations: Option<CitationsConfig>,
-                        context: Option<String>,
-                        title: Option<String>,
-                    },
-                    #[serde(rename = "search_result")]
-                    SearchResult {
-                        content: Vec<ContentBlock>,
-                        source: String,
-                        title: String,
-                        cache_control: Option<CacheControlEphemeral>,
-                        citations: Option<CitationsConfig>,
-                    },
-                    #[serde(rename = "tool_use")]
-                    ToolUse {
-                        id: String,
-                        name: String,
-                        input: Value,
-                        cache_control: Option<CacheControlEphemeral>,
-                        caller: Option<ToolCaller>,
-                    },
-                    #[serde(rename = "tool_result")]
-                    ToolResult {
-                        tool_use_id: String,
-                        content: Option<ToolResultContent>,
-                        cache_control: Option<CacheControlEphemeral>,
-                        is_error: Option<bool>,
-                    },
-                    #[serde(rename = "thinking")]
-                    Thinking {
-                        thinking: String,
-                        #[serde(default)]
-                        signature: String,
-                    },
-                    #[serde(rename = "redacted_thinking")]
-                    RedactedThinking { data: String },
-                    #[serde(rename = "server_tool_use")]
-                    ServerToolUse {
-                        id: String,
-                        name: String,
-                        input: Value,
-                        cache_control: Option<CacheControlEphemeral>,
-                        caller: Option<ToolCaller>,
-                    },
-                    #[serde(rename = "web_search_tool_result")]
-                    WebSearchToolResult {
-                        content: WebSearchToolResultContent,
-                        tool_use_id: String,
-                        cache_control: Option<CacheControlEphemeral>,
-                        caller: Option<ToolCaller>,
-                    },
-                    #[serde(rename = "web_fetch_tool_result")]
-                    WebFetchToolResult {
-                        content: WebFetchToolResultContent,
-                        tool_use_id: String,
-                        cache_control: Option<CacheControlEphemeral>,
-                        caller: Option<ToolCaller>,
-                    },
-                    #[serde(rename = "code_execution_tool_result")]
-                    CodeExecutionToolResult {
-                        content: Value,
-                        tool_use_id: String,
-                        cache_control: Option<CacheControlEphemeral>,
-                    },
-                    #[serde(rename = "bash_code_execution_tool_result")]
-                    BashCodeExecutionToolResult {
-                        content: Value,
-                        tool_use_id: String,
-                        cache_control: Option<CacheControlEphemeral>,
-                    },
-                    #[serde(rename = "text_editor_code_execution_tool_result")]
-                    TextEditorCodeExecutionToolResult {
-                        content: Value,
-                        tool_use_id: String,
-                        cache_control: Option<CacheControlEphemeral>,
-                    },
-                    #[serde(rename = "tool_search_tool_result")]
-                    ToolSearchToolResult {
-                        content: Value,
-                        tool_use_id: String,
-                        cache_control: Option<CacheControlEphemeral>,
-                    },
-                    #[serde(rename = "container_upload")]
-                    ContainerUpload {
-                        file_id: String,
-                        cache_control: Option<CacheControlEphemeral>,
-                    },
-                }
+        #[derive(Deserialize)]
+        #[serde(tag = "type")]
+        enum Helper {
+            #[serde(rename = "text")]
+            Text {
+                text: String,
+                cache_control: Option<CacheControlEphemeral>,
+                citations: Option<Vec<TextCitation>>,
+            },
+            #[serde(rename = "image")]
+            Image {
+                source: ImageSource,
+                cache_control: Option<CacheControlEphemeral>,
+            },
+            #[serde(rename = "document")]
+            Document {
+                source: DocumentSource,
+                cache_control: Option<CacheControlEphemeral>,
+                citations: Option<CitationsConfig>,
+                context: Option<String>,
+                title: Option<String>,
+            },
+            #[serde(rename = "search_result")]
+            SearchResult {
+                content: Vec<ContentBlock>,
+                source: String,
+                title: String,
+                cache_control: Option<CacheControlEphemeral>,
+                citations: Option<CitationsConfig>,
+            },
+            #[serde(rename = "tool_use")]
+            ToolUse {
+                id: String,
+                name: String,
+                input: Value,
+                cache_control: Option<CacheControlEphemeral>,
+                caller: Option<ToolCaller>,
+            },
+            #[serde(rename = "tool_result")]
+            ToolResult {
+                tool_use_id: String,
+                content: Option<ToolResultContent>,
+                cache_control: Option<CacheControlEphemeral>,
+                is_error: Option<bool>,
+            },
+            #[serde(rename = "thinking")]
+            Thinking {
+                thinking: String,
+                #[serde(default)]
+                signature: String,
+            },
+            #[serde(rename = "redacted_thinking")]
+            RedactedThinking { data: String },
+            #[serde(rename = "server_tool_use")]
+            ServerToolUse {
+                id: String,
+                name: String,
+                input: Value,
+                cache_control: Option<CacheControlEphemeral>,
+                caller: Option<ToolCaller>,
+            },
+            #[serde(rename = "web_search_tool_result")]
+            WebSearchToolResult {
+                content: WebSearchToolResultContent,
+                tool_use_id: String,
+                cache_control: Option<CacheControlEphemeral>,
+                caller: Option<ToolCaller>,
+            },
+            #[serde(rename = "web_fetch_tool_result")]
+            WebFetchToolResult {
+                content: WebFetchToolResultContent,
+                tool_use_id: String,
+                cache_control: Option<CacheControlEphemeral>,
+                caller: Option<ToolCaller>,
+            },
+            #[serde(rename = "code_execution_tool_result")]
+            CodeExecutionToolResult {
+                content: Value,
+                tool_use_id: String,
+                cache_control: Option<CacheControlEphemeral>,
+            },
+            #[serde(rename = "bash_code_execution_tool_result")]
+            BashCodeExecutionToolResult {
+                content: Value,
+                tool_use_id: String,
+                cache_control: Option<CacheControlEphemeral>,
+            },
+            #[serde(rename = "text_editor_code_execution_tool_result")]
+            TextEditorCodeExecutionToolResult {
+                content: Value,
+                tool_use_id: String,
+                cache_control: Option<CacheControlEphemeral>,
+            },
+            #[serde(rename = "tool_search_tool_result")]
+            ToolSearchToolResult {
+                content: Value,
+                tool_use_id: String,
+                cache_control: Option<CacheControlEphemeral>,
+            },
+            #[serde(rename = "container_upload")]
+            ContainerUpload {
+                file_id: String,
+                cache_control: Option<CacheControlEphemeral>,
+            },
+        }
 
-                match serde_json::from_value::<Helper>(value.clone()) {
-                    Ok(h) => Ok(match h {
-                        Helper::Text {
-                            text,
-                            cache_control,
-                            citations,
-                        } => ContentBlock::Text {
-                            text,
-                            cache_control,
-                            citations,
-                        },
-                        Helper::Image {
-                            source,
-                            cache_control,
-                        } => ContentBlock::Image {
-                            source,
-                            cache_control,
-                        },
-                        Helper::Document {
-                            source,
-                            cache_control,
-                            citations,
-                            context,
-                            title,
-                        } => ContentBlock::Document {
-                            source,
-                            cache_control,
-                            citations,
-                            context,
-                            title,
-                        },
-                        Helper::SearchResult {
-                            content,
-                            source,
-                            title,
-                            cache_control,
-                            citations,
-                        } => ContentBlock::SearchResult {
-                            content,
-                            source,
-                            title,
-                            cache_control,
-                            citations,
-                        },
-                        Helper::ToolUse {
-                            id,
-                            name,
-                            input,
-                            cache_control,
-                            caller,
-                        } => ContentBlock::ToolUse {
-                            id,
-                            name,
-                            input,
-                            cache_control,
-                            caller,
-                        },
-                        Helper::ToolResult {
-                            tool_use_id,
-                            content,
-                            cache_control,
-                            is_error,
-                        } => ContentBlock::ToolResult {
-                            tool_use_id,
-                            content,
-                            cache_control,
-                            is_error,
-                        },
-                        Helper::Thinking {
-                            thinking,
-                            signature,
-                        } => ContentBlock::Thinking {
-                            thinking,
-                            signature,
-                        },
-                        Helper::RedactedThinking { data } => {
-                            ContentBlock::RedactedThinking { data }
-                        }
-                        Helper::ServerToolUse {
-                            id,
-                            name,
-                            input,
-                            cache_control,
-                            caller,
-                        } => ContentBlock::ServerToolUse {
-                            id,
-                            name,
-                            input,
-                            cache_control,
-                            caller,
-                        },
-                        Helper::WebSearchToolResult {
-                            content,
-                            tool_use_id,
-                            cache_control,
-                            caller,
-                        } => ContentBlock::WebSearchToolResult {
-                            content,
-                            tool_use_id,
-                            cache_control,
-                            caller,
-                        },
-                        Helper::WebFetchToolResult {
-                            content,
-                            tool_use_id,
-                            cache_control,
-                            caller,
-                        } => ContentBlock::WebFetchToolResult {
-                            content,
-                            tool_use_id,
-                            cache_control,
-                            caller,
-                        },
-                        Helper::CodeExecutionToolResult {
-                            content,
-                            tool_use_id,
-                            cache_control,
-                        } => ContentBlock::CodeExecutionToolResult {
-                            content,
-                            tool_use_id,
-                            cache_control,
-                        },
-                        Helper::BashCodeExecutionToolResult {
-                            content,
-                            tool_use_id,
-                            cache_control,
-                        } => ContentBlock::BashCodeExecutionToolResult {
-                            content,
-                            tool_use_id,
-                            cache_control,
-                        },
-                        Helper::TextEditorCodeExecutionToolResult {
-                            content,
-                            tool_use_id,
-                            cache_control,
-                        } => ContentBlock::TextEditorCodeExecutionToolResult {
-                            content,
-                            tool_use_id,
-                            cache_control,
-                        },
-                        Helper::ToolSearchToolResult {
-                            content,
-                            tool_use_id,
-                            cache_control,
-                        } => ContentBlock::ToolSearchToolResult {
-                            content,
-                            tool_use_id,
-                            cache_control,
-                        },
-                        Helper::ContainerUpload {
-                            file_id,
-                            cache_control,
-                        } => ContentBlock::ContainerUpload {
-                            file_id,
-                            cache_control,
-                        },
-                    }),
-                    Err(_) => Ok(ContentBlock::Any(value)),
-                }
-            }
-            _ => Ok(ContentBlock::Any(value)),
+        match Helper::deserialize(&value) {
+            Ok(h) => Ok(match h {
+                Helper::Text {
+                    text,
+                    cache_control,
+                    citations,
+                } => ContentBlock::Text {
+                    text,
+                    cache_control,
+                    citations,
+                },
+                Helper::Image {
+                    source,
+                    cache_control,
+                } => ContentBlock::Image {
+                    source,
+                    cache_control,
+                },
+                Helper::Document {
+                    source,
+                    cache_control,
+                    citations,
+                    context,
+                    title,
+                } => ContentBlock::Document {
+                    source,
+                    cache_control,
+                    citations,
+                    context,
+                    title,
+                },
+                Helper::SearchResult {
+                    content,
+                    source,
+                    title,
+                    cache_control,
+                    citations,
+                } => ContentBlock::SearchResult {
+                    content,
+                    source,
+                    title,
+                    cache_control,
+                    citations,
+                },
+                Helper::ToolUse {
+                    id,
+                    name,
+                    input,
+                    cache_control,
+                    caller,
+                } => ContentBlock::ToolUse {
+                    id,
+                    name,
+                    input,
+                    cache_control,
+                    caller,
+                },
+                Helper::ToolResult {
+                    tool_use_id,
+                    content,
+                    cache_control,
+                    is_error,
+                } => ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    cache_control,
+                    is_error,
+                },
+                Helper::Thinking {
+                    thinking,
+                    signature,
+                } => ContentBlock::Thinking {
+                    thinking,
+                    signature,
+                },
+                Helper::RedactedThinking { data } => ContentBlock::RedactedThinking { data },
+                Helper::ServerToolUse {
+                    id,
+                    name,
+                    input,
+                    cache_control,
+                    caller,
+                } => ContentBlock::ServerToolUse {
+                    id,
+                    name,
+                    input,
+                    cache_control,
+                    caller,
+                },
+                Helper::WebSearchToolResult {
+                    content,
+                    tool_use_id,
+                    cache_control,
+                    caller,
+                } => ContentBlock::WebSearchToolResult {
+                    content,
+                    tool_use_id,
+                    cache_control,
+                    caller,
+                },
+                Helper::WebFetchToolResult {
+                    content,
+                    tool_use_id,
+                    cache_control,
+                    caller,
+                } => ContentBlock::WebFetchToolResult {
+                    content,
+                    tool_use_id,
+                    cache_control,
+                    caller,
+                },
+                Helper::CodeExecutionToolResult {
+                    content,
+                    tool_use_id,
+                    cache_control,
+                } => ContentBlock::CodeExecutionToolResult {
+                    content,
+                    tool_use_id,
+                    cache_control,
+                },
+                Helper::BashCodeExecutionToolResult {
+                    content,
+                    tool_use_id,
+                    cache_control,
+                } => ContentBlock::BashCodeExecutionToolResult {
+                    content,
+                    tool_use_id,
+                    cache_control,
+                },
+                Helper::TextEditorCodeExecutionToolResult {
+                    content,
+                    tool_use_id,
+                    cache_control,
+                } => ContentBlock::TextEditorCodeExecutionToolResult {
+                    content,
+                    tool_use_id,
+                    cache_control,
+                },
+                Helper::ToolSearchToolResult {
+                    content,
+                    tool_use_id,
+                    cache_control,
+                } => ContentBlock::ToolSearchToolResult {
+                    content,
+                    tool_use_id,
+                    cache_control,
+                },
+                Helper::ContainerUpload {
+                    file_id,
+                    cache_control,
+                } => ContentBlock::ContainerUpload {
+                    file_id,
+                    cache_control,
+                },
+            }),
+            Err(_) => Ok(ContentBlock::Any(value)),
         }
     }
 }
@@ -986,49 +958,14 @@ pub enum StopReason {
     Other(String),
 }
 
-impl StopReason {
-    fn as_str(&self) -> &str {
-        match self {
-            Self::EndTurn => "end_turn",
-            Self::MaxTokens => "max_tokens",
-            Self::StopSequence => "stop_sequence",
-            Self::ToolUse => "tool_use",
-            Self::PauseTurn => "pause_turn",
-            Self::Refusal => "refusal",
-            Self::Other(value) => value.as_str(),
-        }
-    }
-}
-
-impl Serialize for StopReason {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(self.as_str())
-    }
-}
-
-impl<'de> Deserialize<'de> for StopReason {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        Ok(match value.as_str() {
-            "end_turn" => Self::EndTurn,
-            "stop" => Self::EndTurn,
-            "max_tokens" => Self::MaxTokens,
-            "length" => Self::MaxTokens,
-            "stop_sequence" => Self::StopSequence,
-            "tool_use" => Self::ToolUse,
-            "tool_calls" => Self::ToolUse,
-            "pause_turn" => Self::PauseTurn,
-            "refusal" => Self::Refusal,
-            _ => Self::Other(value),
-        })
-    }
-}
+string_enum_serde!(StopReason, {
+    "end_turn" | "stop" => EndTurn,
+    "max_tokens" | "length" => MaxTokens,
+    "stop_sequence" => StopSequence,
+    "tool_use" | "tool_calls" => ToolUse,
+    "pause_turn" => PauseTurn,
+    "refusal" => Refusal,
+}, Other);
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct CacheCreation {
@@ -1054,43 +991,14 @@ pub enum UsageServiceTier {
     Other(String),
 }
 
-impl UsageServiceTier {
-    fn as_str(&self) -> &str {
-        match self {
-            Self::Standard => "standard",
-            Self::Priority => "priority",
-            Self::Batch => "batch",
-            Self::Other(value) => value.as_str(),
-        }
-    }
-}
-
-impl Serialize for UsageServiceTier {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(self.as_str())
-    }
-}
-
-impl<'de> Deserialize<'de> for UsageServiceTier {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        Ok(match value.as_str() {
-            "standard" => Self::Standard,
-            "priority" => Self::Priority,
-            "batch" => Self::Batch,
-            _ => Self::Other(value),
-        })
-    }
-}
+string_enum_serde!(UsageServiceTier, {
+    "standard" => Standard,
+    "priority" => Priority,
+    "batch" => Batch,
+}, Other);
 
 /// Token usage statistics
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 pub struct Usage {
     /// Input tokens used
     #[serde(default)]
@@ -1176,7 +1084,7 @@ fn text_block_from_json(value: &Value) -> ContentBlock {
 }
 
 fn content_block_from_any(value: Value) -> ContentBlock {
-    match serde_json::from_value::<ContentBlock>(value.clone()) {
+    match ContentBlock::deserialize(&value) {
         Ok(block) if !matches!(&block, ContentBlock::Any(_)) => block,
         _ => text_block_from_json(&value),
     }
@@ -1484,8 +1392,6 @@ impl CreateMessageResponse {
         if self.content.is_empty() {
             output.failed_reason = serde_json::to_string(&self.stop_reason).ok();
         } else {
-            let content_parts: Vec<ContentPart> =
-                self.content.iter().cloned().map(|v| v.into()).collect();
             output
                 .raw_history
                 .push(assistant_raw_message.unwrap_or_else(|| {
@@ -1494,6 +1400,8 @@ impl CreateMessageResponse {
                         "content": self.content,
                     })
                 }));
+            let content_parts: Vec<ContentPart> =
+                self.content.into_iter().map(|v| v.into()).collect();
 
             let msg = CoreMessage {
                 role: "assistant".to_string(),
@@ -1604,85 +1512,62 @@ impl<'de> Deserialize<'de> for StreamEvent {
         D: serde::Deserializer<'de>,
     {
         let value = Value::deserialize(deserializer)?;
-        match &value {
-            Value::Object(map)
-                if matches!(
-                    map.get("type").and_then(|t| t.as_str()),
-                    Some(
-                        "message_start"
-                            | "content_block_start"
-                            | "content_block_delta"
-                            | "content_block_stop"
-                            | "message_delta"
-                            | "message_stop"
-                            | "ping"
-                            | "error"
-                    )
-                ) =>
-            {
-                #[derive(Deserialize)]
-                #[serde(tag = "type")]
-                enum Helper {
-                    #[serde(rename = "message_start")]
-                    MessageStart { message: MessageStartContent },
-                    #[serde(rename = "content_block_start")]
-                    ContentBlockStart {
-                        #[serde(default)]
-                        index: usize,
-                        content_block: ContentBlock,
-                    },
-                    #[serde(rename = "content_block_delta")]
-                    ContentBlockDelta {
-                        #[serde(default)]
-                        index: usize,
-                        delta: ContentBlockDelta,
-                    },
-                    #[serde(rename = "content_block_stop")]
-                    ContentBlockStop {
-                        #[serde(default)]
-                        index: usize,
-                    },
-                    #[serde(rename = "message_delta")]
-                    MessageDelta {
-                        #[serde(default)]
-                        delta: MessageDeltaContent,
-                        usage: Option<Usage>,
-                    },
-                    #[serde(rename = "message_stop")]
-                    MessageStop,
-                    #[serde(rename = "ping")]
-                    Ping,
-                    #[serde(rename = "error")]
-                    Error { error: StreamError },
-                }
+        #[derive(Deserialize)]
+        #[serde(tag = "type")]
+        enum Helper {
+            #[serde(rename = "message_start")]
+            MessageStart { message: MessageStartContent },
+            #[serde(rename = "content_block_start")]
+            ContentBlockStart {
+                #[serde(default)]
+                index: usize,
+                content_block: ContentBlock,
+            },
+            #[serde(rename = "content_block_delta")]
+            ContentBlockDelta {
+                #[serde(default)]
+                index: usize,
+                delta: ContentBlockDelta,
+            },
+            #[serde(rename = "content_block_stop")]
+            ContentBlockStop {
+                #[serde(default)]
+                index: usize,
+            },
+            #[serde(rename = "message_delta")]
+            MessageDelta {
+                #[serde(default)]
+                delta: MessageDeltaContent,
+                usage: Option<Usage>,
+            },
+            #[serde(rename = "message_stop")]
+            MessageStop,
+            #[serde(rename = "ping")]
+            Ping,
+            #[serde(rename = "error")]
+            Error { error: StreamError },
+        }
 
-                match serde_json::from_value::<Helper>(value.clone()) {
-                    Ok(Helper::MessageStart { message }) => {
-                        Ok(StreamEvent::MessageStart { message })
-                    }
-                    Ok(Helper::ContentBlockStart {
-                        index,
-                        content_block,
-                    }) => Ok(StreamEvent::ContentBlockStart {
-                        index,
-                        content_block,
-                    }),
-                    Ok(Helper::ContentBlockDelta { index, delta }) => {
-                        Ok(StreamEvent::ContentBlockDelta { index, delta })
-                    }
-                    Ok(Helper::ContentBlockStop { index }) => {
-                        Ok(StreamEvent::ContentBlockStop { index })
-                    }
-                    Ok(Helper::MessageDelta { delta, usage }) => {
-                        Ok(StreamEvent::MessageDelta { delta, usage })
-                    }
-                    Ok(Helper::MessageStop) => Ok(StreamEvent::MessageStop),
-                    Ok(Helper::Ping) => Ok(StreamEvent::Ping),
-                    Ok(Helper::Error { error }) => Ok(StreamEvent::Error { error }),
-                    Err(_) => Ok(StreamEvent::Any(value)),
-                }
+        match Helper::deserialize(&value) {
+            Ok(Helper::MessageStart { message }) => Ok(StreamEvent::MessageStart { message }),
+            Ok(Helper::ContentBlockStart {
+                index,
+                content_block,
+            }) => Ok(StreamEvent::ContentBlockStart {
+                index,
+                content_block,
+            }),
+            Ok(Helper::ContentBlockDelta { index, delta }) => {
+                Ok(StreamEvent::ContentBlockDelta { index, delta })
             }
-            _ => Ok(StreamEvent::Any(value)),
+            Ok(Helper::ContentBlockStop { index }) => Ok(StreamEvent::ContentBlockStop { index }),
+            Ok(Helper::MessageDelta { delta, usage }) => {
+                Ok(StreamEvent::MessageDelta { delta, usage })
+            }
+            Ok(Helper::MessageStop) => Ok(StreamEvent::MessageStop),
+            Ok(Helper::Ping) => Ok(StreamEvent::Ping),
+            Ok(Helper::Error { error }) => Ok(StreamEvent::Error { error }),
+            Err(_) => Ok(StreamEvent::Any(value)),
         }
     }
 }
@@ -1723,65 +1608,49 @@ impl<'de> Deserialize<'de> for ContentBlockDelta {
         D: serde::Deserializer<'de>,
     {
         let value = Value::deserialize(deserializer)?;
-        match &value {
-            Value::Object(map)
-                if matches!(
-                    map.get("type").and_then(|t| t.as_str()),
-                    Some(
-                        "text_delta"
-                            | "input_json_delta"
-                            | "thinking_delta"
-                            | "signature_delta"
-                            | "citations_delta"
-                    )
-                ) =>
-            {
-                #[allow(clippy::enum_variant_names)]
-                #[derive(Deserialize)]
-                #[serde(tag = "type")]
-                enum Helper {
-                    #[serde(rename = "text_delta")]
-                    TextDelta {
-                        #[serde(default)]
-                        text: String,
-                    },
-                    #[serde(rename = "input_json_delta")]
-                    InputJsonDelta {
-                        #[serde(default)]
-                        partial_json: String,
-                    },
-                    #[serde(rename = "thinking_delta")]
-                    ThinkingDelta {
-                        #[serde(default)]
-                        thinking: String,
-                    },
-                    #[serde(rename = "signature_delta")]
-                    SignatureDelta {
-                        #[serde(default)]
-                        signature: String,
-                    },
-                    #[serde(rename = "citations_delta")]
-                    CitationsDelta { citation: TextCitation },
-                }
+        #[allow(clippy::enum_variant_names)]
+        #[derive(Deserialize)]
+        #[serde(tag = "type")]
+        enum Helper {
+            #[serde(rename = "text_delta")]
+            TextDelta {
+                #[serde(default)]
+                text: String,
+            },
+            #[serde(rename = "input_json_delta")]
+            InputJsonDelta {
+                #[serde(default)]
+                partial_json: String,
+            },
+            #[serde(rename = "thinking_delta")]
+            ThinkingDelta {
+                #[serde(default)]
+                thinking: String,
+            },
+            #[serde(rename = "signature_delta")]
+            SignatureDelta {
+                #[serde(default)]
+                signature: String,
+            },
+            #[serde(rename = "citations_delta")]
+            CitationsDelta { citation: TextCitation },
+        }
 
-                match serde_json::from_value::<Helper>(value.clone()) {
-                    Ok(Helper::TextDelta { text }) => Ok(ContentBlockDelta::TextDelta { text }),
-                    Ok(Helper::InputJsonDelta { partial_json }) => {
-                        Ok(ContentBlockDelta::InputJsonDelta { partial_json })
-                    }
-                    Ok(Helper::ThinkingDelta { thinking }) => {
-                        Ok(ContentBlockDelta::ThinkingDelta { thinking })
-                    }
-                    Ok(Helper::SignatureDelta { signature }) => {
-                        Ok(ContentBlockDelta::SignatureDelta { signature })
-                    }
-                    Ok(Helper::CitationsDelta { citation }) => {
-                        Ok(ContentBlockDelta::CitationsDelta { citation })
-                    }
-                    Err(_) => Ok(ContentBlockDelta::Any(value)),
-                }
+        match Helper::deserialize(&value) {
+            Ok(Helper::TextDelta { text }) => Ok(ContentBlockDelta::TextDelta { text }),
+            Ok(Helper::InputJsonDelta { partial_json }) => {
+                Ok(ContentBlockDelta::InputJsonDelta { partial_json })
             }
-            _ => Ok(ContentBlockDelta::Any(value)),
+            Ok(Helper::ThinkingDelta { thinking }) => {
+                Ok(ContentBlockDelta::ThinkingDelta { thinking })
+            }
+            Ok(Helper::SignatureDelta { signature }) => {
+                Ok(ContentBlockDelta::SignatureDelta { signature })
+            }
+            Ok(Helper::CitationsDelta { citation }) => {
+                Ok(ContentBlockDelta::CitationsDelta { citation })
+            }
+            Err(_) => Ok(ContentBlockDelta::Any(value)),
         }
     }
 }

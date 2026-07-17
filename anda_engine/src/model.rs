@@ -29,6 +29,67 @@ use std::{
 pub mod anthropic;
 pub mod gemini;
 pub mod openai;
+#[cfg(test)]
+pub(crate) mod test_support;
+
+/// Deserializes a JSON `null` as the type's default value, so providers that
+/// send explicit nulls for optional counters/objects do not fail typed parses.
+pub(crate) fn null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+/// Generates `as_str`, `Serialize`, and `Deserialize` for an open string enum:
+/// known wire values map to variants (extra input-only aliases may follow the
+/// canonical value with `|`), and unknown values are preserved in the given
+/// catch-all variant instead of failing the parse.
+macro_rules! string_enum_serde {
+    ($ty:ident, { $($wire:literal $(| $alias:literal)* => $variant:ident),+ $(,)? }, $unknown:ident) => {
+        impl $ty {
+            fn as_str(&self) -> &str {
+                match self {
+                    $(Self::$variant => $wire,)+
+                    Self::$unknown(value) => value.as_str(),
+                }
+            }
+        }
+
+        impl serde::Serialize for $ty {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                serializer.serialize_str(self.as_str())
+            }
+        }
+
+        impl<'de> serde::Deserialize<'de> for $ty {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                let value = String::deserialize(deserializer)?;
+                Ok(match value.as_str() {
+                    $($wire $(| $alias)* => Self::$variant,)+
+                    _ => Self::$unknown(value),
+                })
+            }
+        }
+    };
+}
+pub(crate) use string_enum_serde;
+
+/// Resolves a configured endpoint, falling back to the provider default when
+/// the endpoint is absent or empty.
+pub(crate) fn resolve_endpoint(endpoint: Option<String>, default: &str) -> String {
+    match endpoint {
+        Some(endpoint) if !endpoint.is_empty() => endpoint,
+        _ => default.to_string(),
+    }
+}
 
 pub use reqwest;
 pub use reqwest::Proxy;
@@ -171,19 +232,17 @@ impl ModelConfig {
                 ))
             }
             "openai" => {
+                let cli = openai::Client::new(&self.api_key, Some(self.api_base.clone()))
+                    .with_client(http_client);
                 if self.model.starts_with("gpt") {
                     Model::with_completer(Arc::new(
-                        openai::Client::new(&self.api_key, Some(self.api_base.clone()))
-                            .with_client(http_client)
-                            .completion_model_v2(&self.model)
+                        cli.completion_model_v2(&self.model)
                             .with_stream(self.stream)
                             .with_effort(self.effort),
                     ))
                 } else {
                     Model::with_completer(Arc::new(
-                        openai::Client::new(&self.api_key, Some(self.api_base.clone()))
-                            .with_client(http_client)
-                            .completion_model(&self.model)
+                        cli.completion_model(&self.model)
                             .with_stream(self.stream)
                             .with_effort(self.effort),
                     ))
@@ -229,31 +288,17 @@ impl Default for Models {
 impl Models {
     /// Creates a new Models instance by cloning the internal state of another Models instance.
     pub fn from_clone(other: &Models) -> Self {
-        let models: HashMap<String, Vec<Model>> = HashMap::from_iter(
-            other
-                .models
-                .load()
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone())),
-        );
         Self {
             model: ArcSwap::new(other.model.load_full()),
-            models: ArcSwap::new(Arc::new(models)),
+            models: ArcSwap::new(Arc::new(other.models.load().as_ref().clone())),
         }
     }
 
     /// Replaces this registry with a clone of another [`Models`] instance.
     pub fn replace(&self, other: &Models) {
-        let model = other.model.load_full();
-        let models: HashMap<String, Vec<Model>> = HashMap::from_iter(
-            other
-                .models
-                .load()
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone())),
-        );
-        self.model.store(model);
-        self.models.store(Arc::new(models));
+        self.model.store(other.model.load_full());
+        self.models
+            .store(Arc::new(other.models.load().as_ref().clone()));
     }
 
     /// Builds a registry from model configs by registering every resolved label.
@@ -474,12 +519,7 @@ impl Model {
 
     /// Creates a model from a completion provider.
     pub fn with_completer(completer: Arc<dyn CompletionFeaturesDyn>) -> Self {
-        Self {
-            completer,
-            labels: Vec::new(),
-            context_window: 0,
-            max_output: 0,
-        }
+        Self::new(completer)
     }
 
     /// Assigns labels used by [`Models`] for routing.
@@ -490,22 +530,12 @@ impl Model {
 
     /// Creates a model whose completion calls return `not implemented` errors.
     pub fn not_implemented() -> Self {
-        Self {
-            completer: Arc::new(NotImplemented),
-            labels: Vec::new(),
-            context_window: 0,
-            max_output: 0,
-        }
+        Self::new(Arc::new(NotImplemented))
     }
 
     /// Creates a model with deterministic mock completion behavior for tests.
     pub fn mock_implemented() -> Self {
-        Self {
-            completer: Arc::new(MockImplemented),
-            labels: Vec::new(),
-            context_window: 0,
-            max_output: 0,
-        }
+        Self::new(Arc::new(MockImplemented))
     }
 
     /// Returns the provider model name for this model.
@@ -596,23 +626,33 @@ impl Error for ModelError {
     }
 }
 
-/// Returns true if the error chain carries a retryable model error signal.
-pub fn is_retryable_model_error(error: &(dyn Error + 'static)) -> bool {
+/// Walks an error chain and returns the first value produced by `f`.
+fn find_in_error_chain<T>(
+    error: &(dyn Error + 'static),
+    f: impl Fn(&(dyn Error + 'static)) -> Option<T>,
+) -> Option<T> {
     let mut current = Some(error);
     while let Some(error) = current {
-        if let Some(error) = error.downcast_ref::<ModelError>()
-            && error.is_retryable()
-        {
-            return true;
-        }
-        if let Some(error) = error.downcast_ref::<reqwest::Error>()
-            && is_retryable_reqwest_error(error)
-        {
-            return true;
+        if let Some(found) = f(error) {
+            return Some(found);
         }
         current = error.source();
     }
-    false
+    None
+}
+
+/// Returns true if the error chain carries a retryable model error signal.
+pub fn is_retryable_model_error(error: &(dyn Error + 'static)) -> bool {
+    find_in_error_chain(error, |error| {
+        let retryable = error
+            .downcast_ref::<ModelError>()
+            .is_some_and(ModelError::is_retryable)
+            || error
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(is_retryable_reqwest_error);
+        retryable.then_some(())
+    })
+    .is_some()
 }
 
 /// Convenience wrapper for callers that keep completion errors as [`BoxError`].
@@ -622,30 +662,14 @@ pub fn is_retryable_box_error(error: &BoxError) -> bool {
 
 /// Returns the first [`ModelError`] HTTP status found in the error chain.
 pub fn model_error_status(error: &(dyn Error + 'static)) -> Option<http::StatusCode> {
-    let mut current = Some(error);
-    while let Some(error) = current {
-        if let Some(error) = error.downcast_ref::<ModelError>()
-            && error.status().is_some()
-        {
-            return error.status();
-        }
-        current = error.source();
-    }
-    None
+    find_in_error_chain(error, |error| error.downcast_ref::<ModelError>()?.status())
 }
 
 /// Returns the first upstream retry delay found in the error chain.
 pub fn model_error_retry_after(error: &(dyn Error + 'static)) -> Option<Duration> {
-    let mut current = Some(error);
-    while let Some(error) = current {
-        if let Some(error) = error.downcast_ref::<ModelError>()
-            && error.retry_after().is_some()
-        {
-            return error.retry_after();
-        }
-        current = error.source();
-    }
-    None
+    find_in_error_chain(error, |error| {
+        error.downcast_ref::<ModelError>()?.retry_after()
+    })
 }
 
 /// Statuses that are transient enough for one immediate SDK retry and for an
@@ -1195,10 +1219,7 @@ pub(crate) fn streaming_completion_request(
 mod tests {
     use super::*;
     use anda_core::FunctionDefinition;
-    use axum::{Router, body::Bytes, extract::State, response::IntoResponse, routing::any};
-    use http::{HeaderMap, HeaderValue, Method, StatusCode};
-    use std::collections::VecDeque;
-    use std::sync::Mutex;
+    use http::{HeaderMap, HeaderValue, StatusCode};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[derive(Clone)]
@@ -1221,44 +1242,7 @@ mod tests {
     }
 
     fn http_client() -> reqwest::Client {
-        reqwest::Client::builder().no_proxy().build().unwrap()
-    }
-
-    #[derive(Clone)]
-    struct MockHttpResponse {
-        status: StatusCode,
-        headers: HeaderMap,
-        body: Vec<u8>,
-    }
-
-    type RetryState = Arc<Mutex<(VecDeque<MockHttpResponse>, usize)>>;
-
-    async fn retry_mock_handler(
-        State(state): State<RetryState>,
-        _method: Method,
-        _body: Bytes,
-    ) -> impl IntoResponse {
-        let mut state = state.lock().unwrap();
-        state.1 += 1;
-        let mock = state.0.pop_front().expect("mock response should exist");
-        let mut response = (mock.status, mock.body).into_response();
-        for (name, value) in mock.headers.iter() {
-            response.headers_mut().insert(name, value.clone());
-        }
-        response
-    }
-
-    async fn spawn_retry_mock_server(responses: Vec<MockHttpResponse>) -> (String, RetryState) {
-        let state = Arc::new(Mutex::new((responses.into(), 0)));
-        let app = Router::new()
-            .fallback(any(retry_mock_handler))
-            .with_state(state.clone());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        (format!("http://{addr}"), state)
+        test_support::no_proxy_client()
     }
 
     async fn spawn_truncated_sse_after_done_server() -> String {
@@ -1340,7 +1324,7 @@ mod tests {
         format!("http://{addr}")
     }
 
-    fn retry_count(state: &RetryState) -> usize {
+    fn retry_count(state: &test_support::RetryState) -> usize {
         state.lock().unwrap().1
     }
 
@@ -1689,12 +1673,13 @@ mod tests {
             http::header::CONTENT_TYPE,
             HeaderValue::from_static("text/event-stream"),
         );
-        let (endpoint, _) = spawn_retry_mock_server(vec![MockHttpResponse {
-            status: StatusCode::OK,
-            headers,
-            body: b"data: {\"a\":1}\n\ndata: [DONE]\n\n".to_vec(),
-        }])
-        .await;
+        let (endpoint, _) =
+            test_support::spawn_retry_mock_server(vec![test_support::MockResponse {
+                status: StatusCode::OK,
+                headers,
+                body: b"data: {\"a\":1}\n\ndata: [DONE]\n\n".to_vec(),
+            }])
+            .await;
         let client = request_client_builder()
             .https_only(false)
             .no_proxy()
@@ -1863,12 +1848,13 @@ mod tests {
             http::header::CONTENT_ENCODING,
             HeaderValue::from_static("gzip"),
         );
-        let (endpoint, _) = spawn_retry_mock_server(vec![MockHttpResponse {
-            status: StatusCode::OK,
-            headers,
-            body: b"data: {\"a\":1}\n\ndata: [DONE]\n\n".to_vec(),
-        }])
-        .await;
+        let (endpoint, _) =
+            test_support::spawn_retry_mock_server(vec![test_support::MockResponse {
+                status: StatusCode::OK,
+                headers,
+                body: b"data: {\"a\":1}\n\ndata: [DONE]\n\n".to_vec(),
+            }])
+            .await;
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let response = streaming_completion_request(client.get(endpoint))
             .send()
@@ -1928,13 +1914,13 @@ mod tests {
     async fn completion_request_retries_transient_errors_and_exposes_retry_signal() {
         let mut headers = HeaderMap::new();
         headers.insert(http::header::RETRY_AFTER, HeaderValue::from_static("0"));
-        let (endpoint, state) = spawn_retry_mock_server(vec![
-            MockHttpResponse {
+        let (endpoint, state) = test_support::spawn_retry_mock_server(vec![
+            test_support::MockResponse {
                 status: StatusCode::TOO_MANY_REQUESTS,
                 headers,
                 body: b"rate limited".to_vec(),
             },
-            MockHttpResponse {
+            test_support::MockResponse {
                 status: StatusCode::OK,
                 headers: HeaderMap::new(),
                 body: b"ok".to_vec(),
@@ -1958,23 +1944,23 @@ mod tests {
         retry_now.insert(http::header::RETRY_AFTER, HeaderValue::from_static("0"));
         let mut final_headers = HeaderMap::new();
         final_headers.insert(http::header::RETRY_AFTER, HeaderValue::from_static("45"));
-        let (endpoint, state) = spawn_retry_mock_server(vec![
-            MockHttpResponse {
+        let (endpoint, state) = test_support::spawn_retry_mock_server(vec![
+            test_support::MockResponse {
                 status: StatusCode::TOO_MANY_REQUESTS,
                 headers: retry_now.clone(),
                 body: b"first limit".to_vec(),
             },
-            MockHttpResponse {
+            test_support::MockResponse {
                 status: StatusCode::TOO_MANY_REQUESTS,
                 headers: retry_now.clone(),
                 body: b"still limited".to_vec(),
             },
-            MockHttpResponse {
+            test_support::MockResponse {
                 status: StatusCode::TOO_MANY_REQUESTS,
                 headers: retry_now,
                 body: b"limited again".to_vec(),
             },
-            MockHttpResponse {
+            test_support::MockResponse {
                 status: StatusCode::TOO_MANY_REQUESTS,
                 headers: final_headers,
                 body: b"finally limited".to_vec(),
@@ -2001,12 +1987,13 @@ mod tests {
             Some(Duration::from_secs(45))
         );
 
-        let (endpoint, state) = spawn_retry_mock_server(vec![MockHttpResponse {
-            status: StatusCode::BAD_REQUEST,
-            headers: HeaderMap::new(),
-            body: b"bad request".to_vec(),
-        }])
-        .await;
+        let (endpoint, state) =
+            test_support::spawn_retry_mock_server(vec![test_support::MockResponse {
+                status: StatusCode::BAD_REQUEST,
+                headers: HeaderMap::new(),
+                body: b"bad request".to_vec(),
+            }])
+            .await;
         let err = execute_completion_request_with_retry(
             "retry-test",
             || client.post(&endpoint),

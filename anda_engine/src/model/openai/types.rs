@@ -13,6 +13,7 @@ use anda_core::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, json};
 
+use crate::model::{null_default, string_enum_serde};
 use crate::unix_ms;
 
 fn default_true() -> bool {
@@ -21,14 +22,6 @@ fn default_true() -> bool {
 
 fn default_image_detail() -> String {
     "auto".to_string()
-}
-
-fn null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: Default + Deserialize<'de>,
-{
-    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[derive(Debug, Deserialize)]
@@ -95,14 +88,14 @@ fn push_message_item(rt: &mut Vec<MessageItem>, role: &str, content: &mut Vec<Co
 }
 
 fn content_item_from_any(value: &Json) -> Option<ContentItem> {
-    match serde_json::from_value::<ContentItem>(value.clone()) {
+    match ContentItem::deserialize(value) {
         Ok(item) if !matches!(&item, ContentItem::Any(_)) => Some(item),
         _ => None,
     }
 }
 
 fn message_item_from_any(value: &Json) -> Option<MessageItem> {
-    match serde_json::from_value::<MessageItem>(value.clone()) {
+    match MessageItem::deserialize(value) {
         Ok(item) if !matches!(&item, MessageItem::Any(_)) => Some(item),
         _ => None,
     }
@@ -146,11 +139,10 @@ fn normalize_message_item(item: MessageItem) -> Option<MessageItem> {
 }
 
 pub(crate) fn raw_history_into(value: Json) -> Vec<MessageItem> {
-    let item = serde_json::from_value::<MessageItem>(value.clone())
-        .unwrap_or_else(|_| MessageItem::Any(value.clone()));
+    let item = MessageItem::deserialize(&value).unwrap_or(MessageItem::Any(value));
     match item {
         MessageItem::Any(value) => {
-            if let Ok(msg) = serde_json::from_value::<Message>(value.clone())
+            if let Ok(msg) = Message::deserialize(&value)
                 && !msg.role.is_empty()
             {
                 message_into(msg)
@@ -354,7 +346,7 @@ impl CompletionResponse {
         self.parsed_output = self
             .output
             .iter()
-            .filter_map(|item| serde_json::from_value::<MessageItem>(item.clone()).ok())
+            .filter_map(|item| MessageItem::deserialize(item).ok())
             .collect();
     }
 
@@ -488,149 +480,125 @@ impl<'de> Deserialize<'de> for StreamEvent {
         D: serde::Deserializer<'de>,
     {
         let value = Json::deserialize(deserializer)?;
-        match &value {
-            Json::Object(map)
-                if matches!(
-                    map.get("type").and_then(|t| t.as_str()),
-                    Some(
-                        "response.created"
-                            | "response.in_progress"
-                            | "response.completed"
-                            | "response.failed"
-                            | "response.incomplete"
-                            | "response.output_item.added"
-                            | "response.output_item.done"
-                            | "response.content_part.added"
-                            | "response.content_part.done"
-                            | "response.output_text.delta"
-                            | "response.output_text.done"
-                    )
-                ) =>
-            {
-                #[allow(clippy::enum_variant_names)]
-                #[derive(Deserialize)]
-                #[serde(tag = "type")]
-                enum Helper {
-                    #[serde(rename = "response.created")]
-                    ResponseCreated { response: CompletionResponse },
-                    #[serde(rename = "response.in_progress")]
-                    ResponseInProgress { response: CompletionResponse },
-                    #[serde(rename = "response.completed")]
-                    ResponseCompleted { response: CompletionResponse },
-                    #[serde(rename = "response.failed")]
-                    ResponseFailed { response: CompletionResponse },
-                    #[serde(rename = "response.incomplete")]
-                    ResponseIncomplete { response: CompletionResponse },
-                    #[serde(rename = "response.output_item.added")]
-                    ResponseOutputItemAdded {
-                        output_index: usize,
-                        item: MessageItem,
-                    },
-                    #[serde(rename = "response.output_item.done")]
-                    ResponseOutputItemDone {
-                        output_index: usize,
-                        item: MessageItem,
-                    },
-                    #[serde(rename = "response.content_part.added")]
-                    ResponseContentPartAdded {
-                        item_id: String,
-                        output_index: usize,
-                        content_index: usize,
-                        part: ContentItem,
-                    },
-                    #[serde(rename = "response.content_part.done")]
-                    ResponseContentPartDone {
-                        item_id: String,
-                        output_index: usize,
-                        content_index: usize,
-                        part: ContentItem,
-                    },
-                    #[serde(rename = "response.output_text.delta")]
-                    ResponseOutputTextDelta {
-                        item_id: String,
-                        output_index: usize,
-                        content_index: usize,
-                        delta: String,
-                    },
-                    #[serde(rename = "response.output_text.done")]
-                    ResponseOutputTextDone {
-                        item_id: String,
-                        output_index: usize,
-                        content_index: usize,
-                        text: String,
-                    },
-                }
+        #[allow(clippy::enum_variant_names)]
+        #[derive(Deserialize)]
+        #[serde(tag = "type")]
+        enum Helper {
+            #[serde(rename = "response.created")]
+            ResponseCreated { response: CompletionResponse },
+            #[serde(rename = "response.in_progress")]
+            ResponseInProgress { response: CompletionResponse },
+            #[serde(rename = "response.completed")]
+            ResponseCompleted { response: CompletionResponse },
+            #[serde(rename = "response.failed")]
+            ResponseFailed { response: CompletionResponse },
+            #[serde(rename = "response.incomplete")]
+            ResponseIncomplete { response: CompletionResponse },
+            #[serde(rename = "response.output_item.added")]
+            ResponseOutputItemAdded {
+                output_index: usize,
+                item: MessageItem,
+            },
+            #[serde(rename = "response.output_item.done")]
+            ResponseOutputItemDone {
+                output_index: usize,
+                item: MessageItem,
+            },
+            #[serde(rename = "response.content_part.added")]
+            ResponseContentPartAdded {
+                item_id: String,
+                output_index: usize,
+                content_index: usize,
+                part: ContentItem,
+            },
+            #[serde(rename = "response.content_part.done")]
+            ResponseContentPartDone {
+                item_id: String,
+                output_index: usize,
+                content_index: usize,
+                part: ContentItem,
+            },
+            #[serde(rename = "response.output_text.delta")]
+            ResponseOutputTextDelta {
+                item_id: String,
+                output_index: usize,
+                content_index: usize,
+                delta: String,
+            },
+            #[serde(rename = "response.output_text.done")]
+            ResponseOutputTextDone {
+                item_id: String,
+                output_index: usize,
+                content_index: usize,
+                text: String,
+            },
+        }
 
-                match serde_json::from_value::<Helper>(value.clone()) {
-                    Ok(Helper::ResponseCreated { response }) => {
-                        Ok(StreamEvent::ResponseCreated { response })
-                    }
-                    Ok(Helper::ResponseInProgress { response }) => {
-                        Ok(StreamEvent::ResponseInProgress { response })
-                    }
-                    Ok(Helper::ResponseCompleted { response }) => {
-                        Ok(StreamEvent::ResponseCompleted { response })
-                    }
-                    Ok(Helper::ResponseFailed { response }) => {
-                        Ok(StreamEvent::ResponseFailed { response })
-                    }
-                    Ok(Helper::ResponseIncomplete { response }) => {
-                        Ok(StreamEvent::ResponseIncomplete { response })
-                    }
-                    Ok(Helper::ResponseOutputItemAdded { output_index, item }) => {
-                        Ok(StreamEvent::ResponseOutputItemAdded { output_index, item })
-                    }
-                    Ok(Helper::ResponseOutputItemDone { output_index, item }) => {
-                        Ok(StreamEvent::ResponseOutputItemDone { output_index, item })
-                    }
-                    Ok(Helper::ResponseContentPartAdded {
-                        item_id,
-                        output_index,
-                        content_index,
-                        part,
-                    }) => Ok(StreamEvent::ResponseContentPartAdded {
-                        item_id,
-                        output_index,
-                        content_index,
-                        part,
-                    }),
-                    Ok(Helper::ResponseContentPartDone {
-                        item_id,
-                        output_index,
-                        content_index,
-                        part,
-                    }) => Ok(StreamEvent::ResponseContentPartDone {
-                        item_id,
-                        output_index,
-                        content_index,
-                        part,
-                    }),
-                    Ok(Helper::ResponseOutputTextDelta {
-                        item_id,
-                        output_index,
-                        content_index,
-                        delta,
-                    }) => Ok(StreamEvent::ResponseOutputTextDelta {
-                        item_id,
-                        output_index,
-                        content_index,
-                        delta,
-                    }),
-                    Ok(Helper::ResponseOutputTextDone {
-                        item_id,
-                        output_index,
-                        content_index,
-                        text,
-                    }) => Ok(StreamEvent::ResponseOutputTextDone {
-                        item_id,
-                        output_index,
-                        content_index,
-                        text,
-                    }),
-                    Err(_) => Ok(StreamEvent::Any(value)),
-                }
+        match Helper::deserialize(&value) {
+            Ok(Helper::ResponseCreated { response }) => {
+                Ok(StreamEvent::ResponseCreated { response })
             }
-            _ => Ok(StreamEvent::Any(value)),
+            Ok(Helper::ResponseInProgress { response }) => {
+                Ok(StreamEvent::ResponseInProgress { response })
+            }
+            Ok(Helper::ResponseCompleted { response }) => {
+                Ok(StreamEvent::ResponseCompleted { response })
+            }
+            Ok(Helper::ResponseFailed { response }) => Ok(StreamEvent::ResponseFailed { response }),
+            Ok(Helper::ResponseIncomplete { response }) => {
+                Ok(StreamEvent::ResponseIncomplete { response })
+            }
+            Ok(Helper::ResponseOutputItemAdded { output_index, item }) => {
+                Ok(StreamEvent::ResponseOutputItemAdded { output_index, item })
+            }
+            Ok(Helper::ResponseOutputItemDone { output_index, item }) => {
+                Ok(StreamEvent::ResponseOutputItemDone { output_index, item })
+            }
+            Ok(Helper::ResponseContentPartAdded {
+                item_id,
+                output_index,
+                content_index,
+                part,
+            }) => Ok(StreamEvent::ResponseContentPartAdded {
+                item_id,
+                output_index,
+                content_index,
+                part,
+            }),
+            Ok(Helper::ResponseContentPartDone {
+                item_id,
+                output_index,
+                content_index,
+                part,
+            }) => Ok(StreamEvent::ResponseContentPartDone {
+                item_id,
+                output_index,
+                content_index,
+                part,
+            }),
+            Ok(Helper::ResponseOutputTextDelta {
+                item_id,
+                output_index,
+                content_index,
+                delta,
+            }) => Ok(StreamEvent::ResponseOutputTextDelta {
+                item_id,
+                output_index,
+                content_index,
+                delta,
+            }),
+            Ok(Helper::ResponseOutputTextDone {
+                item_id,
+                output_index,
+                content_index,
+                text,
+            }) => Ok(StreamEvent::ResponseOutputTextDone {
+                item_id,
+                output_index,
+                content_index,
+                text,
+            }),
+            Err(_) => Ok(StreamEvent::Any(value)),
         }
     }
 }
@@ -895,538 +863,500 @@ impl<'de> Deserialize<'de> for MessageItem {
         D: serde::Deserializer<'de>,
     {
         let value = Json::deserialize(deserializer)?;
-        match &value {
-            Json::Object(map)
-                if matches!(
-                    map.get("type").and_then(|t| t.as_str()),
-                    Some(
-                        "message"
-                            | "file_search_call"
-                            | "computer_call"
-                            | "computer_call_output"
-                            | "web_search_call"
-                            | "function_call"
-                            | "function_call_output"
-                            | "tool_search_call"
-                            | "tool_search_output"
-                            | "reasoning"
-                            | "compaction"
-                            | "image_generation_call"
-                            | "code_interpreter_call"
-                            | "local_shell_call"
-                            | "local_shell_call_output"
-                            | "shell_call"
-                            | "shell_call_output"
-                            | "apply_patch_call"
-                            | "apply_patch_call_output"
-                            | "mcp_call"
-                            | "mcp_list_tools"
-                            | "mcp_approval_request"
-                            | "mcp_approval_response"
-                            | "custom_tool_call"
-                            | "custom_tool_call_output"
-                            | "compaction_trigger"
-                            | "item_reference"
-                    )
-                ) =>
-            {
-                #[derive(Deserialize)]
-                #[serde(tag = "type", rename_all = "snake_case")]
-                enum Helper {
-                    Message {
-                        role: String,
-                        #[serde(deserialize_with = "deserialize_content_items")]
-                        content: Vec<ContentItem>,
-                        status: Option<String>,
-                        id: Option<String>,
-                        phase: Option<MessagePhase>,
-                    },
-                    FileSearchCall {
-                        id: Option<String>,
-                        #[serde(default)]
-                        queries: Vec<String>,
-                        status: Option<String>,
-                        results: Option<Vec<FileSearchResult>>,
-                    },
-                    ComputerCall {
-                        id: Option<String>,
-                        call_id: String,
-                        #[serde(default)]
-                        pending_safety_checks: Vec<ComputerSafetyCheck>,
-                        status: Option<String>,
-                        action: Option<Json>,
-                        actions: Option<Vec<Json>>,
-                    },
-                    ComputerCallOutput {
-                        id: Option<String>,
-                        call_id: String,
-                        output: ComputerScreenshot,
-                        acknowledged_safety_checks: Option<Vec<ComputerSafetyCheck>>,
-                        status: Option<String>,
-                        created_by: Option<String>,
-                    },
-                    WebSearchCall {
-                        id: Option<String>,
-                        action: WebSearchAction,
-                        status: Option<String>,
-                    },
-                    FunctionCall {
-                        name: String,
-                        arguments: String,
-                        call_id: String,
-                        id: Option<String>,
-                        namespace: Option<String>,
-                        status: Option<String>,
-                    },
-                    FunctionCallOutput {
-                        id: Option<String>,
-                        call_id: String,
-                        output: FunctionCallOutput,
-                        status: Option<String>,
-                        created_by: Option<String>,
-                    },
-                    ToolSearchCall {
-                        id: Option<String>,
-                        call_id: Option<String>,
-                        arguments: Json,
-                        execution: Option<String>,
-                        status: Option<String>,
-                        created_by: Option<String>,
-                    },
-                    ToolSearchOutput {
-                        id: Option<String>,
-                        call_id: Option<String>,
-                        #[serde(default)]
-                        tools: Vec<ToolDefinition>,
-                        execution: Option<String>,
-                        status: Option<String>,
-                        created_by: Option<String>,
-                    },
-                    Reasoning {
-                        id: String,
-                        summary: Vec<ReasoningSummary>,
-                        content: Option<Vec<ReasoningContent>>,
-                        encrypted_content: Option<String>,
-                        status: Option<String>,
-                    },
-                    Compaction {
-                        id: Option<String>,
-                        encrypted_content: String,
-                        created_by: Option<String>,
-                    },
-                    ImageGenerationCall {
-                        id: String,
-                        result: String,
-                        status: String,
-                    },
-                    CodeInterpreterCall {
-                        id: String,
-                        code: Option<String>,
-                        container_id: String,
-                        outputs: Option<Vec<CodeInterpreterOutput>>,
-                        status: String,
-                    },
-                    LocalShellCall {
-                        id: String,
-                        action: LocalShellAction,
-                        call_id: String,
-                        status: String,
-                    },
-                    LocalShellCallOutput {
-                        id: String,
-                        output: String,
-                        status: Option<String>,
-                    },
-                    ShellCall {
-                        id: Option<String>,
-                        action: ShellAction,
-                        call_id: String,
-                        environment: Option<ShellEnvironment>,
-                        status: String,
-                        created_by: Option<String>,
-                    },
-                    ShellCallOutput {
-                        id: Option<String>,
-                        call_id: String,
-                        max_output_length: Option<u64>,
-                        #[serde(default)]
-                        output: Vec<ShellCallOutputContent>,
-                        status: String,
-                        created_by: Option<String>,
-                    },
-                    ApplyPatchCall {
-                        id: Option<String>,
-                        call_id: String,
-                        operation: ApplyPatchOperation,
-                        status: String,
-                        created_by: Option<String>,
-                    },
-                    ApplyPatchCallOutput {
-                        id: Option<String>,
-                        call_id: String,
-                        status: String,
-                        output: Option<String>,
-                        created_by: Option<String>,
-                    },
-                    McpCall {
-                        id: String,
-                        arguments: String,
-                        name: String,
-                        server_label: String,
-                        approval_request_id: Option<String>,
-                        error: Option<String>,
-                        output: Option<String>,
-                        status: Option<String>,
-                    },
-                    McpListTools {
-                        id: String,
-                        server_label: String,
-                        #[serde(default)]
-                        tools: Vec<McpTool>,
-                        error: Option<String>,
-                    },
-                    McpApprovalRequest {
-                        id: String,
-                        arguments: String,
-                        name: String,
-                        server_label: String,
-                    },
-                    McpApprovalResponse {
-                        id: Option<String>,
-                        approval_request_id: String,
-                        approve: bool,
-                        reason: Option<String>,
-                    },
-                    CustomToolCall {
-                        id: Option<String>,
-                        call_id: String,
-                        input: String,
-                        name: String,
-                        namespace: Option<String>,
-                    },
-                    CustomToolCallOutput {
-                        id: Option<String>,
-                        call_id: String,
-                        output: FunctionCallOutput,
-                        status: Option<String>,
-                        created_by: Option<String>,
-                    },
-                    CompactionTrigger,
-                    ItemReference {
-                        id: String,
-                    },
-                }
+        #[derive(Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum Helper {
+            Message {
+                role: String,
+                #[serde(deserialize_with = "deserialize_content_items")]
+                content: Vec<ContentItem>,
+                status: Option<String>,
+                id: Option<String>,
+                phase: Option<MessagePhase>,
+            },
+            FileSearchCall {
+                id: Option<String>,
+                #[serde(default)]
+                queries: Vec<String>,
+                status: Option<String>,
+                results: Option<Vec<FileSearchResult>>,
+            },
+            ComputerCall {
+                id: Option<String>,
+                call_id: String,
+                #[serde(default)]
+                pending_safety_checks: Vec<ComputerSafetyCheck>,
+                status: Option<String>,
+                action: Option<Json>,
+                actions: Option<Vec<Json>>,
+            },
+            ComputerCallOutput {
+                id: Option<String>,
+                call_id: String,
+                output: ComputerScreenshot,
+                acknowledged_safety_checks: Option<Vec<ComputerSafetyCheck>>,
+                status: Option<String>,
+                created_by: Option<String>,
+            },
+            WebSearchCall {
+                id: Option<String>,
+                action: WebSearchAction,
+                status: Option<String>,
+            },
+            FunctionCall {
+                name: String,
+                arguments: String,
+                call_id: String,
+                id: Option<String>,
+                namespace: Option<String>,
+                status: Option<String>,
+            },
+            FunctionCallOutput {
+                id: Option<String>,
+                call_id: String,
+                output: FunctionCallOutput,
+                status: Option<String>,
+                created_by: Option<String>,
+            },
+            ToolSearchCall {
+                id: Option<String>,
+                call_id: Option<String>,
+                arguments: Json,
+                execution: Option<String>,
+                status: Option<String>,
+                created_by: Option<String>,
+            },
+            ToolSearchOutput {
+                id: Option<String>,
+                call_id: Option<String>,
+                #[serde(default)]
+                tools: Vec<ToolDefinition>,
+                execution: Option<String>,
+                status: Option<String>,
+                created_by: Option<String>,
+            },
+            Reasoning {
+                id: String,
+                summary: Vec<ReasoningSummary>,
+                content: Option<Vec<ReasoningContent>>,
+                encrypted_content: Option<String>,
+                status: Option<String>,
+            },
+            Compaction {
+                id: Option<String>,
+                encrypted_content: String,
+                created_by: Option<String>,
+            },
+            ImageGenerationCall {
+                id: String,
+                result: String,
+                status: String,
+            },
+            CodeInterpreterCall {
+                id: String,
+                code: Option<String>,
+                container_id: String,
+                outputs: Option<Vec<CodeInterpreterOutput>>,
+                status: String,
+            },
+            LocalShellCall {
+                id: String,
+                action: LocalShellAction,
+                call_id: String,
+                status: String,
+            },
+            LocalShellCallOutput {
+                id: String,
+                output: String,
+                status: Option<String>,
+            },
+            ShellCall {
+                id: Option<String>,
+                action: ShellAction,
+                call_id: String,
+                environment: Option<ShellEnvironment>,
+                status: String,
+                created_by: Option<String>,
+            },
+            ShellCallOutput {
+                id: Option<String>,
+                call_id: String,
+                max_output_length: Option<u64>,
+                #[serde(default)]
+                output: Vec<ShellCallOutputContent>,
+                status: String,
+                created_by: Option<String>,
+            },
+            ApplyPatchCall {
+                id: Option<String>,
+                call_id: String,
+                operation: ApplyPatchOperation,
+                status: String,
+                created_by: Option<String>,
+            },
+            ApplyPatchCallOutput {
+                id: Option<String>,
+                call_id: String,
+                status: String,
+                output: Option<String>,
+                created_by: Option<String>,
+            },
+            McpCall {
+                id: String,
+                arguments: String,
+                name: String,
+                server_label: String,
+                approval_request_id: Option<String>,
+                error: Option<String>,
+                output: Option<String>,
+                status: Option<String>,
+            },
+            McpListTools {
+                id: String,
+                server_label: String,
+                #[serde(default)]
+                tools: Vec<McpTool>,
+                error: Option<String>,
+            },
+            McpApprovalRequest {
+                id: String,
+                arguments: String,
+                name: String,
+                server_label: String,
+            },
+            McpApprovalResponse {
+                id: Option<String>,
+                approval_request_id: String,
+                approve: bool,
+                reason: Option<String>,
+            },
+            CustomToolCall {
+                id: Option<String>,
+                call_id: String,
+                input: String,
+                name: String,
+                namespace: Option<String>,
+            },
+            CustomToolCallOutput {
+                id: Option<String>,
+                call_id: String,
+                output: FunctionCallOutput,
+                status: Option<String>,
+                created_by: Option<String>,
+            },
+            CompactionTrigger,
+            ItemReference {
+                id: String,
+            },
+        }
 
-                match serde_json::from_value::<Helper>(value.clone()) {
-                    Ok(h) => Ok(match h {
-                        Helper::Message {
-                            role,
-                            content,
-                            status,
-                            id,
-                            phase,
-                        } => MessageItem::Message {
-                            role,
-                            content,
-                            status,
-                            id,
-                            phase,
-                        },
-                        Helper::FileSearchCall {
-                            id,
-                            queries,
-                            status,
-                            results,
-                        } => MessageItem::FileSearchCall {
-                            id,
-                            queries,
-                            status,
-                            results,
-                        },
-                        Helper::ComputerCall {
-                            id,
-                            call_id,
-                            pending_safety_checks,
-                            status,
-                            action,
-                            actions,
-                        } => MessageItem::ComputerCall {
-                            id,
-                            call_id,
-                            pending_safety_checks,
-                            status,
-                            action,
-                            actions,
-                        },
-                        Helper::ComputerCallOutput {
-                            id,
-                            call_id,
-                            output,
-                            acknowledged_safety_checks,
-                            status,
-                            created_by,
-                        } => MessageItem::ComputerCallOutput {
-                            id,
-                            call_id,
-                            output,
-                            acknowledged_safety_checks,
-                            status,
-                            created_by,
-                        },
-                        Helper::WebSearchCall { id, action, status } => {
-                            MessageItem::WebSearchCall { id, action, status }
-                        }
-                        Helper::FunctionCall {
-                            name,
-                            arguments,
-                            call_id,
-                            id,
-                            namespace,
-                            status,
-                        } => MessageItem::FunctionCall {
-                            name,
-                            arguments,
-                            call_id,
-                            id,
-                            namespace,
-                            status,
-                        },
-                        Helper::FunctionCallOutput {
-                            id,
-                            call_id,
-                            output,
-                            status,
-                            created_by,
-                        } => MessageItem::FunctionCallOutput {
-                            id,
-                            call_id,
-                            output,
-                            status,
-                            created_by,
-                        },
-                        Helper::ToolSearchCall {
-                            id,
-                            call_id,
-                            arguments,
-                            execution,
-                            status,
-                            created_by,
-                        } => MessageItem::ToolSearchCall {
-                            id,
-                            call_id,
-                            arguments,
-                            execution,
-                            status,
-                            created_by,
-                        },
-                        Helper::ToolSearchOutput {
-                            id,
-                            call_id,
-                            tools,
-                            execution,
-                            status,
-                            created_by,
-                        } => MessageItem::ToolSearchOutput {
-                            id,
-                            call_id,
-                            tools,
-                            execution,
-                            status,
-                            created_by,
-                        },
-                        Helper::Reasoning {
-                            id,
-                            summary,
-                            content,
-                            encrypted_content,
-                            status,
-                        } => MessageItem::Reasoning {
-                            id,
-                            summary,
-                            content,
-                            encrypted_content,
-                            status,
-                        },
-                        Helper::Compaction {
-                            id,
-                            encrypted_content,
-                            created_by,
-                        } => MessageItem::Compaction {
-                            id,
-                            encrypted_content,
-                            created_by,
-                        },
-                        Helper::ImageGenerationCall { id, result, status } => {
-                            MessageItem::ImageGenerationCall { id, result, status }
-                        }
-                        Helper::CodeInterpreterCall {
-                            id,
-                            code,
-                            container_id,
-                            outputs,
-                            status,
-                        } => MessageItem::CodeInterpreterCall {
-                            id,
-                            code,
-                            container_id,
-                            outputs,
-                            status,
-                        },
-                        Helper::LocalShellCall {
-                            id,
-                            action,
-                            call_id,
-                            status,
-                        } => MessageItem::LocalShellCall {
-                            id,
-                            action,
-                            call_id,
-                            status,
-                        },
-                        Helper::LocalShellCallOutput { id, output, status } => {
-                            MessageItem::LocalShellCallOutput { id, output, status }
-                        }
-                        Helper::ShellCall {
-                            id,
-                            action,
-                            call_id,
-                            environment,
-                            status,
-                            created_by,
-                        } => MessageItem::ShellCall {
-                            id,
-                            action,
-                            call_id,
-                            environment,
-                            status,
-                            created_by,
-                        },
-                        Helper::ShellCallOutput {
-                            id,
-                            call_id,
-                            max_output_length,
-                            output,
-                            status,
-                            created_by,
-                        } => MessageItem::ShellCallOutput {
-                            id,
-                            call_id,
-                            max_output_length,
-                            output,
-                            status,
-                            created_by,
-                        },
-                        Helper::ApplyPatchCall {
-                            id,
-                            call_id,
-                            operation,
-                            status,
-                            created_by,
-                        } => MessageItem::ApplyPatchCall {
-                            id,
-                            call_id,
-                            operation,
-                            status,
-                            created_by,
-                        },
-                        Helper::ApplyPatchCallOutput {
-                            id,
-                            call_id,
-                            status,
-                            output,
-                            created_by,
-                        } => MessageItem::ApplyPatchCallOutput {
-                            id,
-                            call_id,
-                            status,
-                            output,
-                            created_by,
-                        },
-                        Helper::McpCall {
-                            id,
-                            arguments,
-                            name,
-                            server_label,
-                            approval_request_id,
-                            error,
-                            output,
-                            status,
-                        } => MessageItem::McpCall {
-                            id,
-                            arguments,
-                            name,
-                            server_label,
-                            approval_request_id,
-                            error,
-                            output,
-                            status,
-                        },
-                        Helper::McpListTools {
-                            id,
-                            server_label,
-                            tools,
-                            error,
-                        } => MessageItem::McpListTools {
-                            id,
-                            server_label,
-                            tools,
-                            error,
-                        },
-                        Helper::McpApprovalRequest {
-                            id,
-                            arguments,
-                            name,
-                            server_label,
-                        } => MessageItem::McpApprovalRequest {
-                            id,
-                            arguments,
-                            name,
-                            server_label,
-                        },
-                        Helper::McpApprovalResponse {
-                            id,
-                            approval_request_id,
-                            approve,
-                            reason,
-                        } => MessageItem::McpApprovalResponse {
-                            id,
-                            approval_request_id,
-                            approve,
-                            reason,
-                        },
-                        Helper::CustomToolCall {
-                            id,
-                            call_id,
-                            input,
-                            name,
-                            namespace,
-                        } => MessageItem::CustomToolCall {
-                            id,
-                            call_id,
-                            input,
-                            name,
-                            namespace,
-                        },
-                        Helper::CustomToolCallOutput {
-                            id,
-                            call_id,
-                            output,
-                            status,
-                            created_by,
-                        } => MessageItem::CustomToolCallOutput {
-                            id,
-                            call_id,
-                            output,
-                            status,
-                            created_by,
-                        },
-                        Helper::CompactionTrigger => MessageItem::CompactionTrigger,
-                        Helper::ItemReference { id } => MessageItem::ItemReference { id },
-                    }),
-                    Err(_) => Ok(MessageItem::Any(value)),
+        match Helper::deserialize(&value) {
+            Ok(h) => Ok(match h {
+                Helper::Message {
+                    role,
+                    content,
+                    status,
+                    id,
+                    phase,
+                } => MessageItem::Message {
+                    role,
+                    content,
+                    status,
+                    id,
+                    phase,
+                },
+                Helper::FileSearchCall {
+                    id,
+                    queries,
+                    status,
+                    results,
+                } => MessageItem::FileSearchCall {
+                    id,
+                    queries,
+                    status,
+                    results,
+                },
+                Helper::ComputerCall {
+                    id,
+                    call_id,
+                    pending_safety_checks,
+                    status,
+                    action,
+                    actions,
+                } => MessageItem::ComputerCall {
+                    id,
+                    call_id,
+                    pending_safety_checks,
+                    status,
+                    action,
+                    actions,
+                },
+                Helper::ComputerCallOutput {
+                    id,
+                    call_id,
+                    output,
+                    acknowledged_safety_checks,
+                    status,
+                    created_by,
+                } => MessageItem::ComputerCallOutput {
+                    id,
+                    call_id,
+                    output,
+                    acknowledged_safety_checks,
+                    status,
+                    created_by,
+                },
+                Helper::WebSearchCall { id, action, status } => {
+                    MessageItem::WebSearchCall { id, action, status }
                 }
-            }
-            _ => Ok(MessageItem::Any(value)),
+                Helper::FunctionCall {
+                    name,
+                    arguments,
+                    call_id,
+                    id,
+                    namespace,
+                    status,
+                } => MessageItem::FunctionCall {
+                    name,
+                    arguments,
+                    call_id,
+                    id,
+                    namespace,
+                    status,
+                },
+                Helper::FunctionCallOutput {
+                    id,
+                    call_id,
+                    output,
+                    status,
+                    created_by,
+                } => MessageItem::FunctionCallOutput {
+                    id,
+                    call_id,
+                    output,
+                    status,
+                    created_by,
+                },
+                Helper::ToolSearchCall {
+                    id,
+                    call_id,
+                    arguments,
+                    execution,
+                    status,
+                    created_by,
+                } => MessageItem::ToolSearchCall {
+                    id,
+                    call_id,
+                    arguments,
+                    execution,
+                    status,
+                    created_by,
+                },
+                Helper::ToolSearchOutput {
+                    id,
+                    call_id,
+                    tools,
+                    execution,
+                    status,
+                    created_by,
+                } => MessageItem::ToolSearchOutput {
+                    id,
+                    call_id,
+                    tools,
+                    execution,
+                    status,
+                    created_by,
+                },
+                Helper::Reasoning {
+                    id,
+                    summary,
+                    content,
+                    encrypted_content,
+                    status,
+                } => MessageItem::Reasoning {
+                    id,
+                    summary,
+                    content,
+                    encrypted_content,
+                    status,
+                },
+                Helper::Compaction {
+                    id,
+                    encrypted_content,
+                    created_by,
+                } => MessageItem::Compaction {
+                    id,
+                    encrypted_content,
+                    created_by,
+                },
+                Helper::ImageGenerationCall { id, result, status } => {
+                    MessageItem::ImageGenerationCall { id, result, status }
+                }
+                Helper::CodeInterpreterCall {
+                    id,
+                    code,
+                    container_id,
+                    outputs,
+                    status,
+                } => MessageItem::CodeInterpreterCall {
+                    id,
+                    code,
+                    container_id,
+                    outputs,
+                    status,
+                },
+                Helper::LocalShellCall {
+                    id,
+                    action,
+                    call_id,
+                    status,
+                } => MessageItem::LocalShellCall {
+                    id,
+                    action,
+                    call_id,
+                    status,
+                },
+                Helper::LocalShellCallOutput { id, output, status } => {
+                    MessageItem::LocalShellCallOutput { id, output, status }
+                }
+                Helper::ShellCall {
+                    id,
+                    action,
+                    call_id,
+                    environment,
+                    status,
+                    created_by,
+                } => MessageItem::ShellCall {
+                    id,
+                    action,
+                    call_id,
+                    environment,
+                    status,
+                    created_by,
+                },
+                Helper::ShellCallOutput {
+                    id,
+                    call_id,
+                    max_output_length,
+                    output,
+                    status,
+                    created_by,
+                } => MessageItem::ShellCallOutput {
+                    id,
+                    call_id,
+                    max_output_length,
+                    output,
+                    status,
+                    created_by,
+                },
+                Helper::ApplyPatchCall {
+                    id,
+                    call_id,
+                    operation,
+                    status,
+                    created_by,
+                } => MessageItem::ApplyPatchCall {
+                    id,
+                    call_id,
+                    operation,
+                    status,
+                    created_by,
+                },
+                Helper::ApplyPatchCallOutput {
+                    id,
+                    call_id,
+                    status,
+                    output,
+                    created_by,
+                } => MessageItem::ApplyPatchCallOutput {
+                    id,
+                    call_id,
+                    status,
+                    output,
+                    created_by,
+                },
+                Helper::McpCall {
+                    id,
+                    arguments,
+                    name,
+                    server_label,
+                    approval_request_id,
+                    error,
+                    output,
+                    status,
+                } => MessageItem::McpCall {
+                    id,
+                    arguments,
+                    name,
+                    server_label,
+                    approval_request_id,
+                    error,
+                    output,
+                    status,
+                },
+                Helper::McpListTools {
+                    id,
+                    server_label,
+                    tools,
+                    error,
+                } => MessageItem::McpListTools {
+                    id,
+                    server_label,
+                    tools,
+                    error,
+                },
+                Helper::McpApprovalRequest {
+                    id,
+                    arguments,
+                    name,
+                    server_label,
+                } => MessageItem::McpApprovalRequest {
+                    id,
+                    arguments,
+                    name,
+                    server_label,
+                },
+                Helper::McpApprovalResponse {
+                    id,
+                    approval_request_id,
+                    approve,
+                    reason,
+                } => MessageItem::McpApprovalResponse {
+                    id,
+                    approval_request_id,
+                    approve,
+                    reason,
+                },
+                Helper::CustomToolCall {
+                    id,
+                    call_id,
+                    input,
+                    name,
+                    namespace,
+                } => MessageItem::CustomToolCall {
+                    id,
+                    call_id,
+                    input,
+                    name,
+                    namespace,
+                },
+                Helper::CustomToolCallOutput {
+                    id,
+                    call_id,
+                    output,
+                    status,
+                    created_by,
+                } => MessageItem::CustomToolCallOutput {
+                    id,
+                    call_id,
+                    output,
+                    status,
+                    created_by,
+                },
+                Helper::CompactionTrigger => MessageItem::CompactionTrigger,
+                Helper::ItemReference { id } => MessageItem::ItemReference { id },
+            }),
+            Err(_) => Ok(MessageItem::Any(value)),
         }
     }
 }
@@ -1852,79 +1782,62 @@ impl<'de> Deserialize<'de> for ContentItem {
         D: serde::Deserializer<'de>,
     {
         let value = Json::deserialize(deserializer)?;
-        match &value {
-            Json::Object(map)
-                if matches!(
-                    map.get("type").and_then(|t| t.as_str()),
-                    Some(
-                        "input_text"
-                            | "output_text"
-                            | "refusal"
-                            | "input_image"
-                            | "input_file"
-                            | "input_audio"
-                    )
-                ) =>
-            {
-                #[derive(Deserialize)]
-                #[serde(tag = "type")]
-                enum Helper {
-                    #[serde(rename = "input_text")]
-                    Text { text: String },
-                    #[serde(rename = "output_text")]
-                    OutputText { text: String },
-                    #[serde(rename = "refusal")]
-                    Refusal { refusal: String },
-                    #[serde(rename = "input_image")]
-                    Image {
-                        #[serde(default = "default_image_detail")]
-                        detail: String,
-                        #[serde(default)]
-                        image_url: String,
-                        file_id: Option<String>,
-                    },
-                    #[serde(rename = "input_file")]
-                    File {
-                        file_data: Option<String>,
-                        file_url: Option<String>,
-                        file_id: Option<String>,
-                        filename: Option<String>,
-                    },
-                    #[serde(rename = "input_audio")]
-                    Audio { input_audio: InputAudio },
-                }
+        #[derive(Deserialize)]
+        #[serde(tag = "type")]
+        enum Helper {
+            #[serde(rename = "input_text")]
+            Text { text: String },
+            #[serde(rename = "output_text")]
+            OutputText { text: String },
+            #[serde(rename = "refusal")]
+            Refusal { refusal: String },
+            #[serde(rename = "input_image")]
+            Image {
+                #[serde(default = "default_image_detail")]
+                detail: String,
+                #[serde(default)]
+                image_url: String,
+                file_id: Option<String>,
+            },
+            #[serde(rename = "input_file")]
+            File {
+                file_data: Option<String>,
+                file_url: Option<String>,
+                file_id: Option<String>,
+                filename: Option<String>,
+            },
+            #[serde(rename = "input_audio")]
+            Audio { input_audio: InputAudio },
+        }
 
-                match serde_json::from_value::<Helper>(value.clone()) {
-                    Ok(h) => Ok(match h {
-                        Helper::Text { text } => ContentItem::Text { text },
-                        Helper::OutputText { text } => ContentItem::OutputText { text },
-                        Helper::Refusal { refusal } => ContentItem::Refusal { refusal },
-                        Helper::Image {
-                            detail,
-                            image_url,
-                            file_id,
-                        } => ContentItem::Image {
-                            detail,
-                            image_url,
-                            file_id,
-                        },
-                        Helper::File {
-                            file_data,
-                            file_url,
-                            file_id,
-                            filename,
-                        } => ContentItem::File {
-                            file_data,
-                            file_url,
-                            file_id,
-                            filename,
-                        },
-                        Helper::Audio { input_audio } => ContentItem::Audio { input_audio },
-                    }),
-                    Err(_) => Ok(ContentItem::Any(value)),
-                }
-            }
-            _ => Ok(ContentItem::Any(value)),
+        match Helper::deserialize(&value) {
+            Ok(h) => Ok(match h {
+                Helper::Text { text } => ContentItem::Text { text },
+                Helper::OutputText { text } => ContentItem::OutputText { text },
+                Helper::Refusal { refusal } => ContentItem::Refusal { refusal },
+                Helper::Image {
+                    detail,
+                    image_url,
+                    file_id,
+                } => ContentItem::Image {
+                    detail,
+                    image_url,
+                    file_id,
+                },
+                Helper::File {
+                    file_data,
+                    file_url,
+                    file_id,
+                    filename,
+                } => ContentItem::File {
+                    file_data,
+                    file_url,
+                    file_id,
+                    filename,
+                },
+                Helper::Audio { input_audio } => ContentItem::Audio { input_audio },
+            }),
+            Err(_) => Ok(ContentItem::Any(value)),
         }
     }
 }
@@ -2133,287 +2046,259 @@ impl<'de> Deserialize<'de> for ToolDefinition {
         D: serde::Deserializer<'de>,
     {
         let value = Json::deserialize(deserializer)?;
-        match &value {
-            Json::Object(map)
-                if matches!(
-                    map.get("type").and_then(|t| t.as_str()),
-                    Some(
-                        "function"
-                            | "file_search"
-                            | "computer"
-                            | "computer_use_preview"
-                            | "web_search"
-                            | "web_search_2025_08_26"
-                            | "mcp"
-                            | "code_interpreter"
-                            | "image_generation"
-                            | "local_shell"
-                            | "shell"
-                            | "custom"
-                            | "namespace"
-                            | "tool_search"
-                            | "web_search_preview"
-                            | "web_search_preview_2025_03_11"
-                            | "apply_patch"
-                    )
-                ) =>
-            {
-                #[derive(Deserialize)]
-                #[serde(tag = "type", rename_all = "snake_case")]
-                enum Helper {
-                    Function {
-                        name: String,
-                        #[serde(default)]
-                        parameters: Json,
-                        #[serde(default = "default_true")]
-                        strict: bool,
-                        description: Option<String>,
-                        defer_loading: Option<bool>,
-                    },
-                    FileSearch {
-                        #[serde(default)]
-                        vector_store_ids: Vec<String>,
-                        filters: Option<Json>,
-                        max_num_results: Option<u32>,
-                        ranking_options: Option<FileSearchRankingOptions>,
-                    },
-                    Computer,
-                    ComputerUsePreview {
-                        display_height: u32,
-                        display_width: u32,
-                        environment: String,
-                    },
-                    WebSearch {
-                        filters: Option<WebSearchFilters>,
-                        search_context_size: Option<String>,
-                        user_location: Option<UserLocation>,
-                    },
-                    #[serde(rename = "web_search_2025_08_26")]
-                    WebSearch20250826 {
-                        filters: Option<WebSearchFilters>,
-                        search_context_size: Option<String>,
-                        user_location: Option<UserLocation>,
-                    },
-                    Mcp {
-                        server_label: String,
-                        allowed_tools: Option<McpAllowedTools>,
-                        authorization: Option<String>,
-                        connector_id: Option<String>,
-                        defer_loading: Option<bool>,
-                        headers: Option<Map<String, Json>>,
-                        require_approval: Option<Json>,
-                        server_description: Option<String>,
-                        server_url: Option<String>,
-                    },
-                    CodeInterpreter {
-                        container: CodeInterpreterContainer,
-                    },
-                    ImageGeneration {
-                        action: Option<String>,
-                        background: Option<String>,
-                        input_fidelity: Option<String>,
-                        input_image_mask: Option<ImageInputMask>,
-                        model: Option<String>,
-                        moderation: Option<String>,
-                        output_compression: Option<u8>,
-                        output_format: Option<String>,
-                        partial_images: Option<u8>,
-                        quality: Option<String>,
-                        size: Option<String>,
-                    },
-                    LocalShell,
-                    Shell {
-                        environment: Option<Json>,
-                    },
-                    Custom {
-                        name: String,
-                        defer_loading: Option<bool>,
-                        description: Option<String>,
-                        format: Option<CustomToolInputFormat>,
-                    },
-                    Namespace {
-                        description: String,
-                        name: String,
-                        #[serde(default)]
-                        tools: Vec<NamespaceToolDefinition>,
-                    },
-                    ToolSearch {
-                        description: Option<String>,
-                        execution: Option<String>,
-                        parameters: Option<Json>,
-                    },
-                    WebSearchPreview {
-                        search_content_types: Option<Vec<String>>,
-                        search_context_size: Option<String>,
-                        user_location: Option<UserLocation>,
-                    },
-                    #[serde(rename = "web_search_preview_2025_03_11")]
-                    WebSearchPreview20250311 {
-                        search_content_types: Option<Vec<String>>,
-                        search_context_size: Option<String>,
-                        user_location: Option<UserLocation>,
-                    },
-                    ApplyPatch,
-                }
+        #[derive(Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum Helper {
+            Function {
+                name: String,
+                #[serde(default)]
+                parameters: Json,
+                #[serde(default = "default_true")]
+                strict: bool,
+                description: Option<String>,
+                defer_loading: Option<bool>,
+            },
+            FileSearch {
+                #[serde(default)]
+                vector_store_ids: Vec<String>,
+                filters: Option<Json>,
+                max_num_results: Option<u32>,
+                ranking_options: Option<FileSearchRankingOptions>,
+            },
+            Computer,
+            ComputerUsePreview {
+                display_height: u32,
+                display_width: u32,
+                environment: String,
+            },
+            WebSearch {
+                filters: Option<WebSearchFilters>,
+                search_context_size: Option<String>,
+                user_location: Option<UserLocation>,
+            },
+            #[serde(rename = "web_search_2025_08_26")]
+            WebSearch20250826 {
+                filters: Option<WebSearchFilters>,
+                search_context_size: Option<String>,
+                user_location: Option<UserLocation>,
+            },
+            Mcp {
+                server_label: String,
+                allowed_tools: Option<McpAllowedTools>,
+                authorization: Option<String>,
+                connector_id: Option<String>,
+                defer_loading: Option<bool>,
+                headers: Option<Map<String, Json>>,
+                require_approval: Option<Json>,
+                server_description: Option<String>,
+                server_url: Option<String>,
+            },
+            CodeInterpreter {
+                container: CodeInterpreterContainer,
+            },
+            ImageGeneration {
+                action: Option<String>,
+                background: Option<String>,
+                input_fidelity: Option<String>,
+                input_image_mask: Option<ImageInputMask>,
+                model: Option<String>,
+                moderation: Option<String>,
+                output_compression: Option<u8>,
+                output_format: Option<String>,
+                partial_images: Option<u8>,
+                quality: Option<String>,
+                size: Option<String>,
+            },
+            LocalShell,
+            Shell {
+                environment: Option<Json>,
+            },
+            Custom {
+                name: String,
+                defer_loading: Option<bool>,
+                description: Option<String>,
+                format: Option<CustomToolInputFormat>,
+            },
+            Namespace {
+                description: String,
+                name: String,
+                #[serde(default)]
+                tools: Vec<NamespaceToolDefinition>,
+            },
+            ToolSearch {
+                description: Option<String>,
+                execution: Option<String>,
+                parameters: Option<Json>,
+            },
+            WebSearchPreview {
+                search_content_types: Option<Vec<String>>,
+                search_context_size: Option<String>,
+                user_location: Option<UserLocation>,
+            },
+            #[serde(rename = "web_search_preview_2025_03_11")]
+            WebSearchPreview20250311 {
+                search_content_types: Option<Vec<String>>,
+                search_context_size: Option<String>,
+                user_location: Option<UserLocation>,
+            },
+            ApplyPatch,
+        }
 
-                match serde_json::from_value::<Helper>(value.clone()) {
-                    Ok(h) => Ok(match h {
-                        Helper::Function {
-                            name,
-                            parameters,
-                            strict,
-                            description,
-                            defer_loading,
-                        } => ToolDefinition::Function {
-                            name,
-                            parameters,
-                            strict,
-                            description,
-                            defer_loading,
-                        },
-                        Helper::FileSearch {
-                            vector_store_ids,
-                            filters,
-                            max_num_results,
-                            ranking_options,
-                        } => ToolDefinition::FileSearch {
-                            vector_store_ids,
-                            filters,
-                            max_num_results,
-                            ranking_options,
-                        },
-                        Helper::Computer => ToolDefinition::Computer,
-                        Helper::ComputerUsePreview {
-                            display_height,
-                            display_width,
-                            environment,
-                        } => ToolDefinition::ComputerUsePreview {
-                            display_height,
-                            display_width,
-                            environment,
-                        },
-                        Helper::WebSearch {
-                            filters,
-                            search_context_size,
-                            user_location,
-                        } => ToolDefinition::WebSearch {
-                            filters,
-                            search_context_size,
-                            user_location,
-                        },
-                        Helper::WebSearch20250826 {
-                            filters,
-                            search_context_size,
-                            user_location,
-                        } => ToolDefinition::WebSearch20250826 {
-                            filters,
-                            search_context_size,
-                            user_location,
-                        },
-                        Helper::Mcp {
-                            server_label,
-                            allowed_tools,
-                            authorization,
-                            connector_id,
-                            defer_loading,
-                            headers,
-                            require_approval,
-                            server_description,
-                            server_url,
-                        } => ToolDefinition::Mcp {
-                            server_label,
-                            allowed_tools,
-                            authorization,
-                            connector_id,
-                            defer_loading,
-                            headers,
-                            require_approval,
-                            server_description,
-                            server_url,
-                        },
-                        Helper::CodeInterpreter { container } => {
-                            ToolDefinition::CodeInterpreter { container }
-                        }
-                        Helper::ImageGeneration {
-                            action,
-                            background,
-                            input_fidelity,
-                            input_image_mask,
-                            model,
-                            moderation,
-                            output_compression,
-                            output_format,
-                            partial_images,
-                            quality,
-                            size,
-                        } => ToolDefinition::ImageGeneration {
-                            action,
-                            background,
-                            input_fidelity,
-                            input_image_mask,
-                            model,
-                            moderation,
-                            output_compression,
-                            output_format,
-                            partial_images,
-                            quality,
-                            size,
-                        },
-                        Helper::LocalShell => ToolDefinition::LocalShell,
-                        Helper::Shell { environment } => ToolDefinition::Shell { environment },
-                        Helper::Custom {
-                            name,
-                            defer_loading,
-                            description,
-                            format,
-                        } => ToolDefinition::Custom {
-                            name,
-                            defer_loading,
-                            description,
-                            format,
-                        },
-                        Helper::Namespace {
-                            description,
-                            name,
-                            tools,
-                        } => ToolDefinition::Namespace {
-                            description,
-                            name,
-                            tools,
-                        },
-                        Helper::ToolSearch {
-                            description,
-                            execution,
-                            parameters,
-                        } => ToolDefinition::ToolSearch {
-                            description,
-                            execution,
-                            parameters,
-                        },
-                        Helper::WebSearchPreview {
-                            search_content_types,
-                            search_context_size,
-                            user_location,
-                        } => ToolDefinition::WebSearchPreview {
-                            search_content_types,
-                            search_context_size,
-                            user_location,
-                        },
-                        Helper::WebSearchPreview20250311 {
-                            search_content_types,
-                            search_context_size,
-                            user_location,
-                        } => ToolDefinition::WebSearchPreview20250311 {
-                            search_content_types,
-                            search_context_size,
-                            user_location,
-                        },
-                        Helper::ApplyPatch => ToolDefinition::ApplyPatch,
-                    }),
-                    Err(_) => Ok(ToolDefinition::Any(value)),
+        match Helper::deserialize(&value) {
+            Ok(h) => Ok(match h {
+                Helper::Function {
+                    name,
+                    parameters,
+                    strict,
+                    description,
+                    defer_loading,
+                } => ToolDefinition::Function {
+                    name,
+                    parameters,
+                    strict,
+                    description,
+                    defer_loading,
+                },
+                Helper::FileSearch {
+                    vector_store_ids,
+                    filters,
+                    max_num_results,
+                    ranking_options,
+                } => ToolDefinition::FileSearch {
+                    vector_store_ids,
+                    filters,
+                    max_num_results,
+                    ranking_options,
+                },
+                Helper::Computer => ToolDefinition::Computer,
+                Helper::ComputerUsePreview {
+                    display_height,
+                    display_width,
+                    environment,
+                } => ToolDefinition::ComputerUsePreview {
+                    display_height,
+                    display_width,
+                    environment,
+                },
+                Helper::WebSearch {
+                    filters,
+                    search_context_size,
+                    user_location,
+                } => ToolDefinition::WebSearch {
+                    filters,
+                    search_context_size,
+                    user_location,
+                },
+                Helper::WebSearch20250826 {
+                    filters,
+                    search_context_size,
+                    user_location,
+                } => ToolDefinition::WebSearch20250826 {
+                    filters,
+                    search_context_size,
+                    user_location,
+                },
+                Helper::Mcp {
+                    server_label,
+                    allowed_tools,
+                    authorization,
+                    connector_id,
+                    defer_loading,
+                    headers,
+                    require_approval,
+                    server_description,
+                    server_url,
+                } => ToolDefinition::Mcp {
+                    server_label,
+                    allowed_tools,
+                    authorization,
+                    connector_id,
+                    defer_loading,
+                    headers,
+                    require_approval,
+                    server_description,
+                    server_url,
+                },
+                Helper::CodeInterpreter { container } => {
+                    ToolDefinition::CodeInterpreter { container }
                 }
-            }
-            _ => Ok(ToolDefinition::Any(value)),
+                Helper::ImageGeneration {
+                    action,
+                    background,
+                    input_fidelity,
+                    input_image_mask,
+                    model,
+                    moderation,
+                    output_compression,
+                    output_format,
+                    partial_images,
+                    quality,
+                    size,
+                } => ToolDefinition::ImageGeneration {
+                    action,
+                    background,
+                    input_fidelity,
+                    input_image_mask,
+                    model,
+                    moderation,
+                    output_compression,
+                    output_format,
+                    partial_images,
+                    quality,
+                    size,
+                },
+                Helper::LocalShell => ToolDefinition::LocalShell,
+                Helper::Shell { environment } => ToolDefinition::Shell { environment },
+                Helper::Custom {
+                    name,
+                    defer_loading,
+                    description,
+                    format,
+                } => ToolDefinition::Custom {
+                    name,
+                    defer_loading,
+                    description,
+                    format,
+                },
+                Helper::Namespace {
+                    description,
+                    name,
+                    tools,
+                } => ToolDefinition::Namespace {
+                    description,
+                    name,
+                    tools,
+                },
+                Helper::ToolSearch {
+                    description,
+                    execution,
+                    parameters,
+                } => ToolDefinition::ToolSearch {
+                    description,
+                    execution,
+                    parameters,
+                },
+                Helper::WebSearchPreview {
+                    search_content_types,
+                    search_context_size,
+                    user_location,
+                } => ToolDefinition::WebSearchPreview {
+                    search_content_types,
+                    search_context_size,
+                    user_location,
+                },
+                Helper::WebSearchPreview20250311 {
+                    search_content_types,
+                    search_context_size,
+                    user_location,
+                } => ToolDefinition::WebSearchPreview20250311 {
+                    search_content_types,
+                    search_context_size,
+                    user_location,
+                },
+                Helper::ApplyPatch => ToolDefinition::ApplyPatch,
+            }),
+            Err(_) => Ok(ToolDefinition::Any(value)),
         }
     }
 }
@@ -2538,60 +2423,50 @@ impl<'de> Deserialize<'de> for NamespaceToolDefinition {
         D: serde::Deserializer<'de>,
     {
         let value = Json::deserialize(deserializer)?;
-        match &value {
-            Json::Object(map)
-                if matches!(
-                    map.get("type").and_then(|t| t.as_str()),
-                    Some("function" | "custom")
-                ) =>
-            {
-                #[derive(Deserialize)]
-                #[serde(tag = "type", rename_all = "snake_case")]
-                enum Helper {
-                    Function {
-                        name: String,
-                        parameters: Option<Json>,
-                        strict: Option<bool>,
-                        description: Option<String>,
-                        defer_loading: Option<bool>,
-                    },
-                    Custom {
-                        name: String,
-                        defer_loading: Option<bool>,
-                        description: Option<String>,
-                        format: Option<CustomToolInputFormat>,
-                    },
-                }
+        #[derive(Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum Helper {
+            Function {
+                name: String,
+                parameters: Option<Json>,
+                strict: Option<bool>,
+                description: Option<String>,
+                defer_loading: Option<bool>,
+            },
+            Custom {
+                name: String,
+                defer_loading: Option<bool>,
+                description: Option<String>,
+                format: Option<CustomToolInputFormat>,
+            },
+        }
 
-                match serde_json::from_value::<Helper>(value.clone()) {
-                    Ok(Helper::Function {
-                        name,
-                        parameters,
-                        strict,
-                        description,
-                        defer_loading,
-                    }) => Ok(NamespaceToolDefinition::Function {
-                        name,
-                        parameters,
-                        strict,
-                        description,
-                        defer_loading,
-                    }),
-                    Ok(Helper::Custom {
-                        name,
-                        defer_loading,
-                        description,
-                        format,
-                    }) => Ok(NamespaceToolDefinition::Custom {
-                        name,
-                        defer_loading,
-                        description,
-                        format,
-                    }),
-                    Err(_) => Ok(NamespaceToolDefinition::Any(value)),
-                }
-            }
-            _ => Ok(NamespaceToolDefinition::Any(value)),
+        match Helper::deserialize(&value) {
+            Ok(Helper::Function {
+                name,
+                parameters,
+                strict,
+                description,
+                defer_loading,
+            }) => Ok(NamespaceToolDefinition::Function {
+                name,
+                parameters,
+                strict,
+                description,
+                defer_loading,
+            }),
+            Ok(Helper::Custom {
+                name,
+                defer_loading,
+                description,
+                format,
+            }) => Ok(NamespaceToolDefinition::Custom {
+                name,
+                defer_loading,
+                description,
+                format,
+            }),
+            Err(_) => Ok(NamespaceToolDefinition::Any(value)),
         }
     }
 }
@@ -2725,19 +2600,16 @@ pub enum ResponseStatus {
     Other(String),
 }
 
-impl ResponseStatus {
-    fn as_str(&self) -> &str {
-        match self {
-            Self::InProgress => "in_progress",
-            Self::Completed => "completed",
-            Self::Failed => "failed",
-            Self::Cancelled => "cancelled",
-            Self::Queued => "queued",
-            Self::Incomplete => "incomplete",
-            Self::Other(value) => value.as_str(),
-        }
-    }
+string_enum_serde!(ResponseStatus, {
+    "in_progress" => InProgress,
+    "completed" => Completed,
+    "failed" => Failed,
+    "cancelled" => Cancelled,
+    "queued" => Queued,
+    "incomplete" => Incomplete,
+}, Other);
 
+impl ResponseStatus {
     /// Returns true for explicit non-success terminal statuses.
     ///
     /// `in_progress`/`queued`/unknown statuses are not failures: stream
@@ -2745,33 +2617,6 @@ impl ResponseStatus {
     /// provider omits the final `response.completed` event.
     fn is_failure(&self) -> bool {
         matches!(self, Self::Failed | Self::Cancelled | Self::Incomplete)
-    }
-}
-
-impl Serialize for ResponseStatus {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(self.as_str())
-    }
-}
-
-impl<'de> Deserialize<'de> for ResponseStatus {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        Ok(match value.as_str() {
-            "in_progress" => Self::InProgress,
-            "completed" => Self::Completed,
-            "failed" => Self::Failed,
-            "cancelled" => Self::Cancelled,
-            "queued" => Self::Queued,
-            "incomplete" => Self::Incomplete,
-            _ => Self::Other(value),
-        })
     }
 }
 
@@ -2884,44 +2729,13 @@ pub enum OpenAIServiceTier {
     Other(String),
 }
 
-impl OpenAIServiceTier {
-    fn as_str(&self) -> &str {
-        match self {
-            Self::Auto => "auto",
-            Self::Default => "default",
-            Self::Flex => "flex",
-            Self::Scale => "scale",
-            Self::Priority => "priority",
-            Self::Other(value) => value.as_str(),
-        }
-    }
-}
-
-impl Serialize for OpenAIServiceTier {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(self.as_str())
-    }
-}
-
-impl<'de> Deserialize<'de> for OpenAIServiceTier {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        Ok(match value.as_str() {
-            "auto" => Self::Auto,
-            "default" => Self::Default,
-            "flex" => Self::Flex,
-            "scale" => Self::Scale,
-            "priority" => Self::Priority,
-            _ => Self::Other(value),
-        })
-    }
-}
+string_enum_serde!(OpenAIServiceTier, {
+    "auto" => Auto,
+    "default" => Default,
+    "flex" => Flex,
+    "scale" => Scale,
+    "priority" => Priority,
+}, Other);
 
 /// The amount of reasoning effort that will be used by a given model.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

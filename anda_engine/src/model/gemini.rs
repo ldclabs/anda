@@ -9,7 +9,6 @@ use anda_core::{
     AgentOutput, BoxError, BoxPinFut, CompletionFeatures, CompletionRequest, Message, Resource,
 };
 use log::{Level::Debug, log_enabled};
-use serde_json::json;
 use std::collections::BTreeMap;
 
 use super::{
@@ -58,14 +57,8 @@ impl Client {
     /// # Returns
     /// Configured Gemini client instance
     pub fn new(api_key: &str, endpoint: Option<String>) -> Self {
-        let endpoint = endpoint.unwrap_or_else(|| API_BASE_URL.to_string());
-        let endpoint = if endpoint.is_empty() {
-            API_BASE_URL.to_string()
-        } else {
-            endpoint
-        };
         Self {
-            endpoint,
+            endpoint: super::resolve_endpoint(endpoint, API_BASE_URL),
             api_key: api_key.to_string(),
             http: request_client_builder()
                 .build()
@@ -428,30 +421,29 @@ impl CompletionFeaturesDyn for CompletionModel {
             )
             .await?;
 
-            let mut logged_request = r.clone();
-            logged_request.system_instruction = None;
-            if log_enabled!(Debug) {
-                log::debug!(
-                    model = model,
-                    request:serde = logged_request,
-                    response:serde = res;
-                    "Completion response");
-            } else if res.maybe_failed() {
-                log::warn!(
-                    model = model,
-                    request:serde = logged_request,
-                    response:serde = res;
-                    "Completion maybe failed");
+            if log_enabled!(Debug) || res.maybe_failed() {
+                let mut logged_request = r.clone();
+                logged_request.system_instruction = None;
+                if log_enabled!(Debug) {
+                    log::debug!(
+                        model = model,
+                        request:serde = logged_request,
+                        response:serde = res;
+                        "Completion response");
+                } else {
+                    log::warn!(
+                        model = model,
+                        request:serde = logged_request,
+                        response:serde = res;
+                        "Completion maybe failed");
+                }
             }
 
             if skip_raw > 0 {
                 r.contents.drain(0..skip_raw);
             }
 
-            res.try_into(
-                r.contents.into_iter().map(|v| json!(v)).collect(),
-                chat_history,
-            )
+            res.try_into(r.contents, chat_history)
         })
     }
 }
@@ -459,91 +451,11 @@ impl CompletionFeaturesDyn for CompletionModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::test_support::{no_proxy_client, recorded, spawn_mock_server, sse_headers};
     use anda_core::FunctionDefinition;
-    use axum::{Router, body::Bytes, extract::State, response::IntoResponse, routing::any};
-    use http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
+    use http::{HeaderMap, Method, StatusCode};
     use reqwest::header::ACCEPT;
-    use serde_json::Value;
-    use std::sync::{Arc, Mutex};
-
-    #[derive(Clone)]
-    struct MockResponse {
-        status: StatusCode,
-        headers: HeaderMap,
-        body: Vec<u8>,
-    }
-
-    #[derive(Clone, Debug)]
-    struct RecordedRequest {
-        method: Method,
-        uri: Uri,
-        headers: HeaderMap,
-        body: Vec<u8>,
-    }
-
-    type MockState = Arc<Mutex<(MockResponse, Option<RecordedRequest>)>>;
-
-    async fn mock_handler(
-        State(state): State<MockState>,
-        method: Method,
-        uri: Uri,
-        headers: HeaderMap,
-        body: Bytes,
-    ) -> impl IntoResponse {
-        let mut state = state.lock().unwrap();
-        state.1 = Some(RecordedRequest {
-            method,
-            uri,
-            headers,
-            body: body.to_vec(),
-        });
-        let mut response = (state.0.status, state.0.body.clone()).into_response();
-        for (name, value) in state.0.headers.iter() {
-            response.headers_mut().insert(name, value.clone());
-        }
-        response
-    }
-
-    async fn spawn_mock_server(
-        status: StatusCode,
-        headers: HeaderMap,
-        body: impl Into<Vec<u8>>,
-    ) -> (String, MockState) {
-        let state = Arc::new(Mutex::new((
-            MockResponse {
-                status,
-                headers,
-                body: body.into(),
-            },
-            None,
-        )));
-        let app = Router::new()
-            .fallback(any(mock_handler))
-            .with_state(state.clone());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        (format!("http://{addr}"), state)
-    }
-
-    fn no_proxy_client() -> reqwest::Client {
-        reqwest::Client::builder().no_proxy().build().unwrap()
-    }
-
-    fn recorded(state: &MockState) -> RecordedRequest {
-        state.lock().unwrap().1.clone().unwrap()
-    }
-
-    fn sse_headers() -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            http::header::CONTENT_TYPE,
-            HeaderValue::from_static("text/event-stream"),
-        );
-        headers
-    }
+    use serde_json::{Value, json};
 
     async fn complete(
         model: &CompletionModel,
