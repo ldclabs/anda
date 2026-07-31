@@ -2,6 +2,41 @@
 
 All notable changes to the Anda project will be documented in this file.
 
+## [0.14.5] — 2026-07-31
+
+### Added — anda_cli v0.14.5
+
+- **Explicit remote HTTP opt-in** — New global `--allow-http` flag is required before the CLI sends signed requests to a non-loopback `http://` endpoint. Local loopback endpoints continue to work without configuration.
+
+### Changed — anda_core v0.14.5, anda_engine v0.14.5, anda_engine_server v0.14.5, anda_web3_client v0.14.5, anda_cli v0.14.5
+
+- **AndaDB 0.10→0.11** — Upgraded `anda_db`, `anda_db_tfs`, `anda_cognitive_nexus`, `anda_db_schema`, and `anda_kip` to 0.11. Conversation pagination now uses the database's newest-first ID query while preserving stable newest-first results across pages.
+
+### Changed — anda_engine v0.14.5
+
+- **rmcp 2.2→3.0** — Updated the MCP client integration for rmcp 3.0, including its peer metadata and OAuth metadata APIs.
+- **MCP server discovery** — Tool-provider groups now retain an MCP server's handshake title, description, and instructions so consumers can present a coherent server capability bundle instead of only a flat tool list.
+- **On-demand cache namespaces** — Agent, tool, runtime-discovered MCP, and subagent cache namespaces are now created lazily while retaining per-namespace isolation and configured capacity limits.
+
+### Fixed — anda_engine v0.14.5
+
+- **Workspace-bound filesystem and shell tools** — Caller-controlled `workspace`/`workspaces` metadata can now only narrow to a resolved subdirectory of a configured workspace; it can no longer redirect file or shell operations outside the configured roots. File search additionally caps scanned entries and observes cancellation, and `edit_file` rejects a replacement result exceeding the file-size limit before allocation.
+- **Conversation resource authorization** — `get_resource_content` now requires the owning conversation and verifies both conversation ownership and resource membership before returning a resource, closing global resource-ID disclosure. Conversation persistence also preserves concurrently queued steering/follow-up messages and clears stale failure reasons after a successful update.
+- **Model-adapter edge cases** — OpenAI-compatible completions preserve messages when `finish_reason` is omitted and treat empty tool arguments as `{}`. Anthropic requests derive matching non-empty tool IDs when an upstream provider omitted one, omit persisted reasoning blocks lacking a valid signature, and bound provider-supplied streaming content-block indexes to prevent oversized allocations.
+- **Callable routing and cancellation** — Allowlisted subagents and remote callables now match their advertised routing prefixes; duplicate callable names across local and remote sources are suppressed; cancellation closes visible in-flight tool calls with interruption outputs so persisted histories remain replayable.
+- **Hook cleanup** — When a later agent/tool start hook rejects, all previously started hooks are unwound even if an intermediate end hook fails, preventing stateful hooks from stranding leases.
+- **Skills and background tasks** — Loaded skills retain stable subagent session registries across lookups and reloads; directly reading a skill refreshes its materialized subagent. Background task IDs are namespaced by subagent, preventing same-named sessions from colliding.
+- **MCP resilience and routing** — Tool-list change notifications cannot be lost during a refresh; failed lists retry instead of accepting a stale route table; local-name collisions are safely disambiguated; peer-closed transports reconnect; client-credentials sessions reconnect before expiry; and stdio transport environment values are redacted from `Debug` output.
+- **Remote engine initialization** — `EngineBuilder::mock_ctx` now registers configured remote engines just as `build` does, so remote tools and agents are available in mock contexts.
+
+### Fixed — anda_engine_server v0.14.5
+
+- **Credential handling fails closed** — Requests carrying malformed authorization headers are rejected instead of silently becoming anonymous, and configured CWT bearer tokens must carry an expiration claim.
+
+### Fixed — anda_web3_client v0.14.5
+
+- **Signed endpoint URL guard** — Rejects embedded URL userinfo such as `https://trusted.example@attacker.example/`, which could otherwise send a signed request to a misleading host.
+
 ## [0.14.4] — 2026-07-17
 
 ### Fixed — anda_engine v0.14.4

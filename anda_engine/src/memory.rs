@@ -667,7 +667,7 @@ impl Conversations {
             Some(cursor) => cursor,
             None => self.conversations.max_document_id() + 1,
         };
-        let filter = Some(Filter::And(vec![
+        let filter = Filter::And(vec![
             Box::new(Filter::Field((
                 "user".to_string(),
                 RangeQuery::Eq(Fv::Bytes(user.as_slice().to_vec())),
@@ -676,16 +676,13 @@ impl Conversations {
                 "_id".to_string(),
                 RangeQuery::Lt(Fv::U64(cursor)),
             ))),
-        ]));
+        ]);
 
-        let mut rt: Vec<Conversation> = self
-            .conversations
-            .search_as(Query {
-                search: None,
-                filter,
-                limit: Some(limit),
-            })
-            .await?;
+        // `query_last_ids` returns the newest page for any filter shape; the IDs
+        // come back ascending, so reverse them for newest-first output.
+        let mut ids = self.conversations.query_last_ids(filter, Some(limit)).await?;
+        ids.reverse();
+        let rt = materialize_conversation_ids(&self.conversations, ids).await?;
         // The page holds the newest matching conversations; the next cursor is the smallest ID,
         // so the following page fetches strictly older ones.
         let cursor = if rt.len() >= limit {
@@ -696,7 +693,6 @@ impl Conversations {
         } else {
             None
         };
-        rt.sort_by_key(|conversation| std::cmp::Reverse(conversation._id));
         Ok((rt, cursor))
     }
 
@@ -752,6 +748,22 @@ impl Conversations {
         self.conversations.flush(unix_ms()).await?;
         Ok(count)
     }
+}
+
+// Load sequentially so every ID returned by the index is materialized in the same order.
+async fn materialize_conversation_ids(
+    conversations: &Collection,
+    ids: Vec<u64>,
+) -> Result<Vec<Conversation>, DBError> {
+    let mut results = Vec::with_capacity(ids.len());
+    for id in ids {
+        match conversations.get_as(id).await {
+            Ok(conversation) => results.push(conversation),
+            Err(DBError::NotFound { .. }) => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(results)
 }
 
 /// The maximum number of expired conversations fetched per deletion batch. The database caps
