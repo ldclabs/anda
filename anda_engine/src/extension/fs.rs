@@ -101,22 +101,44 @@ where
     normalized
 }
 
-pub(crate) fn tool_workspaces(meta: &RequestMeta, defaults: &[PathBuf]) -> Vec<PathBuf> {
-    let mut workspaces = Vec::new();
+/// Resolves the workspace roots for a tool call.
+///
+/// `RequestMeta.extra` is flattened straight off the RPC body, so a requested workspace is
+/// caller-controlled and untrusted. A request may only ever *narrow* the configured roots by
+/// prioritizing a subdirectory of one of them; a requested root that does not resolve inside a
+/// configured root is dropped, so the configured roots always bound what the tool can reach.
+pub(crate) async fn tool_workspaces(meta: &RequestMeta, defaults: &[PathBuf]) -> Vec<PathBuf> {
+    let mut requested = Vec::new();
 
     if let Some(workspace) = meta.get_extra_as::<PathBuf>("workspace") {
-        push_workspace(&mut workspaces, workspace);
+        push_workspace(&mut requested, workspace);
     } else if let Some(extra_workspaces) = meta.get_extra_as::<Vec<PathBuf>>("workspace") {
         for workspace in extra_workspaces {
-            push_workspace(&mut workspaces, workspace);
+            push_workspace(&mut requested, workspace);
         }
     }
 
     if let Some(workspace) = meta.get_extra_as::<PathBuf>("workspaces") {
-        push_workspace(&mut workspaces, workspace);
+        push_workspace(&mut requested, workspace);
     } else if let Some(extra_workspaces) = meta.get_extra_as::<Vec<PathBuf>>("workspaces") {
         for workspace in extra_workspaces {
-            push_workspace(&mut workspaces, workspace);
+            push_workspace(&mut requested, workspace);
+        }
+    }
+
+    let mut workspaces = Vec::new();
+    if !requested.is_empty() {
+        let resolved_defaults = resolve_workspace_paths(defaults).await;
+        for workspace in requested {
+            if is_within_workspaces(&workspace, &resolved_defaults).await {
+                push_workspace(&mut workspaces, workspace);
+            } else {
+                log::warn!(
+                    "ignoring requested workspace {:?} outside the configured workspaces {}",
+                    workspace.display().to_string(),
+                    format_workspaces(defaults),
+                );
+            }
         }
     }
 
@@ -125,6 +147,29 @@ pub(crate) fn tool_workspaces(meta: &RequestMeta, defaults: &[PathBuf]) -> Vec<P
     }
 
     workspaces
+}
+
+/// Canonicalizes each workspace, dropping the ones that cannot be resolved.
+async fn resolve_workspace_paths(workspaces: &[PathBuf]) -> Vec<PathBuf> {
+    let mut resolved = Vec::with_capacity(workspaces.len());
+    for workspace in workspaces {
+        if let Ok(path) = resolve_workspace_path(workspace).await {
+            push_workspace(&mut resolved, path);
+        }
+    }
+
+    resolved
+}
+
+/// Returns true when `candidate` canonicalizes inside one of the already-resolved roots.
+async fn is_within_workspaces(candidate: &Path, resolved_workspaces: &[PathBuf]) -> bool {
+    let Ok(resolved) = resolve_workspace_path(candidate).await else {
+        return false;
+    };
+
+    resolved_workspaces
+        .iter()
+        .any(|root| ensure_path_in_workspace(root, &resolved).is_ok())
 }
 
 pub(crate) fn format_workspaces(workspaces: &[PathBuf]) -> String {
@@ -786,8 +831,6 @@ mod tests {
     fn workspace_helpers_normalize_dedupe_and_report_empty_sets() {
         let first = PathBuf::from("/tmp/one");
         let second = PathBuf::from("/tmp/two");
-        let third = PathBuf::from("/tmp/three");
-        let fourth = PathBuf::from("/tmp/four");
 
         assert_eq!(
             normalize_workspaces(vec![
@@ -804,25 +847,60 @@ mod tests {
                 .to_string(),
             "Path is not accessible from any configured workspace (requested_path: file.txt, workspaces: [<none>])"
         );
+    }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn tool_workspaces_only_accepts_requests_inside_configured_roots() {
+        let root = temp_dir("tool_workspaces");
+        let configured = root.join("configured");
+        let nested = configured.join("nested");
+        let outside = root.join("outside");
+        tokio::fs::create_dir_all(&nested).await.unwrap();
+        tokio::fs::create_dir_all(&outside).await.unwrap();
+
+        // No request metadata: the configured roots are used as-is.
+        assert_eq!(
+            tool_workspaces(&RequestMeta::default(), std::slice::from_ref(&configured)).await,
+            vec![configured.clone()]
+        );
+
+        // A request may narrow to a subdirectory of a configured root, which then takes priority.
+        let mut meta = RequestMeta::default();
+        meta.extra
+            .insert("workspace".to_string(), json!([nested, "", nested]));
+        assert_eq!(
+            tool_workspaces(&meta, std::slice::from_ref(&configured)).await,
+            vec![nested.clone(), configured.clone()]
+        );
+
+        // A request outside the configured roots is dropped, not prioritized.
+        let mut meta = RequestMeta::default();
+        meta.extra.insert("workspace".to_string(), json!(outside));
+        assert_eq!(
+            tool_workspaces(&meta, std::slice::from_ref(&configured)).await,
+            vec![configured.clone()]
+        );
+
+        // Filesystem root, the widest possible escape, is likewise rejected.
+        let mut meta = RequestMeta::default();
+        meta.extra.insert("workspaces".to_string(), json!("/"));
+        assert_eq!(
+            tool_workspaces(&meta, std::slice::from_ref(&configured)).await,
+            vec![configured.clone()]
+        );
+
+        // A path that does not exist cannot be resolved and is dropped.
         let mut meta = RequestMeta::default();
         meta.extra.insert(
             "workspace".to_string(),
-            json!([first, "", second.clone(), second]),
+            json!(configured.join("does-not-exist")),
         );
-        meta.extra
-            .insert("workspaces".to_string(), json!(third.clone()));
-
-        let workspaces = tool_workspaces(&meta, &[third, fourth.clone()]);
         assert_eq!(
-            workspaces,
-            vec![
-                PathBuf::from("/tmp/one"),
-                PathBuf::from("/tmp/two"),
-                PathBuf::from("/tmp/three"),
-                fourth
-            ]
+            tool_workspaces(&meta, std::slice::from_ref(&configured)).await,
+            vec![configured.clone()]
         );
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
     }
 
     #[test]

@@ -46,7 +46,8 @@ anda/
 ├── anda_cli/              # Anda エンジンサーバーのコマンドラインインターフェース
 ├── anda_core/             # コア traits、型、ランタイム契約
 ├── anda_engine/           # エージェントランタイム、オーケストレーション、コンテキスト、モデル、拡張
-└── anda_engine_server/    # 1 つ以上の Anda エンジンを提供する HTTP サーバー
+├── anda_engine_server/    # 1 つ以上の Anda エンジンを提供する HTTP サーバー
+└── anda_web3_client/      # 非 TEE 環境向け Web3 クライアント
 ```
 
 ### 使用方法と貢献方法

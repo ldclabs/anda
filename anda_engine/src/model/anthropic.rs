@@ -213,14 +213,32 @@ fn merge_usage(usage: &mut types::Usage, delta: types::Usage) {
     }
 }
 
+/// Upper bound on the content-block index accepted from a stream.
+///
+/// `index` is provider-supplied and drives a `Vec` resize, so without a bound a single small
+/// SSE event could request an arbitrarily large allocation (aborting the process, since an
+/// allocation failure is not a catchable per-task error), and `usize::MAX` would overflow
+/// `index + 1`. Real responses carry a handful of blocks; this is far above any legitimate
+/// count while keeping the worst-case allocation trivial.
+const MAX_STREAM_CONTENT_BLOCKS: usize = 4096;
+
+/// Returns the slot for `index`, growing `blocks` as needed.
+///
+/// Returns `None` when the index exceeds [`MAX_STREAM_CONTENT_BLOCKS`], in which case the
+/// event is dropped rather than honored.
 fn ensure_content_block(
     blocks: &mut Vec<Option<types::ContentBlock>>,
     index: usize,
-) -> &mut Option<types::ContentBlock> {
+) -> Option<&mut Option<types::ContentBlock>> {
+    if index >= MAX_STREAM_CONTENT_BLOCKS {
+        log::warn!("ignoring content block index {index} beyond the supported range");
+        return None;
+    }
+
     if blocks.len() <= index {
         blocks.resize_with(index + 1, || None);
     }
-    &mut blocks[index]
+    Some(&mut blocks[index])
 }
 
 fn apply_content_delta(
@@ -231,7 +249,10 @@ fn apply_content_delta(
 ) {
     match delta {
         types::ContentBlockDelta::TextDelta { text: delta_text } => {
-            match ensure_content_block(blocks, index) {
+            let Some(slot) = ensure_content_block(blocks, index) else {
+                return;
+            };
+            match slot {
                 Some(types::ContentBlock::Text { text, .. }) => text.push_str(&delta_text),
                 block @ None => {
                     *block = Some(types::ContentBlock::Text {
@@ -250,7 +271,10 @@ fn apply_content_delta(
                 .push_str(&partial_json);
         }
         types::ContentBlockDelta::ThinkingDelta { thinking } => {
-            match ensure_content_block(blocks, index) {
+            let Some(slot) = ensure_content_block(blocks, index) else {
+                return;
+            };
+            match slot {
                 Some(types::ContentBlock::Thinking { thinking: text, .. }) => {
                     text.push_str(&thinking)
                 }
@@ -264,7 +288,10 @@ fn apply_content_delta(
             }
         }
         types::ContentBlockDelta::SignatureDelta { signature } => {
-            match ensure_content_block(blocks, index) {
+            let Some(slot) = ensure_content_block(blocks, index) else {
+                return;
+            };
+            match slot {
                 Some(types::ContentBlock::Thinking {
                     signature: text, ..
                 }) => text.push_str(&signature),
@@ -278,7 +305,7 @@ fn apply_content_delta(
             }
         }
         types::ContentBlockDelta::CitationsDelta { citation } => {
-            if let Some(types::ContentBlock::Text { citations, .. }) =
+            if let Some(Some(types::ContentBlock::Text { citations, .. })) =
                 ensure_content_block(blocks, index)
             {
                 citations.get_or_insert_with(Vec::new).push(citation);
@@ -344,7 +371,9 @@ fn response_from_stream_events(
                 index,
                 content_block,
             } => {
-                *ensure_content_block(&mut content, index) = Some(content_block);
+                if let Some(slot) = ensure_content_block(&mut content, index) {
+                    *slot = Some(content_block);
+                }
             }
             types::StreamEvent::ContentBlockDelta { index, delta } => {
                 apply_content_delta(&mut content, &mut json_buffers, index, delta);
@@ -1144,5 +1173,70 @@ mod tests {
             ContentPart::ToolCall { name, args, call_id: Some(call_id) }
                 if name == "lookup" && args == &json!({"q": "anda"}) && call_id == "toolu_1"
         ));
+    }
+
+    #[test]
+    fn stream_content_block_index_is_bounded() {
+        // `index` is provider-supplied and drives a `Vec` resize. Without a bound, a huge
+        // value requests an allocation that aborts the process, and `usize::MAX` overflows
+        // `index + 1` (release builds have no overflow checks), truncating the vec and then
+        // panicking on the index. Oversized indices must be dropped instead.
+        for oversized in [MAX_STREAM_CONTENT_BLOCKS, 1_000_000_000, usize::MAX] {
+            let events = vec![
+                serde_json::from_value::<types::StreamEvent>(json!({
+                    "type": "message_start",
+                    "message": {
+                        "id": "msg_bounds",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [],
+                        "model": "claude-sonnet-4-6",
+                        "stop_reason": null,
+                        "stop_sequence": null,
+                        "usage": {"input_tokens": 1, "output_tokens": 0}
+                    }
+                }))
+                .unwrap(),
+                serde_json::from_value::<types::StreamEvent>(json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": ""}
+                }))
+                .unwrap(),
+                serde_json::from_value::<types::StreamEvent>(json!({
+                    "type": "content_block_start",
+                    "index": oversized,
+                    "content_block": {"type": "text", "text": "ignored"}
+                }))
+                .unwrap(),
+                serde_json::from_value::<types::StreamEvent>(json!({
+                    "type": "content_block_delta",
+                    "index": oversized,
+                    "delta": {"type": "text_delta", "text": "ignored"}
+                }))
+                .unwrap(),
+                serde_json::from_value::<types::StreamEvent>(json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": "kept"}
+                }))
+                .unwrap(),
+                serde_json::from_value::<types::StreamEvent>(json!({
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn", "stop_sequence": null},
+                    "usage": {"output_tokens": 1}
+                }))
+                .unwrap(),
+                serde_json::from_value::<types::StreamEvent>(json!({"type": "message_stop"}))
+                    .unwrap(),
+            ];
+
+            let response = response_from_stream_events(events).unwrap();
+            let output = response.try_into(vec![], vec![]).unwrap();
+            assert_eq!(
+                output.content, "kept",
+                "index {oversized} must be dropped without disturbing valid blocks"
+            );
+        }
     }
 }

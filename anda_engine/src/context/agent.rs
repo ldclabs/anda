@@ -3,18 +3,16 @@
 //! This module provides the core implementation of the Agent context ([`AgentCtx`]) which serves as
 //! the primary execution environment for agents in the Anda system. The context provides:
 //!
-//! - Access to AI models for completions and embeddings;
+//! - Access to AI models for completions;
 //! - Tool execution capabilities;
 //! - Agent-to-agent communication;
 //! - Cryptographic operations;
 //! - Storage and caching facilities;
-//! - Canister interaction capabilities;
 //! - HTTP communication features.
 //!
 //! The [`AgentCtx`] implements multiple traits that provide different sets of functionality:
 //! - [`AgentContext`]: Core agent operations and tool/agent management;
 //! - [`CompletionFeatures`]: AI model completion capabilities;
-//! - [`EmbeddingFeatures`]: Text embedding generation;
 //! - [`StateFeatures`]: Context state management;
 //! - [`KeysFeatures`]: Cryptographic key operations;
 //! - [`StoreFeatures`]: Persistent storage operations;
@@ -96,6 +94,17 @@ Keep the summary compact, structured, and actionable. Prefer short sections and 
 pub(crate) fn strip_prefix_ignore_ascii_case<'a>(name: &'a str, prefix: &str) -> Option<&'a str> {
     let (head, tail) = name.split_at_checked(prefix.len())?;
     head.eq_ignore_ascii_case(prefix).then_some(tail)
+}
+
+/// Strips whichever routing prefix `name` carries, if any.
+///
+/// Routing prefixes are added when definitions are produced and stripped when calls are
+/// dispatched, so any check that compares a model-emitted name against a registered name must
+/// normalize through here first.
+pub(crate) fn strip_routing_prefix(name: &str) -> Option<&str> {
+    [SUB_AGENT_PREFIX, REMOTE_TOOL_PREFIX, REMOTE_AGENT_PREFIX]
+        .into_iter()
+        .find_map(|prefix| strip_prefix_ignore_ascii_case(name, prefix))
 }
 
 pub(crate) fn agent_context_path(agent_name: &str) -> String {
@@ -554,13 +563,29 @@ impl AgentContext for AgentCtx {
             return Vec::new();
         }
 
-        let mut definitions = self.tool_definitions(names);
-        definitions.extend(self.agent_definitions(names));
+        // Deduplicate across every source, not just within each one. Tools, agents,
+        // subagents, and remote engines are independent registries, so nothing prevents one
+        // name from being registered in two of them (e.g. a tool and an agent both named
+        // `search`, or an MCP tool colliding with an agent). Emitting the name twice makes
+        // providers reject the entire request with a duplicate-function-name error, taking
+        // down every completion in the engine.
+        let mut definitions = Vec::new();
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        let mut extend_unique = |source: Vec<FunctionDefinition>, definitions: &mut Vec<_>| {
+            for definition in source {
+                if seen.insert(definition.name.to_ascii_lowercase()) {
+                    definitions.push(definition);
+                }
+            }
+        };
+
+        extend_unique(self.tool_definitions(names), &mut definitions);
+        extend_unique(self.agent_definitions(names), &mut definitions);
         if let Ok(remote) = self.remote_tool_definitions(None, names).await {
-            definitions.extend(remote);
+            extend_unique(remote, &mut definitions);
         }
         if let Ok(remote) = self.remote_agent_definitions(None, names).await {
-            definitions.extend(remote);
+            extend_unique(remote, &mut definitions);
         }
 
         definitions
@@ -1255,12 +1280,25 @@ impl CompletionRunner {
     }
 
     /// Returns whether the runner may execute the lowercased callable `name`.
+    ///
+    /// The name arrives as the model emitted it, so it still carries any routing prefix
+    /// (`SA_`, `RT_`, `RA_`) that [`Self::definitions`] added. Allowlists are written in terms
+    /// of the unprefixed names the caller registered — the same names `definitions(Some(..))`
+    /// filters on — so the prefix is stripped before matching. Both spellings are accepted,
+    /// since a caller may reasonably whitelist either.
     fn is_callable_allowed(&self, name_lowercase: &str) -> bool {
         match &self.allowed_callables {
             None => true,
             Some(allowed) => {
-                allowed.contains(name_lowercase)
+                if allowed.contains(name_lowercase)
                     || self.discovered_tools.contains_key(name_lowercase)
+                {
+                    return true;
+                }
+
+                strip_routing_prefix(name_lowercase).is_some_and(|unprefixed| {
+                    allowed.contains(unprefixed) || self.discovered_tools.contains_key(unprefixed)
+                })
             }
         }
     }
@@ -1930,6 +1968,15 @@ impl CompletionRunner {
         let token = self.ctx.base.cancellation_token();
         tokio::select! {
             _ = token.cancelled() => {
+                // Dropping `inner_next` can abort mid tool-execution. `pending_tool_calls`
+                // was already drained by `execute_pending_tool_calls_into_request`, so the
+                // visible history can end on a `ToolCall` with no matching `ToolOutput`,
+                // which providers reject when the persisted history is replayed. Close the
+                // unanswered calls the same way every other interrupt path does.
+                self.discard_in_flight_request_with_interrupted_tool_outputs(
+                    "tool call interrupted by cancellation",
+                    None,
+                );
                 let output = AgentOutput {
                     failed_reason: Some("operation cancelled".to_string()),
                     ..Default::default()
@@ -4960,6 +5007,39 @@ mod tests {
             !new_runner.is_callable_allowed("echo_tool"),
             "a non-whitelisted callable must stay blocked after compaction"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn allowlist_matches_callables_through_their_routing_prefix() {
+        // Allowlists are written with the unprefixed names the caller registered, but the
+        // model calls the prefixed name that `definitions` advertises (`SA_helper`,
+        // `RT_...`, `RA_...`). Matching the raw name against the allowlist would reject
+        // every whitelisted subagent and remote callable, permanently.
+        let model = Model::with_completer(Arc::new(EchoCompleter));
+        let ctx = EngineBuilder::new().with_model(model).mock_ctx();
+
+        let runner = ctx
+            .completion_iter(CompletionRequest::default(), Vec::new())
+            .with_allowed_callables(Some(BTreeSet::from([
+                "helper".to_string(),
+                "lookup".to_string(),
+                "chat".to_string(),
+            ])));
+
+        for name in ["helper", "sa_helper", "rt_lookup", "ra_chat"] {
+            assert!(
+                runner.is_callable_allowed(name),
+                "{name} must be permitted for a runner whitelisting its unprefixed name"
+            );
+        }
+
+        // Stripping a prefix must not turn an unrelated callable into an allowed one.
+        for name in ["other", "sa_other", "rt_helperx"] {
+            assert!(
+                !runner.is_callable_allowed(name),
+                "{name} must stay blocked"
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

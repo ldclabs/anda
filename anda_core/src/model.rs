@@ -166,13 +166,23 @@ pub struct AgentOutput {
     pub tool_calls: Vec<ToolCall>,
 
     /// The history of the conversation.
+    ///
+    /// The provider-neutral, persistable view (see [`ContentPart`]). This is what callers
+    /// store and replay; it deliberately carries no provider-specific intermediate state.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub chat_history: Vec<Message>,
 
     /// Provider-specific conversation history used internally by model adapters.
     ///
-    /// This is included in completion responses for follow-up calls, but should
-    /// not be exposed as a stable engine API response.
+    /// Carries the provider's own message JSON verbatim so per-turn opaque state (Anthropic
+    /// `thinking.signature`, Gemini `thoughtSignature`) survives a reasoning round without
+    /// being modelled in [`ContentPart`]. The runner appends this onto
+    /// [`CompletionRequest::raw_history`](crate::model::CompletionRequest::raw_history) for
+    /// the next turn; see that field for the full contract.
+    ///
+    /// Scoped to one in-process round: `#[serde(skip)]` keeps it off the wire and the engine
+    /// clears it at the RPC boundary, so it is never part of the stable engine API response
+    /// and never reaches a persisted conversation.
     #[serde(skip)]
     pub raw_history: Vec<Json>,
 
@@ -406,6 +416,25 @@ impl Message {
 ///
 /// The enum supports Anda's normalized content types while preserving unknown
 /// provider-specific JSON payloads in [`ContentPart::Any`].
+///
+/// # This is the persisted, provider-neutral view
+///
+/// `ContentPart` is what gets **stored** as conversation history and what crosses the engine
+/// API boundary. It intentionally does **not** carry a provider's per-turn intermediate
+/// state — Anthropic's `thinking.signature`, Gemini's `thoughtSignature`, and similar opaque
+/// tokens. Those are only meaningful inside the reasoning round that produced them, so a
+/// stored conversation has no use for them.
+///
+/// Within a round they are not lost: the provider-native messages travel in
+/// [`CompletionRequest::raw_history`](crate::model::CompletionRequest::raw_history), which
+/// every model adapter sends ahead of the converted `chat_history`, so they never pass
+/// through this lossy conversion. See that field's docs for the full contract.
+///
+/// **Do not add provider-specific fields to this enum** to "preserve" such state — that is
+/// what `raw_history` is for. A conversion that *drops* one on the way in is correct by
+/// design. What is not correct is a conversion that, on the way back *out*, emits something
+/// the provider rejects (for example an Anthropic `thinking` block with an empty signature);
+/// omit the block instead.
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all_fields = "camelCase")]
 pub enum ContentPart {

@@ -23,6 +23,8 @@ The first implementation supports MCP tools only:
 - Runtime add: callers can keep an `Arc<McpToolProvider>` after registering it
   with an engine, then call `add_server` to connect a new MCP server and expose
   its tools without rebuilding the `Engine`.
+- Authorization: a Streamable HTTP server may use a static bearer token or
+  OAuth 2.1. See [Authorization](#authorization).
 
 The implementation intentionally does not integrate SEP-2577-deprecated
 capabilities: Roots, Sampling, and Logging control. Anda does not advertise
@@ -107,11 +109,36 @@ tools shadowed by static tools are hidden from the provider group, and duplicate
 group ids are merged so `tools_select { group }` expands the whole visible
 bundle deterministically.
 
+## Authorization
+
+Streamable HTTP servers may require credentials. `McpStreamableHttpTransport`
+supports a static `bearer_token`, or `McpOAuthConfig` for OAuth 2.1:
+
+- **Client Credentials** (`McpOAuthConfig::ClientCredentials`) is headless: the
+  token is obtained during session setup with no human in the loop. Per
+  RFC 6749 §4.4.3 this grant issues no refresh token, so the session carries the
+  token's deadline and re-establishes itself shortly before expiry to mint a new
+  one. `resource` (RFC 8707) is required by the MCP auth spec even though the
+  field is optional in the config type.
+- **Authorization Code** (`McpOAuthConfig::AuthorizationCode`) is interactive.
+  `anda_engine` is a library and does not open a browser or receive the redirect:
+  call `begin_authorization` to get the URL, present it however the application
+  likes, then call `complete_authorization` with the returned code. Refresh
+  happens on demand from the stored credentials.
+- `discover_http_oauth` probes an endpoint (RFC 9728 / RFC 8414) so an
+  application can decide from a bare URL whether a flow is needed at all.
+
+Credential persistence belongs to the application. Implement
+`McpCredentialStore` to store tokens durably; `InMemoryMcpCredentialStore` is
+provided for tests and short-lived processes, and loses tokens on restart.
+
 ## Security Boundaries
 
 - MCP servers are never enabled implicitly by this crate.
 - Stdio uses `command` plus `args`; it does not invoke a shell string.
 - Streamable HTTP validates custom headers before connecting.
+- Bearer tokens, OAuth client secrets, and stdio `env` values are redacted from
+  `Debug` output, so a config can be logged without leaking expanded secrets.
 - Remote tool descriptions and annotations are treated as untrusted metadata.
 - Server title and `instructions` are likewise untrusted: they are surfaced as
   group data the model reads, never as system instructions or runtime

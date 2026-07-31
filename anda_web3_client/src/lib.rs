@@ -5,12 +5,15 @@
 //! implementations. Everything is feature-gated so the default build pulls
 //! neither `ic-agent` nor any `ic_tee_*` crate:
 //!
-//! - `client`: the generic Web3 [`client::Client`] backed by `ic-agent`,
-//!   `ic-cose`, and local key derivation ([`crypto`]) — for non-TEE
+//! - `client`: the generic Web3 `client::Client` backed by `ic-agent`,
+//!   `ic-cose`, and local key derivation (`crypto`) — for non-TEE
 //!   environments.
-//! - `tee`: the TEE gateway-backed [`tee::TeeClient`], which pulls the
+//! - `tee`: the TEE gateway-backed `tee::TeeClient`, which pulls the
 //!   `ic_tee_*` crates.
 //! - `full`: enables both.
+//!
+//! The module names above are not intra-doc links because each is behind the
+//! feature that gates it, so they do not resolve in a default-feature build.
 
 /// Deterministic key derivation shared by the generic client.
 #[cfg(feature = "client")]

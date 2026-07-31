@@ -103,6 +103,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::{Duration, Instant},
 };
 use tokio::{process::Command, sync::Mutex};
 
@@ -110,6 +111,15 @@ use crate::context::BaseCtx;
 
 /// Default model-facing prefix for MCP-backed tools.
 pub const DEFAULT_MCP_TOOL_PREFIX: &str = "mcp";
+
+/// How many times to re-derive a local tool name before giving up on a collision.
+const MAX_LOCAL_NAME_ATTEMPTS: usize = 8;
+
+/// How far ahead of a client-credentials token's expiry to re-establish the session.
+///
+/// Comfortably wider than rmcp's own 30s refresh buffer, so the reconnect happens before any
+/// request can fail with `AuthorizationRequired`.
+const CLIENT_CREDENTIALS_RENEW_BUFFER: Duration = Duration::from_secs(120);
 
 /// Dynamic tool provider backed by one or more MCP servers.
 #[derive(Clone)]
@@ -209,11 +219,26 @@ impl McpToolProvider {
             let service = session.service.lock().await;
             service.peer().clone()
         };
+        // Clear `dirty` *before* listing, not after. `on_tool_list_changed` runs on the rmcp
+        // service task and can fire while `list_all_tools` is in flight; clearing afterwards
+        // would swallow that notification, and since the server will not re-announce an
+        // already-sent change, the route table would stay stale indefinitely. Clearing first
+        // means a concurrent change re-arms the flag and is picked up by the next refresh.
+        session.dirty.store(false, Ordering::SeqCst);
+
         // Capture the server's self-description (title, instructions) from the
         // initialize handshake so the discovery layer can present each server as
         // a coherent capability bundle, not just a flat list of tools.
         let meta = McpServerMeta::from_peer_info(&config.id, peer.peer_info().as_deref());
-        let tools = peer.list_all_tools().await?;
+        let tools = match peer.list_all_tools().await {
+            Ok(tools) => tools,
+            Err(err) => {
+                // The listing failed, so the snapshot was not applied; re-arm the flag so
+                // the next call retries instead of trusting a stale route table.
+                session.dirty.store(true, Ordering::SeqCst);
+                return Err(err.into());
+            }
+        };
 
         let routes = self.routes_for_tools(&config.id, tools)?;
         {
@@ -221,7 +246,6 @@ impl McpToolProvider {
             index.replace_server_routes(&config.id, routes);
             index.metas.insert(config.id.clone(), meta);
         }
-        session.dirty.store(false, Ordering::SeqCst);
         Ok(())
     }
 
@@ -328,6 +352,7 @@ impl McpToolProvider {
 
         let dirty = Arc::new(AtomicBool::new(false));
         let handler = AndaMcpClient::new(dirty.clone());
+        let mut expires_at = None;
         let service = match &config.transport {
             McpTransportConfig::Stdio(stdio) => {
                 let transport = TokioChildProcess::new(stdio.command())?;
@@ -340,8 +365,11 @@ impl McpToolProvider {
                     serve_client(handler, transport).await?
                 }
                 Some(McpOAuthConfig::ClientCredentials(cc)) => {
-                    // Headless: obtain a token at connection time, no human loop.
-                    let manager = self.authorize_client_credentials(http, cc).await?;
+                    // Headless: obtain a token at connection time, no human loop. The grant
+                    // issues no refresh token, so the session carries the token's deadline
+                    // and reconnects to mint a new one.
+                    let (manager, deadline) = self.authorize_client_credentials(http, cc).await?;
+                    expires_at = deadline;
                     let transport = StreamableHttpClientTransport::with_client(
                         AuthClient::new(ReqwestClient::new(), manager),
                         http.base_transport_config()?,
@@ -364,6 +392,7 @@ impl McpToolProvider {
         let session = Arc::new(McpSession {
             service: Mutex::new(service),
             dirty,
+            expires_at,
         });
         self.inner
             .index
@@ -521,11 +550,18 @@ impl McpToolProvider {
     }
 
     /// Obtains an authorized manager via the headless Client Credentials flow.
+    /// Runs the headless Client Credentials exchange and reports when the token expires.
+    ///
+    /// RFC 6749 §4.4.3 says a client-credentials grant SHOULD NOT issue a refresh token, and
+    /// rmcp's only renewal path is `refresh_token`. Once the access token expires, every
+    /// request fails with `AuthorizationRequired` and nothing re-runs this exchange. The
+    /// returned deadline lets the session expire itself slightly early so `ensure_session`
+    /// reconnects and mints a fresh token instead of failing permanently.
     async fn authorize_client_credentials(
         &self,
         http: &McpStreamableHttpTransport,
         config: &OAuthClientCredentialsConfig,
-    ) -> Result<AuthorizationManager, BoxError> {
+    ) -> Result<(AuthorizationManager, Option<Instant>), BoxError> {
         let mut state = OAuthState::new(http.url.as_str(), Some(ReqwestClient::new())).await?;
         state
             .authenticate_client_credentials(ClientCredentialsConfig::ClientSecret {
@@ -535,9 +571,28 @@ impl McpToolProvider {
                 resource: config.resource.clone(),
             })
             .await?;
-        state
+
+        // Renew before rmcp's own 30s refresh buffer would kick in and fail. `expires_in` is
+        // read through the token response's `Serialize` impl so this does not depend on
+        // `oauth2` directly, which would risk a version skew with the one rmcp uses.
+        let expires_at = match state.get_credentials().await {
+            Ok((_, Some(token))) => serde_json::to_value(&token)
+                .ok()
+                .and_then(|token| token.get("expires_in").and_then(Json::as_u64))
+                .map(|secs| {
+                    let ttl = Duration::from_secs(secs);
+                    Instant::now()
+                        + ttl
+                            .saturating_sub(CLIENT_CREDENTIALS_RENEW_BUFFER)
+                            .max(ttl / 10)
+                }),
+            _ => None,
+        };
+
+        let manager = state
             .into_authorization_manager()
-            .ok_or_else(|| "MCP client_credentials authorization did not complete".into())
+            .ok_or("MCP client_credentials authorization did not complete")?;
+        Ok((manager, expires_at))
     }
 
     async fn refresh_if_dirty(&self, server_id: &str) -> Result<(), BoxError> {
@@ -574,9 +629,27 @@ impl McpToolProvider {
                 continue;
             }
 
+            // Two remote names can sanitize or hash-truncate onto the same local name, and
+            // the hash suffix uses a fixed-key hasher truncated to 32 bits, so a server
+            // operator can compute a collision offline. Keep disambiguating until the name
+            // is unique: silently reusing it would overwrite the earlier route below, so
+            // the local name the model already learned would dispatch to a different remote
+            // tool. If no unique name can be found, drop the tool rather than hijack.
             let mut local_name = self.local_tool_name(server_id, &remote_name, None)?;
+            let mut attempt = 0usize;
+            while used.contains(&local_name) {
+                if attempt >= MAX_LOCAL_NAME_ATTEMPTS {
+                    log::warn!(
+                        "skipping MCP tool {remote_name:?} on server {server_id:?}: could not derive a unique local name"
+                    );
+                    break;
+                }
+                let key = format!("{remote_name}#{attempt}");
+                local_name = self.local_tool_name(server_id, &remote_name, Some(&key))?;
+                attempt += 1;
+            }
             if used.contains(&local_name) {
-                local_name = self.local_tool_name(server_id, &remote_name, Some(&remote_name))?;
+                continue;
             }
             used.insert(local_name.clone());
 
@@ -1042,11 +1115,32 @@ pub struct McpToolRoute {
 struct McpSession {
     service: Mutex<RunningService<RoleClient, AndaMcpClient>>,
     dirty: Arc<AtomicBool>,
+    /// Deadline after which the session's credentials are stale and it must be re-established.
+    ///
+    /// Only set for the Client Credentials flow, whose grant issues no refresh token.
+    expires_at: Option<Instant>,
 }
 
 impl McpSession {
+    /// Reports whether the session can still carry requests.
+    ///
+    /// `RunningService::is_closed` only reflects a *locally* initiated shutdown: it is
+    /// `handle.is_none() || cancellation_token.is_cancelled()`, and rmcp's serve loop exits
+    /// with `QuitReason::Closed` on a peer-initiated close without cancelling that token. A
+    /// crashed or exited MCP server would therefore look alive forever and every later call
+    /// would fail with `TransportClosed` instead of triggering a reconnect. The peer's
+    /// transport state is what actually flips, so check both — plus the credential deadline,
+    /// since an expired token makes the session unusable while the transport is still open.
     async fn is_closed(&self) -> bool {
-        self.service.lock().await.is_closed()
+        if self
+            .expires_at
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return true;
+        }
+
+        let service = self.service.lock().await;
+        service.is_closed() || service.peer().is_transport_closed()
     }
 }
 
@@ -1150,7 +1244,7 @@ impl McpTransportConfig {
 }
 
 /// stdio child process transport configuration.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 pub struct McpStdioTransport {
     /// Executable to spawn.
     pub command: String,
@@ -1158,11 +1252,34 @@ pub struct McpStdioTransport {
     #[serde(default)]
     pub args: Vec<String>,
     /// Additional environment variables.
+    ///
+    /// This is where a host application expands per-server secrets (API keys and the like),
+    /// so the values are redacted from [`Debug`] output.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     /// Optional working directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<PathBuf>,
+}
+
+// Custom `Debug` to keep expanded environment secrets out of logs and error output. Keys are
+// kept because they are useful for diagnosing a misconfigured server; only values are hidden.
+impl std::fmt::Debug for McpStdioTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpStdioTransport")
+            .field("command", &self.command)
+            .field("args", &self.args)
+            .field(
+                "env",
+                &self
+                    .env
+                    .keys()
+                    .map(|key| (key, "[REDACTED]"))
+                    .collect::<BTreeMap<_, _>>(),
+            )
+            .field("cwd", &self.cwd)
+            .finish()
+    }
 }
 
 impl McpStdioTransport {
@@ -1942,6 +2059,19 @@ done
         }
         let rendered = format!("{server:?}");
         assert!(!rendered.contains("super-secret-value"), "{rendered}");
+
+        // The stdio `env` map is where a host application expands per-server secrets, so its
+        // values must be redacted too. Keys stay visible for diagnostics.
+        let mut server = McpServerConfig::stdio("files", "mcp-files");
+        if let McpTransportConfig::Stdio(stdio) = &mut server.transport {
+            stdio
+                .env
+                .insert("GITHUB_TOKEN".to_string(), "ghp_live_value".to_string());
+        }
+        let rendered = format!("{server:?}");
+        assert!(!rendered.contains("ghp_live_value"), "{rendered}");
+        assert!(rendered.contains("GITHUB_TOKEN"), "{rendered}");
+        assert!(rendered.contains("[REDACTED]"), "{rendered}");
     }
 
     #[test]

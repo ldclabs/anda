@@ -16,14 +16,14 @@ Full API documentation is available on [docs.rs][docs].
 
 ```toml
 [dependencies]
-anda_core = "0.11"
+anda_core = "0.14"
 ```
 
 ## What It Provides
 
 - Strongly typed [`Agent`][agent-trait] and [`Tool`][tool-trait] traits.
 - Dynamic registries through [`AgentSet`][agent-set] and [`ToolSet`][tool-set].
-- Execution context capability traits for state, keys, storage, cache, HTTP, and canister calls.
+- Execution context capability traits for state, keys, storage, cache, and HTTP.
 - Provider-neutral model types such as [`Message`][message], [`ContentPart`][content-part], [`CompletionRequest`][completion-request], and [`AgentOutput`][agent-output].
 - JSON schema helpers for LLM function calling.
 - CBOR/Candid HTTP RPC helpers for remote engines and ICP canisters.
@@ -62,7 +62,8 @@ Tools can declare supported resource tags. During a call, the runtime removes ma
 - [`StoreFeatures`][store-features] for isolated object storage.
 - [`CacheFeatures`][cache-features] for isolated in-memory cache values with optional TTL/TTI expiration.
 - [`HttpFeatures`][http-features] for runtime-managed HTTPS calls.
-- `CanisterCaller` for ICP canister calls.
+`BaseContext` deliberately excludes canister access: runtimes that need it implement
+`CanisterCaller` separately on their own context type.
 
 [`AgentContext`][agent-context] extends `BaseContext` with LLM completion and orchestration methods for local or remote agents and tools.
 

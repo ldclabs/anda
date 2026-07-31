@@ -46,7 +46,8 @@ anda/
 ├── anda_cli/              # Command-line interface for Anda engine servers
 ├── anda_core/             # Core traits, types, and runtime contracts
 ├── anda_engine/           # Agent runtime, orchestration, contexts, models, and extensions
-└── anda_engine_server/    # HTTP server for serving one or more Anda engines
+├── anda_engine_server/    # HTTP server for serving one or more Anda engines
+└── anda_web3_client/      # Web3 client for non-TEE environments
 ```
 
 ### How to Use and Contribute

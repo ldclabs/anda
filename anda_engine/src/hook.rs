@@ -561,9 +561,34 @@ impl Hooks {
 
 #[async_trait]
 impl Hook for Hooks {
+    /// Runs every hook's `on_agent_start`, unwinding on failure.
+    ///
+    /// `on_agent_start` and `on_agent_end` are paired: a hook may acquire state in the
+    /// former that only the latter releases (e.g. [`SingleThreadHook`]'s per-caller lease).
+    /// When a later hook rejects, the caller returns the error without ever running
+    /// `on_agent_end`, so the hooks that already succeeded would strand their state. Release
+    /// them here by giving each a matching end call carrying the failure reason.
     async fn on_agent_start(&self, ctx: &AgentCtx, agent: &str) -> Result<(), BoxError> {
-        for hook in &self.hooks {
-            hook.on_agent_start(ctx, agent).await?;
+        for (idx, hook) in self.hooks.iter().enumerate() {
+            if let Err(err) = hook.on_agent_start(ctx, agent).await {
+                let mut output = AgentOutput {
+                    failed_reason: Some(err.to_string()),
+                    ..Default::default()
+                };
+                for started in self.hooks[..idx].iter().rev() {
+                    match started.on_agent_end(ctx, agent, output).await {
+                        Ok(next) => output = next,
+                        // An unwind failure must not mask the original rejection.
+                        Err(unwind_err) => {
+                            log::warn!(
+                                "on_agent_end failed while unwinding a rejected agent start (agent: {agent}): {unwind_err}"
+                            );
+                            break;
+                        }
+                    }
+                }
+                return Err(err);
+            }
         }
         Ok(())
     }
@@ -580,9 +605,30 @@ impl Hook for Hooks {
         Ok(output)
     }
 
+    /// Runs every hook's `on_tool_start`, unwinding on failure.
+    ///
+    /// Same pairing contract as [`Hooks::on_agent_start`]: hooks that already acquired state
+    /// get a matching end call before the rejection propagates.
     async fn on_tool_start(&self, ctx: &BaseCtx, tool: &str) -> Result<(), BoxError> {
-        for hook in &self.hooks {
-            hook.on_tool_start(ctx, tool).await?;
+        for (idx, hook) in self.hooks.iter().enumerate() {
+            if let Err(err) = hook.on_tool_start(ctx, tool).await {
+                let mut output = ToolOutput {
+                    is_error: Some(true),
+                    ..ToolOutput::new(Json::String(err.to_string()))
+                };
+                for started in self.hooks[..idx].iter().rev() {
+                    match started.on_tool_end(ctx, tool, output).await {
+                        Ok(next) => output = next,
+                        Err(unwind_err) => {
+                            log::warn!(
+                                "on_tool_end failed while unwinding a rejected tool start (tool: {tool}): {unwind_err}"
+                            );
+                            break;
+                        }
+                    }
+                }
+                return Err(err);
+            }
         }
         Ok(())
     }

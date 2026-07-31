@@ -64,9 +64,38 @@ pub struct CompletionRequest {
     pub role: Option<String>,
 
     /// The chat history to be sent to the completion model provider.
+    ///
+    /// This is the provider-neutral, persistable view (see [`ContentPart`]). Adapters
+    /// convert it into provider messages, which is lossy by design: a provider's per-turn
+    /// intermediate state does not survive the round trip. Use [`Self::raw_history`] to keep
+    /// a round lossless.
     pub chat_history: Vec<Message>,
 
     /// Provider-specific history used by model adapters. It is empty for most callers.
+    ///
+    /// # Why this exists
+    ///
+    /// Some providers require their own opaque per-turn state to be echoed back on the next
+    /// request — Anthropic's `thinking.signature`, Gemini's `thoughtSignature`. Round-tripping
+    /// that through [`ContentPart`] would mean polluting the persisted wire type with
+    /// provider-specific fields, so instead the adapter stores the provider's own message
+    /// JSON here verbatim.
+    ///
+    /// # The contract
+    ///
+    /// - Each turn, the runner appends the response's
+    ///   [`AgentOutput::raw_history`](crate::model::AgentOutput::raw_history) onto this field
+    ///   and clears [`Self::chat_history`], so `raw_history` accumulates across one complete
+    ///   reasoning round.
+    /// - Every adapter must send `raw_history` **before** the messages converted from
+    ///   `chat_history`, so provider state stays intact for the whole round.
+    /// - It is scoped to one in-process round only: the engine clears it at the RPC boundary
+    ///   and it is `#[serde(skip)]` on `AgentOutput`, so it never reaches a persisted
+    ///   conversation or a remote caller.
+    ///
+    /// A resumed conversation therefore replays from `chat_history` alone and legitimately
+    /// carries no provider intermediate state. Adapters must tolerate that rather than emit a
+    /// block the provider will reject.
     pub raw_history: Vec<Json>,
 
     /// The documents to embed into the prompt.

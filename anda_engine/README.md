@@ -24,7 +24,8 @@ Full API documentation is available on [docs.rs][docs].
 - Persistent memory tools built on AndaDB, Cognitive Nexus, and KIP.
 - Remote engine discovery and cross-engine tool or agent calls.
 - Hook APIs for observing and transforming agent and tool execution.
-- Workspace tools for filesystem access, shell execution, web fetch, extraction, notes, skills, todos, and search.
+- Workspace tools for filesystem access, shell execution, web fetch, notes, skills, todos, and search.
+- MCP client support exposing remote MCP servers as runtime-discovered tools.
 - Web3 and TEE challenge signing through the Anda Web3 stack.
 
 ## Installation
@@ -37,7 +38,7 @@ The crate has no default optional features.
 
 ```toml
 [dependencies]
-anda_engine = "0.11"
+anda_engine = "0.14"
 ```
 
 ## Quick Start
@@ -111,11 +112,10 @@ The `extension` module provides reusable tools for common agent capabilities:
 - `fetch`: signed HTTP fetching and resource loading.
 - `fs`: workspace-scoped file read, write, search, and edit tools.
 - `shell`: native or sandboxed shell command execution.
-- `extractor`: structured data extraction.
+- `mcp`: MCP servers as runtime-discovered tool providers.
 - `note`: lightweight per-agent note storage.
 - `skill`: file-backed skill loading and lifecycle management.
 - `todo`: session-scoped task tracking.
-- `google`: Google web search integration.
 
 Filesystem and shell tools are intentionally workspace-scoped. Shell commands receive a restricted environment; only allowlisted host variables and explicitly configured keys are forwarded.
 
@@ -127,8 +127,8 @@ The `memory` module stores conversations, resources, artifacts, usage, steering 
 
 Engines can register other engines by endpoint. Remote metadata is fetched through signed RPC, and exported remote functions are exposed with prefixed names:
 
-- Tools: `{handle}_{tool}`
-- Agents: `{handle}_{agent}`
+- Tools: `RT_{handle}_{tool}`
+- Agents: `RA_{handle}_{agent}`
 
 This lets agents discover and call capabilities hosted by other engines without linking them into the same process.
 

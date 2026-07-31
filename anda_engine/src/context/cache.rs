@@ -31,6 +31,7 @@ use bytes::Bytes;
 use cbor2::{from_slice, to_canonical_vec};
 use moka::{future::Cache, policy::Expiry};
 use object_store::path::Path;
+use parking_lot::RwLock;
 use serde::{Serialize, de::DeserializeOwned};
 use std::collections::BTreeSet;
 use std::{
@@ -45,7 +46,8 @@ type NamespaceCache = Cache<String, CacheValue>;
 
 #[derive(Debug)]
 pub(crate) struct CacheService {
-    cache_store: HashMap<Path, NamespaceCache>,
+    max_capacity: u64,
+    cache_store: RwLock<HashMap<Path, NamespaceCache>>,
 }
 
 /// CacheService provides an in-memory LRU cache with expiration for AI Agent system's agents and tools.
@@ -56,39 +58,56 @@ pub(crate) struct CacheService {
 /// Note: Data is cached only in memory and will be lost upon system restart.
 /// For persistent storage, use `StoreFeatures`.
 impl CacheService {
-    fn cache(&self, path: &Path) -> Option<&NamespaceCache> {
-        self.cache_store.get(path)
+    /// Returns the namespace cache for `path`, creating it on first use.
+    ///
+    /// Namespaces cannot be fully enumerated up front: provider-backed tools (MCP) are
+    /// discovered after the engine is built, and subagents can be registered at runtime.
+    /// Requiring pre-registration made every cache operation in those contexts fail silently
+    /// — `get_with` returned an error *without running the initializer*, and
+    /// `set_if_not_exists` returned `false`, which lease-style callers read as "already
+    /// held". Creating on demand keeps the per-agent/per-tool isolation while removing that
+    /// whole failure class.
+    fn cache(&self, path: &Path) -> NamespaceCache {
+        // `moka::future::Cache` is a cheap handle over shared state, so cloning it out of
+        // the lock lets callers await without holding the lock.
+        if let Some(cache) = self.cache_store.read().get(path) {
+            return cache.clone();
+        }
+
+        let mut store = self.cache_store.write();
+        store
+            .entry(path.clone())
+            .or_insert_with(|| Self::new_namespace(self.max_capacity))
+            .clone()
     }
 
-    fn missing_path(path: &Path) -> BoxError {
-        format!("cache path {} not found", path).into()
+    fn new_namespace(max_capacity: u64) -> NamespaceCache {
+        Cache::builder()
+            .max_capacity(max_capacity)
+            // max TTI is 7 days
+            .time_to_idle(Duration::from_secs(3600 * 24 * 7))
+            .expire_after(CacheServiceExpiry)
+            .build()
     }
 
     /// Creates a new CacheService instance with specified maximum capacity.
     ///
     /// # Arguments
     /// * `max_capacity` - Maximum number of items the cache can hold (u64);
-    /// * `names` - Set of base paths for cache namespacing.
+    /// * `names` - Base paths to pre-create. Any other namespace is created on first use.
     ///
     /// # Default Behavior
     /// - Maximum time-to-idle (TTI): 7 days;
     /// - Uses custom expiration policy based on CacheExpiry.
     pub fn new(max_capacity: u64, names: BTreeSet<Path>) -> Self {
         Self {
-            cache_store: names
-                .into_iter()
-                .map(|k| {
-                    (
-                        k,
-                        Cache::builder()
-                            .max_capacity(max_capacity)
-                            // max TTI is 7 days
-                            .time_to_idle(Duration::from_secs(3600 * 24 * 7))
-                            .expire_after(CacheServiceExpiry)
-                            .build(),
-                    )
-                })
-                .collect(),
+            max_capacity,
+            cache_store: RwLock::new(
+                names
+                    .into_iter()
+                    .map(|k| (k, Self::new_namespace(max_capacity)))
+                    .collect(),
+            ),
         }
     }
 }
@@ -103,9 +122,7 @@ impl CacheService {
     /// # Returns
     /// `true` if key exists, `false` otherwise, including when the cache namespace is missing.
     pub fn contains(&self, path: &Path, key: &str) -> bool {
-        self.cache(path)
-            .map(|cache| cache.contains_key(key))
-            .unwrap_or(false)
+        self.cache(path).contains_key(key)
     }
 
     /// Retrieves a cached value by key.
@@ -120,12 +137,9 @@ impl CacheService {
     where
         T: DeserializeOwned,
     {
-        match self.cache(path) {
-            Some(cache) => match cache.get(key).await {
-                Some(val) => from_slice(&val.0[..]).map_err(|err| err.into()),
-                None => Err(format!("key {} not found", key).into()),
-            },
-            None => Err(Self::missing_path(path)),
+        match self.cache(path).get(key).await {
+            Some(val) => from_slice(&val.0[..]).map_err(|err| err.into()),
+            None => Err(format!("key {} not found", key).into()),
         }
     }
 
@@ -145,7 +159,7 @@ impl CacheService {
         T: Sized + DeserializeOwned + Serialize + Send,
         F: Future<Output = Result<(T, Option<CacheExpiry>), BoxError>> + Send + 'static,
     {
-        let cache = self.cache(path).ok_or_else(|| Self::missing_path(path))?;
+        let cache = self.cache(path);
         futures_util::pin_mut!(init);
         match cache
             .try_get_with_by_ref(key, async move {
@@ -179,10 +193,7 @@ impl CacheService {
     where
         T: Sized + Serialize + Send,
     {
-        let Some(cache) = self.cache(path) else {
-            log::warn!("CacheService set on unregistered namespace, path: {path}, key: {key}");
-            return;
-        };
+        let cache = self.cache(path);
         let data = match to_canonical_vec(&value.0) {
             Ok(data) => data,
             Err(err) => {
@@ -210,12 +221,7 @@ impl CacheService {
     where
         T: Sized + Serialize + Send,
     {
-        let Some(cache) = self.cache(path) else {
-            log::warn!(
-                "CacheService set_if_not_exists on unregistered namespace, path: {path}, key: {key}"
-            );
-            return false;
-        };
+        let cache = self.cache(path);
         let data = match to_canonical_vec(&value.0) {
             Ok(data) => data,
             Err(err) => {
@@ -239,18 +245,19 @@ impl CacheService {
     /// # Returns
     /// `true` if key existed and was deleted, `false` otherwise.
     pub async fn delete(&self, path: &Path, key: &str) -> bool {
-        match self.cache(path) {
-            Some(cache) => cache.remove(key).await.is_some(),
-            None => false,
-        }
+        self.cache(path).remove(key).await.is_some()
     }
 
     /// Returns an iterator over the cache entries for a given path.
+    ///
+    /// Moka's iterator borrows the namespace handle, which is created on demand and owned by
+    /// this call, so entries are collected eagerly. Namespaces are per-agent/per-tool and
+    /// capacity-bounded, so the snapshot stays small.
     pub fn iter(
         &self,
         path: &Path,
     ) -> impl Iterator<Item = (Arc<String>, Arc<(Bytes, Option<CacheExpiry>)>)> {
-        self.cache(path).into_iter().flat_map(|cache| cache.iter())
+        self.cache(path).iter().collect::<Vec<_>>().into_iter()
     }
 }
 
@@ -380,7 +387,12 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn test_cache_service_missing_path() {
+    async fn unregistered_namespace_is_created_on_demand() {
+        // Namespaces cannot be enumerated up front: MCP tools are discovered after the
+        // engine is built, and subagents can be registered at runtime. An unregistered path
+        // must behave like any other namespace rather than failing every operation — in
+        // particular `get_with` must run its initializer, and `set_if_not_exists` must
+        // report `true` on the first insert (lease callers read `false` as "already held").
         let path1 = Path::from("path1");
         let path2 = Path::from("path2");
         let cache = CacheService::new(100, BTreeSet::from([path1.clone()]));
@@ -393,21 +405,29 @@ mod tests {
         assert!(cache.get::<Profile>(&path2, "key").await.is_err());
 
         let p1 = profile.clone();
+        let initialized = cache
+            .get_with(&path2, "key", async move { Ok((p1, None)) })
+            .await
+            .expect("the initializer must run on an on-demand namespace");
+        assert_eq!(initialized, profile);
+        assert!(cache.contains(&path2, "key"));
+
+        assert!(cache.delete(&path2, "key").await);
         assert!(
             cache
-                .get_with(&path2, "key", async move { Ok((p1, None)) })
-                .await
-                .is_err()
+                .set_if_not_exists(&path2, "key", (profile.clone(), None))
+                .await,
+            "the first insert must claim the key"
         );
-
-        cache.set(&path2, "key", (profile.clone(), None)).await;
         assert!(
             !cache
                 .set_if_not_exists(&path2, "key", (profile.clone(), None))
-                .await
+                .await,
+            "a second insert must observe the existing key"
         );
-        assert!(!cache.delete(&path2, "key").await);
-        assert_eq!(cache.iter(&path2).count(), 0);
+        assert_eq!(cache.iter(&path2).count(), 1);
+
+        // Namespaces stay isolated: writing to `path2` does not populate `path1`.
         assert!(cache.get::<Profile>(&path1, "key").await.is_err());
     }
 }

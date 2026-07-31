@@ -26,6 +26,14 @@ const DEFAULT_LIMIT: usize = 1000;
 /// Hard cap on collected matches across all workspaces. Scanning stops here so
 /// pathological patterns (e.g. `**/*` over a huge tree) stay bounded.
 const MAX_GLOB_MATCHES: usize = 10_000;
+/// Hard cap on entries *examined* across all workspaces.
+///
+/// [`MAX_GLOB_MATCHES`] only counts matches that survive the workspace-containment filter,
+/// so a pattern whose every match is rejected (e.g. one reaching through a symlink that
+/// leaves the workspace) would never reach it and would walk without bound. This bounds the
+/// walk itself. It is deliberately well above the match cap so a legitimate search over a
+/// large tree is not truncated by entries it merely skipped.
+const MAX_GLOB_SCANNED: usize = 200_000;
 
 /// Arguments for filesystem glob operations.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -65,13 +73,16 @@ impl SearchFileTool {
     pub const NAME: &'static str = "search_file";
 
     /// Create a new `SearchFileTool` with the default workspace directory.
-    /// You can add workspace directories for each call by including `workspace` or `workspaces` in the tool call's context meta extra.
+    /// A call may narrow the workspace by including `workspace` or `workspaces` in the tool
+    /// call's context meta extra. Request metadata is caller-controlled, so a requested
+    /// directory is honored only when it resolves inside a configured workspace.
     pub fn new(workspace: PathBuf) -> Self {
         Self::with_workspaces([workspace])
     }
 
     /// Create a new `SearchFileTool` with the default workspace directories.
-    /// Context meta workspaces take precedence over these defaults at call time.
+    /// A requested workspace that resolves inside one of these takes precedence at call
+    /// time; one that does not is ignored, so these bound everything the tool can reach.
     pub fn with_workspaces<I>(workspaces: I) -> Self
     where
         I: IntoIterator<Item = PathBuf>,
@@ -147,11 +158,13 @@ impl Tool<BaseCtx> for SearchFileTool {
             args
         };
 
-        let workspaces = tool_workspaces(ctx.meta(), &self.workspaces);
+        let workspaces = tool_workspaces(ctx.meta(), &self.workspaces).await;
         let mut paths = Vec::new();
         let mut errors = Vec::new();
         let mut searched_any_workspace = false;
         let mut scan_truncated = false;
+        let mut scanned = 0usize;
+        let cancellation_token = ctx.cancellation_token();
 
         'workspaces: for workspace in &workspaces {
             let workspace_display = workspace.display().to_string();
@@ -175,6 +188,19 @@ impl Tool<BaseCtx> for SearchFileTool {
                     )
                 })?
             {
+                // Bound the walk itself, not just the surviving matches, and stay
+                // interruptible: the glob iterator is synchronous and a pathological
+                // pattern can enumerate an unbounded number of entries that all get
+                // filtered out below.
+                scanned += 1;
+                if scanned > MAX_GLOB_SCANNED {
+                    scan_truncated = true;
+                    break 'workspaces;
+                }
+                if cancellation_token.is_cancelled() {
+                    return Err("search_file cancelled".into());
+                }
+
                 // Unreadable directories or entries removed mid-scan must not fail the
                 // whole search; skip them and keep matching.
                 let Ok(path) = entry else {
@@ -526,20 +552,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn searches_meta_extra_and_default_workspaces() {
+    async fn searches_meta_extra_workspaces_only_inside_the_configured_workspace() {
         let temp_dir = TestTempDir::new().await;
+        let home_workspace = temp_dir.path().join("home");
+        // Nested under the configured workspace: a legitimate narrowing request.
+        let nested_workspace = home_workspace.join("nested");
+        // Siblings of the configured workspace: requesting these would be an escape.
         let runtime_workspace = temp_dir.path().join("runtime");
         let extra_workspace = temp_dir.path().join("extra");
-        let home_workspace = temp_dir.path().join("home");
-        tokio::fs::create_dir_all(runtime_workspace.join("src"))
-            .await
-            .unwrap();
-        tokio::fs::create_dir_all(extra_workspace.join("src"))
-            .await
-            .unwrap();
-        tokio::fs::create_dir_all(home_workspace.join("src"))
-            .await
-            .unwrap();
+        for dir in [
+            &runtime_workspace,
+            &extra_workspace,
+            &home_workspace,
+            &nested_workspace,
+        ] {
+            tokio::fs::create_dir_all(dir.join("src")).await.unwrap();
+        }
         tokio::fs::write(runtime_workspace.join("src/runtime.rs"), "runtime")
             .await
             .unwrap();
@@ -549,7 +577,12 @@ mod tests {
         tokio::fs::write(home_workspace.join("src/home.rs"), "home")
             .await
             .unwrap();
+        tokio::fs::write(nested_workspace.join("src/nested.rs"), "nested")
+            .await
+            .unwrap();
 
+        // Requested roots outside the configured workspace are ignored, so neither
+        // `runtime.rs` nor `extra.rs` is reachable.
         let result = glob_tool(&home_workspace)
             .call(
                 mock_ctx_with_workspaces(&runtime_workspace, &[&extra_workspace]),
@@ -562,11 +595,23 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            result.output.paths,
-            ["src/extra.rs", "src/home.rs", "src/runtime.rs"]
-        );
-        assert_eq!(result.output.total_matches, 3);
+        assert_eq!(result.output.paths, ["src/home.rs"]);
+        assert_eq!(result.output.total_matches, 1);
+
+        // A request nested inside the configured workspace is honored and takes priority.
+        let result = glob_tool(&home_workspace)
+            .call(
+                mock_ctx_with_workspaces(&nested_workspace, &[]),
+                SearchFileArgs {
+                    pattern: "src/*.rs".to_string(),
+                    limit: 0,
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.output.paths, ["src/home.rs", "src/nested.rs"]);
     }
 
     #[tokio::test]

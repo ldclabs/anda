@@ -65,13 +65,16 @@ impl WriteFileTool {
     pub const NAME: &'static str = "write_file";
 
     /// Create a new `WriteFileTool` with the default workspace directory.
-    /// You can add workspace directories for each call by including `workspace` or `workspaces` in the tool call's context meta extra.
+    /// A call may narrow the workspace by including `workspace` or `workspaces` in the tool
+    /// call's context meta extra. Request metadata is caller-controlled, so a requested
+    /// directory is honored only when it resolves inside a configured workspace.
     pub fn new(workspace: PathBuf) -> Self {
         Self::with_workspaces([workspace])
     }
 
     /// Create a new `WriteFileTool` with the default workspace directories.
-    /// Context meta workspaces take precedence over these defaults at call time.
+    /// A requested workspace that resolves inside one of these takes precedence at call
+    /// time; one that does not is ignored, so these bound everything the tool can reach.
     pub fn with_workspaces<I>(workspaces: I) -> Self
     where
         I: IntoIterator<Item = PathBuf>,
@@ -151,7 +154,7 @@ impl Tool<BaseCtx> for WriteFileTool {
             args
         };
 
-        let workspaces = tool_workspaces(ctx.meta(), &self.workspaces);
+        let workspaces = tool_workspaces(ctx.meta(), &self.workspaces).await;
         let resolved = resolve_write_path_in_workspaces(&workspaces, &args.path).await?;
         let workspace_display = resolved.workspace.display().to_string();
         let resolved_path = resolved.path;
@@ -429,17 +432,17 @@ mod tests {
     #[tokio::test]
     async fn writes_new_relative_file_in_meta_workspace_first() {
         let temp_dir = TestTempDir::new().await;
-        let runtime_workspace = temp_dir.path().join("runtime");
         let home_workspace = temp_dir.path().join("home");
-        tokio::fs::create_dir_all(&runtime_workspace).await.unwrap();
-        tokio::fs::create_dir_all(&home_workspace).await.unwrap();
+        let nested_workspace = home_workspace.join("nested");
+        tokio::fs::create_dir_all(&nested_workspace).await.unwrap();
 
+        // A requested workspace inside the configured one is honored and wins.
         write_tool(&home_workspace)
             .call(
-                mock_ctx_with_workspace(&runtime_workspace),
+                mock_ctx_with_workspace(&nested_workspace),
                 WriteFileArgs {
                     path: "notes.txt".to_string(),
-                    content: "runtime".to_string(),
+                    content: "nested".to_string(),
                     encoding: UTF8_ENCODING.to_string(),
                 },
                 Vec::new(),
@@ -447,12 +450,45 @@ mod tests {
             .await
             .unwrap();
 
-        let written = tokio::fs::read_to_string(runtime_workspace.join("notes.txt"))
+        let written = tokio::fs::read_to_string(nested_workspace.join("notes.txt"))
             .await
             .unwrap();
-        assert_eq!(written, "runtime");
+        assert_eq!(written, "nested");
         assert!(matches!(
             tokio::fs::metadata(home_workspace.join("notes.txt")).await,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound
+        ));
+    }
+
+    #[tokio::test]
+    async fn ignores_meta_workspace_outside_the_configured_workspace() {
+        let temp_dir = TestTempDir::new().await;
+        let runtime_workspace = temp_dir.path().join("runtime");
+        let home_workspace = temp_dir.path().join("home");
+        tokio::fs::create_dir_all(&runtime_workspace).await.unwrap();
+        tokio::fs::create_dir_all(&home_workspace).await.unwrap();
+
+        // Request metadata is caller-controlled, so a sibling directory must not become a
+        // write target; the write lands in the configured workspace instead.
+        write_tool(&home_workspace)
+            .call(
+                mock_ctx_with_workspace(&runtime_workspace),
+                WriteFileArgs {
+                    path: "notes.txt".to_string(),
+                    content: "home".to_string(),
+                    encoding: UTF8_ENCODING.to_string(),
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        let written = tokio::fs::read_to_string(home_workspace.join("notes.txt"))
+            .await
+            .unwrap();
+        assert_eq!(written, "home");
+        assert!(matches!(
+            tokio::fs::metadata(runtime_workspace.join("notes.txt")).await,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound
         ));
     }

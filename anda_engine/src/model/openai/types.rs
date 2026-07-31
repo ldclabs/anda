@@ -1678,7 +1678,7 @@ pub fn message_from(output: Vec<MessageItem>) -> (Option<Message>, Option<String
                 call_id,
                 ..
             } => {
-                let args: Json = serde_json::from_str(&arguments).unwrap_or_default();
+                let args: Json = super::parse_tool_arguments(&arguments);
                 msg.content.push(ContentPart::ToolCall {
                     name,
                     args,

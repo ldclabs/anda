@@ -261,10 +261,32 @@ impl CompletionResponse {
     }
 }
 
+/// Parses a tool call's `arguments` string into JSON.
+///
+/// An empty or whitespace-only string means a no-argument call: the provider can send
+/// `"arguments": ""` or `null`, and a stream can finish without any `arguments` delta.
+/// `serde_json::from_str("")` errors, so `unwrap_or_default()` would yield `Json::Null` and
+/// the tool's own `from_value` then fails with "invalid type: null, expected struct". Map it
+/// to `{}` instead, mirroring the official SDKs' `JSON.parse(buf || "{}")`.
+pub(crate) fn parse_tool_arguments(arguments: &str) -> Json {
+    if arguments.trim().is_empty() {
+        return Json::Object(Default::default());
+    }
+
+    serde_json::from_str(arguments).unwrap_or_default()
+}
+
+/// Reports whether a `finish_reason` indicates a usable completion.
+///
+/// An empty string means the provider omitted the field or sent `null` (both map to `""` via
+/// `null_default`), and a stream can also end without any chunk carrying one. That is an
+/// absent verdict, not a failure verdict — several OpenAI-compatible providers omit it — so
+/// it is treated as success. Classifying it as a failure would discard the assistant message
+/// (text, reasoning, and tool calls) and abort the run with a blank reason.
 fn is_success_finish_reason(reason: &str) -> bool {
     matches!(
         reason,
-        "stop" | "tool_calls" | "tool_call" | "function_call" | "tool_use"
+        "" | "stop" | "tool_calls" | "tool_call" | "function_call" | "tool_use"
     )
 }
 
@@ -1379,7 +1401,7 @@ impl From<MessageOutput> for Message {
         if let Some(function_call) = msg.function_call {
             content.push(ContentPart::ToolCall {
                 name: function_call.name,
-                args: serde_json::from_str(&function_call.arguments).unwrap_or_default(),
+                args: parse_tool_arguments(&function_call.arguments),
                 call_id: None,
             });
         }
@@ -1394,7 +1416,7 @@ impl From<MessageOutput> for Message {
                 match (function, custom) {
                     (Some(function), _) => content.push(ContentPart::ToolCall {
                         name: function.name,
-                        args: serde_json::from_str(&function.arguments).unwrap_or_default(),
+                        args: parse_tool_arguments(&function.arguments),
                         call_id: Some(id),
                     }),
                     (None, Some(custom)) => {
@@ -3462,5 +3484,62 @@ mod tests {
         assert!(response.maybe_failed());
         let output = response.try_into(vec![], vec![]).unwrap();
         assert_eq!(output.failed_reason.as_deref(), Some("policy fail"));
+    }
+
+    #[test]
+    fn absent_finish_reason_keeps_the_assistant_message() {
+        // Several OpenAI-compatible providers omit `finish_reason` or send `null`; both
+        // deserialize to `""`. Treating that as a failure verdict would discard the whole
+        // assistant message and abort the run with a blank reason.
+        for finish_reason in [json!(null), Json::Null] {
+            let mut response: CompletionResponse = serde_json::from_value(json!({
+                "id": "chatcmpl_no_finish",
+                "object": "chat.completion",
+                "created": 1741569954,
+                "model": "compat-model",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "answer",
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "sql", "arguments": "{\"q\":1}"}
+                        }]
+                    },
+                    "finish_reason": finish_reason
+                }]
+            }))
+            .unwrap();
+
+            response.parse_output();
+            assert!(!response.maybe_failed());
+            let output = response.try_into(vec![], vec![]).unwrap();
+            assert_eq!(output.content, "answer");
+            assert_eq!(output.tool_calls.len(), 1);
+            assert!(
+                output.failed_reason.is_none(),
+                "an absent finish_reason is not a failure"
+            );
+            assert_eq!(output.raw_history.len(), 1, "the message must be recorded");
+        }
+
+        // A real failure verdict is still reported.
+        let mut response: CompletionResponse = serde_json::from_value(json!({
+            "id": "chatcmpl_len",
+            "object": "chat.completion",
+            "created": 1741569954,
+            "model": "compat-model",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "truncated"},
+                "finish_reason": "length"
+            }]
+        }))
+        .unwrap();
+        response.parse_output();
+        let output = response.try_into(vec![], vec![]).unwrap();
+        assert_eq!(output.failed_reason.as_deref(), Some("length"));
     }
 }

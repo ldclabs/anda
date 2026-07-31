@@ -99,7 +99,7 @@
 <div class="anda-grid three">
 <div class="anda-box"><strong>Scoped state</strong><small>caller、request meta、elapsed time、typed state extensions、depth-limited children。</small></div>
 <div class="anda-box"><strong>Store and cache</strong><small>基于 context path 的命名空间隔离 agent/tool 数据。</small></div>
-<div class="anda-box"><strong>External calls</strong><small>HTTP、signed RPC、key derivation/signing、canister calls 通过配置的 Web3SDK 提供。</small></div>
+<div class="anda-box"><strong>External calls</strong><small>HTTP、signed RPC、key derivation/signing 通过配置的 Web3SDK 提供。</small></div>
 </div>
 </div>
 <div class="anda-layer model">
@@ -107,7 +107,7 @@
 <div class="anda-grid three">
 <div class="anda-box"><strong>Models</strong><small>标签映射加 primary model。`pro`、`flash`、`lite` 等标签选择 provider entry。</small></div>
 <div class="anda-box"><strong>Adapters</strong><small>OpenAI-compatible、Anthropic、Gemini，以及自定义 `CompletionFeaturesDyn` providers。</small></div>
-<div class="anda-box"><strong>Reliability</strong><small>请求默认值、SSE/NDJSON 解析、一次短重试、retryable `ModelError` 信号。</small></div>
+<div class="anda-box"><strong>Reliability</strong><small>请求默认值、SSE/NDJSON 解析、有上限的退避重试、retryable `ModelError` 信号。</small></div>
 </div>
 </div>
 <div class="anda-layer storage">
@@ -225,6 +225,7 @@ Host --> Caller : response
 - `tools_groups`、`tools_search` 和 `tools_select` 是 agents，不是旁路机制。`tools_groups` 返回当前可见 capability bundles 的紧凑目录；`tools_select` 可以把一个 group 展开成 schemas，发现到的 schemas 仍保留在 tool-output context 中，并压缩 conversation context 中重复的 schema payload。
 - `BaseCtx` 创建命名空间隔离的 child contexts。Agent 路径使用 `a_<agent>`，tool 路径使用 `t_<tool>`，store/cache 操作都在该 path 下解析。
 - `Models` 先按 label 路由，再回落到 primary/default model。provider 真实模型名留在 adapter 配置内部。
+- 对话历史有两套视图，这个区分是有约束意义的。`chat_history`（由 `ContentPart` 组成的 `Vec<Message>`）是 provider-neutral 的视图，用于持久化并跨越 RPC 边界。`raw_history`（`Vec<Json>`）原样保存 provider 自己的消息 JSON，存在的目的就是让每轮的不透明中间态 —— Anthropic 的 `thinking.signature`、Gemini 的 `thoughtSignature` —— 在一轮推理内不丢失，而不必把它们建模进 `ContentPart`。每轮 runner 把响应的 `raw_history` 追加到请求的 `raw_history` 并清空 `chat_history`；所有 adapter 都先发送 `raw_history`，再发送由 `chat_history` 转换出来的消息。engine 在 RPC 边界清空它，因此它的作用域仅限进程内的一轮推理。恢复的对话只能从 `chat_history` 重放，按设计就没有 provider 中间态 —— adapter 必须容忍这一点，而不是发出 provider 会拒绝的块。
 - `SubAgentManager` 把持久化或临时 `SubAgent` 定义转成可调用的 `SA_<name>` agents。长任务 session 通过 hooks 推送 progress 和 final output。
 - Memory 是 extension 层。Conversation/resource 存储使用 AndaDB collections，长期知识操作作为 KIP tools 暴露，并由 Cognitive Nexus 支撑。
 - Web3、TEE、ICP、IC-COSE 等集成只是 `Web3SDK`、`HttpFeatures`、`KeysFeatures`、`CanisterCaller` 或 `ObjectStore` 后面的实现选择，不是 engine 本身的必需架构层。

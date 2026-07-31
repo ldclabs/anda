@@ -781,6 +781,15 @@ impl EngineBuilder {
         // cache lookups (e.g. dynamic remote-engine resolution) can hit memory
         // instead of always falling through to the store backend.
         names.insert(Path::default());
+
+        // Register the same remote engines `build` does. Dropping them here would silently
+        // discard every `register_remote_engine` call, so remote tools and agents would go
+        // missing with no error at build time.
+        let mut remote = RemoteEngines::new();
+        for (_, engine) in self.remote {
+            remote.register(self.web3.as_ref(), engine).await?;
+        }
+
         let ctx = BaseCtx::new(
             id,
             self.info.name.clone(),
@@ -789,7 +798,7 @@ impl EngineBuilder {
             names,
             self.web3,
             self.store,
-            Arc::new(RemoteEngines::new()),
+            Arc::new(remote),
         );
 
         let tools = Arc::new(self.tools);

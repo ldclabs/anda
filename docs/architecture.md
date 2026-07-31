@@ -99,7 +99,7 @@ Source map:
 <div class="anda-grid three">
 <div class="anda-box"><strong>Scoped state</strong><small>Caller, request meta, elapsed time, typed state extensions, and depth-limited children.</small></div>
 <div class="anda-box"><strong>Store and cache</strong><small>Context-path namespaces isolate agent and tool data in object store and cache.</small></div>
-<div class="anda-box"><strong>External calls</strong><small>HTTP, signed RPC, key derivation/signing, and canister calls through a configured Web3SDK.</small></div>
+<div class="anda-box"><strong>External calls</strong><small>HTTP, signed RPC, and key derivation/signing through a configured Web3SDK.</small></div>
 </div>
 </div>
 <div class="anda-layer model">
@@ -107,7 +107,7 @@ Source map:
 <div class="anda-grid three">
 <div class="anda-box"><strong>Models</strong><small>Label map plus primary model. Labels such as `pro`, `flash`, or `lite` choose provider entries.</small></div>
 <div class="anda-box"><strong>Adapters</strong><small>OpenAI-compatible, Anthropic, Gemini, and custom `CompletionFeaturesDyn` providers.</small></div>
-<div class="anda-box"><strong>Reliability</strong><small>Request defaults, SSE/NDJSON parsing, one short retry, and retryable `ModelError` signals.</small></div>
+<div class="anda-box"><strong>Reliability</strong><small>Request defaults, SSE/NDJSON parsing, bounded retries with backoff, and retryable `ModelError` signals.</small></div>
 </div>
 </div>
 <div class="anda-layer storage">
@@ -225,6 +225,7 @@ Host --> Caller : response
 - `tools_groups`, `tools_search`, and `tools_select` are agents, not side channels. `tools_groups` returns a compact directory of visible capability bundles; `tools_select` can expand one group into schemas, and discovered schemas stay in tool-output context while repeated payloads are compacted from conversation context.
 - `BaseCtx` creates namespace-scoped child contexts. Agent paths use `a_<agent>`, tool paths use `t_<tool>`, and all store/cache operations are resolved under that path.
 - `Models` routes by label first and then falls back to the primary/default model. Provider-specific names stay inside adapter configuration.
+- Conversation history has two views, and the distinction is load-bearing. `chat_history` (`Vec<Message>` of `ContentPart`) is the provider-neutral view that gets persisted and crosses the RPC boundary. `raw_history` (`Vec<Json>`) holds the provider's own message JSON verbatim and exists so per-turn opaque state — Anthropic `thinking.signature`, Gemini `thoughtSignature` — survives a reasoning round without being modelled in `ContentPart`. Each turn the runner appends the response's `raw_history` onto the request's and clears `chat_history`; every adapter sends `raw_history` before the converted `chat_history`. The engine clears it at the RPC boundary, so it is scoped to one in-process round. A resumed conversation replays from `chat_history` alone and legitimately has no provider intermediate state — adapters must tolerate that rather than emit a block the provider rejects.
 - `SubAgentManager` turns persisted or temporary `SubAgent` definitions into callable `SA_<name>` agents. Long-running subagent sessions use hooks to push progress and final output.
 - Memory is an extension layer. Conversation/resource storage uses AndaDB collections, and persistent knowledge operations are exposed as KIP tools backed by Cognitive Nexus.
 - Web3, TEE, ICP, and IC-COSE integrations are implementation choices behind `Web3SDK`, `HttpFeatures`, `KeysFeatures`, `CanisterCaller`, or `ObjectStore`. They are not mandatory architecture layers for the engine itself.

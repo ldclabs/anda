@@ -330,6 +330,55 @@ async fn signed_rpc_rejects_envelope_without_digest() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn unparseable_credential_is_rejected_not_downgraded_to_anonymous() {
+    let (endpoint, _id) = spawn_default_server().await;
+    let client = http_client();
+
+    let body = cbor2::to_canonical_vec(&RPCRequest {
+        method: "information".to_string(),
+        params: ByteBufB64::default(),
+    })
+    .unwrap();
+
+    // A credential that is present but does not parse must be rejected. Both envelope
+    // parsers return `None` for malformed input exactly as they do for an absent header, so
+    // falling through to anonymous would let an on-path attacker strip or corrupt one header
+    // to launder an authenticated call into an unattributable anonymous one that still runs.
+    for credential in [
+        // Malformed `ICP` envelope: base64 that is not a valid CBOR envelope.
+        ("authorization", "ICP bm90LWFuLWVudmVsb3Bl"),
+        // A bearer token when no trusted CWT key is configured.
+        ("authorization", "Bearer some-token"),
+        // A partial `ic-auth-*` credential (pubkey without signature or digest).
+        ("ic-auth-pubkey", "AQEBAQ"),
+    ] {
+        let res = client
+            .post(format!("{endpoint}/default"))
+            .header(http::header::CONTENT_TYPE, CONTENT_TYPE_CBOR)
+            .header(credential.0, credential.1)
+            .body(body.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            401,
+            "credential {credential:?} must be rejected, not downgraded to anonymous"
+        );
+    }
+
+    // No credential at all is still anonymous, which the public engine accepts.
+    let res = client
+        .post(format!("{endpoint}/default"))
+        .header(http::header::CONTENT_TYPE, CONTENT_TYPE_CBOR)
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn api_key_middleware_guards_requests() {
     let engine = build_engine().await;
     let id = engine.id();

@@ -60,13 +60,16 @@ impl EditFileTool {
     pub const NAME: &'static str = "edit_file";
 
     /// Create a new `EditFileTool` with the default workspace directory.
-    /// You can add workspace directories for each call by including `workspace` or `workspaces` in the tool call's context meta extra.
+    /// A call may narrow the workspace by including `workspace` or `workspaces` in the tool
+    /// call's context meta extra. Request metadata is caller-controlled, so a requested
+    /// directory is honored only when it resolves inside a configured workspace.
     pub fn new(workspace: PathBuf) -> Self {
         Self::with_workspaces([workspace])
     }
 
     /// Create a new `EditFileTool` with the default workspace directories.
-    /// Context meta workspaces take precedence over these defaults at call time.
+    /// A requested workspace that resolves inside one of these takes precedence at call
+    /// time; one that does not is ignored, so these bound everything the tool can reach.
     pub fn with_workspaces<I>(workspaces: I) -> Self
     where
         I: IntoIterator<Item = PathBuf>,
@@ -150,7 +153,7 @@ impl Tool<BaseCtx> for EditFileTool {
             args
         };
 
-        let workspaces = tool_workspaces(ctx.meta(), &self.workspaces);
+        let workspaces = tool_workspaces(ctx.meta(), &self.workspaces).await;
         let workspace_display = format_workspaces(&workspaces);
 
         if args.old_string.is_empty() {
@@ -227,6 +230,25 @@ impl Tool<BaseCtx> for EditFileTool {
                 size: original_size,
             }
         } else {
+            // `old_string`, `new_string`, and `limit` are all model-supplied, so the
+            // replacement can expand the file without bound: 10 MiB of single-byte matches
+            // against an 8 KiB replacement is ~85 GiB, and an allocation failure aborts the
+            // whole process rather than failing this one call. The input cap bounds the
+            // input, so bound the output the same way and reject before allocating.
+            let projected_len = text
+                .len()
+                .saturating_sub(replacements.saturating_mul(args.old_string.len()))
+                .saturating_add(replacements.saturating_mul(args.new_string.len()));
+            if projected_len as u64 > MAX_FILE_SIZE_BYTES {
+                return Err(format!(
+                    "Edit result exceeds the maximum file size (workspace: {}, requested_path: {}, resolved_path: {}, projected_size: {projected_len}, max_size: {MAX_FILE_SIZE_BYTES}, replacements: {replacements})",
+                    workspace_display,
+                    args.path,
+                    resolved_path.display(),
+                )
+                .into());
+            }
+
             let updated = if args.limit == 0 {
                 text.replace(&args.old_string, &args.new_string)
             } else {

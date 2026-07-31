@@ -227,22 +227,6 @@ impl Conversation {
             ),
             ("updated_at".to_string(), Fv::U64(self.updated_at)),
             (
-                "steering_messages".to_string(),
-                if let Some(msg) = self.steering_messages.clone() {
-                    msg.into()
-                } else {
-                    Fv::Null
-                },
-            ),
-            (
-                "follow_up_messages".to_string(),
-                if let Some(msg) = self.follow_up_messages.clone() {
-                    msg.into()
-                } else {
-                    Fv::Null
-                },
-            ),
-            (
                 "label".to_string(),
                 if let Some(label) = self.label.clone() {
                     label.into()
@@ -260,12 +244,30 @@ impl Conversation {
             ),
         ]);
 
+        // `steering_messages` and `follow_up_messages` are inbound queues owned by a different
+        // writer (`memory_api`'s Steer/FollowUp handlers), and a persisting runner typically
+        // holds a `Conversation` that never loaded them. `Collection::update` merges by field,
+        // so emitting `Fv::Null` for a local `None` would erase a message the user just queued
+        // and was told was accepted. Write them only when this writer actually has a value.
+        if let Some(msg) = self.steering_messages.clone() {
+            changes.insert("steering_messages".to_string(), msg.into());
+        }
+        if let Some(msg) = self.follow_up_messages.clone() {
+            changes.insert("follow_up_messages".to_string(), msg.into());
+        }
+
         if let Some(child) = self.child {
             changes.insert("child".to_string(), Fv::U64(child));
         }
-        if let Some(reason) = &self.failed_reason {
-            changes.insert("failed_reason".to_string(), Fv::Text(reason.clone()));
-        }
+        // Clear a stale reason on a successful update; otherwise a conversation that failed
+        // once keeps reporting that reason after a later turn succeeds.
+        changes.insert(
+            "failed_reason".to_string(),
+            match &self.failed_reason {
+                Some(reason) => Fv::Text(reason.clone()),
+                None => Fv::Null,
+            },
+        );
         Ok(changes)
     }
 
@@ -949,8 +951,45 @@ impl MemoryManagement {
     }
 
     /// Retrieves a resource by ID.
+    ///
+    /// Stored resources carry no owner, so this performs **no** access control. Every
+    /// caller-facing path must go through [`MemoryManagement::get_resource_for`] instead.
     pub async fn get_resource(&self, id: u64) -> Result<Resource, DBError> {
         self.resources.get_as(id).await
+    }
+
+    /// Retrieves a resource on behalf of `caller`, enforcing ownership.
+    ///
+    /// Resources live in a single global collection with dense sequential IDs and no owner
+    /// field, so ownership is established indirectly: the caller names a conversation, that
+    /// conversation must belong to them, and the resource must belong to that conversation.
+    /// Without the second half, any caller could read an arbitrary resource by pairing its ID
+    /// with a conversation they own.
+    pub async fn get_resource_for(
+        &self,
+        caller: &Principal,
+        conversation: u64,
+        id: u64,
+    ) -> Result<Resource, BoxError> {
+        let conversation = self.get_conversation(conversation).await?;
+        if &conversation.user != caller {
+            return Err("permission denied".into());
+        }
+
+        if !conversation
+            .resources
+            .iter()
+            .chain(conversation.artifacts.iter())
+            .any(|resource| resource._id == id)
+        {
+            return Err(format!(
+                "permission denied: resource {id} does not belong to conversation {}",
+                conversation._id
+            )
+            .into());
+        }
+
+        Ok(self.get_resource(id).await?)
     }
 
     /// Adds a conversation through the shared conversations API.
@@ -1009,7 +1048,7 @@ impl MemoryManagement {
     /// Deletes all conversations created before `timestamp` (in milliseconds).
     ///
     /// Referenced resources are intentionally **not** deleted here. Resources are
-    /// content-deduplicated (see [`Memory::try_add_resources`]): a single
+    /// content-deduplicated (see [`MemoryManagement::try_add_resources`]): a single
     /// resource `_id` can be shared by several conversations, and resources carry
     /// no owner or reference count. Deleting a resource when one referencing
     /// conversation expires would break every other (possibly still-active)
@@ -1152,6 +1191,8 @@ impl Tool<BaseCtx> for MemoryReadonly {
 pub struct GetResourceContentArgs {
     /// The ID of the resource to get
     pub _id: u64,
+    /// The ID of the conversation the resource belongs to
+    pub conversation: u64,
 }
 
 /// Tool that retrieves the full content for a stored resource.
@@ -1181,7 +1222,7 @@ impl Tool<BaseCtx> for GetResourceContentTool {
     }
 
     fn description(&self) -> String {
-        "Retrieves the full content of a stored resource by its ID. Returns the content as plain text if UTF-8 encoded, or as a base64url-encoded string for binary data. If the resource has no local blob but has a URI, it will be fetched from the remote source.".to_string()
+        "Retrieves the full content of a stored resource by its ID, within a conversation you own that references it. Returns the content as plain text if UTF-8 encoded, or as a base64url-encoded string for binary data. If the resource has no local blob but has a URI, it will be fetched from the remote source.".to_string()
     }
 
     fn group(&self) -> Option<ToolGroupInfo> {
@@ -1203,7 +1244,10 @@ impl Tool<BaseCtx> for GetResourceContentTool {
         args: Self::Args,
         _resources: Vec<Resource>,
     ) -> Result<ToolOutput<Self::Output>, BoxError> {
-        let res = self.memory.get_resource(args._id).await?;
+        let res = self
+            .memory
+            .get_resource_for(ctx.caller(), args.conversation, args._id)
+            .await?;
         let text = match res.blob {
             Some(blob) => match String::from_utf8(blob.0) {
                 Ok(s) => s,
@@ -1605,28 +1649,10 @@ impl Tool<BaseCtx> for MemoryTool {
     ) -> Result<ToolOutput<Self::Output>, BoxError> {
         match args {
             MemoryToolArgs::GetResource { _id, conversation } => {
-                let conversation = self.memory.get_conversation(conversation).await?;
-                if &conversation.user != ctx.caller() {
-                    return Err("permission denied".into());
-                }
-
-                // Ownership is established through the conversation, so the resource must
-                // actually belong to it; otherwise any caller could read arbitrary resources
-                // by pairing them with a conversation they own.
-                if !conversation
-                    .resources
-                    .iter()
-                    .chain(conversation.artifacts.iter())
-                    .any(|resource| resource._id == _id)
-                {
-                    return Err(format!(
-                        "permission denied: resource {_id} does not belong to conversation {}",
-                        conversation._id
-                    )
-                    .into());
-                }
-
-                let mut res = self.memory.get_resource(_id).await?;
+                let mut res = self
+                    .memory
+                    .get_resource_for(ctx.caller(), conversation, _id)
+                    .await?;
                 if res.blob.is_none()
                     && let Some(uri) = &res.uri
                 {
@@ -2048,12 +2074,15 @@ mod tests {
             ..Default::default()
         };
         let changes = sparse.to_changes().unwrap();
-        assert!(matches!(changes.get("steering_messages"), Some(Fv::Null)));
-        assert!(matches!(changes.get("follow_up_messages"), Some(Fv::Null)));
+        // The steer/follow-up queues belong to `memory_api`, so a writer that has no value
+        // for them must omit the key entirely rather than clearing what the user queued.
+        assert!(!changes.contains_key("steering_messages"));
+        assert!(!changes.contains_key("follow_up_messages"));
         assert!(matches!(changes.get("label"), Some(Fv::Null)));
         assert!(matches!(changes.get("extra"), Some(Fv::Null)));
         assert!(!changes.contains_key("child"));
-        assert!(!changes.contains_key("failed_reason"));
+        // A cleared reason must be written so a stale failure does not survive a later success.
+        assert!(matches!(changes.get("failed_reason"), Some(Fv::Null)));
     }
 
     #[test]
@@ -2544,11 +2573,36 @@ mod tests {
             .await
             .unwrap();
 
+        let empty_resource = Resource {
+            name: "empty".to_string(),
+            tags: vec!["text".to_string()],
+            ..Default::default()
+        };
+        let missing_id = memory
+            .add_resource(ResourceRef::from(&empty_resource))
+            .await
+            .unwrap();
+        // A resource nobody's conversation references, used to check the ownership guard.
+        let unowned_id = memory
+            .add_resource(ResourceRef::from(&resource("unowned", Some(b"secret"))))
+            .await
+            .unwrap();
+
         let mut stored = conversation(user, "delta memory api", 3);
-        stored.resources = vec![Resource {
-            _id: text_id,
-            ..text_resource.clone()
-        }];
+        stored.resources = vec![
+            Resource {
+                _id: text_id,
+                ..text_resource.clone()
+            },
+            Resource {
+                _id: binary_id,
+                ..binary_resource.clone()
+            },
+            Resource {
+                _id: missing_id,
+                ..empty_resource.clone()
+            },
+        ];
         stored.status = ConversationStatus::Working;
         let conversation_id = memory
             .add_conversation(ConversationRef::from(&stored))
@@ -2567,7 +2621,10 @@ mod tests {
         let output = get_content
             .call(
                 ctx.clone(),
-                GetResourceContentArgs { _id: text_id },
+                GetResourceContentArgs {
+                    _id: text_id,
+                    conversation: conversation_id,
+                },
                 Vec::new(),
             )
             .await
@@ -2579,7 +2636,10 @@ mod tests {
         let output = get_content
             .call(
                 ctx.clone(),
-                GetResourceContentArgs { _id: binary_id },
+                GetResourceContentArgs {
+                    _id: binary_id,
+                    conversation: conversation_id,
+                },
                 Vec::new(),
             )
             .await
@@ -2590,23 +2650,47 @@ mod tests {
             }
             other => panic!("unexpected response: {other:?}"),
         }
-        let missing_id = memory
-            .add_resource(ResourceRef::from(&Resource {
-                name: "empty".to_string(),
-                tags: vec!["text".to_string()],
-                ..Default::default()
-            }))
-            .await
-            .unwrap();
         let err = get_content
             .call(
                 ctx.clone(),
-                GetResourceContentArgs { _id: missing_id },
+                GetResourceContentArgs {
+                    _id: missing_id,
+                    conversation: conversation_id,
+                },
                 Vec::new(),
             )
             .await
             .unwrap_err();
         assert!(err.to_string().contains("no blob or uri"));
+
+        // Resource ids are dense and global, so naming one the conversation does not
+        // reference must be refused rather than dumping another caller's blob.
+        let err = get_content
+            .call(
+                ctx.clone(),
+                GetResourceContentArgs {
+                    _id: unowned_id,
+                    conversation: conversation_id,
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("permission denied"));
+
+        // A conversation owned by somebody else is refused before the resource is read.
+        let err = get_content
+            .call(
+                test_ctx(principal(6)),
+                GetResourceContentArgs {
+                    _id: text_id,
+                    conversation: conversation_id,
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("permission denied"));
 
         let list_tool = ListConversationsTool::new(Conversations {
             conversations: memory.conversations.clone(),
@@ -2728,7 +2812,7 @@ mod tests {
             .call(
                 ctx.clone(),
                 MemoryToolArgs::GetResource {
-                    _id: binary_id,
+                    _id: unowned_id,
                     conversation: conversation_id,
                 },
                 Vec::new(),

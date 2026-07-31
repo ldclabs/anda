@@ -22,8 +22,53 @@ struct Cli {
     #[arg(long, env = "ID_SECRET", default_value = "Anonymous")]
     id: String,
 
+    /// Allow plain `http://` endpoints on non-loopback hosts.
+    ///
+    /// Requests are signed with your identity, so over plain HTTP both the payload and the
+    /// authorization envelope are readable — and replayable — by anyone on the path. Loopback
+    /// endpoints are allowed without this flag so local development works out of the box.
+    #[arg(long, global = true)]
+    allow_http: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
+}
+
+/// Whether the client may use plain HTTP for `endpoint`.
+///
+/// Defaults to loopback-only: the built-in endpoint default is `http://127.0.0.1:8042`, so
+/// local use needs no flag, while a remote `http://` target requires opting in explicitly
+/// rather than silently transmitting a signed envelope in the clear.
+fn allow_http_for(endpoint: &str, forced: bool) -> bool {
+    if forced {
+        return true;
+    }
+
+    // Only the `http` scheme needs a decision; anything else is left to the client's own
+    // scheme validation.
+    let Some(rest) = endpoint.strip_prefix("http://") else {
+        return false;
+    };
+
+    // Authority runs up to the first `/`, `?`, or `#`; drop any userinfo and port.
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .rsplit('@')
+        .next()
+        .unwrap_or_default();
+    let host = match authority.strip_prefix('[') {
+        // IPv6 literal: `[::1]:8042`.
+        Some(v6) => v6.split(']').next().unwrap_or_default(),
+        None => authority.split(':').next().unwrap_or_default(),
+    };
+
+    host.eq_ignore_ascii_case("localhost")
+        || host == "::1"
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// CLI subcommands supported by `anda`.
@@ -176,7 +221,7 @@ async fn main() -> Result<(), BoxError> {
             let web3 = Web3Client::builder()
                 .with_ic_host(&cli.host)
                 .with_identity(Arc::new(identity))
-                .with_allow_http(true)
+                .with_allow_http(allow_http_for(endpoint, cli.allow_http))
                 .build()
                 .await?;
 
@@ -195,7 +240,7 @@ async fn main() -> Result<(), BoxError> {
             let web3 = Web3Client::builder()
                 .with_ic_host(&cli.host)
                 .with_identity(Arc::new(identity))
-                .with_allow_http(true)
+                .with_allow_http(allow_http_for(endpoint, cli.allow_http))
                 .build()
                 .await?;
 
@@ -215,7 +260,7 @@ async fn main() -> Result<(), BoxError> {
             let web3 = Web3Client::builder()
                 .with_ic_host(&cli.host)
                 .with_identity(Arc::new(identity))
-                .with_allow_http(true)
+                .with_allow_http(allow_http_for(endpoint, cli.allow_http))
                 .build()
                 .await?;
 
@@ -364,5 +409,44 @@ mod tests {
         assert_eq!(input.name, "lookup");
         assert_eq!(input.args["q"], "anda");
         assert!(tool_input("lookup", "bad json").is_err());
+    }
+
+    #[test]
+    fn plain_http_is_allowed_only_for_loopback_or_an_explicit_opt_in() {
+        // Requests are signed with the user's identity, so plain HTTP to a remote host
+        // exposes a replayable authorization envelope. Local development still works
+        // unflagged because the built-in endpoint defaults are loopback.
+        for endpoint in [
+            "http://127.0.0.1:8042/default",
+            "http://localhost:8042/default",
+            "http://LOCALHOST:8042/default",
+            "http://[::1]:8042/default",
+            "http://127.0.0.1",
+        ] {
+            assert!(
+                allow_http_for(endpoint, false),
+                "{endpoint} is loopback and must be allowed"
+            );
+        }
+
+        for endpoint in [
+            "http://engine.example/default",
+            "http://169.254.169.254/latest",
+            // Userinfo must not be mistaken for the host.
+            "http://127.0.0.1@evil.example/default",
+            "not-a-url",
+        ] {
+            assert!(
+                !allow_http_for(endpoint, false),
+                "{endpoint} is not loopback and must require --allow-http"
+            );
+            assert!(
+                allow_http_for(endpoint, true),
+                "{endpoint} must be allowed once --allow-http is passed"
+            );
+        }
+
+        // https endpoints never need the plain-http allowance.
+        assert!(!allow_http_for("https://engine.example/default", false));
     }
 }

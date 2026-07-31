@@ -76,6 +76,12 @@ pub struct SkillManager {
     /// Directories scanned for skills, with `default_skills_dir` first.
     skills_dirs: Vec<PathBuf>,
     skills: RwLock<BTreeMap<String, Skill>>,
+    /// Materialized [`SubAgent`] per skill, keyed by lowercase name.
+    ///
+    /// A `SubAgent` owns its live session registry in `Arc<SubSessions>`, so lookups must hand
+    /// out clones of one stable instance. Rebuilding a `SubAgent` per lookup would give every
+    /// caller a fresh empty registry, and a running session could never be found again.
+    subagents: RwLock<BTreeMap<String, SubAgent>>,
     description: String,
     default_skill_tools: Vec<String>,
 }
@@ -143,6 +149,7 @@ impl SkillManager {
         let skills_dirs = build_skills_dirs(default_skills_dir.clone(), additional_skills_dirs);
         Self {
             skills: RwLock::new(BTreeMap::new()),
+            subagents: RwLock::new(BTreeMap::new()),
             description: build_description(&default_skills_dir, &skills_dirs),
             default_skills_dir,
             skills_dirs,
@@ -353,8 +360,26 @@ impl SkillManager {
             loaded_dirs,
             format_path_list(&self.skills_dirs)
         );
+        self.rebuild_subagents(&skills);
         *self.skills.write() = skills;
         Ok(())
+    }
+
+    /// Rebuilds the materialized subagents, carrying over the live session registry of every
+    /// skill that survived the reload so running sessions stay reachable.
+    fn rebuild_subagents(&self, skills: &BTreeMap<String, Skill>) {
+        let mut subagents = self.subagents.write();
+        let rebuilt = skills
+            .iter()
+            .map(|(name, skill)| {
+                let mut agent = self.with_default_tools(SubAgent::from(skill));
+                if let Some(existing) = subagents.get(name) {
+                    agent.subsessions = existing.subsessions.clone();
+                }
+                (name.clone(), agent)
+            })
+            .collect();
+        *subagents = rebuilt;
     }
 
     /// Retrieve the full [`Skill`] by its normalised name.
@@ -364,12 +389,7 @@ impl SkillManager {
 
     /// Return all loaded skills as [`SubAgent`]s with default tools included.
     pub fn subagents(&self) -> Vec<SubAgent> {
-        self.skills
-            .read()
-            .values()
-            .map(SubAgent::from)
-            .map(|agent| self.with_default_tools(agent))
-            .collect::<Vec<_>>()
+        self.subagents.read().values().cloned().collect::<Vec<_>>()
     }
 
     /// Return all loaded skills.
@@ -388,34 +408,23 @@ impl SubAgentSet for SkillManager {
     }
 
     fn get_lowercase(&self, lowercase_name: &str) -> Option<SubAgent> {
-        self.skills
-            .read()
-            .get(lowercase_name)
-            .map(SubAgent::from)
-            .map(|agent| self.with_default_tools(agent))
+        // Clone the materialized instance so the returned agent shares the live session
+        // registry; building a fresh `SubAgent` here would hand out an empty one.
+        self.subagents.read().get(lowercase_name).cloned()
     }
 
     fn definitions(&self, names: Option<&[String]>) -> Vec<FunctionDefinition> {
+        let subagents = self.subagents.read();
         match names {
-            None => self
-                .skills
-                .read()
-                .values()
-                .map(SubAgent::from)
-                .map(|agent| agent.definition())
+            None => subagents.values().map(|agent| agent.definition()).collect(),
+            Some(names) => names
+                .iter()
+                .filter_map(|name| {
+                    subagents
+                        .get(&name.to_ascii_lowercase())
+                        .map(|agent| agent.definition())
+                })
                 .collect(),
-            Some(names) => {
-                let skills = self.skills.read();
-                names
-                    .iter()
-                    .filter_map(|name| {
-                        skills
-                            .get(&name.to_ascii_lowercase())
-                            .map(SubAgent::from)
-                            .map(|agent| agent.definition())
-                    })
-                    .collect()
-            }
         }
     }
 

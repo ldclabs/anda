@@ -81,7 +81,6 @@ pub struct BaseCtx {
 /// - Cryptographic operations;
 /// - Storage operations;
 /// - Caching mechanisms;
-/// - Canister communication;
 /// - HTTP operations.
 ///
 /// The context is designed to be thread-safe and cloneable, with each clone

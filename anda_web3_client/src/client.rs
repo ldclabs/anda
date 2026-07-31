@@ -267,12 +267,17 @@ impl Client {
     /// other scheme (`file`, `ftp`, `data`, ...) is rejected, and the URL must
     /// carry a host.
     ///
+    /// Embedded userinfo is rejected: in `https://api.trusted.example@evil.tld/`
+    /// the authority is `evil.tld`, but the text reads as the trusted host. That
+    /// mismatch is the classic URL-smuggling primitive, and here it would send a
+    /// request signed with the client identity to the attacker's host.
+    ///
     /// This is a syntactic guard, not an SSRF firewall: it does not block
     /// private, loopback, or link-local hosts (e.g. cloud metadata at
-    /// `169.254.169.254`). When this client is used as a library, treat every
-    /// endpoint passed to a signed call as trusted — the request is signed with
-    /// the client identity before it is sent, so an attacker-controlled endpoint
-    /// receives a valid signed request.
+    /// `169.254.169.254`), and it does not re-validate redirect hops. When this
+    /// client is used as a library, treat every endpoint passed to a signed call
+    /// as trusted — the request is signed with the client identity before it is
+    /// sent, so an attacker-controlled endpoint receives a valid signed request.
     fn check_url(&self, url: &str) -> Result<(), BoxError> {
         let parsed =
             reqwest::Url::parse(url).map_err(|err| format!("Invalid url {url:?}: {err}"))?;
@@ -290,6 +295,9 @@ impl Client {
         }
         if !parsed.has_host() {
             return Err(format!("Invalid url {url:?}: missing host").into());
+        }
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err(format!("Invalid url {url:?}: embedded userinfo is not allowed").into());
         }
         Ok(())
     }

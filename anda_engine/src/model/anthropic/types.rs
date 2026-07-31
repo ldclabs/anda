@@ -1083,6 +1083,21 @@ fn text_block_from_json(value: &Value) -> ContentBlock {
     }
 }
 
+/// Derives a tool-use id for a content part that carries none.
+///
+/// Other providers can emit a tool call without an id — Gemini's `functionCall` often omits
+/// it, as does OpenAI's legacy `function_call` — which reaches Anda as `call_id: None`.
+/// Anthropic rejects an empty `tool_use.id` and an unmatched `tool_result.tool_use_id`, so
+/// replaying such a history would fail outright. Deriving from the tool name keeps the call
+/// and its result paired, since both parts carry it.
+fn synthetic_tool_use_id(name: &str) -> String {
+    let sanitized: String = name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    format!("toolu_anda_{sanitized}")
+}
+
 fn content_block_from_any(value: Value) -> ContentBlock {
     match ContentBlock::deserialize(&value) {
         Ok(block) if !matches!(&block, ContentBlock::Any(_)) => block,
@@ -1165,20 +1180,20 @@ impl From<ContentPart> for ContentBlock {
                 args,
                 call_id,
             } => ContentBlock::ToolUse {
-                id: call_id.unwrap_or_default(),
+                id: call_id.unwrap_or_else(|| synthetic_tool_use_id(&name)),
                 name,
                 input: args,
                 cache_control: None,
                 caller: None,
             },
             ContentPart::ToolOutput {
-                name: _,
+                name,
                 output,
                 is_error,
                 call_id,
                 ..
             } => ContentBlock::ToolResult {
-                tool_use_id: call_id.unwrap_or_default(),
+                tool_use_id: call_id.unwrap_or_else(|| synthetic_tool_use_id(&name)),
                 content: Some(ToolResultContent::Text(match &output {
                     Value::String(s) => s.clone(),
                     _ => serde_json::to_string(&output).unwrap_or_default(),
@@ -1300,7 +1315,22 @@ impl From<CoreMessage> for Message {
             "assistant" | "model" => Role::Assistant,
             _ => Role::User,
         };
-        let blocks: Vec<ContentBlock> = msg.content.into_iter().map(|v| v.into()).collect();
+        let blocks: Vec<ContentBlock> = msg
+            .content
+            .into_iter()
+            .map(ContentBlock::from)
+            // Within one reasoning round the provider-native messages travel in
+            // `CompletionRequest::raw_history`, which is appended ahead of this conversion
+            // and keeps thinking blocks with their real signatures. This path converts
+            // `chat_history`, the persisted provider-neutral view, which deliberately does
+            // not carry provider intermediate state — so a `Reasoning` part here never has a
+            // signature. Emitting `{"type":"thinking","signature":""}` from it would be
+            // rejected by Anthropic and fail the whole request. Thinking blocks are optional
+            // in request input, so omit them instead and let the turn replay without them.
+            .filter(|block| {
+                !matches!(block, ContentBlock::Thinking { signature, .. } if signature.is_empty())
+            })
+            .collect();
         if blocks.len() == 1
             && let Some(ContentBlock::Text { text, .. }) = blocks.first()
         {
@@ -1895,10 +1925,14 @@ mod tests {
             call_id: None,
         }
         .into();
+        // A part with no `call_id` (what Gemini's `functionCall` and OpenAI's legacy
+        // `function_call` produce) must still get a non-empty, name-derived id: Anthropic
+        // rejects an empty `tool_use.id`, and the matching `tool_result` derives the same id
+        // so the pair stays correlated.
         assert!(matches!(
             tool_call_block,
             ContentBlock::ToolUse { id, name, input, .. }
-                if id.is_empty() && name == "lookup" && input == json!({"query": "anda"})
+                if id == "toolu_anda_lookup" && name == "lookup" && input == json!({"query": "anda"})
         ));
 
         let text_tool_result: ContentBlock = ContentPart::ToolOutput {
@@ -1916,7 +1950,7 @@ mod tests {
                 content: Some(ToolResultContent::Text(content)),
                 is_error: Some(false),
                 ..
-            } if tool_use_id.is_empty() && content == "ok"
+            } if tool_use_id == "toolu_anda_lookup" && content == "ok"
         ));
 
         let json_tool_result: ContentBlock = ContentPart::ToolOutput {

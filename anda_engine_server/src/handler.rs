@@ -15,7 +15,10 @@ use cbor2::{from_slice, to_canonical_vec};
 use http::header::AUTHORIZATION;
 use ic_auth_types::ByteBufB64;
 use ic_auth_verifier::{
-    envelope::{ANONYMOUS_PRINCIPAL, SignedEnvelope},
+    envelope::{
+        ANONYMOUS_PRINCIPAL, HEADER_IC_AUTH_CONTENT_DIGEST, HEADER_IC_AUTH_DELEGATION,
+        HEADER_IC_AUTH_PUBKEY, HEADER_IC_AUTH_SIGNATURE, SignedEnvelope,
+    },
     unix_timestamp,
 };
 use ic_cose_types::cose::{
@@ -56,7 +59,9 @@ impl AppState {
     /// 1. A `Bearer` CWT token signed by one of the trusted `ed25519_pubkeys`.
     ///    Bearer tokens are not bound to a single request, so `expect_target`
     ///    and `expect_digest` do not apply to this path. This path is only
-    ///    attempted when at least one trusted key is configured.
+    ///    attempted when at least one trusted key is configured. Because the
+    ///    token's lifetime is its only containment, a token without an `exp`
+    ///    claim is rejected.
     /// 2. A [`SignedEnvelope`] from the `Authorization` header or the
     ///    `ic-auth-*` headers, verified against `expect_target` and
     ///    `expect_digest`.
@@ -76,6 +81,31 @@ impl AppState {
     /// echoing the hash as `digest`. Genuine cross-protocol / oracle resistance
     /// requires domain separation in the signature scheme (`ic_auth_verifier`),
     /// which is out of scope for this crate.
+    ///
+    /// # Replay and target binding
+    ///
+    /// A verified envelope is **not** bound to one request occurrence or to one
+    /// engine, so an observer who captures a single signed request can replay it:
+    ///
+    /// - **Freshness.** `now_ms` reaches [`SignedEnvelope::verify`], but that
+    ///   function consults it only for delegation expiry and canister-signature
+    ///   certificates. For a direct-key envelope (`delegation: None`, what
+    ///   `anda_web3_client` and `anda_cli` produce) the sole check is the
+    ///   signature over the body hash. The signed payload carries no nonce,
+    ///   timestamp, or sequence number, so an identical re-POST verifies forever.
+    /// - **Target.** `expect_target` is likewise only compared inside the
+    ///   delegation loop, and only when the delegation carries `targets`. A
+    ///   direct-key envelope is therefore accepted by any engine on any server
+    ///   holding the same principal. The one available narrowing is
+    ///   [`RequestMeta::engine`](anda_core::RequestMeta), which
+    ///   `Engine::agent_run` / `Engine::tool_call` enforce when the client sets
+    ///   it — it is optional, so clients that omit it get no binding.
+    ///
+    /// Closing either gap requires committing a nonce (and an engine id) inside
+    /// the signed payload, which is a protocol change across every client, not a
+    /// server-side check. Until then: serve only over TLS, treat a captured
+    /// request as a bearer credential for the operation it encodes, and set
+    /// `RequestMeta::engine` on clients so cross-engine replay is rejected.
     ///
     /// Returns the anonymous principal only when no credential is present. When a
     /// credential is present but fails to verify (bad signature, wrong target,
@@ -124,12 +154,26 @@ impl AppState {
             };
         }
 
+        // Neither parser produced an envelope. Both return `None` for a malformed credential
+        // just as they do for an absent one, so distinguish the two here: a request that
+        // carries credential headers we could not parse must be rejected, not silently
+        // downgraded to anonymous (which would let an on-path attacker strip one header to
+        // launder an authenticated call into an unattributable anonymous one).
+        if has_credential_headers(headers) {
+            return Err("unparseable request credential".to_string());
+        }
+
         // No credential supplied: treat as anonymous.
         Ok(ANONYMOUS_PRINCIPAL)
     }
 
     /// Verifies a raw `Bearer` CWT token string against the trusted `ed25519_pubkeys`.
     /// Returns `None` when no trusted key is configured or verification fails.
+    ///
+    /// A bearer token is not bound to a request body or a target engine, so its only
+    /// containment is its lifetime. [`cwt_from`] treats `exp` as optional and accepts a
+    /// token with no time claims at all, which would grant an unbounded, unrevocable
+    /// credential; this wrapper therefore rejects a token that carries no `exp`.
     fn verify_cwt_token(&self, token: &str, now_ms: u64) -> Option<ClaimsSet> {
         if self.ed25519_pubkeys.is_empty() {
             return None;
@@ -137,8 +181,23 @@ impl AppState {
         let data = ByteBufB64::from_str(token).ok()?;
         let data = skip_prefix(&SIGN1_TAG, &data);
         let cs1 = cose_sign1_from(data, &[], &[], &self.ed25519_pubkeys).ok()?;
-        cwt_from(&cs1.payload.unwrap_or_default(), (now_ms / 1000) as i64).ok()
+        let claims = cwt_from(&cs1.payload.unwrap_or_default(), (now_ms / 1000) as i64).ok()?;
+        claims.expiration.as_ref()?;
+        Some(claims)
     }
+}
+
+/// Returns true when the request carries any credential header, whether or not it parses.
+///
+/// Used to tell "no credential" apart from "malformed credential": both
+/// [`SignedEnvelope::from_authorization`] and [`SignedEnvelope::from_headers`] return `None`
+/// in either case.
+fn has_credential_headers(headers: &http::HeaderMap) -> bool {
+    headers.contains_key(AUTHORIZATION)
+        || headers.contains_key(&HEADER_IC_AUTH_PUBKEY)
+        || headers.contains_key(&HEADER_IC_AUTH_SIGNATURE)
+        || headers.contains_key(&HEADER_IC_AUTH_CONTENT_DIGEST)
+        || headers.contains_key(&HEADER_IC_AUTH_DELEGATION)
 }
 
 /// GET /.well-known/information

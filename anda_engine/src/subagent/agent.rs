@@ -529,7 +529,9 @@ impl Agent<AgentCtx> for SubAgent {
         // graceful `/stop`, matching the semantics of the `/stop` control command.
         let session_token = ctx.base.cancellation_token().child_token();
         if let Some(hook) = &agent_hook {
-            let handle = BackgroundHandle::new(&session.id, session_token.clone());
+            // Namespaced by agent: the parent's registry is shared across subagents, and
+            // session ids are only unique within one subagent.
+            let handle = BackgroundHandle::new(session.background_task_id(), session_token.clone());
             hook.on_background_start(&ctx, handle, &req).await;
         }
 
@@ -635,8 +637,12 @@ impl Agent<AgentCtx> for SubAgent {
                             conversation.record_output(&mut output, status).await;
                         }
                         if let Some(hook) = &runner.agent_hook {
-                            hook.on_background_end(runner.runner.ctx(), session.id.clone(), output)
-                                .await;
+                            hook.on_background_end(
+                                runner.runner.ctx(),
+                                session.background_task_id(),
+                                output,
+                            )
+                            .await;
                         }
                         break;
                     }
@@ -654,8 +660,12 @@ impl Agent<AgentCtx> for SubAgent {
                             conversation.record_output(&mut output, status).await;
                         }
                         if let Some(hook) = &runner.agent_hook {
-                            hook.on_background_end(runner.runner.ctx(), session.id.clone(), output)
-                                .await;
+                            hook.on_background_end(
+                                runner.runner.ctx(),
+                                session.background_task_id(),
+                                output,
+                            )
+                            .await;
                         }
                         log::error!("Error processing session {}: {:?}", session.id, err);
                         break;

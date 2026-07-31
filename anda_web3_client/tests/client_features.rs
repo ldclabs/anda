@@ -303,6 +303,8 @@ async fn http_guards_local_calls_and_signed_rpc_paths_are_exercised() {
     // `allow_http` is enabled, so an attacker cannot smuggle `file://` /
     // `data:` / metadata-style targets through a signed call. `allow_http` only
     // opens the plain `http` scheme.
+    // The userinfo forms below read as the trusted host but resolve to `evil.test`;
+    // accepting them would deliver an identity-signed request to the attacker.
     let permissive = client_with_identity(true).await;
     for bad in [
         "file:///etc/passwd",
@@ -311,6 +313,9 @@ async fn http_guards_local_calls_and_signed_rpc_paths_are_exercised() {
         "ws://example.test/socket",
         "not-a-url",
         "https://",
+        "https://example.test@evil.test/rpc",
+        "https://example.test:token@evil.test/rpc",
+        "http://example.test@evil.test/rpc",
     ] {
         let err = HttpFeatures::https_call(&permissive, bad, http::Method::GET, None, None)
             .await

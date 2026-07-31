@@ -39,6 +39,15 @@ to change.
 - When changing model/provider conversion code, preserve raw-history and
   tool/user message boundaries. Do not merge tool outputs into user messages or
   lose provider-specific content unless the existing code explicitly does so.
+- `ContentPart` / `chat_history` is the persisted, provider-neutral history.
+  Provider per-turn intermediate state (Anthropic `thinking.signature`, Gemini
+  `thoughtSignature`) belongs in `CompletionRequest::raw_history`, which every
+  adapter sends ahead of the converted `chat_history` and which is scoped to one
+  in-process reasoning round. Do not add provider-specific fields to
+  `ContentPart` to carry such state — an adapter dropping it on the way *in* is
+  correct by design. Do fix the reverse: converting *out of* `ContentPart` must
+  never emit something the provider rejects (e.g. a `thinking` block with an
+  empty signature); omit it instead.
 
 ## Runtime Boundaries
 

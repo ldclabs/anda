@@ -71,13 +71,16 @@ impl ReadFileTool {
     pub const NAME: &'static str = "read_file";
 
     /// Create a new `ReadFileTool` with the default workspace directory.
-    /// You can add workspace directories for each call by including `workspace` or `workspaces` in the tool call's context meta extra.
+    /// A call may narrow the workspace by including `workspace` or `workspaces` in the tool
+    /// call's context meta extra. Request metadata is caller-controlled, so a requested
+    /// directory is honored only when it resolves inside a configured workspace.
     pub fn new(workspace: PathBuf) -> Self {
         Self::with_workspaces([workspace])
     }
 
     /// Create a new `ReadFileTool` with the default workspace directories.
-    /// Context meta workspaces take precedence over these defaults at call time.
+    /// A requested workspace that resolves inside one of these takes precedence at call
+    /// time; one that does not is ignored, so these bound everything the tool can reach.
     pub fn with_workspaces<I>(workspaces: I) -> Self
     where
         I: IntoIterator<Item = PathBuf>,
@@ -157,7 +160,7 @@ impl Tool<BaseCtx> for ReadFileTool {
             args
         };
 
-        let workspaces = tool_workspaces(ctx.meta(), &self.workspaces);
+        let workspaces = tool_workspaces(ctx.meta(), &self.workspaces).await;
         let resolved = resolve_read_path_in_workspaces(&workspaces, &args.path).await?;
         let workspace_display = resolved.workspace.display().to_string();
         let resolved_path = resolved.path;

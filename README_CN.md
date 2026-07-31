@@ -46,7 +46,8 @@ anda/
 ├── anda_cli/              # 与 Anda 引擎服务交互的命令行工具
 ├── anda_core/             # 核心 traits、类型和运行时契约
 ├── anda_engine/           # 智能体运行时、编排、上下文、模型和扩展
-└── anda_engine_server/    # 支持一个或多个 Anda 引擎的 HTTP 服务
+├── anda_engine_server/    # 支持一个或多个 Anda 引擎的 HTTP 服务
+└── anda_web3_client/      # 非 TEE 环境下的 Web3 客户端
 ```
 
 ### 如何使用和参与贡献

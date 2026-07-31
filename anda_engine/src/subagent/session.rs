@@ -549,6 +549,19 @@ impl SubSession {
         }
     }
 
+    /// Identifier this session registers under in the *parent's* background-task registry.
+    ///
+    /// Session ids are caller-supplied and only unique within one subagent, but the parent's
+    /// [`BackgroundTaskControls`] is a flat map shared by every subagent it launches. Keying
+    /// on the bare session id would let `SA_alpha {session: "job1"}` and
+    /// `SA_beta {session: "job1"}` overwrite each other: the second registration evicts the
+    /// first, so one task's completion is attributed to the other, the other's final output
+    /// is dropped entirely, and `/stop_task job1` stops the wrong one. Namespacing by agent
+    /// keeps them distinct.
+    pub(super) fn background_task_id(&self) -> String {
+        format!("{}:{}", self.agent, self.id)
+    }
+
     pub(super) fn set_conversation_id(&self, conversation: u64) {
         self.conversation.store(conversation, Ordering::SeqCst);
     }
