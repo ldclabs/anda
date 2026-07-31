@@ -576,14 +576,13 @@ impl Hook for Hooks {
                     ..Default::default()
                 };
                 for started in self.hooks[..idx].iter().rev() {
-                    match started.on_agent_end(ctx, agent, output).await {
+                    match started.on_agent_end(ctx, agent, output.clone()).await {
                         Ok(next) => output = next,
                         // An unwind failure must not mask the original rejection.
                         Err(unwind_err) => {
                             log::warn!(
                                 "on_agent_end failed while unwinding a rejected agent start (agent: {agent}): {unwind_err}"
                             );
-                            break;
                         }
                     }
                 }
@@ -617,13 +616,12 @@ impl Hook for Hooks {
                     ..ToolOutput::new(Json::String(err.to_string()))
                 };
                 for started in self.hooks[..idx].iter().rev() {
-                    match started.on_tool_end(ctx, tool, output).await {
+                    match started.on_tool_end(ctx, tool, output.clone()).await {
                         Ok(next) => output = next,
                         Err(unwind_err) => {
                             log::warn!(
                                 "on_tool_end failed while unwinding a rejected tool start (tool: {tool}): {unwind_err}"
                             );
-                            break;
                         }
                     }
                 }
@@ -887,6 +885,111 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(output.output, Json::String("ok-one-two".to_string()));
+    }
+
+    struct UnwindHook {
+        name: &'static str,
+        events: Arc<Mutex<Vec<String>>>,
+        reject_start: bool,
+        fail_end: bool,
+    }
+
+    #[async_trait]
+    impl Hook for UnwindHook {
+        async fn on_agent_start(&self, _ctx: &AgentCtx, _agent: &str) -> Result<(), BoxError> {
+            self.events
+                .lock()
+                .push(format!("agent-start:{}", self.name));
+            if self.reject_start {
+                return Err(format!("{} agent start rejected", self.name).into());
+            }
+            Ok(())
+        }
+
+        async fn on_agent_end(
+            &self,
+            _ctx: &AgentCtx,
+            _agent: &str,
+            output: AgentOutput,
+        ) -> Result<AgentOutput, BoxError> {
+            self.events.lock().push(format!("agent-end:{}", self.name));
+            if self.fail_end {
+                return Err(format!("{} agent end failed", self.name).into());
+            }
+            Ok(output)
+        }
+
+        async fn on_tool_start(&self, _ctx: &BaseCtx, _tool: &str) -> Result<(), BoxError> {
+            self.events.lock().push(format!("tool-start:{}", self.name));
+            if self.reject_start {
+                return Err(format!("{} tool start rejected", self.name).into());
+            }
+            Ok(())
+        }
+
+        async fn on_tool_end(
+            &self,
+            _ctx: &BaseCtx,
+            _tool: &str,
+            output: ToolOutput<Json>,
+        ) -> Result<ToolOutput<Json>, BoxError> {
+            self.events.lock().push(format!("tool-end:{}", self.name));
+            if self.fail_end {
+                return Err(format!("{} tool end failed", self.name).into());
+            }
+            Ok(output)
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hook_unwind_continues_after_an_end_hook_fails() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut hooks = Hooks::new();
+        for (name, reject_start, fail_end) in [
+            ("first", false, false),
+            ("second", false, true),
+            ("rejecting", true, false),
+        ] {
+            hooks.add(Box::new(UnwindHook {
+                name,
+                events: events.clone(),
+                reject_start,
+                fail_end,
+            }));
+        }
+
+        let err = hooks
+            .on_agent_start(&agent_ctx(), "worker")
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "rejecting agent start rejected");
+        assert_eq!(
+            *events.lock(),
+            [
+                "agent-start:first",
+                "agent-start:second",
+                "agent-start:rejecting",
+                "agent-end:second",
+                "agent-end:first",
+            ]
+        );
+
+        events.lock().clear();
+        let err = hooks
+            .on_tool_start(&base_ctx(), "lookup")
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "rejecting tool start rejected");
+        assert_eq!(
+            *events.lock(),
+            [
+                "tool-start:first",
+                "tool-start:second",
+                "tool-start:rejecting",
+                "tool-end:second",
+                "tool-end:first",
+            ]
+        );
     }
 
     struct PrefixToolHook {

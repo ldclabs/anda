@@ -75,7 +75,7 @@ use reqwest::Client as ReqwestClient;
 use rmcp::{
     ClientHandler, RoleClient,
     model::{
-        CallToolRequestParams, CallToolResult, ClientInfo, Implementation, InitializeResult,
+        CallToolRequestParams, CallToolResult, ClientInfo, Implementation, ServerPeerInfo,
         Tool as McpTool,
     },
     serve_client,
@@ -83,7 +83,7 @@ use rmcp::{
     transport::{
         AuthClient, AuthError, AuthorizationManager, ClientCredentialsConfig, CredentialStore,
         StreamableHttpClientTransport, TokioChildProcess,
-        auth::{AuthorizationCallback, OAuthClientConfig, OAuthState},
+        auth::{AuthorizationCallback, AuthorizationMetadataSource, OAuthClientConfig, OAuthState},
         streamable_http_client::StreamableHttpClientTransportConfig,
     },
 };
@@ -120,6 +120,9 @@ const MAX_LOCAL_NAME_ATTEMPTS: usize = 8;
 /// Comfortably wider than rmcp's own 30s refresh buffer, so the reconnect happens before any
 /// request can fail with `AuthorizationRequired`.
 const CLIENT_CREDENTIALS_RENEW_BUFFER: Duration = Duration::from_secs(120);
+
+/// Minimum buffer that stays just ahead of rmcp's 30-second proactive refresh threshold.
+const CLIENT_CREDENTIALS_MIN_RENEW_BUFFER: Duration = Duration::from_secs(31);
 
 /// Dynamic tool provider backed by one or more MCP servers.
 #[derive(Clone)]
@@ -213,6 +216,18 @@ impl McpToolProvider {
 
     /// Refreshes a single configured server and updates the provider snapshot.
     pub async fn refresh_server(&self, server_id: &str) -> Result<(), BoxError> {
+        self.refresh_server_inner(server_id, true).await
+    }
+
+    /// Refreshes one server after optionally clearing a pre-existing dirty notification.
+    ///
+    /// A caller that already claimed `dirty` with `swap(false)` must pass `false`: clearing it
+    /// again would erase a second notification delivered between the claim and `tools/list`.
+    async fn refresh_server_inner(
+        &self,
+        server_id: &str,
+        clear_dirty: bool,
+    ) -> Result<(), BoxError> {
         let config = self.server_config(server_id)?;
         let session = self.ensure_session(&config).await?;
         let peer = {
@@ -224,7 +239,9 @@ impl McpToolProvider {
         // would swallow that notification, and since the server will not re-announce an
         // already-sent change, the route table would stay stale indefinitely. Clearing first
         // means a concurrent change re-arms the flag and is picked up by the next refresh.
-        session.dirty.store(false, Ordering::SeqCst);
+        if clear_dirty {
+            session.dirty.store(false, Ordering::SeqCst);
+        }
 
         // Capture the server's self-description (title, instructions) from the
         // initialize handshake so the discovery layer can present each server as
@@ -412,14 +429,15 @@ impl McpToolProvider {
     /// authorization flow.
     pub async fn discover_http_oauth(url: &str) -> Result<Option<McpOAuthMetadata>, BoxError> {
         let manager = AuthorizationManager::new(url).await?;
-        match manager.discover_metadata().await {
-            Ok(metadata) => Ok(Some(McpOAuthMetadata {
-                scopes_supported: metadata.scopes_supported.unwrap_or_default(),
-                registration_supported: metadata.registration_endpoint.is_some(),
-            })),
-            Err(AuthError::NoAuthorizationSupport) => Ok(None),
-            Err(err) => Err(err.into()),
+        let resolution = manager.resolve_metadata().await?;
+        if resolution.source == AuthorizationMetadataSource::LegacyEndpointFallback {
+            return Ok(None);
         }
+        let metadata = resolution.metadata;
+        Ok(Some(McpOAuthMetadata {
+            scopes_supported: metadata.scopes_supported.unwrap_or_default(),
+            registration_supported: metadata.registration_endpoint.is_some(),
+        }))
     }
 
     /// Starts the interactive OAuth Authorization Code flow for `server_id` and
@@ -448,7 +466,7 @@ impl McpToolProvider {
 
         let mut manager = AuthorizationManager::new(http.url.as_str()).await?;
         manager.set_credential_store(self.scoped_store(server_id));
-        let metadata = manager.discover_metadata().await?;
+        let metadata = manager.resolve_metadata().await?.metadata;
         manager.set_metadata(metadata);
 
         let scope_refs: Vec<&str> = ac.scopes.iter().map(String::as_str).collect();
@@ -579,12 +597,8 @@ impl McpToolProvider {
             Ok((_, Some(token))) => serde_json::to_value(&token)
                 .ok()
                 .and_then(|token| token.get("expires_in").and_then(Json::as_u64))
-                .map(|secs| {
-                    let ttl = Duration::from_secs(secs);
-                    Instant::now()
-                        + ttl
-                            .saturating_sub(CLIENT_CREDENTIALS_RENEW_BUFFER)
-                            .max(ttl / 10)
+                .and_then(|secs| {
+                    client_credentials_deadline(Instant::now(), Duration::from_secs(secs))
                 }),
             _ => None,
         };
@@ -606,7 +620,7 @@ impl McpToolProvider {
             .get(server_id)
             .map(|session| session.dirty.swap(false, Ordering::SeqCst))
             .unwrap_or(false);
-        if claimed && let Err(err) = self.refresh_server(server_id).await {
+        if claimed && let Err(err) = self.refresh_server_inner(server_id, false).await {
             // Restore the dirty flag so a later call retries the refresh.
             if let Some(session) = self.inner.index.read().sessions.get(server_id) {
                 session.dirty.store(true, Ordering::SeqCst);
@@ -1063,17 +1077,21 @@ struct McpServerMeta {
 }
 
 impl McpServerMeta {
-    fn from_peer_info(server_id: &str, info: Option<&InitializeResult>) -> Self {
+    fn from_peer_info(server_id: &str, info: Option<&ServerPeerInfo>) -> Self {
         let Some(info) = info else {
             return Self::default();
         };
-        let implementation = &info.server_info;
-        let title = non_empty(implementation.title.as_deref())
-            .or_else(|| non_empty(Some(implementation.name.as_str())))
+        let implementation = info.server_info.as_ref();
+        let title = implementation
+            .and_then(|implementation| {
+                non_empty(implementation.title.as_deref())
+                    .or_else(|| non_empty(Some(implementation.name.as_str())))
+            })
             .filter(|title| title != server_id);
         Self {
             title,
-            description: non_empty(implementation.description.as_deref()),
+            description: implementation
+                .and_then(|implementation| non_empty(implementation.description.as_deref())),
             instructions: non_empty(info.instructions.as_deref()),
         }
     }
@@ -1097,6 +1115,21 @@ fn non_empty(value: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
+}
+
+/// Computes the reconnect deadline for a client-credentials token.
+///
+/// Long-lived tokens renew 120 seconds early. Shorter tokens keep at least half their useful
+/// lifetime while still staying ahead of rmcp's 30-second proactive refresh threshold. A remote
+/// authorization server controls `expires_in`, so `checked_add` turns an unrepresentable duration
+/// into "no local deadline" instead of panicking the process.
+fn client_credentials_deadline(now: Instant, ttl: Duration) -> Option<Instant> {
+    let buffer = if ttl >= CLIENT_CREDENTIALS_RENEW_BUFFER.saturating_mul(2) {
+        CLIENT_CREDENTIALS_RENEW_BUFFER
+    } else {
+        (ttl / 2).max(CLIENT_CREDENTIALS_MIN_RENEW_BUFFER).min(ttl)
+    };
+    now.checked_add(ttl.saturating_sub(buffer))
 }
 
 /// One Anda-facing route to an MCP tool.
@@ -2072,6 +2105,29 @@ done
         assert!(!rendered.contains("ghp_live_value"), "{rendered}");
         assert!(rendered.contains("GITHUB_TOKEN"), "{rendered}");
         assert!(rendered.contains("[REDACTED]"), "{rendered}");
+    }
+
+    #[test]
+    fn client_credentials_deadlines_preserve_short_token_lifetime_and_do_not_overflow() {
+        let now = Instant::now();
+        let after = |secs| {
+            client_credentials_deadline(now, Duration::from_secs(secs))
+                .unwrap()
+                .duration_since(now)
+        };
+
+        assert_eq!(after(3_600), Duration::from_secs(3_480));
+        assert_eq!(after(240), Duration::from_secs(120));
+        assert_eq!(after(120), Duration::from_secs(60));
+        // Stay just ahead of rmcp's 30-second refresh threshold without throwing away 90% of
+        // a one-minute token's lifetime.
+        assert_eq!(after(60), Duration::from_secs(29));
+        assert_eq!(after(30), Duration::ZERO);
+
+        assert!(
+            client_credentials_deadline(now, Duration::MAX).is_none(),
+            "an untrusted, unrepresentable expires_in must not panic"
+        );
     }
 
     #[test]

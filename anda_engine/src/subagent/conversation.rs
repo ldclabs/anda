@@ -123,7 +123,7 @@ impl SubAgentConversationLog {
     }
 
     async fn persist(&self) {
-        match self.conversation.to_changes() {
+        match self.conversation.to_runner_changes() {
             Ok(changes) => {
                 if let Err(err) = self
                     .recorder

@@ -307,10 +307,7 @@ impl SkillManager {
             )
             .into());
         }
-        self.skills
-            .write()
-            .entry(skill.agent_name.clone())
-            .insert_entry(skill.clone());
+        self.upsert_skill(skill.clone());
 
         Ok(SkillContentOutput {
             name: skill.frontmatter.name,
@@ -360,14 +357,13 @@ impl SkillManager {
             loaded_dirs,
             format_path_list(&self.skills_dirs)
         );
-        self.rebuild_subagents(&skills);
-        *self.skills.write() = skills;
+        self.replace_skills(skills);
         Ok(())
     }
 
-    /// Rebuilds the materialized subagents, carrying over the live session registry of every
-    /// skill that survived the reload so running sessions stay reachable.
-    fn rebuild_subagents(&self, skills: &BTreeMap<String, Skill>) {
+    /// Replaces the loaded skills and materialized subagents as one update, carrying over the
+    /// live session registry of every skill that survived the reload.
+    fn replace_skills(&self, skills: BTreeMap<String, Skill>) {
         let mut subagents = self.subagents.write();
         let rebuilt = skills
             .iter()
@@ -380,6 +376,23 @@ impl SkillManager {
             })
             .collect();
         *subagents = rebuilt;
+        *self.skills.write() = skills;
+    }
+
+    /// Inserts or refreshes one skill after a direct `SKILL.md` read.
+    ///
+    /// Reading a skill has historically made it immediately callable. Keep the stable
+    /// materialized agent in sync with the parsed skill while preserving any live sessions
+    /// already owned by that skill.
+    fn upsert_skill(&self, skill: Skill) {
+        let name = skill.agent_name.clone();
+        let mut subagents = self.subagents.write();
+        let mut agent = self.with_default_tools(SubAgent::from(&skill));
+        if let Some(existing) = subagents.get(&name) {
+            agent.subsessions = existing.subsessions.clone();
+        }
+        subagents.insert(name.clone(), agent);
+        self.skills.write().insert(name, skill);
     }
 
     /// Retrieve the full [`Skill`] by its normalised name.
@@ -647,6 +660,69 @@ Beta instructions.
 
         // Clean up.
         let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reading_a_skill_refreshes_the_materialized_subagent() {
+        let root = std::env::temp_dir().join(format!(
+            "anda-skills-read-refresh-{:016x}",
+            rand::random::<u64>()
+        ));
+        let skill_dir = root.join("alpha");
+        tokio::fs::create_dir_all(&skill_dir).await.unwrap();
+        tokio::fs::write(
+            skill_dir.join("SKILL.md"),
+            skill_md(
+                "alpha",
+                "Alpha skill before refresh.",
+                "Original instructions.",
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+
+        let mgr = SkillManager::new(root.clone());
+
+        // A direct read loads a newly created skill without requiring a separate full reload.
+        mgr.call_raw(mock_ctx(), json!({"name": "alpha"}), Vec::new())
+            .await
+            .unwrap();
+        let before = mgr
+            .get_lowercase("skill_alpha")
+            .expect("the directly read skill must be callable");
+        assert!(before.instructions.contains("Original instructions."));
+
+        tokio::fs::write(
+            skill_dir.join("SKILL.md"),
+            skill_md(
+                "alpha",
+                "Alpha skill after refresh.",
+                "Updated instructions.",
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        mgr.call_raw(mock_ctx(), json!({"name": "alpha"}), Vec::new())
+            .await
+            .unwrap();
+
+        let after = mgr
+            .get_lowercase("skill_alpha")
+            .expect("the refreshed skill must remain callable");
+        assert_eq!(after.description, "Alpha skill after refresh.");
+        assert!(after.instructions.contains("Updated instructions."));
+        assert!(
+            Arc::ptr_eq(&before.subsessions, &after.subsessions),
+            "refreshing instructions must not disconnect live sessions"
+        );
+        assert_eq!(
+            mgr.definitions(Some(&["skill_alpha".to_string()]))[0].description,
+            after.definition().description
+        );
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
     }
 
     #[tokio::test]

@@ -203,6 +203,23 @@ impl Conversation {
 
     /// Converts mutable conversation fields into AndaDB update values.
     pub fn to_changes(&self) -> Result<BTreeMap<String, Fv>, BoxError> {
+        self.to_changes_with_inbound_queues(true)
+    }
+
+    /// Builds runner-owned changes without overwriting concurrently queued steering/follow-ups.
+    ///
+    /// The memory API owns those inbound queue fields, while a running conversation recorder
+    /// normally holds a snapshot that never loaded them. Omitting the fields keeps the database's
+    /// current queues intact; all other mutable state, including clearing a stale failure reason,
+    /// is still persisted.
+    pub(crate) fn to_runner_changes(&self) -> Result<BTreeMap<String, Fv>, BoxError> {
+        self.to_changes_with_inbound_queues(false)
+    }
+
+    fn to_changes_with_inbound_queues(
+        &self,
+        include_inbound_queues: bool,
+    ) -> Result<BTreeMap<String, Fv>, BoxError> {
         let messages = cbor!(self.messages).map_err(|err| format!("encode messages: {err}"))?;
         let resources = cbor!(self.resources).map_err(|err| format!("encode resources: {err}"))?;
         let artifacts = cbor!(self.artifacts).map_err(|err| format!("encode artifacts: {err}"))?;
@@ -244,16 +261,15 @@ impl Conversation {
             ),
         ]);
 
-        // `steering_messages` and `follow_up_messages` are inbound queues owned by a different
-        // writer (`memory_api`'s Steer/FollowUp handlers), and a persisting runner typically
-        // holds a `Conversation` that never loaded them. `Collection::update` merges by field,
-        // so emitting `Fv::Null` for a local `None` would erase a message the user just queued
-        // and was told was accepted. Write them only when this writer actually has a value.
-        if let Some(msg) = self.steering_messages.clone() {
-            changes.insert("steering_messages".to_string(), msg.into());
-        }
-        if let Some(msg) = self.follow_up_messages.clone() {
-            changes.insert("follow_up_messages".to_string(), msg.into());
+        if include_inbound_queues {
+            changes.insert(
+                "steering_messages".to_string(),
+                self.steering_messages.clone().map_or(Fv::Null, Into::into),
+            );
+            changes.insert(
+                "follow_up_messages".to_string(),
+                self.follow_up_messages.clone().map_or(Fv::Null, Into::into),
+            );
         }
 
         if let Some(child) = self.child {
@@ -2073,7 +2089,7 @@ mod tests {
             updated_at: 1_700_000_000_010,
             ..Default::default()
         };
-        let changes = sparse.to_changes().unwrap();
+        let changes = sparse.to_runner_changes().unwrap();
         // The steer/follow-up queues belong to `memory_api`, so a writer that has no value
         // for them must omit the key entirely rather than clearing what the user queued.
         assert!(!changes.contains_key("steering_messages"));
@@ -2083,6 +2099,17 @@ mod tests {
         assert!(!changes.contains_key("child"));
         // A cleared reason must be written so a stale failure does not survive a later success.
         assert!(matches!(changes.get("failed_reason"), Some(Fv::Null)));
+
+        // The public full-snapshot conversion retains its original ability to clear queues.
+        let full_changes = sparse.to_changes().unwrap();
+        assert!(matches!(
+            full_changes.get("steering_messages"),
+            Some(Fv::Null)
+        ));
+        assert!(matches!(
+            full_changes.get("follow_up_messages"),
+            Some(Fv::Null)
+        ));
     }
 
     #[test]
