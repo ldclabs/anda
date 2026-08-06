@@ -89,6 +89,10 @@ pub struct CompletionRequest {
     ///   reasoning round.
     /// - Every adapter must send `raw_history` **before** the messages converted from
     ///   `chat_history`, so provider state stays intact for the whole round.
+    /// - It belongs to the model that produced it. Adapters send it verbatim, so handing one
+    ///   provider another's messages makes the request unparseable and the provider rejects the
+    ///   whole call. A caller that reroutes a live conversation to a different model must clear
+    ///   this field and replay `chat_history` instead.
     /// - It is scoped to one in-process round only: the engine clears it at the RPC boundary
     ///   and it is `#[serde(skip)]` on `AgentOutput`, so it never reaches a persisted
     ///   conversation or a remote caller.

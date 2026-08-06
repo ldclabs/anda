@@ -2313,6 +2313,45 @@ impl CompletionRunner {
         Ok(true)
     }
 
+    /// Re-resolves the routed model for the upcoming turn, dropping accumulated
+    /// provider-native history when the routing lands on a different model.
+    ///
+    /// The registry behind [`Models::resolve`](crate::model::Models::resolve) is live: a host can
+    /// swap the active model (or reload its model configs) while a long-lived runner is mid
+    /// conversation, so the model that serves the next turn is not necessarily the one that served
+    /// the last. [`CompletionRequest::raw_history`] holds the previous model's *own* message JSON
+    /// — OpenAI `input_text` parts, Anthropic content blocks, Gemini parts — and replaying that to
+    /// a different provider makes the request unparseable, so the provider rejects the whole call
+    /// (`unknown variant 'input_text'`) and the conversation is wedged until the process restarts.
+    ///
+    /// So when the model changes, the raw history is dropped and the provider-neutral
+    /// [`Self::chat_history`] is replayed in its place. That costs the round its per-turn opaque
+    /// state (thinking signatures and the like) — the very thing `raw_history` exists to preserve —
+    /// but a resumed conversation already replays without it, and adapters must tolerate that.
+    ///
+    /// `self.req.chat_history` is always a subset of `self.chat_history` here (the only writer,
+    /// [`Self::commit_tool_outputs_to_history`], appends to both), so overwriting it neither
+    /// duplicates nor drops a message.
+    fn sync_model_for_next_turn(&mut self) {
+        let label = self.req.model.as_deref().unwrap_or(&self.ctx.label);
+        let Some(model) = self.ctx.models.resolve(label) else {
+            return;
+        };
+
+        if model.model_name() != self.model.model_name() && !self.req.raw_history.is_empty() {
+            log::info!(
+                "model changed from {} to {}, replaying the provider-neutral chat history",
+                self.model.model_name(),
+                model.model_name()
+            );
+            self.req.raw_history.clear();
+            self.pending_tool_call_raw_history_start = None;
+            self.req.chat_history = self.chat_history.clone();
+        }
+
+        self.model = model;
+    }
+
     fn commit_tool_outputs_to_history(&mut self) {
         if self.req.role.as_deref() != Some("tool") || self.req.content.is_empty() {
             return;
@@ -2362,17 +2401,14 @@ impl CompletionRunner {
             }
         }
 
+        self.sync_model_for_next_turn();
+
         self.turns += 1;
         let mut req = self.req.clone();
         if !pending_tool_calls && let Some(implicit_context) = self.implicit_context.take() {
             req.chat_history.push(implicit_context);
         }
         self.merge_discovered_tools_into_request(&mut req);
-
-        let label = req.model.as_ref().unwrap_or(&self.ctx.label);
-        if let Some(model) = self.ctx.models.resolve(label) {
-            self.model = model;
-        }
 
         let mut output = self.model.completion(req).await?;
         output.model = Some(self.model.model_name());
@@ -6502,6 +6538,132 @@ mod tests {
         let mut runner = ctx.completion_iter(req, Vec::new());
         let output = runner.next().await.unwrap().unwrap();
         assert_eq!(output.model, Some("echo".to_string()));
+    }
+
+    // ── Live model switching ──
+
+    /// Completer standing in for a provider adapter: it records every request it
+    /// receives and answers with both the normalized `chat_history` and its own
+    /// provider-native `raw_history`, tagged with the model name so a test can
+    /// tell whose messages ended up on the wire.
+    #[derive(Clone, Debug)]
+    struct ProviderCompleter {
+        name: &'static str,
+        requests: Arc<Mutex<Vec<CompletionRequest>>>,
+    }
+
+    impl CompletionFeaturesDyn for ProviderCompleter {
+        fn model_name(&self) -> String {
+            self.name.to_string()
+        }
+
+        fn completion(
+            &self,
+            req: CompletionRequest,
+        ) -> anda_core::BoxPinFut<Result<AgentOutput, BoxError>> {
+            self.requests.lock().unwrap().push(req);
+            let name = self.name;
+            Box::pin(futures::future::ready(Ok(AgentOutput {
+                content: format!("{name} replied"),
+                chat_history: vec![Message {
+                    role: "assistant".to_string(),
+                    content: vec![ContentPart::Text {
+                        text: format!("{name} replied"),
+                    }],
+                    ..Default::default()
+                }],
+                raw_history: vec![json!({"provider": name})],
+                ..Default::default()
+            })))
+        }
+    }
+
+    fn provider_model(
+        name: &'static str,
+        requests: Arc<Mutex<Vec<CompletionRequest>>>,
+    ) -> (Model, Arc<ProviderCompleter>) {
+        let completer = Arc::new(ProviderCompleter { name, requests });
+        (Model::with_completer(completer.clone()), completer)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_drops_raw_history_when_the_active_model_changes() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (first, _) = provider_model("provider_a", requests.clone());
+        let (second, _) = provider_model("provider_b", requests.clone());
+
+        let ctx = EngineBuilder::new().with_model(first).mock_ctx();
+        let mut runner = ctx.clone().completion_iter(
+            CompletionRequest {
+                prompt: "hello".to_string(),
+                ..Default::default()
+            },
+            Vec::new(),
+        );
+        runner.set_unbound(true);
+
+        let output = runner.next().await.unwrap().unwrap();
+        assert_eq!(output.model.as_deref(), Some("provider_a"));
+        // The first provider's own message JSON is now carried into the next turn.
+        assert_eq!(
+            runner.req.raw_history,
+            vec![json!({"provider": "provider_a"})]
+        );
+
+        // The host swaps the active model mid conversation, exactly as a runtime
+        // model switch or a config reload does.
+        ctx.models.set_model(second);
+        runner.follow_up("and now?".to_string());
+
+        let output = runner.next().await.unwrap().unwrap();
+        assert_eq!(output.model.as_deref(), Some("provider_b"));
+
+        // Provider B must never be handed provider A's messages.
+        let seen = requests.lock().unwrap();
+        let switched = seen.last().unwrap();
+        assert!(switched.raw_history.is_empty());
+        // ...and the conversation is replayed to it in the neutral format instead.
+        assert_eq!(
+            switched
+                .chat_history
+                .iter()
+                .flat_map(|msg| msg.content.iter())
+                .filter_map(|part| match part {
+                    ContentPart::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec!["provider_a replied"]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_keeps_raw_history_when_the_model_is_unchanged() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (model, completer) = provider_model("provider_a", requests.clone());
+
+        let ctx = EngineBuilder::new().with_model(model).mock_ctx();
+        let mut runner = ctx.clone().completion_iter(
+            CompletionRequest {
+                prompt: "hello".to_string(),
+                ..Default::default()
+            },
+            Vec::new(),
+        );
+        runner.set_unbound(true);
+        runner.next().await.unwrap().unwrap();
+
+        // A config reload rebuilds the adapters; same model name, so the accumulated
+        // provider state stays usable and must survive.
+        ctx.models
+            .set_model(Model::with_completer(Arc::new((*completer).clone())));
+        runner.follow_up("and now?".to_string());
+        runner.next().await.unwrap().unwrap();
+
+        let seen = requests.lock().unwrap();
+        let second = seen.last().unwrap();
+        assert_eq!(second.raw_history, vec![json!({"provider": "provider_a"})]);
+        assert!(second.chat_history.is_empty());
     }
 
     // ── Multiple tool calls in parallel ──
