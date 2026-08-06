@@ -74,6 +74,13 @@ approval UX, and launcher behavior belong in downstream applications such as
 
 - Use `rmcp` for MCP client behavior. Do not hand-roll JSON-RPC transports.
 - Support MCP tools through `tools/list` and `tools/call`.
+- Keep both protocol generations working: the stateless `2026-07-28` lifecycle
+  (`server/discover`, per-request `_meta`, `subscriptions/listen`) and the legacy
+  `initialize` handshake. Negotiate `2026-07-28` only through discovery, and keep
+  the fallback path for servers that neither implement nor cleanly refuse it.
+- Keep a bound on anything a remote server can leave pending — the discovery
+  probe, a subscription acknowledgment, task polling — so one server cannot wedge
+  session setup or a tool call.
 - Keep stdio transport as `command + args`; do not construct shell strings.
 - Keep Streamable HTTP headers validated before connecting.
 - Treat remote MCP descriptions, annotations, and output as untrusted metadata.

@@ -4,9 +4,30 @@
 //! tools from configured MCP servers, maps them to legal Anda function names,
 //! and dispatches calls back to the original MCP tool name. Each server is also
 //! exposed as a [`ToolGroup`] (carrying its title and `instructions` from the
-//! initialize handshake) so the discovery layer can present a server's tools as
-//! a coherent capability bundle. It intentionally does not expose deprecated MCP
-//! client utility capabilities such as Roots, Sampling, or Logging control.
+//! handshake) so the discovery layer can present a server's tools as a coherent
+//! capability bundle. It intentionally does not expose deprecated MCP client
+//! utility capabilities such as Roots, Sampling, or Logging control.
+//!
+//! # Protocol revisions
+//!
+//! The host speaks MCP `2026-07-28` and the older `initialize`-based revisions.
+//! `2026-07-28` made the protocol stateless: there is no `initialize` handshake
+//! and no session header, servers advertise themselves through `server/discover`,
+//! and `notifications/tools/list_changed` only reaches a client that opened a
+//! `subscriptions/listen` stream for it. [`McpLifecycle`] selects how a server is
+//! approached; the default probes the modern lifecycle and falls back to the
+//! legacy handshake, so both server generations work unchanged.
+//!
+//! Two `2026-07-28` response shapes replace what used to be a plain result:
+//!
+//! - MRTR (SEP-2322) `input_required` rounds. This host advertises neither
+//!   Sampling, Elicitation, nor Roots, so a round that genuinely asks for input
+//!   comes back as a tool-level error; a round that only carries `requestState`
+//!   is echoed back and the call continues.
+//! - Tasks (SEP-2663). Opt in per server with [`McpTasksConfig`]; the provider
+//!   then polls `tasks/get` until the task finishes, so a long-running tool no
+//!   longer has to hold its response open. Without the opt-in the extension is
+//!   not declared and servers must answer inline.
 //!
 //! # Authentication
 //!
@@ -22,6 +43,22 @@
 //!   consumes the redirect via [`McpToolProvider::complete_authorization`]. The
 //!   consuming application owns the browser, the redirect callback, and — via
 //!   [`McpCredentialStore`] — where tokens are persisted.
+//!
+//! The browser does not have to run on the machine hosting the engine. On a
+//! headless server (a user attached over SSH, say), present the authorization
+//! URL as text; the user opens it in their local browser and either tunnels the
+//! loopback redirect back with `ssh -L`, or simply pastes the final redirect URL
+//! — code and state are in its query string — into the conversation for
+//! [`complete_authorization`]. No listener is required for the paste variant.
+//!
+//! Re-authorization needs no special mode: [`begin_authorization`] can run at
+//! any time, valid token or not, and completing the flow persists the new grant
+//! and drops the live session so the next call uses it. To force a from-scratch
+//! consent instead of a silent refresh, call
+//! [`McpToolProvider::clear_credentials`] first.
+//!
+//! [`begin_authorization`]: McpToolProvider::begin_authorization
+//! [`complete_authorization`]: McpToolProvider::complete_authorization
 //!
 //! # Example
 //!
@@ -73,13 +110,15 @@ use http::{HeaderName, HeaderValue};
 use parking_lot::{Mutex as SyncMutex, RwLock};
 use reqwest::Client as ReqwestClient;
 use rmcp::{
-    ClientHandler, RoleClient,
+    ClientHandler, Peer, RoleClient,
     model::{
-        CallToolRequestParams, CallToolResult, ClientInfo, Implementation, ServerPeerInfo,
-        Tool as McpTool,
+        CallToolRequestParams, CallToolResponse, CallToolResult, CancelTaskParams, ClientInfo,
+        ContentBlock, CreateTaskResult, DEFAULT_MRTR_MAX_ROUNDS, ExtensionCapabilities,
+        GetTaskParams, Implementation, InputRequiredResult, ProtocolVersion, ServerNotification,
+        ServerPeerInfo, SubscriptionFilter, TASKS_EXTENSION_ID, TaskPayload, Tool as McpTool,
     },
-    serve_client,
-    service::RunningService,
+    serve_client_with_lifecycle,
+    service::{ClientInitializeError, ClientLifecycleMode, RunningService, Subscription},
     transport::{
         AuthClient, AuthError, AuthorizationManager, ClientCredentialsConfig, CredentialStore,
         StreamableHttpClientTransport, TokioChildProcess,
@@ -123,6 +162,70 @@ const CLIENT_CREDENTIALS_RENEW_BUFFER: Duration = Duration::from_secs(120);
 
 /// Minimum buffer that stays just ahead of rmcp's 30-second proactive refresh threshold.
 const CLIENT_CREDENTIALS_MIN_RENEW_BUFFER: Duration = Duration::from_secs(31);
+
+/// How long a `server/discover` opener may go unanswered before the attempt is
+/// abandoned.
+///
+/// A server that predates `2026-07-28` is not obliged to reject an unknown
+/// method: plenty of them read the line, match nothing, and wait for the next
+/// one, which would leave the handshake pending forever. Bounding the probe turns
+/// that into a fallback ([`McpLifecycle::Auto`]) or an error
+/// ([`McpLifecycle::Discover`]). Pin `initialize` to skip the wait entirely.
+const DISCOVERY_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long to wait for a `subscriptions/listen` acknowledgment before giving up
+/// on live `tools/list_changed` delivery for that session.
+const SUBSCRIPTION_ACK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Delay before reopening a `subscriptions/listen` stream that ended while the
+/// session is still usable. The streams are not resumable, so reopening is the
+/// only way back to live `tools/list_changed` delivery.
+const SUBSCRIPTION_REOPEN_DELAY: Duration = Duration::from_secs(2);
+
+/// How long a subscription stream must last to count as working. Above this, a
+/// server is just recycling idle streams and reopening is expected; below it,
+/// the peer is ending streams as fast as they are opened.
+const SUBSCRIPTION_HEALTHY_LIFETIME: Duration = Duration::from_secs(30);
+
+/// Consecutive short-lived streams tolerated before the pump stops reopening.
+const MAX_SHORT_LIVED_SUBSCRIPTIONS: usize = 5;
+
+/// Pause between MRTR rounds that carry only `requestState`, i.e. the server
+/// asking to be polled rather than asking for input.
+const MRTR_STATE_ROUND_DELAY: Duration = Duration::from_millis(200);
+
+/// Poll interval used when a task suggests none, plus the bounds applied to a
+/// server-suggested one. A remote server controls `pollIntervalMs`, so it is
+/// clamped instead of trusted.
+const TASK_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const TASK_POLL_INTERVAL_MIN: Duration = Duration::from_millis(250);
+const TASK_POLL_INTERVAL_MAX: Duration = Duration::from_secs(10);
+
+/// Default ceiling on how long one tool call waits for a task to finish.
+const DEFAULT_TASK_MAX_WAIT_SECS: u64 = 300;
+
+/// Hard ceiling on a configured `max_wait_secs`.
+///
+/// A tool call blocks for the whole wait, so a day is already far past anything
+/// sane; the bound also keeps the poll deadline from overflowing `Instant`.
+const MAX_TASK_MAX_WAIT_SECS: u64 = 24 * 60 * 60;
+
+/// Protocol revisions this host offers `server/discover`, newest first.
+///
+/// `2025-11-25` stays in the list so a peer that implements the discovery RPC but
+/// not the stateless revision still negotiates a usable version.
+fn preferred_protocol_versions() -> Vec<ProtocolVersion> {
+    vec![ProtocolVersion::V_2026_07_28, ProtocolVersion::V_2025_11_25]
+}
+
+/// Revision proposed by the legacy `initialize` handshake.
+///
+/// `2026-07-28` is deliberately not proposed here: it is only negotiated through
+/// `server/discover`, which proves the peer implements the stateless lifecycle
+/// rather than relying on it echoing back a version it does not serve.
+fn legacy_protocol_version() -> ProtocolVersion {
+    ProtocolVersion::V_2025_11_25
+}
 
 /// Dynamic tool provider backed by one or more MCP servers.
 #[derive(Clone)]
@@ -241,6 +344,11 @@ impl McpToolProvider {
         // means a concurrent change re-arms the flag and is picked up by the next refresh.
         if clear_dirty {
             session.dirty.store(false, Ordering::SeqCst);
+            // SEP-2549 lets a server declare `tools/list` fresh for `ttlMs`, which rmcp
+            // honors with a client-side response cache. An explicit refresh promises a
+            // live listing, so drop the cache first. The notification-driven path keeps
+            // it, since rmcp already invalidates the tool cache on `tools/list_changed`.
+            peer.clear_response_cache().await;
         }
 
         // Capture the server's self-description (title, instructions) from the
@@ -367,19 +475,71 @@ impl McpToolProvider {
             return Ok(session);
         }
 
+        let attempt = match self.connect(config, config.lifecycle.into_mode()).await {
+            Ok(session) => Ok(session),
+            // A pre-2026-07-28 server can answer the `server/discover` opener with
+            // something other than a JSON-RPC "method not found" — an HTTP error, or,
+            // over stdio, by rejecting the message and exiting — which rmcp's in-band
+            // fallback cannot recover from because the transport itself is gone. Retry
+            // once on a fresh transport with the legacy handshake. A failed
+            // authorization is not a lifecycle problem, so it is reported as-is.
+            Err(err)
+                if config.lifecycle == McpLifecycle::Auto
+                    && !is_authorization_error(err.as_ref()) =>
+            {
+                log::info!(
+                    "MCP server {}: discovery lifecycle failed ({err}); retrying with the legacy initialize handshake",
+                    config.id
+                );
+                self.connect(config, ClientLifecycleMode::Initialize).await
+            }
+            Err(err) => Err(err),
+        };
+        let session = attempt.map_err(|err| authorization_required_hint(config, err))?;
+
+        self.inner
+            .index
+            .write()
+            .sessions
+            .insert(config.id.clone(), session.clone());
+        Ok(session)
+    }
+
+    /// Establishes one session over a freshly built transport.
+    ///
+    /// Each attempt needs its own transport: an stdio child that refused the
+    /// opener has already exited, and a streamable-HTTP worker binds its lifecycle
+    /// mode when it sends the first message.
+    async fn connect(
+        &self,
+        config: &McpServerConfig,
+        lifecycle: ClientLifecycleMode,
+    ) -> Result<Arc<McpSession>, BoxError> {
         let dirty = Arc::new(AtomicBool::new(false));
-        let handler = AndaMcpClient::new(dirty.clone());
+        let handler = AndaMcpClient::new(dirty.clone(), config.tasks.is_some());
+        // Only a discovery opener can go unanswered by a server that does not know
+        // it; the legacy handshake is answered or refused by every MCP server.
+        let probe_timeout = (!matches!(lifecycle, ClientLifecycleMode::Initialize))
+            .then_some(DISCOVERY_PROBE_TIMEOUT);
         let mut expires_at = None;
         let service = match &config.transport {
             McpTransportConfig::Stdio(stdio) => {
                 let transport = TokioChildProcess::new(stdio.command())?;
-                serve_client(handler, transport).await?
+                serve_bounded(
+                    serve_client_with_lifecycle(handler, transport, lifecycle),
+                    probe_timeout,
+                )
+                .await?
             }
             McpTransportConfig::StreamableHttp(http) => match &http.auth {
                 None => {
                     let transport =
                         StreamableHttpClientTransport::from_config(http.transport_config()?);
-                    serve_client(handler, transport).await?
+                    serve_bounded(
+                        serve_client_with_lifecycle(handler, transport, lifecycle),
+                        probe_timeout,
+                    )
+                    .await?
                 }
                 Some(McpOAuthConfig::ClientCredentials(cc)) => {
                     // Headless: obtain a token at connection time, no human loop. The grant
@@ -391,7 +551,11 @@ impl McpToolProvider {
                         AuthClient::new(ReqwestClient::new(), manager),
                         http.base_transport_config()?,
                     );
-                    serve_client(handler, transport).await?
+                    serve_bounded(
+                        serve_client_with_lifecycle(handler, transport, lifecycle),
+                        probe_timeout,
+                    )
+                    .await?
                 }
                 Some(McpOAuthConfig::AuthorizationCode(_)) => {
                     // Interactive: reuse credentials persisted by a prior
@@ -401,22 +565,77 @@ impl McpToolProvider {
                         AuthClient::new(ReqwestClient::new(), manager),
                         http.base_transport_config()?,
                     );
-                    serve_client(handler, transport).await?
+                    serve_bounded(
+                        serve_client_with_lifecycle(handler, transport, lifecycle),
+                        probe_timeout,
+                    )
+                    .await?
                 }
             },
         };
 
-        let session = Arc::new(McpSession {
+        let subscription = self
+            .subscribe_tool_changes(&config.id, service.peer(), dirty.clone())
+            .await;
+        Ok(Arc::new(McpSession {
             service: Mutex::new(service),
             dirty,
             expires_at,
-        });
-        self.inner
-            .index
-            .write()
-            .sessions
-            .insert(config.id.clone(), session.clone());
-        Ok(session)
+            subscription,
+        }))
+    }
+
+    /// Opens the `tools/list_changed` stream on a peer that requires one.
+    ///
+    /// SEP-2575 removed the unsolicited server-push channel: on `2026-07-28` a
+    /// list-changed notification is only delivered on a `subscriptions/listen`
+    /// stream the client asked for, so without this the route table would silently
+    /// go stale. Older peers keep pushing the notification into the handler
+    /// callback and need no stream. A failure here costs live updates, not the
+    /// session, so it is logged rather than propagated.
+    async fn subscribe_tool_changes(
+        &self,
+        server_id: &str,
+        peer: &Peer<RoleClient>,
+        dirty: Arc<AtomicBool>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        if !needs_tool_subscription(peer.peer_info().as_deref()) {
+            return None;
+        }
+
+        // A server that accepts the request but never acknowledges it must not wedge
+        // session establishment, so the wait is bounded like the discovery probe.
+        match tokio::time::timeout(
+            SUBSCRIPTION_ACK_TIMEOUT,
+            peer.listen(tool_subscription_filter()),
+        )
+        .await
+        {
+            Ok(Ok(subscription)) => {
+                let peer = peer.clone();
+                let server_id = server_id.to_string();
+                Some(tokio::spawn(pump_tool_subscription(
+                    server_id,
+                    peer,
+                    subscription,
+                    dirty,
+                )))
+            }
+            Ok(Err(err)) => {
+                log::warn!(
+                    "MCP server {server_id}: could not subscribe to tools/list_changed: {err}"
+                );
+                None
+            }
+            Err(_) => {
+                log::warn!(
+                    "MCP server {server_id}: tools/list_changed subscription was not acknowledged \
+                     within {}s",
+                    SUBSCRIPTION_ACK_TIMEOUT.as_secs()
+                );
+                None
+            }
+        }
     }
 
     /// Probes an HTTP MCP endpoint to determine whether it requires OAuth.
@@ -510,6 +729,12 @@ impl McpToolProvider {
     /// sessions establish without further interaction. The pending in-memory
     /// state is consumed whether or not the exchange succeeds; on failure, call
     /// [`Self::begin_authorization`] again.
+    ///
+    /// Any live session for the server is dropped afterwards: a session pins the
+    /// token it connected with, so without the drop, freshly granted credentials
+    /// (a re-authorization for new scopes, for example) would not take effect
+    /// until the old session happened to die. The next refresh or tool call
+    /// reconnects with the new credentials.
     pub async fn complete_authorization(
         &self,
         server_id: &str,
@@ -530,6 +755,7 @@ impl McpToolProvider {
                 callback.issuer.as_deref(),
             )
             .await?;
+        self.disconnect_server(server_id).await;
         Ok(())
     }
 
@@ -538,6 +764,48 @@ impl McpToolProvider {
     /// Returns whether a pending flow was actually cancelled.
     pub fn cancel_authorization(&self, server_id: &str) -> bool {
         self.inner.pending_auth.lock().remove(server_id).is_some()
+    }
+
+    /// Drops the cached session for `server_id`, keeping the server registered
+    /// and its discovered routes intact. Returns whether a session existed.
+    ///
+    /// The next refresh or tool call re-establishes the session from scratch,
+    /// re-running credential acquisition against the [`McpCredentialStore`] (or
+    /// the Client Credentials exchange). In-flight tool calls on the old session
+    /// finish undisturbed; the connection is torn down once they complete.
+    pub async fn disconnect_server(&self, server_id: &str) -> bool {
+        // Hold the per-server connect lock while dropping the session. `ensure_session`
+        // keeps that lock across the handshake *and* the insert, so without it a
+        // reconnect already in flight would install its session — built with the
+        // credentials this call means to retire — right after the removal.
+        let connect_lock = self.inner.connect_locks.read().get(server_id).cloned();
+        let _guard = match &connect_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+        self.inner
+            .index
+            .write()
+            .sessions
+            .remove(server_id)
+            .is_some()
+    }
+
+    /// Removes the persisted OAuth credentials for `server_id` and drops its
+    /// session, forcing the next connection to start from a clean slate.
+    ///
+    /// For an Authorization Code server this is the "sign out / re-consent"
+    /// primitive: the next session attempt fails with
+    /// [`McpAuthorizationRequired`] until [`begin_authorization`] /
+    /// [`complete_authorization`] run again — regardless of whether the
+    /// discarded access token was still valid.
+    ///
+    /// [`begin_authorization`]: Self::begin_authorization
+    /// [`complete_authorization`]: Self::complete_authorization
+    pub async fn clear_credentials(&self, server_id: &str) -> Result<(), BoxError> {
+        self.inner.credential_store.clear(server_id).await?;
+        self.disconnect_server(server_id).await;
+        Ok(())
     }
 
     fn scoped_store(&self, server_id: &str) -> ScopedCredentialStore {
@@ -770,7 +1038,7 @@ impl McpToolProvider {
             let service = session.service.lock().await;
             service.peer().clone()
         };
-        let result = peer.call_tool(params).await?;
+        let result = call_tool_rounds(&route, &peer, params, config.tasks.as_ref()).await?;
         Ok(mcp_result_to_tool_output(&route, result))
     }
 
@@ -808,6 +1076,151 @@ impl McpToolProvider {
         self.inner.connect_locks.write().remove(server_id);
         self.inner.index.write().remove_server(server_id);
         self.inner.pending_auth.lock().remove(server_id);
+    }
+}
+
+/// Drives one `tools/call` until the server produces a result.
+///
+/// Before `2026-07-28` that took a single round trip. The revision adds two
+/// intermediate answers: an MRTR `input_required` result (SEP-2322) and a task
+/// handle (SEP-2663). Both are resolved here so the caller still sees one
+/// [`CallToolResult`].
+async fn call_tool_rounds(
+    route: &McpToolRoute,
+    peer: &Peer<RoleClient>,
+    mut params: CallToolRequestParams,
+    tasks: Option<&McpTasksConfig>,
+) -> Result<CallToolResult, BoxError> {
+    for _ in 0..DEFAULT_MRTR_MAX_ROUNDS {
+        match peer.call_tool_once(params.clone()).await? {
+            CallToolResponse::Complete(result) => return Ok(result),
+            CallToolResponse::InputRequired(result) => {
+                // A round carrying actual `inputRequests` wants Sampling,
+                // Elicitation, or Roots, none of which this host advertises. Report
+                // it as a tool-level error the model can act on instead of failing
+                // the turn. A round with only `requestState` is the server asking to
+                // be polled: echo the state back and continue.
+                if result
+                    .input_requests
+                    .as_ref()
+                    .is_some_and(|requests| !requests.is_empty())
+                {
+                    return Ok(input_required_error(route, &result));
+                }
+                let Some(request_state) = result.request_state else {
+                    return Err(format!(
+                        "MCP tool {} returned an input_required result with neither \
+                         input requests nor request state",
+                        route.name
+                    )
+                    .into());
+                };
+                params.request_state = Some(request_state);
+                params.input_responses = None;
+                tokio::time::sleep(MRTR_STATE_ROUND_DELAY).await;
+            }
+            CallToolResponse::Task(task) => {
+                return await_task(route, peer, task, tasks).await;
+            }
+            other => {
+                return Err(format!(
+                    "MCP tool {} returned an unsupported response: {other:?}",
+                    route.name
+                )
+                .into());
+            }
+        }
+    }
+
+    Err(format!(
+        "MCP tool {} did not complete within {DEFAULT_MRTR_MAX_ROUNDS} input_required rounds",
+        route.name
+    )
+    .into())
+}
+
+/// Polls a SEP-2663 task to a terminal state and returns its tool result.
+///
+/// The task is cancelled best-effort whenever this host walks away from it, so
+/// an abandoned task does not keep running on the server.
+async fn await_task(
+    route: &McpToolRoute,
+    peer: &Peer<RoleClient>,
+    created: CreateTaskResult,
+    tasks: Option<&McpTasksConfig>,
+) -> Result<CallToolResult, BoxError> {
+    let task_id = created.task.task_id.clone();
+    let Some(tasks) = tasks else {
+        cancel_task(peer, &task_id).await;
+        return Err(format!(
+            "MCP tool {} returned a task handle, but the tasks extension is not enabled \
+             for server {}",
+            route.name, route.server_id
+        )
+        .into());
+    };
+
+    let max_wait = tasks.max_wait();
+    let deadline = Instant::now() + max_wait;
+    let mut interval = task_poll_interval(created.task.poll_interval_ms);
+    loop {
+        if Instant::now() + interval > deadline {
+            cancel_task(peer, &task_id).await;
+            return Err(format!(
+                "MCP tool {} task {task_id} did not finish within {}s",
+                route.name,
+                max_wait.as_secs()
+            )
+            .into());
+        }
+        tokio::time::sleep(interval).await;
+
+        let task = peer
+            .get_task(GetTaskParams::new(task_id.clone()))
+            .await?
+            .task;
+        interval = task_poll_interval(task.task.poll_interval_ms);
+        match task.payload {
+            TaskPayload::Working => continue,
+            TaskPayload::Completed { result } => {
+                // The payload mirrors the result of the original request, so it
+                // deserializes as the `tools/call` result it stands in for.
+                return serde_json::from_value(Json::Object(result)).map_err(|err| {
+                    format!(
+                        "MCP tool {} returned an unreadable task result: {err}",
+                        route.name
+                    )
+                    .into()
+                });
+            }
+            TaskPayload::Failed { error } => {
+                return Err(format!(
+                    "MCP tool {} task {task_id} failed: {}",
+                    route.name,
+                    Json::Object(error)
+                )
+                .into());
+            }
+            TaskPayload::Cancelled => {
+                return Err(format!("MCP tool {} task {task_id} was cancelled", route.name).into());
+            }
+            TaskPayload::InputRequired { input_requests } => {
+                // Same reasoning as the MRTR round above: nothing here can answer a
+                // sampling, elicitation, or roots request.
+                cancel_task(peer, &task_id).await;
+                return Ok(unsupported_input_error(
+                    route,
+                    input_requests.keys().map(String::as_str),
+                ));
+            }
+            _ => {
+                return Err(format!(
+                    "MCP tool {} task {task_id} reported an unsupported status",
+                    route.name
+                )
+                .into());
+            }
+        }
     }
 }
 
@@ -1152,6 +1565,19 @@ struct McpSession {
     ///
     /// Only set for the Client Credentials flow, whose grant issues no refresh token.
     expires_at: Option<Instant>,
+    /// Task draining the `subscriptions/listen` stream, for peers that require one
+    /// to deliver `tools/list_changed` (2026-07-28 and newer).
+    subscription: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for McpSession {
+    fn drop(&mut self) {
+        // The pump holds a peer clone and would otherwise outlive the session it
+        // feeds; dropping its `Subscription` also cancels the server-side stream.
+        if let Some(subscription) = &self.subscription {
+            subscription.abort();
+        }
+    }
 }
 
 impl McpSession {
@@ -1184,10 +1610,21 @@ struct AndaMcpClient {
 }
 
 impl AndaMcpClient {
-    fn new(dirty: Arc<AtomicBool>) -> Self {
+    fn new(dirty: Arc<AtomicBool>, tasks: bool) -> Self {
         let mut info = ClientInfo::default();
         info.client_info = Implementation::new("anda_engine", env!("CARGO_PKG_VERSION"))
             .with_title("Anda Engine MCP Host");
+        // Only the legacy handshake reads this; the discovery lifecycle proposes
+        // `preferred_protocol_versions` instead. Capabilities are sent either way —
+        // in the `initialize` params, or in each request's `_meta` when the peer
+        // negotiated the stateless revision.
+        info.protocol_version = legacy_protocol_version();
+        if tasks {
+            info.capabilities
+                .extensions
+                .get_or_insert_with(ExtensionCapabilities::new)
+                .insert(TASKS_EXTENSION_ID.to_string(), Map::new());
+        }
         Self { info, dirty }
     }
 }
@@ -1219,6 +1656,13 @@ pub struct McpServerConfig {
     /// Optional remote tool denylist.
     #[serde(default)]
     pub exclude: BTreeSet<String>,
+    /// How the session negotiates the MCP protocol revision.
+    #[serde(default)]
+    pub lifecycle: McpLifecycle,
+    /// SEP-2663 tasks extension. Omitted (the default) leaves the extension
+    /// undeclared, so the server must answer `tools/call` inline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tasks: Option<McpTasksConfig>,
 }
 
 impl McpServerConfig {
@@ -1232,6 +1676,8 @@ impl McpServerConfig {
             }),
             include: BTreeSet::new(),
             exclude: BTreeSet::new(),
+            lifecycle: McpLifecycle::default(),
+            tasks: None,
         }
     }
 
@@ -1245,6 +1691,8 @@ impl McpServerConfig {
             }),
             include: BTreeSet::new(),
             exclude: BTreeSet::new(),
+            lifecycle: McpLifecycle::default(),
+            tasks: None,
         }
     }
 
@@ -1254,6 +1702,78 @@ impl McpServerConfig {
             return Err("MCP server id must not be empty".into());
         }
         self.transport.validate()
+    }
+}
+
+/// How a session negotiates the MCP protocol revision.
+///
+/// `2026-07-28` replaced the `initialize` handshake with a `server/discover`
+/// probe, so which opener a client sends decides which revisions are reachable.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpLifecycle {
+    /// Probe `server/discover` first and fall back to the legacy handshake when
+    /// the server does not implement it. Works with both server generations.
+    #[default]
+    Auto,
+    /// Require the stateless `server/discover` lifecycle. Connecting fails on a
+    /// server that predates `2026-07-28`.
+    Discover,
+    /// Use the legacy `initialize` handshake only, negotiating at most
+    /// `2025-11-25`. Use it to pin a server that mishandles unknown methods.
+    Initialize,
+}
+
+impl McpLifecycle {
+    fn into_mode(self) -> ClientLifecycleMode {
+        match self {
+            Self::Auto => ClientLifecycleMode::Auto {
+                preferred_versions: preferred_protocol_versions(),
+                legacy_version: Some(legacy_protocol_version()),
+            },
+            Self::Discover => ClientLifecycleMode::Discover {
+                preferred_versions: preferred_protocol_versions(),
+            },
+            Self::Initialize => ClientLifecycleMode::Initialize,
+        }
+    }
+}
+
+/// SEP-2663 tasks extension settings for one MCP server.
+///
+/// Declaring the extension tells the server it may answer a `tools/call` with a
+/// task handle instead of a result. The provider then polls `tasks/get` until the
+/// task reaches a terminal state, so a long-running tool does not have to hold its
+/// response open for the whole run. The tool call still blocks until the task
+/// finishes or [`max_wait_secs`] elapses.
+///
+/// [`max_wait_secs`]: Self::max_wait_secs
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct McpTasksConfig {
+    /// Longest one tool call waits for a task to finish, in seconds. Defaults to
+    /// 300, and is clamped to at least 1 second and at most a day. On timeout the
+    /// task is cancelled best-effort and the call fails.
+    #[serde(default = "default_task_max_wait_secs")]
+    pub max_wait_secs: u64,
+}
+
+fn default_task_max_wait_secs() -> u64 {
+    DEFAULT_TASK_MAX_WAIT_SECS
+}
+
+impl Default for McpTasksConfig {
+    fn default() -> Self {
+        Self {
+            max_wait_secs: DEFAULT_TASK_MAX_WAIT_SECS,
+        }
+    }
+}
+
+impl McpTasksConfig {
+    /// The configured wait, clamped so a deserialized value cannot overflow the
+    /// poll deadline (`Instant + Duration` panics on overflow).
+    fn max_wait(&self) -> Duration {
+        Duration::from_secs(self.max_wait_secs.clamp(1, MAX_TASK_MAX_WAIT_SECS))
     }
 }
 
@@ -1637,6 +2157,226 @@ impl std::fmt::Display for McpAuthorizationRequired {
 
 impl std::error::Error for McpAuthorizationRequired {}
 
+/// Whether a peer only delivers `tools/list_changed` on a subscription stream.
+///
+/// `2026-07-28` removed unsolicited server pushes, so from that revision on the
+/// notification requires an explicit `subscriptions/listen` opt-in — and only if
+/// the server advertises `tools.listChanged` at all.
+fn needs_tool_subscription(info: Option<&ServerPeerInfo>) -> bool {
+    let Some(info) = info else {
+        return false;
+    };
+    info.protocol_version.as_str() >= ProtocolVersion::V_2026_07_28.as_str()
+        && info
+            .capabilities
+            .tools
+            .as_ref()
+            .is_some_and(|tools| tools.list_changed == Some(true))
+}
+
+fn tool_subscription_filter() -> SubscriptionFilter {
+    SubscriptionFilter::builder().tools_list_changed().build()
+}
+
+/// Drains one server's `tools/list_changed` subscription for the life of a session.
+///
+/// Subscription streams are not resumable, so an ended stream is replaced while
+/// the transport is still up, and the session is marked dirty across the gap: a
+/// change announced while nothing was listening must not leave the routes stale.
+///
+/// Reopening is bounded. A stream that survives [`SUBSCRIPTION_HEALTHY_LIFETIME`]
+/// is treated as working — a server closing idle streams periodically keeps its
+/// subscription forever — but a peer that acknowledges and immediately ends the
+/// stream would otherwise spin here for the life of the process, re-listing on
+/// every tool call, so it gets a limited number of consecutive attempts.
+async fn pump_tool_subscription(
+    server_id: String,
+    peer: Peer<RoleClient>,
+    mut subscription: Subscription,
+    dirty: Arc<AtomicBool>,
+) {
+    let mut short_lived = 0usize;
+    loop {
+        let opened_at = Instant::now();
+        loop {
+            match subscription.next().await {
+                Ok(Some(ServerNotification::ToolListChangedNotification(_))) => {
+                    dirty.store(true, Ordering::SeqCst);
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(err) => {
+                    log::debug!("MCP server {server_id}: tools subscription failed: {err}");
+                    break;
+                }
+            }
+        }
+
+        dirty.store(true, Ordering::SeqCst);
+        if peer.is_transport_closed() {
+            return;
+        }
+
+        short_lived = if opened_at.elapsed() >= SUBSCRIPTION_HEALTHY_LIFETIME {
+            0
+        } else {
+            short_lived + 1
+        };
+        if short_lived > MAX_SHORT_LIVED_SUBSCRIPTIONS {
+            log::warn!(
+                "MCP server {server_id}: tools/list_changed stream ended immediately \
+                 {short_lived} times; giving up on live tool updates"
+            );
+            return;
+        }
+
+        tokio::time::sleep(SUBSCRIPTION_REOPEN_DELAY).await;
+        if peer.is_transport_closed() {
+            return;
+        }
+
+        // Bounded like the initial subscription: a peer that accepts the request
+        // and never acknowledges it must not park this task forever.
+        subscription = match tokio::time::timeout(
+            SUBSCRIPTION_ACK_TIMEOUT,
+            peer.listen(tool_subscription_filter()),
+        )
+        .await
+        {
+            Ok(Ok(subscription)) => subscription,
+            Ok(Err(err)) => {
+                log::warn!(
+                    "MCP server {server_id}: could not reopen the tools/list_changed \
+                     subscription: {err}"
+                );
+                return;
+            }
+            Err(_) => {
+                log::warn!(
+                    "MCP server {server_id}: reopened tools/list_changed subscription was not \
+                     acknowledged within {}s",
+                    SUBSCRIPTION_ACK_TIMEOUT.as_secs()
+                );
+                return;
+            }
+        };
+    }
+}
+
+/// Awaits a client handshake, optionally bounding how long it may stay pending.
+async fn serve_bounded<F, S>(handshake: F, timeout: Option<Duration>) -> Result<S, BoxError>
+where
+    F: Future<Output = Result<S, ClientInitializeError>>,
+{
+    match timeout {
+        None => Ok(handshake.await?),
+        Some(limit) => match tokio::time::timeout(limit, handshake).await {
+            Ok(result) => Ok(result?),
+            Err(_) => Err(format!(
+                "the MCP server did not answer the server/discover probe within {}s",
+                limit.as_secs()
+            )
+            .into()),
+        },
+    }
+}
+
+/// Whether a failed connection attempt was about credentials rather than the
+/// lifecycle, in which case retrying with a different opener cannot help.
+fn is_authorization_error(err: &(dyn std::error::Error + 'static)) -> bool {
+    if err.is::<McpAuthorizationRequired>() {
+        return true;
+    }
+    // Credential acquisition reports a revoked or unusable grant directly, before
+    // any transport exists; the handshake reports it wrapped in a transport error.
+    if matches!(
+        err.downcast_ref::<AuthError>(),
+        Some(AuthError::AuthorizationRequired | AuthError::TokenRefreshRejected(_))
+    ) {
+        return true;
+    }
+    err.downcast_ref::<ClientInitializeError>()
+        .is_some_and(ClientInitializeError::is_authorization_required)
+}
+
+/// Re-labels a credential failure on an interactive server as
+/// [`McpAuthorizationRequired`], the signal applications are told to act on.
+///
+/// [`authorize_from_store`] raises that error when nothing is stored, but a grant
+/// the authorization server has since revoked only shows up later, as a rejected
+/// refresh or a `401` during the handshake. Both mean the same thing to the
+/// caller — run the interactive flow again — so both are reported the same way.
+/// The underlying cause is logged rather than dropped silently.
+///
+/// [`authorize_from_store`]: McpToolProvider::authorize_from_store
+fn authorization_required_hint(config: &McpServerConfig, err: BoxError) -> BoxError {
+    if err.is::<McpAuthorizationRequired>() || !is_authorization_error(err.as_ref()) {
+        return err;
+    }
+    let McpTransportConfig::StreamableHttp(http) = &config.transport else {
+        return err;
+    };
+    if !matches!(&http.auth, Some(McpOAuthConfig::AuthorizationCode(_))) {
+        return err;
+    }
+
+    log::warn!(
+        "MCP server {}: stored authorization is no longer usable ({err}); interactive \
+         authorization must run again",
+        config.id
+    );
+    McpAuthorizationRequired {
+        server_id: config.id.clone(),
+    }
+    .into()
+}
+
+/// Clamps a server-suggested `tasks/get` poll interval into a sane range.
+fn task_poll_interval(poll_interval_ms: Option<u64>) -> Duration {
+    poll_interval_ms
+        .map(Duration::from_millis)
+        .unwrap_or(TASK_POLL_INTERVAL)
+        .clamp(TASK_POLL_INTERVAL_MIN, TASK_POLL_INTERVAL_MAX)
+}
+
+/// Abandons a task this host will not wait for, so the server can release it.
+async fn cancel_task(peer: &Peer<RoleClient>, task_id: &str) {
+    if let Err(err) = peer.cancel_task(CancelTaskParams::new(task_id)).await {
+        log::debug!("MCP task {task_id} could not be cancelled: {err}");
+    }
+}
+
+fn input_required_error(route: &McpToolRoute, result: &InputRequiredResult) -> CallToolResult {
+    let keys = result
+        .input_requests
+        .iter()
+        .flat_map(|requests| requests.keys().map(String::as_str));
+    unsupported_input_error(route, keys)
+}
+
+/// Tool-level error for a server round this host cannot answer.
+///
+/// Anda advertises neither Sampling, Elicitation, nor Roots, so an MRTR round
+/// asking for them is a dead end. Returning it as a failed tool result — rather
+/// than an error that aborts the turn — lets the model choose another path.
+fn unsupported_input_error<'a>(
+    route: &McpToolRoute,
+    request_keys: impl Iterator<Item = &'a str>,
+) -> CallToolResult {
+    let keys: Vec<&str> = request_keys.collect();
+    let requested = if keys.is_empty() {
+        String::new()
+    } else {
+        format!(" (requests: {})", keys.join(", "))
+    };
+    CallToolResult::error(vec![ContentBlock::text(format!(
+        "MCP tool {} on server {} requires client-side input{requested}, which this host \
+         does not provide: sampling, elicitation, and roots are not supported. Call the tool \
+         with complete arguments, or use a different tool.",
+        route.remote_name, route.server_id
+    ))])
+}
+
 fn mcp_result_to_tool_output(route: &McpToolRoute, result: CallToolResult) -> ToolOutput<Json> {
     let mut output = ToolOutput::new(json!({
         "server_id": route.server_id,
@@ -1784,10 +2524,16 @@ mod tests {
             std::process::id(),
             "runtime_add"
         ));
+        // A well-behaved pre-2026 server: it refuses the discovery probe with
+        // "method not found", which rmcp answers by falling back to `initialize`
+        // on the same transport.
         let script = r#"#!/bin/sh
 while IFS= read -r line; do
   id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([^,}]*\).*/\1/p')
   case "$line" in
+    *"server/discover"*)
+      printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"Method not found"}}\n' "$id"
+      ;;
     *"initialize"*)
       printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{"listChanged":true}},"serverInfo":{"name":"fake","version":"1.0.0"}}}\n' "$id"
       ;;
@@ -1851,6 +2597,9 @@ done
 while IFS= read -r line; do
   id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([^,}]*\).*/\1/p')
   case "$line" in
+    *"server/discover"*)
+      printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"Method not found"}}\n' "$id"
+      ;;
     *"initialize"*)
       printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{"listChanged":true}},"serverInfo":{"name":"fs","title":"Filesystem","version":"1.0.0"},"instructions":"Call list_dir before read_file."}}\n' "$id"
       ;;
@@ -2216,6 +2965,79 @@ done
         assert!(err.to_string().contains("no pending OAuth authorization"));
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn disconnect_drops_the_session_but_keeps_the_server_and_routes() {
+        let script_path = write_fake_server("disconnect", DISCOVER_SERVER);
+        let provider = McpToolProvider::new(Vec::new()).unwrap();
+        provider
+            .add_server(McpServerConfig::stdio(
+                "stateless",
+                script_path.to_string_lossy().to_string(),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            provider
+                .inner
+                .index
+                .read()
+                .sessions
+                .contains_key("stateless")
+        );
+
+        // Nothing to disconnect for an unknown id.
+        assert!(!provider.disconnect_server("missing").await);
+
+        assert!(provider.disconnect_server("stateless").await);
+        assert!(!provider.disconnect_server("stateless").await);
+        assert!(provider.inner.index.read().sessions.is_empty());
+        // The server stays registered and its discovered tools stay routable…
+        assert!(provider.contains_server("stateless"));
+        let route = provider.routes().remove(0);
+
+        // …and the next call transparently reconnects.
+        let output = provider
+            .call_route(
+                route,
+                ToolInput::new("mcp_stateless_echo".to_string(), json!({})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.is_error, Some(false));
+        assert!(
+            provider
+                .inner
+                .index
+                .read()
+                .sessions
+                .contains_key("stateless")
+        );
+
+        let _ = std::fs::remove_file(script_path);
+    }
+
+    #[tokio::test]
+    async fn clear_credentials_forces_reauthorization() {
+        let store = Arc::new(InMemoryMcpCredentialStore::new());
+        let provider = McpToolProvider::builder()
+            .server(http_auth_code_server("gh", None))
+            .credential_store(store.clone())
+            .build()
+            .unwrap();
+
+        let creds = StoredCredentials::new("client".to_string(), None, vec!["a".to_string()], None);
+        store.save("gh", creds).await.unwrap();
+
+        provider.clear_credentials("gh").await.unwrap();
+        assert!(store.load("gh").await.unwrap().is_none());
+
+        // With the stored grant gone, the next connection reports that the
+        // interactive flow must run again.
+        let err = provider.refresh_server("gh").await.unwrap_err();
+        assert!(err.downcast_ref::<McpAuthorizationRequired>().is_some());
+    }
+
     #[tokio::test]
     async fn in_memory_credential_store_round_trip() {
         let store = InMemoryMcpCredentialStore::new();
@@ -2246,5 +3068,557 @@ done
         assert_eq!(output.output["server_id"], "repo");
         assert_eq!(output.output["tool"], "echo");
         assert_eq!(output.output["structured_content"], json!({"ok": true}));
+    }
+
+    #[test]
+    fn lifecycles_map_to_the_matching_rmcp_modes() {
+        // `2026-07-28` is offered only through discovery, never proposed to the
+        // legacy handshake, which a peer could echo back without implementing it.
+        match McpLifecycle::Auto.into_mode() {
+            ClientLifecycleMode::Auto {
+                preferred_versions,
+                legacy_version,
+            } => {
+                assert_eq!(preferred_versions[0], ProtocolVersion::V_2026_07_28);
+                assert_eq!(legacy_version, Some(ProtocolVersion::V_2025_11_25));
+            }
+            other => panic!("unexpected lifecycle mode: {other:?}"),
+        }
+        match McpLifecycle::Discover.into_mode() {
+            ClientLifecycleMode::Discover { preferred_versions } => {
+                assert!(preferred_versions.contains(&ProtocolVersion::V_2026_07_28));
+            }
+            other => panic!("unexpected lifecycle mode: {other:?}"),
+        }
+        assert_eq!(
+            McpLifecycle::Initialize.into_mode(),
+            ClientLifecycleMode::Initialize
+        );
+        assert_eq!(
+            AndaMcpClient::new(Arc::new(AtomicBool::new(false)), false)
+                .info
+                .protocol_version,
+            ProtocolVersion::V_2025_11_25
+        );
+    }
+
+    #[test]
+    fn declares_the_tasks_extension_only_when_configured() {
+        let dirty = Arc::new(AtomicBool::new(false));
+        assert!(
+            AndaMcpClient::new(dirty.clone(), false)
+                .info
+                .capabilities
+                .extensions
+                .is_none()
+        );
+        let capabilities = AndaMcpClient::new(dirty, true).info.capabilities;
+        assert!(capabilities.supports_tasks());
+    }
+
+    #[test]
+    fn tool_subscriptions_are_required_only_from_2026_07_28() {
+        let peer_info = |version: &str, list_changed: bool| -> ServerPeerInfo {
+            serde_json::from_value(json!({
+                "protocolVersion": version,
+                "capabilities": {"tools": {"listChanged": list_changed}},
+            }))
+            .unwrap()
+        };
+
+        assert!(needs_tool_subscription(Some(&peer_info(
+            "2026-07-28",
+            true
+        ))));
+        // Older peers still push the notification without an opt-in stream.
+        assert!(!needs_tool_subscription(Some(&peer_info(
+            "2025-11-25",
+            true
+        ))));
+        // Nothing to subscribe to when the server never announces changes.
+        assert!(!needs_tool_subscription(Some(&peer_info(
+            "2026-07-28",
+            false
+        ))));
+        assert!(!needs_tool_subscription(None));
+    }
+
+    #[test]
+    fn task_poll_intervals_clamp_untrusted_server_hints() {
+        assert_eq!(task_poll_interval(None), TASK_POLL_INTERVAL);
+        assert_eq!(task_poll_interval(Some(2_000)), Duration::from_secs(2));
+        assert_eq!(task_poll_interval(Some(0)), TASK_POLL_INTERVAL_MIN);
+        assert_eq!(task_poll_interval(Some(u64::MAX)), TASK_POLL_INTERVAL_MAX);
+    }
+
+    #[test]
+    fn task_max_wait_is_clamped_so_the_deadline_cannot_overflow() {
+        assert_eq!(
+            McpTasksConfig::default().max_wait(),
+            Duration::from_secs(DEFAULT_TASK_MAX_WAIT_SECS)
+        );
+        assert_eq!(
+            McpTasksConfig { max_wait_secs: 0 }.max_wait(),
+            Duration::from_secs(1)
+        );
+
+        // A configured value comes from deserialized config; `Instant + Duration`
+        // panics on overflow, so the ceiling must hold before it is added.
+        let huge = McpTasksConfig {
+            max_wait_secs: u64::MAX,
+        };
+        assert_eq!(huge.max_wait(), Duration::from_secs(MAX_TASK_MAX_WAIT_SECS));
+        let _ = Instant::now() + huge.max_wait();
+    }
+
+    #[tokio::test]
+    async fn revoked_authorization_is_reported_as_authorization_required() {
+        // `authorize_from_store` only raises `McpAuthorizationRequired` when nothing
+        // is stored; a grant the authorization server later rejects surfaces as a
+        // transport-level auth failure, which must map to the same signal so the
+        // application knows to re-run the interactive flow.
+        let config = http_auth_code_server("gh", None);
+        let err: BoxError = AuthError::AuthorizationRequired.into();
+        assert!(is_authorization_error(err.as_ref()));
+
+        let mapped = authorization_required_hint(&config, err);
+        let required = mapped
+            .downcast_ref::<McpAuthorizationRequired>()
+            .expect("expected McpAuthorizationRequired");
+        assert_eq!(required.server_id, "gh");
+
+        // A plain lifecycle failure is left alone so the fallback path still sees it.
+        let other: BoxError = "transport closed".into();
+        assert!(
+            authorization_required_hint(&config, other)
+                .downcast_ref::<McpAuthorizationRequired>()
+                .is_none()
+        );
+
+        // Servers without the interactive flow keep their original error.
+        let stdio = McpServerConfig::stdio("cli", "server");
+        let err: BoxError = McpAuthorizationRequired {
+            server_id: "other".to_string(),
+        }
+        .into();
+        assert_eq!(
+            authorization_required_hint(&stdio, err)
+                .downcast_ref::<McpAuthorizationRequired>()
+                .map(|required| required.server_id.clone()),
+            Some("other".to_string())
+        );
+    }
+
+    #[test]
+    fn authorization_failures_are_not_treated_as_lifecycle_failures() {
+        let err: BoxError = McpAuthorizationRequired {
+            server_id: "gh".to_string(),
+        }
+        .into();
+        assert!(is_authorization_error(err.as_ref()));
+
+        let err: BoxError = "transport closed".into();
+        assert!(!is_authorization_error(err.as_ref()));
+    }
+
+    #[test]
+    fn unsupported_input_rounds_become_tool_level_errors() {
+        let route = McpToolRoute {
+            name: "mcp_repo_echo".to_string(),
+            server_id: "repo".to_string(),
+            remote_name: "echo".to_string(),
+            definition: FunctionDefinition::default(),
+        };
+        let result: InputRequiredResult = serde_json::from_value(json!({
+            "resultType": "input_required",
+            "inputRequests": {"pick_root": {"method": "roots/list"}},
+        }))
+        .unwrap();
+
+        let output = mcp_result_to_tool_output(&route, input_required_error(&route, &result));
+        assert_eq!(output.is_error, Some(true));
+        let rendered = output.output.to_string();
+        assert!(rendered.contains("pick_root"), "{rendered}");
+        assert!(rendered.contains("does not provide"), "{rendered}");
+    }
+
+    #[test]
+    fn server_config_defaults_to_the_auto_lifecycle_without_tasks() {
+        let parsed: McpServerConfig = serde_json::from_value(json!({
+            "id": "files",
+            "transport": {"type": "stdio", "command": "server"},
+        }))
+        .unwrap();
+        assert_eq!(parsed.lifecycle, McpLifecycle::Auto);
+        assert!(parsed.tasks.is_none());
+
+        let mut server = McpServerConfig::stdio("files", "server");
+        server.lifecycle = McpLifecycle::Discover;
+        server.tasks = Some(McpTasksConfig::default());
+        let json = serde_json::to_value(&server).unwrap();
+        assert_eq!(json["lifecycle"], "discover");
+        assert_eq!(json["tasks"]["max_wait_secs"], 300);
+
+        let parsed: McpServerConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.lifecycle, McpLifecycle::Discover);
+        assert_eq!(
+            parsed.tasks.map(|tasks| tasks.max_wait()),
+            Some(Duration::from_secs(300))
+        );
+    }
+
+    #[cfg(unix)]
+    fn write_fake_server(name: &str, script: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = std::env::temp_dir().join(format!(
+            "anda_fake_mcp_server_{}_{name}",
+            std::process::id()
+        ));
+        std::fs::write(&path, script).unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        path
+    }
+
+    /// A stateless `2026-07-28` server: no `initialize`, self-description through
+    /// `server/discover`, and results carrying the SEP-2322 `resultType`.
+    #[cfg(unix)]
+    const DISCOVER_SERVER: &str = r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([^,}]*\).*/\1/p')
+  case "$line" in
+    *"server/discover"*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{"listChanged":false}},"instructions":"Call list_dir first.","ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"fs","title":"Stateless Files","version":"1.0.0"}}}}\n' "$id"
+      ;;
+    *"tools/list"*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","ttlMs":0,"cacheScope":"private","tools":[{"name":"echo","description":"Echoes input.","inputSchema":{"type":"object","properties":{"text":{"type":"string"}}}}]}}\n' "$id"
+      ;;
+    *"tools/call"*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","content":[{"type":"text","text":"ok"}],"isError":false}}\n' "$id"
+      ;;
+  esac
+done
+"#;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn negotiates_the_2026_lifecycle_and_calls_tools() {
+        let script_path = write_fake_server("discover", DISCOVER_SERVER);
+        let provider = McpToolProvider::new(Vec::new()).unwrap();
+        provider
+            .add_server(McpServerConfig::stdio(
+                "stateless",
+                script_path.to_string_lossy().to_string(),
+            ))
+            .await
+            .unwrap();
+
+        let routes = provider.routes();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].name, "mcp_stateless_echo");
+
+        // Discovery metadata replaces the handshake as the source of group data.
+        let groups = provider.tool_groups();
+        assert_eq!(groups[0].title, "Stateless Files");
+        assert_eq!(
+            groups[0].instructions.as_deref(),
+            Some("Call list_dir first.")
+        );
+
+        let output = provider
+            .call_route(
+                routes[0].clone(),
+                ToolInput::new("mcp_stateless_echo".to_string(), json!({"text": "hi"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.is_error, Some(false));
+
+        let _ = std::fs::remove_file(script_path);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn falls_back_to_the_legacy_handshake_when_discovery_is_refused() {
+        // Pre-2026 servers do not answer `server/discover` with a JSON-RPC "method
+        // not found"; an stdio child simply rejects the message and exits, taking
+        // the transport with it. Only a retry on a fresh transport recovers.
+        let script_path = write_fake_server(
+            "legacy_only",
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([^,}]*\).*/\1/p')
+  case "$line" in
+    *"server/discover"*)
+      exit 1
+      ;;
+    *"initialize"*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{"listChanged":true}},"serverInfo":{"name":"legacy","version":"1.0.0"}}}\n' "$id"
+      ;;
+    *"tools/list"*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","description":"Echoes input.","inputSchema":{"type":"object","properties":{}}}]}}\n' "$id"
+      ;;
+  esac
+done
+"#,
+        );
+
+        let provider = McpToolProvider::new(Vec::new()).unwrap();
+        provider
+            .add_server(McpServerConfig::stdio(
+                "legacy",
+                script_path.to_string_lossy().to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(provider.routes().len(), 1);
+
+        // Pinning the lifecycle skips the probe entirely.
+        let mut pinned =
+            McpServerConfig::stdio("pinned", script_path.to_string_lossy().to_string());
+        pinned.lifecycle = McpLifecycle::Initialize;
+        provider.add_server(pinned).await.unwrap();
+        assert_eq!(provider.routes().len(), 2);
+
+        let _ = std::fs::remove_file(script_path);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn input_required_results_surface_as_failed_tool_calls() {
+        let script_path = write_fake_server(
+            "mrtr",
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([^,}]*\).*/\1/p')
+  case "$line" in
+    *"server/discover"*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{"listChanged":false}},"ttlMs":0,"cacheScope":"private"}}\n' "$id"
+      ;;
+    *"tools/list"*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","ttlMs":0,"cacheScope":"private","tools":[{"name":"ask","description":"Asks first.","inputSchema":{"type":"object","properties":{}}}]}}\n' "$id"
+      ;;
+    *"tools/call"*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"input_required","inputRequests":{"pick_root":{"method":"roots/list"}},"requestState":"opaque"}}\n' "$id"
+      ;;
+  esac
+done
+"#,
+        );
+
+        let provider = McpToolProvider::new(Vec::new()).unwrap();
+        provider
+            .add_server(McpServerConfig::stdio(
+                "asker",
+                script_path.to_string_lossy().to_string(),
+            ))
+            .await
+            .unwrap();
+
+        let route = provider.routes().remove(0);
+        let output = provider
+            .call_route(
+                route,
+                ToolInput::new("mcp_asker_ask".to_string(), json!({})),
+            )
+            .await
+            .unwrap();
+
+        // The turn survives: the model sees a failed tool call, not a hard error.
+        assert_eq!(output.is_error, Some(true));
+        assert!(output.output.to_string().contains("pick_root"));
+
+        let _ = std::fs::remove_file(script_path);
+    }
+
+    /// A `2026-07-28` server that answers `tools/call` with a SEP-2663 task
+    /// handle, reports one `working` poll, then completes.
+    #[cfg(unix)]
+    const TASK_SERVER: &str = r#"#!/bin/sh
+polls=0
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([^,}]*\).*/\1/p')
+  case "$line" in
+    *"server/discover"*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{"listChanged":false},"extensions":{"io.modelcontextprotocol/tasks":{}}},"ttlMs":0,"cacheScope":"private"}}\n' "$id"
+      ;;
+    *"tools/list"*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","ttlMs":0,"cacheScope":"private","tools":[{"name":"slow","description":"Takes a while.","inputSchema":{"type":"object","properties":{}}}]}}\n' "$id"
+      ;;
+    *"tools/call"*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"task","taskId":"t1","status":"working","createdAt":"2026-07-28T00:00:00Z","lastUpdatedAt":"2026-07-28T00:00:00Z","ttlMs":null,"pollIntervalMs":10}}\n' "$id"
+      ;;
+    *"tasks/get"*)
+      polls=$((polls+1))
+      if [ "$polls" -le 1 ]; then
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","taskId":"t1","status":"working","createdAt":"2026-07-28T00:00:00Z","lastUpdatedAt":"2026-07-28T00:00:01Z","ttlMs":null,"pollIntervalMs":10}}\n' "$id"
+      else
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","taskId":"t1","status":"completed","createdAt":"2026-07-28T00:00:00Z","lastUpdatedAt":"2026-07-28T00:00:02Z","ttlMs":null,"result":{"resultType":"complete","content":[{"type":"text","text":"done"}],"structuredContent":{"ok":true},"isError":false}}}\n' "$id"
+      fi
+      ;;
+    *"tasks/cancel"*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete"}}\n' "$id"
+      ;;
+  esac
+done
+"#;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn polls_tasks_to_completion_when_the_extension_is_enabled() {
+        let script_path = write_fake_server("tasks", TASK_SERVER);
+        let mut server =
+            McpServerConfig::stdio("worker", script_path.to_string_lossy().to_string());
+        server.tasks = Some(McpTasksConfig::default());
+
+        let provider = McpToolProvider::new(Vec::new()).unwrap();
+        provider.add_server(server).await.unwrap();
+
+        let route = provider.routes().remove(0);
+        let output = provider
+            .call_route(
+                route,
+                ToolInput::new("mcp_worker_slow".to_string(), json!({})),
+            )
+            .await
+            .unwrap();
+
+        // The task result stands in for the `tools/call` result, so the caller sees
+        // the usual shape.
+        assert_eq!(output.is_error, Some(false));
+        assert_eq!(output.output["structured_content"], json!({"ok": true}));
+
+        let _ = std::fs::remove_file(script_path);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejects_task_handles_when_the_extension_is_not_enabled() {
+        let script_path = write_fake_server("tasks_undeclared", TASK_SERVER);
+        let provider = McpToolProvider::new(Vec::new()).unwrap();
+        provider
+            .add_server(McpServerConfig::stdio(
+                "worker",
+                script_path.to_string_lossy().to_string(),
+            ))
+            .await
+            .unwrap();
+
+        let route = provider.routes().remove(0);
+        let err = provider
+            .call_route(
+                route,
+                ToolInput::new("mcp_worker_slow".to_string(), json!({})),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("tasks extension is not enabled"), "{err}");
+
+        let _ = std::fs::remove_file(script_path);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn task_waiting_is_bounded_by_max_wait() {
+        let script_path = write_fake_server(
+            "tasks_slow",
+            &TASK_SERVER.replace("\"pollIntervalMs\":10", "\"pollIntervalMs\":9000"),
+        );
+        let mut server =
+            McpServerConfig::stdio("worker", script_path.to_string_lossy().to_string());
+        // The next poll would land past the deadline, so the call gives up instead
+        // of blocking the turn on a task that outlives its budget.
+        server.tasks = Some(McpTasksConfig { max_wait_secs: 1 });
+
+        let provider = McpToolProvider::new(Vec::new()).unwrap();
+        provider.add_server(server).await.unwrap();
+
+        let route = provider.routes().remove(0);
+        let err = provider
+            .call_route(
+                route,
+                ToolInput::new("mcp_worker_slow".to_string(), json!({})),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("did not finish within 1s"), "{err}");
+
+        let _ = std::fs::remove_file(script_path);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tool_list_changes_arrive_on_the_subscription_stream() {
+        // On 2026-07-28 the notification only reaches a client that opened a
+        // `subscriptions/listen` stream, so this covers the whole opt-in path:
+        // subscribe, receive, re-list.
+        let script_path = write_fake_server(
+            "subscriptions",
+            r#"#!/bin/sh
+count=0
+sub=0
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([^,}]*\).*/\1/p')
+  case "$line" in
+    *"server/discover"*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{"listChanged":true}},"ttlMs":0,"cacheScope":"private"}}\n' "$id"
+      ;;
+    *"subscriptions/listen"*)
+      sub=$id
+      printf '{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":%s},"notifications":{"toolsListChanged":true}}}\n' "$sub"
+      ;;
+    *"tools/list"*)
+      count=$((count+1))
+      if [ "$count" -le 1 ]; then
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","ttlMs":0,"cacheScope":"private","tools":[{"name":"echo","description":"Echoes.","inputSchema":{"type":"object","properties":{}}}]}}\n' "$id"
+      else
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","ttlMs":0,"cacheScope":"private","tools":[{"name":"echo","description":"Echoes.","inputSchema":{"type":"object","properties":{}}},{"name":"ping","description":"Pings.","inputSchema":{"type":"object","properties":{}}}]}}\n' "$id"
+      fi
+      ;;
+    *"tools/call"*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","content":[{"type":"text","text":"ok"}],"isError":false}}\n' "$id"
+      printf '{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":%s}}}\n' "$sub"
+      ;;
+  esac
+done
+"#,
+        );
+
+        let provider = McpToolProvider::new(Vec::new()).unwrap();
+        provider
+            .add_server(McpServerConfig::stdio(
+                "live",
+                script_path.to_string_lossy().to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(provider.routes().len(), 1);
+
+        // Every call answers and then announces a change on the stream; the next
+        // call picks the notification up and re-lists.
+        let route = provider.routes().remove(0);
+        for _ in 0..20 {
+            provider
+                .call_route(route.clone(), ToolInput::new(route.name.clone(), json!({})))
+                .await
+                .unwrap();
+            if provider.routes().len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let names: Vec<String> = provider
+            .routes()
+            .into_iter()
+            .map(|route| route.name)
+            .collect();
+        assert_eq!(names, vec!["mcp_live_echo", "mcp_live_ping"]);
+
+        let _ = std::fs::remove_file(script_path);
     }
 }
