@@ -49,7 +49,7 @@ chrono = "0.4"
 encoding_rs = "0.8"
 futures = "0.3"
 futures-util = "0.3"
-http = "1.3"
+http = "1.5"
 mime = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1" }
@@ -57,7 +57,7 @@ serde_bytes = "0.11"
 ic_cose_types = "0.10"
 ic_cose = "0.10"
 ic-oss-types = "1.3"
-ic-agent = "0.48"
+ic-agent = "0.49"
 ic-ed25519 = "0.6"
 ic-secp256k1 = "0.3"
 ic_auth_types = "0.10"
@@ -93,7 +93,7 @@ moka = { version = "0.12", features = ["future"] }
 log = { version = "0.4", features = ["kv_serde"] }
 dotenv = "0.15"
 schemars = { version = "1.0" }
-clap = { version = "4.5", features = ["derive", "env"] }
+clap = { version = "4.6", features = ["derive", "env"] }
 idna = "1.0" # https://github.com/ldclabs/anda/security/dependabot/1
 windows-sys = "0.52"
 hex = "0.4"
