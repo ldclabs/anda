@@ -26,8 +26,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::session::McpTransportConfig;
 use super::McpServerConfig;
+use super::session::McpTransportConfig;
 
 /// How far ahead of a client-credentials token's expiry to re-establish the session.
 ///
@@ -265,7 +265,6 @@ impl std::fmt::Display for McpAuthorizationRequired {
 
 impl std::error::Error for McpAuthorizationRequired {}
 
-
 /// Whether a failed connection attempt was about credentials rather than the
 /// lifecycle, in which case retrying with a different opener cannot help.
 pub(crate) fn is_authorization_error(err: &(dyn std::error::Error + 'static)) -> bool {
@@ -315,7 +314,6 @@ pub(crate) fn authorization_required_hint(config: &McpServerConfig, err: BoxErro
     }
     .into()
 }
-
 
 /// Probes an HTTP MCP endpoint to determine whether it requires OAuth.
 ///
@@ -447,7 +445,9 @@ pub(crate) async fn authorize_client_credentials(
         Ok((_, Some(token))) => serde_json::to_value(&token)
             .ok()
             .and_then(|token| token.get("expires_in").and_then(Json::as_u64))
-            .and_then(|secs| client_credentials_deadline(Instant::now(), Duration::from_secs(secs))),
+            .and_then(|secs| {
+                client_credentials_deadline(Instant::now(), Duration::from_secs(secs))
+            }),
         _ => None,
     };
 

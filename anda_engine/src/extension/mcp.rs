@@ -102,21 +102,18 @@
 //! ```
 
 use anda_core::{
-    BoxError, BoxFut, FunctionDefinition, Json, ToolGroup, ToolInput, ToolOutput, ToolProvider, validate_function_name,
+    BoxError, BoxFut, FunctionDefinition, Json, ToolGroup, ToolInput, ToolOutput, ToolProvider,
+    validate_function_name,
 };
 use parking_lot::{Mutex as SyncMutex, RwLock};
 use reqwest::Client as ReqwestClient;
 use rmcp::{
     Peer, RoleClient,
-    model::{
-        CallToolRequestParams,
-        ServerPeerInfo, Tool as McpTool,
-    },
+    model::{CallToolRequestParams, ServerPeerInfo, Tool as McpTool},
     serve_client_with_lifecycle,
     service::ClientLifecycleMode,
     transport::{
-        AuthClient, AuthorizationManager,
-        StreamableHttpClientTransport, TokioChildProcess,
+        AuthClient, AuthorizationManager, StreamableHttpClientTransport, TokioChildProcess,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -138,7 +135,6 @@ use tokio::sync::Mutex;
 
 use crate::context::BaseCtx;
 
-
 mod auth;
 mod router;
 mod session;
@@ -150,10 +146,7 @@ pub use auth::{
 pub use router::McpToolRoute;
 pub use session::{McpStdioTransport, McpStreamableHttpTransport, McpTransportConfig};
 
-use auth::{
-    ScopedCredentialStore, authorization_required_hint,
-    is_authorization_error,
-};
+use auth::{ScopedCredentialStore, authorization_required_hint, is_authorization_error};
 use router::{
     DEFAULT_TASK_MAX_WAIT_SECS, MAX_LOCAL_NAME_ATTEMPTS, MAX_TASK_MAX_WAIT_SECS, call_tool_rounds,
     mcp_result_to_tool_output, sanitize_name_part, shorten_with_hash,
@@ -620,12 +613,9 @@ impl McpToolProvider {
             .into());
         };
 
-        let (manager, auth_url) = auth::begin_authorization_manager(
-            http.url.as_str(),
-            ac,
-            self.scoped_store(server_id),
-        )
-        .await?;
+        let (manager, auth_url) =
+            auth::begin_authorization_manager(http.url.as_str(), ac, self.scoped_store(server_id))
+                .await?;
 
         self.inner
             .pending_auth
@@ -924,7 +914,6 @@ impl McpToolProvider {
         self.inner.pending_auth.lock().remove(server_id);
     }
 }
-
 
 impl ToolProvider<BaseCtx> for McpToolProvider {
     fn name(&self) -> String {
@@ -1232,7 +1221,6 @@ fn non_empty(value: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
-
 /// MCP server configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct McpServerConfig {
@@ -1366,7 +1354,6 @@ impl McpTasksConfig {
         Duration::from_secs(self.max_wait_secs.clamp(1, MAX_TASK_MAX_WAIT_SECS))
     }
 }
-
 
 #[cfg(test)]
 mod tests {

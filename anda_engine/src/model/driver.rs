@@ -95,7 +95,8 @@ pub(crate) trait WireFormat {
     /// optional provider-native assistant message captured verbatim for the
     /// output raw history (used by providers whose typed response round-trip
     /// would drop unknown fields).
-    fn parse_response(model: &str, data: &[u8]) -> Result<(Self::Response, Option<Json>), BoxError>;
+    fn parse_response(model: &str, data: &[u8])
+    -> Result<(Self::Response, Option<Json>), BoxError>;
 
     /// Whether the response should be logged as a possible failure.
     fn maybe_failed(res: &Self::Response) -> bool;

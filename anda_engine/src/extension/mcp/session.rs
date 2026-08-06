@@ -76,7 +76,6 @@ pub(crate) fn legacy_protocol_version() -> ProtocolVersion {
     ProtocolVersion::V_2025_11_25
 }
 
-
 pub(crate) struct McpSession {
     pub(crate) service: Mutex<RunningService<RoleClient, AndaMcpClient>>,
     pub(crate) dirty: Arc<AtomicBool>,
@@ -161,7 +160,6 @@ impl ClientHandler for AndaMcpClient {
         std::future::ready(())
     }
 }
-
 
 /// MCP transport configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -308,7 +306,9 @@ impl McpStreamableHttpTransport {
 
     /// Base transport config (URI + custom headers) without a static bearer
     /// header, so an [`AuthClient`] can inject the OAuth access token instead.
-    pub(crate) fn base_transport_config(&self) -> Result<StreamableHttpClientTransportConfig, BoxError> {
+    pub(crate) fn base_transport_config(
+        &self,
+    ) -> Result<StreamableHttpClientTransportConfig, BoxError> {
         Ok(
             StreamableHttpClientTransportConfig::with_uri(self.url.clone())
                 .custom_headers(self.custom_headers()?),
@@ -330,7 +330,6 @@ impl McpStreamableHttpTransport {
         Ok(config)
     }
 }
-
 
 /// Whether a peer only delivers `tools/list_changed` on a subscription stream.
 ///
@@ -439,7 +438,10 @@ pub(crate) async fn pump_tool_subscription(
 }
 
 /// Awaits a client handshake, optionally bounding how long it may stay pending.
-pub(crate) async fn serve_bounded<F, S>(handshake: F, timeout: Option<Duration>) -> Result<S, BoxError>
+pub(crate) async fn serve_bounded<F, S>(
+    handshake: F,
+    timeout: Option<Duration>,
+) -> Result<S, BoxError>
 where
     F: Future<Output = Result<S, ClientInitializeError>>,
 {
@@ -455,4 +457,3 @@ where
         },
     }
 }
-

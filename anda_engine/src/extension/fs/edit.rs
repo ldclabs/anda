@@ -165,9 +165,9 @@ impl Tool<BaseCtx> for EditFileTool {
 
         let target = scope.open_edit(&args.path).await?;
         let workspace_display = target.workspace.display().to_string();
-        let resolved_path = target.path.clone();
+        let resolved_path = &target.path;
 
-        let data = tokio::fs::read(&resolved_path).await.map_err(|err| {
+        let data = tokio::fs::read(resolved_path).await.map_err(|err| {
             format!(
                 "Failed to read file (workspace: {}, requested_path: {}, resolved_path: {}): {err}",
                 workspace_display,

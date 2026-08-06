@@ -987,7 +987,9 @@ async fn subagent_records_conversation_through_custom_store() {
 
     let conversation_id = output.conversation.expect("conversation id");
     let records = store.records.lock();
-    let conversation = records.get(&conversation_id).expect("recorded conversation");
+    let conversation = records
+        .get(&conversation_id)
+        .expect("recorded conversation");
     assert_eq!(conversation.status, ConversationStatus::Completed);
     assert_eq!(conversation.label.as_deref(), Some("subagent:auditor"));
     let messages = serde_json::to_string(&conversation.messages).unwrap();

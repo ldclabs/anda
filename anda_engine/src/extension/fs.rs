@@ -286,7 +286,10 @@ impl WriteTarget {
             })?;
         }
 
-        let permissions = self.existing.as_ref().map(|metadata| metadata.permissions());
+        let permissions = self
+            .existing
+            .as_ref()
+            .map(|metadata| metadata.permissions());
         atomic_write_file(&self.path, data, permissions.as_ref()).await
     }
 }
@@ -932,9 +935,7 @@ fn atomic_temp_path(target_path: &Path) -> Result<PathBuf, BoxError> {
 }
 
 /// Finds the nearest existing path component and returns the missing tail components.
-async fn nearest_existing_ancestor(
-    path: &Path,
-) -> Result<(PathBuf, Vec<OsString>), BoxError> {
+async fn nearest_existing_ancestor(path: &Path) -> Result<(PathBuf, Vec<OsString>), BoxError> {
     let mut current = path.to_path_buf();
     let mut missing_components = Vec::new();
 

@@ -6,17 +6,17 @@
 //! It is a regular (non-`cfg(test)`) module so downstream crates can drive
 //! their own agents against it:
 //!
-//! ```rust,ignore
+//! ```rust
 //! use anda_engine::model::{Model, testing::ScriptedCompleter};
 //!
-//! let completer = ScriptedCompleter::new("scripted")
-//!     .push_with(|req| {
-//!         Ok(anda_core::AgentOutput {
-//!             content: format!("saw: {}", req.prompt),
-//!             ..Default::default()
-//!         })
-//!     });
+//! let completer = ScriptedCompleter::new("scripted").push_with(|req| {
+//!     Ok(anda_core::AgentOutput {
+//!         content: format!("saw: {}", req.prompt),
+//!         ..Default::default()
+//!     })
+//! });
 //! let model = Model::with_completer(completer.into_arc());
+//! assert_eq!(model.model_name(), "scripted");
 //! ```
 
 use anda_core::{AgentOutput, BoxError, BoxPinFut, CompletionRequest, ContentPart, Usage};
@@ -158,10 +158,7 @@ mod tests {
         };
 
         assert_eq!(model.completion(req("a")).await.unwrap().content, "first");
-        assert_eq!(
-            model.completion(req("b")).await.unwrap().content,
-            "saw: b"
-        );
+        assert_eq!(model.completion(req("b")).await.unwrap().content, "saw: b");
         assert_eq!(
             model.completion(req("c")).await.unwrap_err().to_string(),
             "boom"
@@ -171,11 +168,7 @@ mod tests {
         assert_eq!(echoed.content, "tail");
         assert_eq!(echoed.usage.requests, 1);
 
-        let seen: Vec<String> = completer
-            .requests()
-            .into_iter()
-            .map(|r| r.prompt)
-            .collect();
+        let seen: Vec<String> = completer.requests().into_iter().map(|r| r.prompt).collect();
         assert_eq!(seen, vec!["a", "b", "c", "tail"]);
     }
 }

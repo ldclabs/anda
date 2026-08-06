@@ -55,7 +55,12 @@ pub struct ToolsOutput {
     pub total_tools: usize,
 }
 
-/// Upper bound on discovered tool definitions injected into request tool lists.
+/// Upper bound on the definitions taken from a *single* discovery-tool output.
+///
+/// It is not a cap on the accumulated set: definitions collected across
+/// successive discovery rounds all stay in [`DiscoveredTools`] until
+/// [`DiscoveredTools::reset_definitions`] clears them, and
+/// [`DiscoveredTools::merge_into_request`] injects the whole set.
 const MAX_DISCOVERED_REQUEST_TOOLS: usize = 16;
 
 /// Runner-side state and policy for tool discovery.

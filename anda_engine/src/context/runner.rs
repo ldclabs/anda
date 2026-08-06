@@ -284,9 +284,7 @@ impl CompletionRunner {
         match &self.allowed_callables {
             None => true,
             Some(allowed) => {
-                if allowed.contains(name_lowercase)
-                    || self.discovered.contains(name_lowercase)
-                {
+                if allowed.contains(name_lowercase) || self.discovered.contains(name_lowercase) {
                     return true;
                 }
 
@@ -372,7 +370,8 @@ impl CompletionRunner {
         if !self.is_idle() || self.req.raw_history.is_empty() {
             return;
         }
-        self.model.prune_tool_interactions(&mut self.req.raw_history);
+        self.model
+            .prune_tool_interactions(&mut self.req.raw_history);
     }
 
     fn discard_in_flight_request_with_interrupted_tool_outputs(
@@ -525,7 +524,8 @@ impl CompletionRunner {
     }
 
     fn compact_discovery_tool_output_for_context(&self, tool_name: &str, output: &mut Json) {
-        self.discovered.compact_output_for_context(tool_name, output);
+        self.discovered
+            .compact_output_for_context(tool_name, output);
     }
 
     // Drains all queued steering messages into a single user turn. When steering exists, queued
@@ -1296,13 +1296,12 @@ impl Stream for CompletionStream {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use anda_core::{
-        AgentContext as _, AgentOutput, BoxError, CancellationToken,
-        CompletionRequest, ContentPart, FunctionDefinition, Json, Message, ModelEffort, Resource,
-        StateFeatures as _, Tool, ToolCall, ToolOutput, Usage,
+        AgentContext as _, AgentOutput, BoxError, CancellationToken, CompletionRequest,
+        ContentPart, FunctionDefinition, Json, Message, ModelEffort, Resource, StateFeatures as _,
+        Tool, ToolCall, ToolOutput, Usage,
     };
     use futures_util::StreamExt;
     use serde::Deserialize;

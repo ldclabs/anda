@@ -28,28 +28,63 @@ pub(crate) fn prune_unanswered_tool_calls(raw_history: &mut Vec<Json>, start: us
         return;
     }
 
-    let retained: Vec<Json> = raw_history
-        .drain(start..)
-        .filter_map(prune_unanswered_tool_calls_from_item)
-        .collect();
-    raw_history.extend(retained);
+    let tail: Vec<Json> = raw_history.drain(start..).collect();
+    raw_history.extend(prune_items(tail, is_tool_call_item));
 }
 
-fn prune_unanswered_tool_calls_from_item(mut value: Json) -> Option<Json> {
-    if is_tool_call_item(&value) {
+/// Removes completed tool interactions (calls and results) from provider raw history.
+pub(crate) fn prune_tool_interactions(raw_history: &mut Vec<Json>) {
+    let items = std::mem::take(raw_history);
+    *raw_history = prune_items(items, |value| {
+        is_tool_call_item(value) || is_tool_output_item(value)
+    });
+}
+
+/// Drops every item `is_pruned` classifies, recursing into wrapper items so a
+/// wrapper keeps its non-tool context and disappears only once nothing
+/// meaningful is left.
+///
+/// Walks backwards so an OpenAI Responses `reasoning` item can see whether the item it
+/// must immediately precede survived; the API rejects a reasoning item whose required
+/// following item is missing, so orphaned reasoning follows its pruned sibling out.
+fn prune_items(items: Vec<Json>, is_pruned: impl Fn(&Json) -> bool + Copy) -> Vec<Json> {
+    let mut retained: Vec<Json> = Vec::with_capacity(items.len());
+    let mut next_kept = true;
+    for value in items.into_iter().rev() {
+        if !next_kept && value.get("type").and_then(|v| v.as_str()) == Some("reasoning") {
+            continue;
+        }
+        match prune_item(value, is_pruned) {
+            Some(value) => {
+                retained.push(value);
+                next_kept = true;
+            }
+            None => next_kept = false,
+        }
+    }
+    retained.reverse();
+    retained
+}
+
+fn prune_item(mut value: Json, is_pruned: impl Fn(&Json) -> bool + Copy) -> Option<Json> {
+    if is_pruned(&value) {
         return None;
     }
 
-    prune_nested_tool_calls(&mut value);
-    if item_has_context(&value) { Some(value) } else { None }
+    prune_nested(&mut value, is_pruned);
+    if item_has_context(&value) {
+        Some(value)
+    } else {
+        None
+    }
 }
 
-fn prune_nested_tool_calls(value: &mut Json) {
+fn prune_nested(value: &mut Json, is_pruned: impl Fn(&Json) -> bool + Copy) {
     match value {
         Json::Array(items) => {
             let retained: Vec<Json> = items
                 .drain(..)
-                .filter_map(prune_unanswered_tool_calls_from_item)
+                .filter_map(|item| prune_item(item, is_pruned))
                 .collect();
             *items = retained;
         }
@@ -63,65 +98,7 @@ fn prune_nested_tool_calls(value: &mut Json) {
             map.remove("functionCall");
 
             for value in map.values_mut() {
-                prune_nested_tool_calls(value);
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Removes completed tool interactions (calls and results) from provider raw history.
-///
-/// Walks backwards so an OpenAI Responses `reasoning` item can see whether the item it
-/// must immediately precede survived; the API rejects a reasoning item whose required
-/// following item is missing, so orphaned reasoning follows its pruned sibling out.
-pub(crate) fn prune_tool_interactions(raw_history: &mut Vec<Json>) {
-    let mut retained: Vec<Json> = Vec::with_capacity(raw_history.len());
-    let mut next_kept = true;
-    for value in raw_history.drain(..).rev() {
-        if !next_kept && value.get("type").and_then(|v| v.as_str()) == Some("reasoning") {
-            continue;
-        }
-        match prune_tool_interactions_from_item(value) {
-            Some(value) => {
-                retained.push(value);
-                next_kept = true;
-            }
-            None => next_kept = false,
-        }
-    }
-    retained.reverse();
-    *raw_history = retained;
-}
-
-fn prune_tool_interactions_from_item(mut value: Json) -> Option<Json> {
-    if is_tool_call_item(&value) || is_tool_output_item(&value) {
-        return None;
-    }
-
-    prune_nested_tool_interactions(&mut value);
-    if item_has_context(&value) { Some(value) } else { None }
-}
-
-// Like `prune_nested_tool_calls`, but also drops tool results, so a wrapper message
-// whose content held only a tool interaction loses its remaining context and is
-// pruned by `item_has_context`.
-fn prune_nested_tool_interactions(value: &mut Json) {
-    match value {
-        Json::Array(items) => {
-            let retained: Vec<Json> = items
-                .drain(..)
-                .filter_map(prune_tool_interactions_from_item)
-                .collect();
-            *items = retained;
-        }
-        Json::Object(map) => {
-            map.remove("tool_calls");
-            map.remove("function_call");
-            map.remove("functionCall");
-
-            for value in map.values_mut() {
-                prune_nested_tool_interactions(value);
+                prune_nested(value, is_pruned);
             }
         }
         _ => {}
@@ -422,5 +399,34 @@ mod tests {
         assert_eq!(raw_history[1]["content"][0]["text"], "anthropic text");
         assert_eq!(raw_history[2]["parts"].as_array().unwrap().len(), 1);
         assert_eq!(raw_history[2]["parts"][0]["text"], "gemini text");
+    }
+
+    #[test]
+    fn prunes_reasoning_orphaned_by_an_unanswered_tool_call() {
+        // OpenAI Responses emits `[reasoning, function_call]` for a tool turn; dropping the
+        // unanswered call must take its reasoning sibling with it, or the next request is
+        // rejected for a reasoning item without its required following item.
+        let sentinel = json!({"role": "user", "content": "prior"});
+        let mut raw_history = vec![
+            sentinel.clone(),
+            json!({"type": "reasoning", "id": "rs_kept", "encrypted_content": "opaque"}),
+            json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "planning"}]
+            }),
+            json!({"type": "reasoning", "id": "rs_orphan", "encrypted_content": "opaque"}),
+            json!({"type": "function_call", "call_id": "call_1", "name": "lookup"}),
+        ];
+
+        prune_unanswered_tool_calls(&mut raw_history, 1);
+
+        let pruned = serde_json::to_string(&raw_history).unwrap();
+        assert_eq!(raw_history.len(), 3);
+        assert_eq!(raw_history[0], sentinel);
+        assert!(pruned.contains("rs_kept"));
+        assert!(pruned.contains("planning"));
+        assert!(!pruned.contains("rs_orphan"));
+        assert!(!pruned.contains("call_1"));
     }
 }

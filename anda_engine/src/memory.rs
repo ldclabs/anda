@@ -24,10 +24,10 @@ use anda_db::{
 };
 use anda_db_schema::{AndaDBSchema, Ft, Fv, Json};
 use anda_db_tfs::jieba_tokenizer;
-use async_trait::async_trait;
 use anda_kip::{
     DescribeTarget, KipError, META_SYSTEM_NAME, MetaCommand, PERSON_TYPE, Request, Response,
 };
+use async_trait::async_trait;
 use candid::Principal;
 use cbor2::cbor;
 use ic_auth_types::ByteBufB64;
@@ -694,7 +694,10 @@ impl Conversations {
 
         // `query_last_ids` returns the newest page for any filter shape; the IDs
         // come back ascending, so reverse them for newest-first output.
-        let mut ids = self.conversations.query_last_ids(filter, Some(limit)).await?;
+        let mut ids = self
+            .conversations
+            .query_last_ids(filter, Some(limit))
+            .await?;
         ids.reverse();
         let rt = materialize_conversation_ids(&self.conversations, ids).await?;
         // The page holds the newest matching conversations; the next cursor is the smallest ID,

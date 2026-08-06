@@ -1674,7 +1674,10 @@ impl WireFormat for CompletionModel {
         chat_completion_response_from_stream_chunks(items)
     }
 
-    fn parse_response(model: &str, data: &[u8]) -> Result<(Self::Response, Option<Json>), BoxError> {
+    fn parse_response(
+        model: &str,
+        data: &[u8],
+    ) -> Result<(Self::Response, Option<Json>), BoxError> {
         match serde_json::from_slice::<CompletionResponse>(data) {
             Ok(mut res) => {
                 res.parse_output();
@@ -1882,7 +1885,10 @@ impl WireFormat for CompletionModelV2 {
         responses_response_from_stream_events(items)
     }
 
-    fn parse_response(model: &str, data: &[u8]) -> Result<(Self::Response, Option<Json>), BoxError> {
+    fn parse_response(
+        model: &str,
+        data: &[u8],
+    ) -> Result<(Self::Response, Option<Json>), BoxError> {
         match serde_json::from_slice::<types::CompletionResponse>(data) {
             Ok(mut res) => {
                 res.parse_output();

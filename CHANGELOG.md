@@ -74,6 +74,17 @@ minor version bump.
   probing, output compaction) extracted from the completion runner into the
   module that owns the discovery vocabulary.
 
+### Fixed — anda_engine
+
+- **Interrupted tool calls no longer strand an OpenAI Responses `reasoning`
+  item** — Dropping unanswered tool-call requests (after steering, discard, or
+  stop) now takes the reasoning item that must immediately precede a pruned
+  call out with it, the way completed-interaction pruning already did.
+  Previously an interrupt mid-tool-call on the Responses adapter left an
+  orphaned reasoning item in `raw_history`, and every subsequent request was
+  rejected for a reasoning item without its required following item — wedging
+  the conversation until the process restarted.
+
 ## [0.14.6] — 2026-08-06
 
 ### Added — anda_engine v0.14.6

@@ -18,7 +18,6 @@ use crate::context::{AgentCtx, BaseCtx};
 
 pub use crate::background::{BackgroundHandle, BackgroundTaskControls, PrefixedId};
 
-
 /// Engine-level hook for agent runs and direct tool calls.
 ///
 /// Returning an error from a start hook aborts execution. End hooks may inspect
@@ -510,7 +509,6 @@ mod tests {
             Arc::new(SubAgentSetManager::new()),
         )
     }
-
 
     struct AppendHook(&'static str);
 

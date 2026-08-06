@@ -507,7 +507,10 @@ impl WireFormat for CompletionModel {
         response_from_stream_events(items)
     }
 
-    fn parse_response(model: &str, data: &[u8]) -> Result<(Self::Response, Option<Json>), BoxError> {
+    fn parse_response(
+        model: &str,
+        data: &[u8],
+    ) -> Result<(Self::Response, Option<Json>), BoxError> {
         let raw_response = match serde_json::from_slice::<Value>(data) {
             Ok(value) => value,
             Err(err) => {

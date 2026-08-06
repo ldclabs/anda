@@ -4,9 +4,8 @@
 //! and small builders used by `context::agent` and `context::runner` tests.
 
 use anda_core::{
-    Agent, AgentOutput, BoxError,
-    CompletionRequest, ContentPart, Function, FunctionDefinition, Message, Resource, Tool,
-    ToolCall, ToolOutput, Usage,
+    Agent, AgentOutput, BoxError, CompletionRequest, ContentPart, Function, FunctionDefinition,
+    Message, Resource, Tool, ToolCall, ToolOutput, Usage,
 };
 use candid::Principal;
 use serde::Deserialize;
@@ -16,9 +15,9 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use crate::context::AgentCtx;
 use crate::context::base::BaseCtx;
 use crate::context::engine::{AgentInfo, EngineCard, RemoteEngines};
-use crate::context::AgentCtx;
 use crate::model::CompletionFeaturesDyn;
 
 #[derive(Clone, Debug)]
@@ -311,9 +310,7 @@ impl CompletionFeaturesDyn for DiscoveryCompactionCompleter {
             req.content
                 .iter()
                 .map(|part| match part {
-                    ContentPart::Text { text } | ContentPart::Reasoning { text } => {
-                        text.clone()
-                    }
+                    ContentPart::Text { text } | ContentPart::Reasoning { text } => text.clone(),
                     _ => String::new(),
                 })
                 .collect::<Vec<_>>()
@@ -561,9 +558,7 @@ impl CompletionFeaturesDyn for ToolCallHistoryCompleter {
             .content
             .iter()
             .filter_map(|part| match part {
-                ContentPart::Text { text } | ContentPart::Reasoning { text } => {
-                    Some(text.as_str())
-                }
+                ContentPart::Text { text } | ContentPart::Reasoning { text } => Some(text.as_str()),
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -777,9 +772,7 @@ impl CompletionFeaturesDyn for RecordingCompleter {
             req.content
                 .iter()
                 .map(|part| match part {
-                    ContentPart::Text { text } | ContentPart::Reasoning { text } => {
-                        text.clone()
-                    }
+                    ContentPart::Text { text } | ContentPart::Reasoning { text } => text.clone(),
                     _ => serde_json::to_string(part).unwrap_or_default(),
                 })
                 .collect::<Vec<_>>()
@@ -991,4 +984,3 @@ pub(crate) fn dynamic_remote_engines() -> RemoteEngines {
     );
     RemoteEngines { engines }
 }
-

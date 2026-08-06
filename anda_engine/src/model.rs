@@ -588,7 +588,8 @@ impl Model {
     ///
     /// See [`CompletionFeaturesDyn::prune_unanswered_tool_calls`].
     pub fn prune_unanswered_tool_calls(&self, raw_history: &mut Vec<Json>, start: usize) {
-        self.completer.prune_unanswered_tool_calls(raw_history, start);
+        self.completer
+            .prune_unanswered_tool_calls(raw_history, start);
     }
 
     /// Removes completed tool interactions from `raw_history` using the

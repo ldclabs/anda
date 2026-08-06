@@ -353,7 +353,10 @@ impl WireFormat for CompletionModel {
         response_from_stream_chunks(items)
     }
 
-    fn parse_response(model: &str, data: &[u8]) -> Result<(Self::Response, Option<Json>), BoxError> {
+    fn parse_response(
+        model: &str,
+        data: &[u8],
+    ) -> Result<(Self::Response, Option<Json>), BoxError> {
         match serde_json::from_slice::<types::GenerateContentResponse>(data) {
             Ok(res) => Ok((res, None)),
             Err(err) => Err(format!(

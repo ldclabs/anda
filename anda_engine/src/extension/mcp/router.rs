@@ -190,7 +190,6 @@ async fn await_task(
     }
 }
 
-
 /// One Anda-facing route to an MCP tool.
 #[derive(Debug, Clone)]
 pub struct McpToolRoute {
@@ -219,7 +218,10 @@ async fn cancel_task(peer: &Peer<RoleClient>, task_id: &str) {
     }
 }
 
-pub(crate) fn input_required_error(route: &McpToolRoute, result: &InputRequiredResult) -> CallToolResult {
+pub(crate) fn input_required_error(
+    route: &McpToolRoute,
+    result: &InputRequiredResult,
+) -> CallToolResult {
     let keys = result
         .input_requests
         .iter()
@@ -250,7 +252,10 @@ pub(crate) fn unsupported_input_error<'a>(
     ))])
 }
 
-pub(crate) fn mcp_result_to_tool_output(route: &McpToolRoute, result: CallToolResult) -> ToolOutput<Json> {
+pub(crate) fn mcp_result_to_tool_output(
+    route: &McpToolRoute,
+    result: CallToolResult,
+) -> ToolOutput<Json> {
     let mut output = ToolOutput::new(json!({
         "server_id": route.server_id,
         "tool": route.remote_name,
@@ -305,4 +310,3 @@ pub(crate) fn shorten_with_hash(base: &str, key: &str) -> String {
     prefix = prefix.trim_end_matches('_').to_string();
     format!("{}_{}", prefix, suffix)
 }
-

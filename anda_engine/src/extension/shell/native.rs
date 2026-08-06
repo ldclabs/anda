@@ -1624,6 +1624,75 @@ mod tests {
         );
     }
 
+    /// The requested working directory is caller-controlled (`RequestMeta.extra` is
+    /// flattened straight off the RPC body), so it may only ever narrow the configured
+    /// workspace. This guards the shell side of that boundary; `fs::tool_workspaces`
+    /// guards the resolution rules themselves.
+    #[tokio::test(flavor = "current_thread")]
+    async fn requested_workspace_narrows_but_never_escapes_the_configured_root() {
+        let root = TestTempDir::new("anda-native-workspace").await;
+        let configured = root.create_dir("configured").await;
+        let nested = root.create_dir("configured/nested").await;
+        let outside = root.create_dir("outside").await;
+        let runtime = NativeRuntime::new(configured.clone());
+        let ctx = EngineBuilder::new().mock_ctx();
+
+        let request = |extra: Vec<(&str, serde_json::Value)>| {
+            let mut meta = anda_core::RequestMeta::default();
+            for (key, value) in extra {
+                meta.extra.insert(key.to_string(), value);
+            }
+            ctx.child_base_with(candid::Principal::anonymous(), "tester", "shell", meta)
+                .unwrap()
+        };
+
+        // No hint: the configured workspace is used as-is.
+        let ctx_default = request(Vec::new());
+        assert_eq!(
+            runtime.requested_workspace(&ctx_default).await.as_path(),
+            configured.as_path()
+        );
+
+        // A subdirectory of the configured workspace narrows the working directory.
+        let ctx_nested = request(vec![("workspace", json!(nested))]);
+        assert_eq!(
+            runtime.requested_workspace(&ctx_nested).await.as_path(),
+            nested.as_path()
+        );
+
+        // The `workspaces` key and the array form are honored the same way as in the
+        // filesystem tools, and the first accepted root wins.
+        let ctx_plural = request(vec![("workspaces", json!([nested, configured]))]);
+        assert_eq!(
+            runtime.requested_workspace(&ctx_plural).await.as_path(),
+            nested.as_path()
+        );
+
+        // A sibling outside the configured workspace is dropped, not honored.
+        let ctx_outside = request(vec![("workspace", json!(outside))]);
+        assert_eq!(
+            runtime.requested_workspace(&ctx_outside).await.as_path(),
+            configured.as_path()
+        );
+
+        // So is the filesystem root, the widest possible escape.
+        let ctx_root = request(vec![("workspaces", json!("/"))]);
+        assert_eq!(
+            runtime.requested_workspace(&ctx_root).await.as_path(),
+            configured.as_path()
+        );
+
+        // A rejected hint does not suppress a later valid one on the same request.
+        let ctx_mixed = request(vec![
+            ("workspace", json!(outside)),
+            ("workspaces", json!(nested)),
+        ]);
+        assert_eq!(
+            runtime.requested_workspace(&ctx_mixed).await.as_path(),
+            nested.as_path()
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn execute_runs_foreground_command_with_envs_and_workspace() {
         let ctx = EngineBuilder::new().mock_ctx();

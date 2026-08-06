@@ -1106,9 +1106,8 @@ fn merge_visible_group(
 mod tests {
     use anda_core::{
         AgentContext as _, AgentInput, BaseContext as _, BoxError, CacheFeatures as _,
-        CacheStoreFeatures as _, CompletionFeatures as _, HttpFeatures as _,
-        Json, KeysFeatures as _, Path, PutMode, StateFeatures as _, StoreFeatures as _,
-        ToolInput,
+        CacheStoreFeatures as _, CompletionFeatures as _, HttpFeatures as _, Json,
+        KeysFeatures as _, Path, PutMode, StateFeatures as _, StoreFeatures as _, ToolInput,
     };
     use bytes::Bytes;
     use candid::Principal;
@@ -1118,14 +1117,10 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        DYNAMIC_REMOTE_ENGINES, REMOTE_AGENT_PREFIX, REMOTE_TOOL_PREFIX,
-        SUB_AGENT_PREFIX,
+        DYNAMIC_REMOTE_ENGINES, REMOTE_AGENT_PREFIX, REMOTE_TOOL_PREFIX, SUB_AGENT_PREFIX,
     };
     use crate::context::test_fixtures::*;
-    use crate::{
-        engine::EngineBuilder,
-        model::Model,
-    };
+    use crate::{engine::EngineBuilder, model::Model};
 
     #[test]
     fn json_in_cbor_works() {
@@ -1449,5 +1444,4 @@ mod tests {
                 .contains("remote engine endpoint https://missing.example not found")
         );
     }
-
 }

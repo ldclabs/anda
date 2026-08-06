@@ -153,12 +153,7 @@ impl SubAgentConversationLog {
     }
 
     async fn persist(&self) {
-        if let Err(err) = self
-            .recorder
-            .conversations
-            .update(&self.conversation)
-            .await
-        {
+        if let Err(err) = self.recorder.conversations.update(&self.conversation).await {
             log::warn!(
                 "failed to update subagent conversation {}: {err}",
                 self.conversation._id

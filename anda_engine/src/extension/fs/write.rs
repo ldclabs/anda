@@ -12,8 +12,8 @@ use serde_json::json;
 use std::{path::PathBuf, str::FromStr};
 
 use super::{
-    BASE64_ENCODING, FileTextEncodeError, WorkspaceScope, default_write_encoding,
-    encode_file_text, format_workspaces, normalize_workspaces,
+    BASE64_ENCODING, FileTextEncodeError, WorkspaceScope, default_write_encoding, encode_file_text,
+    format_workspaces, normalize_workspaces,
 };
 use crate::{
     context::BaseCtx,
