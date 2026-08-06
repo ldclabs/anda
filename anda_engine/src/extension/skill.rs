@@ -1,16 +1,38 @@
 //! Skills manager extension.
 //!
 //! This module provides:
-//! - Loading skills from directory trees of `SKILL.md` files into [`SubAgent`] instances.
+//! - Loading skills from directory trees of `SKILL.md` files.
 //! - Reading loaded skill files via the [`SkillManager`] tool.
+//! - Materializing the subset of skills that opted into subagent execution as [`SubAgent`]s.
 //!
 //! Each `SKILL.md` follows the [Agent Skills specification](https://agentskills.io):
 //! YAML frontmatter (`---` delimiters) with `name`, `description`, and optional
 //! `license`, `compatibility`, `metadata`, `allowed-tools` fields. The Markdown body
-//! becomes the agent's `instructions`.
+//! becomes the skill's instructions.
+//!
+//! # Execution modes
+//!
+//! Skills default to [`SkillExecution::Inline`]: the calling agent reads SKILL.md through the
+//! [`SkillManager`] tool and follows it in its own context, which is what progressive disclosure
+//! means in the specification — the body reaches the agent that holds the conversation, the user,
+//! and the turn's resources.
+//!
+//! A skill can opt into [`SkillExecution::Subagent`] with `execution: subagent` (or
+//! `metadata.execution: subagent`) in its frontmatter. Those skills are additionally exposed as
+//! isolated workers callable as `SA_<agent_name>`. Reserve it for procedures that are genuinely
+//! independent of the conversation — long-running, parallelisable, or context-hungry work — since
+//! a subagent receives only a self-contained prompt plus the resources matching its
+//! `resource-tags`, and has no channel to the user.
+//!
+//! # Bundled files
+//!
+//! A skill's SKILL.md routinely points at scripts and references next to it. Reaching them goes
+//! through the filesystem tools, which are sandboxed to their configured workspaces, so register
+//! [`SkillManager::skills_dirs`] as filesystem workspaces (see [`crate::extension::fs`]) when
+//! wiring the engine. Without that the agent is handed a `base_dir` it is not allowed to read.
 //!
 //! Skill names use kebab-case on disk (e.g. `my-skill`); they are normalised to
-//! snake_case (`my_skill`) when loaded as [`SubAgent`] instances.
+//! snake_case (`skill_my_skill`) for the subagent registry.
 
 use anda_core::{
     Agent, BoxError, FunctionDefinition, Resource, Tool, ToolOutput, select_resources,
@@ -27,7 +49,7 @@ use std::{
 };
 
 use crate::{
-    context::BaseCtx,
+    context::{BaseCtx, SUB_AGENT_PREFIX},
     extension::fs::{ensure_file_size_within_limit, ensure_regular_file, normalize_relative_path},
     subagent::{SubAgent, SubAgentSet},
 };
@@ -55,10 +77,15 @@ pub struct SkillArgs {
 pub struct SkillContentOutput {
     /// Skill name from the SKILL.md frontmatter.
     pub name: String,
-    /// Normalised subagent name exposed by this skill.
-    pub agent_name: String,
     /// Skill description from the SKILL.md frontmatter.
     pub description: String,
+    /// How this skill runs: `inline` (follow `content` yourself) or `subagent` (delegate).
+    pub execution: SkillExecution,
+    /// Callable name for `subagent` skills, absent for `inline` ones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub callable: Option<String>,
+    /// Base directory of the skill, for resolving the bundled files `content` references.
+    pub base_dir: String,
     /// Path to SKILL.md, relative to a configured skills directory when possible.
     pub path: String,
     /// Full SKILL.md content including YAML frontmatter and Markdown body.
@@ -67,9 +94,9 @@ pub struct SkillContentOutput {
 
 /// Manages skills loaded from `SKILL.md` files on disk.
 ///
-/// [`SkillManager`] implements [`Tool<BaseCtx>`] so that LLMs can inspect skill
-/// files at runtime. Skills loaded here are exposed as [`SubAgent`] instances
-/// that the engine can invoke.
+/// [`SkillManager`] implements [`Tool<BaseCtx>`] so that LLMs can read skill files at runtime and
+/// follow them inline, and [`SubAgentSet`] so that the skills which declared
+/// [`SkillExecution::Subagent`] are additionally callable as delegated workers.
 pub struct SkillManager {
     /// Directory used by skill creation workflows. Loading also includes this directory.
     default_skills_dir: PathBuf,
@@ -86,6 +113,10 @@ pub struct SkillManager {
     default_skill_tools: Vec<String>,
 }
 
+/// Tools granted to a subagent skill that declares no `allowed-tools`.
+///
+/// Includes [`SkillManager::NAME`] so skills compose: a delegated skill can read another skill's
+/// SKILL.md and follow it inline, the same way its caller would.
 static DEFAULT_SKILL_TOOLS: &[&str] = &[
     "shell",
     "read_file",
@@ -94,6 +125,7 @@ static DEFAULT_SKILL_TOOLS: &[&str] = &[
     "edit_file",
     "todo",
     "tools_select",
+    SkillManager::NAME,
 ];
 
 fn build_skills_dirs(
@@ -119,9 +151,12 @@ fn format_path_list(paths: &[PathBuf]) -> String {
 
 fn build_description(default_skills_dir: &Path, skills_dirs: &[PathBuf]) -> String {
     format!(
-        "Load reusable skills following the Agent Skills specification and read \
-        a skill's SKILL.md content by name. Agent Skills are folders of instructions, \
-        scripts, and resources that agents can follow directly or invoke as subagents. \
+        "Read a skill's SKILL.md by name, following the Agent Skills specification. Agent Skills \
+        are folders of instructions, scripts, and resources. Most skills run inline: this tool \
+        returns the full SKILL.md and you follow it yourself in this conversation, reading the \
+        bundled files it references from `base_dir` as you need them. A skill that declares \
+        `execution: subagent` instead returns a `callable` name to delegate to, which runs it in \
+        an isolated worker that cannot see this conversation or ask the user anything. \
         Skill directories: {}. Default skill creation directory: {}",
         format_path_list(skills_dirs),
         default_skills_dir.display()
@@ -173,21 +208,25 @@ impl SkillManager {
         self
     }
 
-    /// Sets the default tool names granted to newly loaded skill subagents.
+    /// Sets the tool names granted to skill subagents that declare no `allowed-tools`.
     pub fn with_default_skill_tools(mut self, tools: Vec<String>) -> Self {
         self.default_skill_tools = tools;
         self
     }
 
-    fn with_default_tools(&self, agent: SubAgent) -> SubAgent {
-        let mut tools = self.default_skill_tools.clone();
-        for tool in agent.tools {
-            if !tools.contains(&tool) {
-                tools.push(tool);
-            }
+    /// Materializes a skill into its callable [`SubAgent`].
+    ///
+    /// `allowed-tools` is an upper bound, per the Agent Skills specification: a skill that
+    /// declares it is granted exactly those tools and nothing else. Only a skill that declares no
+    /// tools at all inherits [`Self::default_skill_tools`]. Unioning the defaults in would turn a
+    /// restriction into an escalation — SKILL.md files are third-party content on disk, so a
+    /// manifest asking for `read_file` must not come back holding `shell`.
+    fn materialize(&self, skill: &Skill) -> SubAgent {
+        let mut agent = SubAgent::from(skill);
+        if agent.tools.is_empty() {
+            agent.tools = self.default_skill_tools.clone();
         }
-
-        SubAgent { tools, ..agent }
+        agent
     }
 
     async fn read_text_file(&self, path: &Path, max_size: u64) -> Result<String, BoxError> {
@@ -307,12 +346,18 @@ impl SkillManager {
             )
             .into());
         }
+        let callable = skill
+            .is_subagent()
+            .then(|| format!("{SUB_AGENT_PREFIX}{}", skill.agent_name));
+        let base_dir = skill.base_dir.display().to_string();
         self.upsert_skill(skill.clone());
 
         Ok(SkillContentOutput {
             name: skill.frontmatter.name,
-            agent_name: skill.agent_name,
             description: skill.frontmatter.description,
+            execution: skill.execution,
+            callable,
+            base_dir,
             path: self.display_path(&target),
             content,
         })
@@ -363,12 +408,16 @@ impl SkillManager {
 
     /// Replaces the loaded skills and materialized subagents as one update, carrying over the
     /// live session registry of every skill that survived the reload.
+    ///
+    /// Only skills that opted into [`SkillExecution::Subagent`] become callables; inline skills
+    /// are loaded and readable but never appear in the model's tool list.
     fn replace_skills(&self, skills: BTreeMap<String, Skill>) {
         let mut subagents = self.subagents.write();
         let rebuilt = skills
             .iter()
+            .filter(|(_, skill)| skill.is_subagent())
             .map(|(name, skill)| {
-                let mut agent = self.with_default_tools(SubAgent::from(skill));
+                let mut agent = self.materialize(skill);
                 if let Some(existing) = subagents.get(name) {
                     agent.subsessions = existing.subsessions.clone();
                 }
@@ -381,17 +430,22 @@ impl SkillManager {
 
     /// Inserts or refreshes one skill after a direct `SKILL.md` read.
     ///
-    /// Reading a skill has historically made it immediately callable. Keep the stable
-    /// materialized agent in sync with the parsed skill while preserving any live sessions
-    /// already owned by that skill.
+    /// Reading a skill makes a newly created subagent skill immediately callable without a full
+    /// reload. Keep the stable materialized agent in sync with the parsed skill while preserving
+    /// any live sessions already owned by that skill, and drop the callable when the skill on disk
+    /// switched back to inline execution.
     fn upsert_skill(&self, skill: Skill) {
         let name = skill.agent_name.clone();
         let mut subagents = self.subagents.write();
-        let mut agent = self.with_default_tools(SubAgent::from(&skill));
-        if let Some(existing) = subagents.get(&name) {
-            agent.subsessions = existing.subsessions.clone();
+        if skill.is_subagent() {
+            let mut agent = self.materialize(&skill);
+            if let Some(existing) = subagents.get(&name) {
+                agent.subsessions = existing.subsessions.clone();
+            }
+            subagents.insert(name.clone(), agent);
+        } else {
+            subagents.remove(&name);
         }
-        subagents.insert(name.clone(), agent);
         self.skills.write().insert(name, skill);
     }
 
@@ -400,7 +454,9 @@ impl SkillManager {
         self.skills.read().get(lowercase_name).cloned()
     }
 
-    /// Return all loaded skills as [`SubAgent`]s with default tools included.
+    /// Return the loaded skills that opted into [`SkillExecution::Subagent`], materialized as
+    /// [`SubAgent`]s. Inline skills are excluded: they are followed by the calling agent through
+    /// the [`SkillManager`] tool rather than dispatched as callables.
     pub fn subagents(&self) -> Vec<SubAgent> {
         self.subagents.read().values().cloned().collect::<Vec<_>>()
     }
@@ -416,8 +472,10 @@ impl SubAgentSet for SkillManager {
         self
     }
 
+    // Every lookup below goes through `subagents`, not `skills`: inline skills are followed by the
+    // calling agent through the `skills_manager` tool and must never be dispatchable as callables.
     fn contains_lowercase(&self, lowercase_name: &str) -> bool {
-        self.skills.read().contains_key(lowercase_name)
+        self.subagents.read().contains_key(lowercase_name)
     }
 
     fn get_lowercase(&self, lowercase_name: &str) -> Option<SubAgent> {
@@ -446,10 +504,9 @@ impl SubAgentSet for SkillManager {
             return Vec::new();
         }
 
-        self.skills
+        self.subagents
             .read()
             .get(&name.to_ascii_lowercase())
-            .map(SubAgent::from)
             .map(|agent| {
                 let supported_tags = agent.supported_resource_tags();
                 select_resources(resources, &supported_tags)
@@ -480,7 +537,7 @@ impl Tool<BaseCtx> for SkillManager {
                 "properties": {
                     "name": {
                         "type": "string",
-                        "description": "Skill name in kebab-case (e.g. 'pdf-processing'). Returns the matching SKILL.md content so the agent can follow it directly."
+                        "description": "Skill name in kebab-case (e.g. 'pdf-processing'). Returns the matching SKILL.md content. When `execution` is `inline`, follow that content yourself; when it is `subagent`, call the returned `callable` with a self-contained prompt instead."
                     }
                 },
                 "required": ["name"],
@@ -514,10 +571,13 @@ mod tests {
         EngineBuilder::new().mock_ctx().base
     }
 
-    fn skill_md(name: &str, description: &str, body: &str, allowed_tools: Option<&str>) -> String {
+    /// Builds a `SKILL.md`; `frontmatter` holds extra raw YAML lines such as
+    /// `"execution: subagent"` or `"allowed-tools: shell fetch"`.
+    fn skill_md(name: &str, description: &str, body: &str, frontmatter: &[&str]) -> String {
         let mut content = format!("---\nname: {name}\ndescription: {description}\n");
-        if let Some(allowed_tools) = allowed_tools {
-            content.push_str(&format!("allowed-tools: {allowed_tools}\n"));
+        for line in frontmatter {
+            content.push_str(line);
+            content.push('\n');
         }
         content.push_str("---\n\n");
         content.push_str(body);
@@ -572,6 +632,7 @@ Alpha instructions.
 name: beta-skill
 description: Beta skill for testing.
 license: MIT
+execution: subagent
 allowed-tools: shell fetch
 ---
 
@@ -584,28 +645,19 @@ Beta instructions.
         let mgr = SkillManager::new(tmp.clone());
         mgr.load().await.unwrap();
 
-        assert!(mgr.contains_lowercase("skill_alpha"));
+        // Alpha declares no execution mode, so it stays inline: loaded and readable, never
+        // callable.
+        assert!(mgr.list().contains_key("skill_alpha"));
+        assert!(!mgr.contains_lowercase("skill_alpha"));
+        assert!(mgr.get_lowercase("skill_alpha").is_none());
+
         assert!(mgr.contains_lowercase("skill_beta_skill"));
         assert!(!mgr.contains_lowercase("skill_gamma"));
 
-        let alpha = mgr.get_lowercase("skill_alpha").unwrap();
-        assert_eq!(alpha.description, "Alpha skill for testing.");
-        assert_eq!(alpha.tools, DEFAULT_SKILL_TOOLS);
-
+        // `allowed-tools` is an upper bound: beta gets exactly what it asked for, and none of the
+        // manager defaults are unioned in.
         let beta = mgr.get_lowercase("skill_beta_skill").unwrap();
-        assert_eq!(
-            beta.tools,
-            vec![
-                "shell",
-                "read_file",
-                "search_file",
-                "write_file",
-                "edit_file",
-                "todo",
-                "tools_select",
-                "fetch"
-            ]
-        );
+        assert_eq!(beta.tools, vec!["shell", "fetch"]);
         assert!(beta.instructions.contains("Beta instructions."));
 
         let beta_skill = mgr.get_skill("skill_beta_skill").unwrap();
@@ -616,8 +668,16 @@ Beta instructions.
             .await
             .unwrap();
         assert_eq!(beta_content.output["name"], json!("beta-skill"));
-        assert_eq!(beta_content.output["agent_name"], json!("skill_beta_skill"));
+        assert_eq!(beta_content.output["execution"], json!("subagent"));
+        assert_eq!(
+            beta_content.output["callable"],
+            json!("SA_skill_beta_skill")
+        );
         assert_eq!(beta_content.output["path"], json!("beta-skill/SKILL.md"));
+        assert_eq!(
+            beta_content.output["base_dir"],
+            json!(tmp.join("beta-skill").display().to_string())
+        );
         assert!(
             beta_content.output["content"]
                 .as_str()
@@ -625,6 +685,15 @@ Beta instructions.
                 .contains("Beta instructions.")
         );
 
+        // An inline skill reports no callable; the agent follows the returned content itself.
+        let alpha_content = mgr
+            .call_raw(mock_ctx(), json!({ "name": "alpha" }), Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(alpha_content.output["execution"], json!("inline"));
+        assert!(alpha_content.output.get("callable").is_none());
+
+        // Gamma delegates without declaring tools, so it inherits the manager defaults.
         tokio::fs::create_dir_all(tmp.join("gamma")).await.unwrap();
         tokio::fs::write(
             tmp.join("gamma/SKILL.md"),
@@ -632,7 +701,7 @@ Beta instructions.
                 "gamma",
                 "Gamma skill for testing.",
                 "Gamma instructions.",
-                None,
+                &["execution: subagent"],
             ),
         )
         .await
@@ -642,6 +711,10 @@ Beta instructions.
 
         assert!(mgr.contains_lowercase("skill_gamma"));
         assert!(tmp.join("gamma/SKILL.md").exists());
+        assert_eq!(
+            mgr.get_lowercase("skill_gamma").unwrap().tools,
+            DEFAULT_SKILL_TOOLS
+        );
 
         // Verify on-disk content is valid SKILL.md.
         let on_disk = tokio::fs::read_to_string(tmp.join("gamma/SKILL.md"))
@@ -650,13 +723,20 @@ Beta instructions.
         let reparsed = parse_skill_md(tmp.to_path_buf(), &on_disk).unwrap();
         assert_eq!(reparsed.frontmatter.name, "gamma");
 
-        // Definitions.
+        // Definitions cover the two subagent skills only; alpha never reaches the model's tool
+        // list.
         let defs = mgr.definitions(None);
-        assert_eq!(defs.len(), 3);
+        assert_eq!(defs.len(), 2);
+        assert!(!defs.iter().any(|def| def.name == "skill_alpha"));
 
         let defs_filtered = mgr.definitions(Some(&["skill_gamma".to_string()]));
         assert_eq!(defs_filtered.len(), 1);
         assert_eq!(defs_filtered[0].name, "skill_gamma");
+
+        assert!(
+            mgr.definitions(Some(&["skill_alpha".to_string()]))
+                .is_empty()
+        );
 
         // Clean up.
         let _ = tokio::fs::remove_dir_all(&tmp).await;
@@ -676,7 +756,7 @@ Beta instructions.
                 "alpha",
                 "Alpha skill before refresh.",
                 "Original instructions.",
-                None,
+                &["execution: subagent"],
             ),
         )
         .await
@@ -699,7 +779,7 @@ Beta instructions.
                 "alpha",
                 "Alpha skill after refresh.",
                 "Updated instructions.",
-                None,
+                &["execution: subagent"],
             ),
         )
         .await
@@ -721,6 +801,26 @@ Beta instructions.
             mgr.definitions(Some(&["skill_alpha".to_string()]))[0].description,
             after.definition().description
         );
+
+        // Switching the skill back to inline on disk retires the callable.
+        tokio::fs::write(
+            skill_dir.join("SKILL.md"),
+            skill_md(
+                "alpha",
+                "Alpha skill, now inline.",
+                "Inline instructions.",
+                &[],
+            ),
+        )
+        .await
+        .unwrap();
+        let output = mgr
+            .call_raw(mock_ctx(), json!({"name": "alpha"}), Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(output.output["execution"], json!("inline"));
+        assert!(mgr.get_lowercase("skill_alpha").is_none());
+        assert!(mgr.list().contains_key("skill_alpha"));
 
         let _ = tokio::fs::remove_dir_all(&root).await;
     }
@@ -760,7 +860,7 @@ Beta instructions.
             "legacy-skill",
             "Legacy encoded skill for testing.",
             &body,
-            None,
+            &["execution: subagent"],
         );
         let (encoded, _, had_errors) = encoding.encode(&content);
         assert!(!had_errors);
@@ -806,7 +906,7 @@ Beta instructions.
                 "alpha",
                 "Alpha skill from default directory.",
                 "Alpha instructions.",
-                None,
+                &[],
             ),
         )
         .await
@@ -818,7 +918,7 @@ Beta instructions.
                 "beta",
                 "Beta skill from extra directory.",
                 "Beta instructions.",
-                None,
+                &["execution: subagent"],
             ),
         )
         .await
@@ -834,7 +934,7 @@ Beta instructions.
 
         mgr.load().await.unwrap();
 
-        assert!(mgr.contains_lowercase("skill_alpha"));
+        assert!(mgr.list().contains_key("skill_alpha"));
         assert!(mgr.contains_lowercase("skill_beta"));
 
         let beta_content = mgr
@@ -842,7 +942,7 @@ Beta instructions.
             .await
             .unwrap();
         assert_eq!(beta_content.output["name"], json!("beta"));
-        assert_eq!(beta_content.output["agent_name"], json!("skill_beta"));
+        assert_eq!(beta_content.output["callable"], json!("SA_skill_beta"));
         assert_eq!(beta_content.output["path"], json!("beta/SKILL.md"));
         assert!(
             beta_content.output["content"]
@@ -870,7 +970,24 @@ Beta instructions.
                 "alpha",
                 "Alpha skill for manager coverage.",
                 "Alpha body.",
-                Some("shell todo shell custom_tool"),
+                &[
+                    "execution: subagent",
+                    "allowed-tools: shell todo shell custom_tool",
+                ],
+            ),
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(root.join("inline-one"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            root.join("inline-one/SKILL.md"),
+            skill_md(
+                "inline-one",
+                "Inline skill for manager coverage.",
+                "Inline body.",
+                &[],
             ),
         )
         .await
@@ -885,15 +1002,14 @@ Beta instructions.
         assert_eq!(mgr.list().len(), 0);
 
         mgr.load().await.unwrap();
-        assert_eq!(mgr.list().len(), 1);
+        assert_eq!(mgr.list().len(), 2);
 
+        // Only the skill that opted in is materialized, and its declared tools replace the
+        // configured defaults rather than merging with them.
         let subagents = mgr.subagents();
         assert_eq!(subagents.len(), 1);
         assert_eq!(subagents[0].name, "skill_alpha");
-        assert_eq!(
-            subagents[0].tools,
-            vec!["read_file", "todo", "shell", "custom_tool",]
-        );
+        assert_eq!(subagents[0].tools, vec!["shell", "todo", "custom_tool"]);
 
         let any = mgr.clone().into_any();
         assert!(any.downcast_ref::<SkillManager>().is_some());
@@ -905,11 +1021,17 @@ Beta instructions.
             ..Default::default()
         }];
         assert!(SubAgentSet::select_resources(mgr.as_ref(), "missing", &mut resources).is_empty());
+        // Inline skills are not callables, so they never claim resources.
         assert!(
-            SubAgentSet::select_resources(mgr.as_ref(), "skill_alpha", &mut resources).is_empty()
+            SubAgentSet::select_resources(mgr.as_ref(), "skill_inline_one", &mut resources)
+                .is_empty()
         );
         assert_eq!(resources.len(), 1);
-        resources.clear();
+        // A subagent skill that declares no `resource-tags` takes what the caller offers.
+        let selected = SubAgentSet::select_resources(mgr.as_ref(), "skill_alpha", &mut resources);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].name, "text");
+        assert!(resources.is_empty());
         assert!(
             SubAgentSet::select_resources(mgr.as_ref(), "skill_alpha", &mut resources).is_empty()
         );
@@ -942,20 +1064,20 @@ Beta instructions.
                 "frontmatter-name",
                 "Looked up by parsed frontmatter.",
                 "Frontmatter body.",
-                None,
+                &["execution: subagent"],
             ),
         )
         .await
         .unwrap();
         tokio::fs::write(
             extra_dir.join("duplicate-one/SKILL.md"),
-            skill_md("dupe", "Duplicate one.", "One.", None),
+            skill_md("dupe", "Duplicate one.", "One.", &[]),
         )
         .await
         .unwrap();
         tokio::fs::write(
             extra_dir.join("duplicate-two/SKILL.md"),
-            skill_md("dupe", "Duplicate two.", "Two.", None),
+            skill_md("dupe", "Duplicate two.", "Two.", &[]),
         )
         .await
         .unwrap();
@@ -971,7 +1093,7 @@ Beta instructions.
             .call_raw(mock_ctx(), json!({"name": "frontmatter-name"}), Vec::new())
             .await
             .unwrap();
-        assert_eq!(read.output["agent_name"], json!("skill_frontmatter_name"));
+        assert_eq!(read.output["callable"], json!("SA_skill_frontmatter_name"));
         assert_eq!(read.output["path"], json!("folder-name/SKILL.md"));
 
         let duplicate = mgr
@@ -1008,7 +1130,7 @@ Beta instructions.
                 "other-name",
                 "Mismatched frontmatter name.",
                 "Mismatch body.",
-                None,
+                &[],
             ),
         )
         .await
@@ -1088,7 +1210,6 @@ Body.
         let mgr = SkillManager::new(tmp.clone());
         mgr.load().await.unwrap();
 
-        assert!(mgr.contains_lowercase("skill_correct_name"));
         assert!(mgr.list().contains_key("skill_correct_name"));
 
         let _ = tokio::fs::remove_dir_all(&tmp).await;

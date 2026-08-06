@@ -9,10 +9,73 @@ use serde::{Deserialize, Deserializer, Serialize, de};
 use serde_json::Value;
 use std::{
     collections::BTreeMap,
+    fmt,
     path::{Path, PathBuf},
+    str::FromStr,
 };
 
 use crate::{extension::fs::decode_file_text, subagent::SubAgent};
+
+// ---------------------------------------------------------------------------
+// Execution mode
+// ---------------------------------------------------------------------------
+
+/// How a skill is executed once the agent decides to use it.
+///
+/// The Agent Skills specification is built on progressive disclosure: only the skill's name and
+/// description stay resident, and the SKILL.md body is pulled into the *calling* agent's context
+/// when it becomes relevant. [`SkillExecution::Inline`] implements that model and is the default.
+///
+/// [`SkillExecution::Subagent`] is an opt-in escape hatch for skills that are genuinely
+/// independent units of work — long-running, parallelisable, or context-hungry procedures that do
+/// not need the live conversation. Delegating trades context fidelity for isolation: a subagent
+/// receives only a self-contained prompt plus the resources matching its tags, and it cannot ask
+/// the user anything.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SkillExecution {
+    /// Read SKILL.md into the calling agent's own context and follow it there.
+    #[default]
+    Inline,
+    /// Expose the skill as an isolated subagent worker callable as `SA_<agent_name>`.
+    Subagent,
+}
+
+impl SkillExecution {
+    /// Returns the lowercase wire name of this mode.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Inline => "inline",
+            Self::Subagent => "subagent",
+        }
+    }
+
+    /// Whether the skill should be materialized as a callable subagent.
+    pub const fn is_subagent(&self) -> bool {
+        matches!(self, Self::Subagent)
+    }
+}
+
+impl fmt::Display for SkillExecution {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for SkillExecution {
+    type Err = BoxError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "inline" => Ok(Self::Inline),
+            "subagent" => Ok(Self::Subagent),
+            other => Err(format!(
+                "unknown skill execution mode {other:?}, expected \"inline\" or \"subagent\""
+            )
+            .into()),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // SKILL.md frontmatter — Agent Skills specification
@@ -39,18 +102,47 @@ pub struct SkillFrontmatter {
     pub compatibility: Option<String>,
 
     /// Arbitrary key-value metadata.
+    ///
+    /// `metadata.execution` is honoured as a spec-conformant alternative to the top-level
+    /// `execution` field.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata: BTreeMap<String, Json>,
 
-    /// Space-delimited list of pre-approved tools the skill may use.
+    /// Space-delimited list of tools the skill may use.
+    ///
+    /// This is an upper bound, not an addition: a skill that declares `allowed-tools` is granted
+    /// exactly those tools when run as a subagent. Skills that declare nothing inherit the
+    /// manager's default tool set.
     #[serde(
         default,
         alias = "allowed_tools",
         rename = "allowed-tools",
-        deserialize_with = "deserialize_optional_tools",
+        deserialize_with = "deserialize_optional_token_list",
         skip_serializing_if = "Option::is_none"
     )]
     pub allowed_tools: Option<String>,
+
+    /// How this skill runs. Defaults to [`SkillExecution::Inline`] when absent.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_execution",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub execution: Option<SkillExecution>,
+
+    /// Space-delimited resource tags this skill consumes when run as a subagent.
+    ///
+    /// Only meaningful for [`SkillExecution::Subagent`]. `*` takes every resource offered by the
+    /// caller, which is the default when the field is absent; a narrower list lets sibling
+    /// callables in the same turn keep the resources they need.
+    #[serde(
+        default,
+        alias = "resource_tags",
+        rename = "resource-tags",
+        deserialize_with = "deserialize_optional_token_list",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub resource_tags: Option<String>,
 
     #[serde(flatten)]
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -67,10 +159,22 @@ pub struct Skill {
     pub instructions: String,
     /// Normalised snake_case name derived from `frontmatter.name`.
     pub agent_name: String,
-    /// Resolved tools list (from `allowed-tools` or default).
+    /// Resolved execution mode (from `execution`, `metadata.execution`, or the default).
+    pub execution: SkillExecution,
+    /// Tools declared by `allowed-tools`. Empty means "inherit the manager's defaults"; a
+    /// non-empty list is the complete allowlist for this skill.
     pub tools: Vec<String>,
+    /// Resource tags declared by `resource-tags`. Empty means "accept every offered resource".
+    pub tags: Vec<String>,
     /// Skill directory path (parent of SKILL.md) for resolving relative resources.
     pub base_dir: PathBuf,
+}
+
+impl Skill {
+    /// Whether this skill is exposed as a callable subagent.
+    pub fn is_subagent(&self) -> bool {
+        self.execution.is_subagent()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -117,7 +221,9 @@ pub fn normalise_skill_agent_name(name: &str) -> String {
 // SKILL.md parsing & formatting
 // ---------------------------------------------------------------------------
 
-fn deserialize_optional_tools<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+/// Accepts either a space/comma-delimited string or a YAML list of strings, normalising both to
+/// one space-delimited string. Used by `allowed-tools` and `resource-tags`.
+fn deserialize_optional_token_list<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -132,31 +238,79 @@ where
             if s.is_empty() { Ok(None) } else { Ok(Some(s)) }
         }
         Value::Array(items) => {
-            let mut tools = Vec::new();
+            let mut tokens = Vec::new();
             for item in items {
                 match item {
                     Value::String(s) => {
                         let s = s.trim();
                         if !s.is_empty() {
-                            tools.push(s.to_string());
+                            tokens.push(s.to_string());
                         }
                     }
                     other => {
                         return Err(de::Error::custom(format!(
-                            "allowed-tools entries must be strings, got {other}"
+                            "list entries must be strings, got {other}"
                         )));
                     }
                 }
             }
-            if tools.is_empty() {
+            if tokens.is_empty() {
                 Ok(None)
             } else {
-                Ok(Some(tools.join(" ")))
+                Ok(Some(tokens.join(" ")))
             }
         }
         other => Err(de::Error::custom(format!(
-            "allowed-tools must be a string or a list of strings, got {other}"
+            "expected a string or a list of strings, got {other}"
         ))),
+    }
+}
+
+fn deserialize_optional_execution<'de, D>(
+    deserializer: D,
+) -> Result<Option<SkillExecution>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let Some(value) = Option::<String>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+
+    SkillExecution::from_str(value)
+        .map(Some)
+        .map_err(de::Error::custom)
+}
+
+/// Splits a space/comma-delimited token list into its entries, dropping duplicates while
+/// preserving the declared order.
+fn split_tokens(value: &str) -> Vec<String> {
+    let mut tokens: Vec<String> = Vec::new();
+    for token in value.split(|c: char| c.is_whitespace() || c == ',') {
+        if !token.is_empty() && !tokens.iter().any(|seen| seen == token) {
+            tokens.push(token.to_string());
+        }
+    }
+    tokens
+}
+
+/// Resolves the execution mode, preferring the top-level `execution` field and falling back to
+/// `metadata.execution` — the spec-sanctioned place for custom keys.
+fn resolve_execution(fm: &SkillFrontmatter) -> Result<SkillExecution, BoxError> {
+    if let Some(execution) = fm.execution {
+        return Ok(execution);
+    }
+
+    match fm.metadata.get("execution") {
+        None => Ok(SkillExecution::default()),
+        Some(Json::String(value)) => SkillExecution::from_str(value),
+        Some(other) => {
+            Err(format!("SKILL.md metadata.execution must be a string, got {other}").into())
+        }
     }
 }
 
@@ -267,28 +421,48 @@ pub fn parse_skill_md(base_dir: PathBuf, content: &str) -> Result<Skill, BoxErro
     let agent_name = normalise_skill_agent_name(&fm.name);
     validate_function_name(&agent_name)?;
 
-    // Parse allowed-tools (space-delimited) or use defaults.
+    let execution = resolve_execution(&fm)?;
+
+    // An empty list means "not declared": the manager falls back to its default tool set.
     let tools = match &fm.allowed_tools {
-        Some(at) if !at.trim().is_empty() => at
-            .split(|c: char| c.is_whitespace() || c == ',')
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .collect(),
-        _ => Vec::new(),
+        Some(at) => split_tokens(at),
+        None => Vec::new(),
+    };
+
+    // An empty list means "not declared": the subagent accepts every offered resource.
+    let tags = match &fm.resource_tags {
+        Some(tags) => split_tokens(tags),
+        None => Vec::new(),
     };
 
     Ok(Skill {
         frontmatter: fm,
         instructions: body.to_string(),
         agent_name,
+        execution,
         tools,
+        tags,
         base_dir,
     })
 }
 
 /// Convert a [`Skill`] into a [`SubAgent`].
+///
+/// Only meaningful for [`SkillExecution::Subagent`] skills; inline skills are never materialized
+/// as callables. Tools are taken verbatim from the skill — [`crate::extension::skill::SkillManager`]
+/// substitutes its defaults when the skill declares none.
+///
+/// A skill that declares no `resource-tags` gets `*`, so a delegated skill receives the resources
+/// the caller is holding. Without it a skill subagent can never see the current turn's
+/// attachments, since [`anda_core::select_resources`] returns nothing for an empty tag list.
 impl From<&Skill> for SubAgent {
     fn from(skill: &Skill) -> Self {
+        let tags = if skill.tags.is_empty() {
+            vec!["*".to_string()]
+        } else {
+            skill.tags.clone()
+        };
+
         SubAgent {
             name: skill.agent_name.clone(),
             description: skill.frontmatter.description.clone(),
@@ -299,6 +473,7 @@ impl From<&Skill> for SubAgent {
                 skill.instructions,
             ),
             tools: skill.tools.clone(),
+            tags,
             ..Default::default()
         }
     }
@@ -404,7 +579,7 @@ pub(crate) fn decode_skill_md_bytes(bytes: Vec<u8>) -> Result<String, Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anda_core::Agent;
+    use anda_core::{Agent, Resource, select_resources};
 
     // -- name validation --
 
@@ -670,11 +845,15 @@ Body.
                 license: Some("MIT".to_string()),
                 metadata: BTreeMap::from([("author".to_string(), "test".into())]),
                 allowed_tools: Some("shell fetch".to_string()),
+                execution: Some(SkillExecution::Subagent),
+                resource_tags: Some("text image".to_string()),
                 ..Default::default()
             },
             instructions: "# Instructions\n\nDo something useful.".to_string(),
             agent_name: "skill_my_skill".to_string(),
+            execution: SkillExecution::Subagent,
             tools: vec!["shell".to_string(), "fetch".to_string()],
+            tags: vec!["text".to_string(), "image".to_string()],
         };
 
         let md = format_skill_md(&skill).unwrap();
@@ -690,7 +869,131 @@ Body.
             skill.frontmatter.metadata.get("author")
         );
         assert_eq!(parsed.tools, skill.tools);
+        assert_eq!(parsed.tags, skill.tags);
+        assert_eq!(parsed.execution, SkillExecution::Subagent);
         assert_eq!(parsed.instructions, skill.instructions);
+    }
+
+    // -- execution mode --
+
+    #[test]
+    fn skills_are_inline_unless_they_opt_in() {
+        let md = "\
+---
+name: inline-by-default
+description: No execution field.
+---
+
+Body.
+";
+        let skill = parse_skill_md(PathBuf::from("/test_dir"), md).unwrap();
+        assert_eq!(skill.execution, SkillExecution::Inline);
+        assert!(!skill.is_subagent());
+
+        let md = "\
+---
+name: opted-in
+description: Declares subagent execution.
+execution: subagent
+---
+
+Body.
+";
+        let skill = parse_skill_md(PathBuf::from("/test_dir"), md).unwrap();
+        assert_eq!(skill.execution, SkillExecution::Subagent);
+        assert!(skill.is_subagent());
+
+        // `metadata` is the spec-sanctioned place for custom keys, so it is honoured too.
+        let md = "\
+---
+name: opted-in-via-metadata
+description: Declares subagent execution in metadata.
+metadata:
+  execution: subagent
+---
+
+Body.
+";
+        let skill = parse_skill_md(PathBuf::from("/test_dir"), md).unwrap();
+        assert!(skill.is_subagent());
+
+        // The top-level field wins over metadata.
+        let md = "\
+---
+name: conflicting
+description: Top-level field wins.
+execution: inline
+metadata:
+  execution: subagent
+---
+
+Body.
+";
+        let skill = parse_skill_md(PathBuf::from("/test_dir"), md).unwrap();
+        assert_eq!(skill.execution, SkillExecution::Inline);
+    }
+
+    #[test]
+    fn invalid_execution_mode_errors() {
+        let md = "\
+---
+name: bad-mode
+description: Unknown execution mode.
+execution: background
+---
+
+Body.
+";
+        let err = parse_skill_md(PathBuf::from("/test_dir"), md)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("background"), "{err}");
+
+        let md = "\
+---
+name: bad-metadata-mode
+description: Non-string metadata execution.
+metadata:
+  execution: 42
+---
+
+Body.
+";
+        let err = parse_skill_md(PathBuf::from("/test_dir"), md)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("metadata.execution must be a string"), "{err}");
+    }
+
+    #[test]
+    fn parse_skill_md_accepts_resource_tags_as_string_or_list() {
+        let md = "\
+---
+name: tagged
+description: Declares the resources it consumes.
+execution: subagent
+resource-tags: text, image
+---
+
+Body.
+";
+        let skill = parse_skill_md(PathBuf::from("/test_dir"), md).unwrap();
+        assert_eq!(skill.tags, vec!["text".to_string(), "image".to_string()]);
+
+        let md = "\
+---
+name: tagged-list
+description: Declares the resources it consumes as a list.
+execution: subagent
+resource_tags:
+  - text
+  - audio
+---
+
+Body.
+";
+        let skill = parse_skill_md(PathBuf::from("/test_dir"), md).unwrap();
+        assert_eq!(skill.tags, vec!["text".to_string(), "audio".to_string()]);
     }
 
     // -- SubAgent conversion --
@@ -701,6 +1004,7 @@ Body.
 ---
 name: research
 description: Research things thoroughly.
+execution: subagent
 allowed-tools: shell google_web_search
 ---
 
@@ -718,5 +1022,76 @@ Research instructions here.
 
         let def = agent.definition();
         assert_eq!(def.name, "skill_research");
+    }
+
+    #[test]
+    fn subagent_from_skill_accepts_resources_by_default() {
+        let md = "\
+---
+name: untagged
+description: Declares no resource tags.
+execution: subagent
+---
+
+Body.
+";
+        let skill = parse_skill_md(PathBuf::from("/test_dir"), md).unwrap();
+        let agent = SubAgent::from(&skill);
+        // Without this an empty tag list makes `select_resources` return nothing, so a delegated
+        // skill could never see the current turn's attachments.
+        assert_eq!(agent.supported_resource_tags(), vec!["*".to_string()]);
+
+        let mut resources = vec![
+            Resource {
+                _id: 1,
+                name: "doc".to_string(),
+                tags: vec!["text".to_string()],
+                ..Default::default()
+            },
+            Resource {
+                _id: 2,
+                name: "pic".to_string(),
+                tags: vec!["image".to_string()],
+                ..Default::default()
+            },
+        ];
+        let selected = select_resources(&mut resources, &agent.supported_resource_tags());
+        assert_eq!(selected.len(), 2);
+        assert!(resources.is_empty());
+
+        let md = "\
+---
+name: narrowed
+description: Declares the resource tags it consumes.
+execution: subagent
+resource-tags: image
+---
+
+Body.
+";
+        let skill = parse_skill_md(PathBuf::from("/test_dir"), md).unwrap();
+        let agent = SubAgent::from(&skill);
+        assert_eq!(agent.supported_resource_tags(), vec!["image".to_string()]);
+
+        let mut resources = vec![
+            Resource {
+                _id: 1,
+                name: "doc".to_string(),
+                tags: vec!["text".to_string()],
+                ..Default::default()
+            },
+            Resource {
+                _id: 2,
+                name: "pic".to_string(),
+                tags: vec!["image".to_string()],
+                ..Default::default()
+            },
+        ];
+        let selected = select_resources(&mut resources, &agent.supported_resource_tags());
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].name, "pic");
+        // Sibling callables in the same turn keep what the skill did not claim.
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0].name, "doc");
     }
 }
