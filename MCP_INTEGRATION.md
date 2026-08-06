@@ -205,8 +205,17 @@ run the flow entirely through its conversation channel:
 2. The redirect comes back one of two ways:
    - **SSH port forwarding** — the redirect URI is a loopback address
      (`http://127.0.0.1:<port>/callback`), the application listens on that port
-     on the server, and the user runs `ssh -L <port>:127.0.0.1:<port>` so their
-     local browser reaches the server's listener.
+     on the server, and the user opens a tunnel alongside their interactive
+     session so the local browser reaches that listener:
+
+     ```sh
+     ssh -N -L <port>:127.0.0.1:<port> user@your-server
+     ```
+
+     `-N` runs the tunnel without a remote shell (add `-f` to background it).
+     Use the same port on both sides: the authorization server redirects the
+     browser to the exact `redirect_uri` that was registered, so the local port
+     must be the one that URI names.
    - **Manual paste, no listener at all** — with the same loopback redirect URI
      and nothing listening, the browser lands on "connection refused", but the
      address bar holds the complete redirect URL including `code` and `state`.
