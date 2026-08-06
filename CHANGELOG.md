@@ -2,6 +2,21 @@
 
 All notable changes to the Anda project will be documented in this file.
 
+## [0.14.6] — 2026-08-06
+
+### Added — anda_engine v0.14.6
+
+- **Skill execution modes** — Skills now run inline by default: the `skills_manager` tool returns the full SKILL.md and the calling agent follows it in its own context, keeping the conversation, the user, and the turn's resources in reach. A skill can opt into isolated execution with `execution: subagent` (or `metadata.execution: subagent`) in its frontmatter, exposing it as an `SA_<agent_name>` worker for long-running, parallelisable, or context-hungry procedures. The tool response now reports `execution`, a `callable` name for subagent skills, and `base_dir` for resolving bundled files. Skills that previously ran as subagents must declare the execution mode to keep that behavior.
+- **`resource-tags` for skill subagents** — New frontmatter field narrows which offered resources a delegated skill receives; when absent it accepts every offered resource so the current turn's attachments reach it.
+
+### Changed — anda_engine v0.14.6
+
+- **`allowed-tools` is now an upper bound** — A skill that declares `allowed-tools` is granted exactly those tools as a subagent; only skills that declare nothing inherit the manager's default tool set. Previously the configured defaults were merged into every skill, which could escalate a restriction written in a third-party SKILL.md.
+
+### Fixed — anda_engine v0.14.6
+
+- **Live model switch replay** — `raw_history` belongs to the model that produced it: replaying one provider's native message JSON (OpenAI `input_text` parts, Anthropic content blocks, Gemini parts) through another provider makes the request unparseable and the provider rejects the whole call, wedging the conversation until restart. Each turn now re-resolves the routed model; when it changes, the engine drops `raw_history` and replays the provider-neutral `chat_history`.
+
 ## [0.14.5] — 2026-07-31
 
 ### Added — anda_cli v0.14.5
