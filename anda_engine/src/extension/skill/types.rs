@@ -161,10 +161,12 @@ pub struct Skill {
     pub agent_name: String,
     /// Resolved execution mode (from `execution`, `metadata.execution`, or the default).
     pub execution: SkillExecution,
-    /// Tools declared by `allowed-tools`. Empty means "inherit the manager's defaults"; a
-    /// non-empty list is the complete allowlist for this skill.
+    /// Tools declared by `allowed-tools`, the complete allowlist for this skill. Empty when the
+    /// skill declared an empty list, and also when it declared nothing — see
+    /// [`Self::declares_tools`], which is what decides whether the manager's defaults apply.
     pub tools: Vec<String>,
-    /// Resource tags declared by `resource-tags`. Empty means "accept every offered resource".
+    /// Resource tags declared by `resource-tags`. Empty when the skill declared an empty list, and
+    /// also when it declared nothing — see [`Self::declares_resource_tags`].
     pub tags: Vec<String>,
     /// Skill directory path (parent of SKILL.md) for resolving relative resources.
     pub base_dir: PathBuf,
@@ -174,6 +176,22 @@ impl Skill {
     /// Whether this skill is exposed as a callable subagent.
     pub fn is_subagent(&self) -> bool {
         self.execution.is_subagent()
+    }
+
+    /// Whether the skill declared `allowed-tools` at all.
+    ///
+    /// Distinct from a non-empty [`Self::tools`]: `allowed-tools: []` is a skill asking for *no*
+    /// tools, and must not fall through to the manager's default grant.
+    pub fn declares_tools(&self) -> bool {
+        self.frontmatter.allowed_tools.is_some()
+    }
+
+    /// Whether the skill declared `resource-tags` at all.
+    ///
+    /// Distinct from a non-empty [`Self::tags`]: `resource-tags: []` is a skill asking for no
+    /// resources, and must not fall through to the `*` default.
+    pub fn declares_resource_tags(&self) -> bool {
+        self.frontmatter.resource_tags.is_some()
     }
 }
 
@@ -223,6 +241,11 @@ pub fn normalise_skill_agent_name(name: &str) -> String {
 
 /// Accepts either a space/comma-delimited string or a YAML list of strings, normalising both to
 /// one space-delimited string. Used by `allowed-tools` and `resource-tags`.
+///
+/// An explicitly empty declaration (`[]` or `""`) stays `Some("")` rather than collapsing to
+/// `None`: both fields widen the grant when they are absent — tools fall back to the manager's
+/// defaults, resource tags to `*` — so a manifest that asks for nothing must not be read as a
+/// manifest that asked for nothing *in particular*. Only a missing or null key means "undeclared".
 fn deserialize_optional_token_list<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
     D: Deserializer<'de>,
@@ -233,10 +256,7 @@ where
 
     match value {
         Value::Null => Ok(None),
-        Value::String(s) => {
-            let s = s.trim().to_string();
-            if s.is_empty() { Ok(None) } else { Ok(Some(s)) }
-        }
+        Value::String(s) => Ok(Some(s.trim().to_string())),
         Value::Array(items) => {
             let mut tokens = Vec::new();
             for item in items {
@@ -254,11 +274,7 @@ where
                     }
                 }
             }
-            if tokens.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(tokens.join(" ")))
-            }
+            Ok(Some(tokens.join(" ")))
         }
         other => Err(de::Error::custom(format!(
             "expected a string or a list of strings, got {other}"
@@ -454,13 +470,15 @@ pub fn parse_skill_md(base_dir: PathBuf, content: &str) -> Result<Skill, BoxErro
 ///
 /// A skill that declares no `resource-tags` gets `*`, so a delegated skill receives the resources
 /// the caller is holding. Without it a skill subagent can never see the current turn's
-/// attachments, since [`anda_core::select_resources`] returns nothing for an empty tag list.
+/// attachments, since [`anda_core::select_resources`] returns nothing for an empty tag list. A
+/// skill that declares an empty list means the opposite — take nothing — so it keeps its empty
+/// tags.
 impl From<&Skill> for SubAgent {
     fn from(skill: &Skill) -> Self {
-        let tags = if skill.tags.is_empty() {
-            vec!["*".to_string()]
-        } else {
+        let tags = if skill.declares_resource_tags() {
             skill.tags.clone()
+        } else {
+            vec!["*".to_string()]
         };
 
         SubAgent {
@@ -789,6 +807,46 @@ Use the listed tools.
         assert_eq!(
             skill.tools,
             vec!["shell".to_string(), "read_file".to_string()]
+        );
+    }
+
+    #[test]
+    fn an_empty_declaration_is_not_an_undeclared_one() {
+        // Both fields widen the grant when absent, so asking for nothing must stay a request for
+        // nothing rather than falling through to the defaults.
+        let md = "\
+---
+name: locked-down
+description: Wants no tools and no resources.
+execution: subagent
+allowed-tools: []
+resource-tags: []
+---
+
+Body.
+";
+        let skill = parse_skill_md(PathBuf::from("/test_dir"), md).unwrap();
+        assert!(skill.tools.is_empty());
+        assert!(skill.declares_tools());
+        assert!(skill.tags.is_empty());
+        assert!(skill.declares_resource_tags());
+        assert!(SubAgent::from(&skill).supported_resource_tags().is_empty());
+
+        let md = "\
+---
+name: undeclared
+description: Declares neither field.
+execution: subagent
+---
+
+Body.
+";
+        let skill = parse_skill_md(PathBuf::from("/test_dir"), md).unwrap();
+        assert!(!skill.declares_tools());
+        assert!(!skill.declares_resource_tags());
+        assert_eq!(
+            SubAgent::from(&skill).supported_resource_tags(),
+            vec!["*".to_string()]
         );
     }
 

@@ -217,13 +217,14 @@ impl SkillManager {
     /// Materializes a skill into its callable [`SubAgent`].
     ///
     /// `allowed-tools` is an upper bound, per the Agent Skills specification: a skill that
-    /// declares it is granted exactly those tools and nothing else. Only a skill that declares no
-    /// tools at all inherits [`Self::default_skill_tools`]. Unioning the defaults in would turn a
-    /// restriction into an escalation — SKILL.md files are third-party content on disk, so a
-    /// manifest asking for `read_file` must not come back holding `shell`.
+    /// declares it is granted exactly those tools and nothing else. Only a skill that omits the
+    /// field inherits [`Self::default_skill_tools`] — an explicitly empty `allowed-tools` asks for
+    /// no tools and gets none. Unioning the defaults in would turn a restriction into an
+    /// escalation — SKILL.md files are third-party content on disk, so a manifest asking for
+    /// `read_file` must not come back holding `shell`.
     fn materialize(&self, skill: &Skill) -> SubAgent {
         let mut agent = SubAgent::from(skill);
-        if agent.tools.is_empty() {
+        if !skill.declares_tools() {
             agent.tools = self.default_skill_tools.clone();
         }
         agent
@@ -465,6 +466,28 @@ impl SkillManager {
     pub fn list(&self) -> BTreeMap<String, Skill> {
         self.skills.read().clone()
     }
+
+    /// Renders the resident catalog of loaded skills appended to the tool description.
+    ///
+    /// Progressive disclosure defers a skill's *body*, not its existence: the name and the
+    /// description have to stay resident or the model cannot know there is anything to pull in.
+    /// Subagent skills get that from their `SA_` definitions, but inline skills appear in no tool
+    /// list at all, so without this catalog the only way to reach one would be to guess its name.
+    fn skills_catalog(&self) -> String {
+        let skills = self.skills.read();
+        if skills.is_empty() {
+            return String::new();
+        }
+
+        let mut catalog = String::from("\nLoaded skills (name, execution, description):");
+        for skill in skills.values() {
+            catalog.push_str(&format!(
+                "\n- {} [{}]: {}",
+                skill.frontmatter.name, skill.execution, skill.frontmatter.description
+            ));
+        }
+        catalog
+    }
 }
 
 impl SubAgentSet for SkillManager {
@@ -524,7 +547,7 @@ impl Tool<BaseCtx> for SkillManager {
     }
 
     fn description(&self) -> String {
-        self.description.clone()
+        format!("{}{}", self.description, self.skills_catalog())
     }
 
     fn definition(&self) -> FunctionDefinition {
@@ -992,6 +1015,20 @@ Beta instructions.
         )
         .await
         .unwrap();
+        tokio::fs::create_dir_all(root.join("locked-down"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            root.join("locked-down/SKILL.md"),
+            skill_md(
+                "locked-down",
+                "Delegates but asks for no tools.",
+                "Locked body.",
+                &["execution: subagent", "allowed-tools: []"],
+            ),
+        )
+        .await
+        .unwrap();
 
         let mgr = Arc::new(
             SkillManager::new(root.clone())
@@ -1002,14 +1039,34 @@ Beta instructions.
         assert_eq!(mgr.list().len(), 0);
 
         mgr.load().await.unwrap();
-        assert_eq!(mgr.list().len(), 2);
+        assert_eq!(mgr.list().len(), 3);
 
-        // Only the skill that opted in is materialized, and its declared tools replace the
+        // Inline skills are in no tool list, so the description carries the resident catalog:
+        // without it the model would have to guess that `inline-one` exists.
+        let description = mgr.description();
+        assert!(
+            description.starts_with("custom skill reader"),
+            "{description}"
+        );
+        assert!(
+            description.contains("- inline-one [inline]: Inline skill for manager coverage."),
+            "{description}"
+        );
+        assert!(
+            description.contains("- alpha [subagent]: Alpha skill for manager coverage."),
+            "{description}"
+        );
+
+        // Only the skills that opted in are materialized, and their declared tools replace the
         // configured defaults rather than merging with them.
         let subagents = mgr.subagents();
-        assert_eq!(subagents.len(), 1);
+        assert_eq!(subagents.len(), 2);
         assert_eq!(subagents[0].name, "skill_alpha");
         assert_eq!(subagents[0].tools, vec!["shell", "todo", "custom_tool"]);
+        // An empty `allowed-tools` is a declaration of none, not an omission, so the manager's
+        // defaults do not fill it in.
+        assert_eq!(subagents[1].name, "skill_locked_down");
+        assert!(subagents[1].tools.is_empty());
 
         let any = mgr.clone().into_any();
         assert!(any.downcast_ref::<SkillManager>().is_some());

@@ -336,6 +336,7 @@ impl AgentCtx {
         }
         CompletionRunner {
             ctx: self,
+            history_prefix: req.chat_history.clone(),
             req,
             model,
             resources,
@@ -1109,6 +1110,13 @@ pub struct CompletionRunner {
     model: Model,
     resources: Vec<Resource>,
     chat_history: Vec<Message>,
+    /// Conversation the caller seeded `req.chat_history` with, kept verbatim.
+    ///
+    /// `chat_history` accumulates only what this runner generates, and the request's own history
+    /// is cleared after the first turn, so this is the sole neutral copy of everything that came
+    /// before. [`Self::sync_model_for_next_turn`] replays it when a live model switch forces the
+    /// provider-native history to be dropped.
+    history_prefix: Vec<Message>,
     tool_calls: Vec<ToolCall>,
     total_usage: Usage,
     current_usage: Usage,
@@ -1931,6 +1939,7 @@ impl CompletionRunner {
             model: self.model.clone(),
             resources: Vec::new(),
             chat_history: Vec::new(),
+            history_prefix: Vec::new(),
             tool_calls: Vec::new(),
             total_usage: Usage::default(),
             current_usage: Usage::default(),
@@ -2329,7 +2338,11 @@ impl CompletionRunner {
     /// state (thinking signatures and the like) — the very thing `raw_history` exists to preserve —
     /// but a resumed conversation already replays without it, and adapters must tolerate that.
     ///
-    /// `self.req.chat_history` is always a subset of `self.chat_history` here (the only writer,
+    /// The replay is [`Self::history_prefix`] followed by [`Self::chat_history`]: the runner only
+    /// accumulates the messages it generates, so the conversation the caller seeded the request
+    /// with lives nowhere else once the first turn has cleared `req.chat_history` — it survives
+    /// only inside the raw history that is being dropped here. `self.req.chat_history` itself is
+    /// always a subset of `self.chat_history` at this point (the only writer,
     /// [`Self::commit_tool_outputs_to_history`], appends to both), so overwriting it neither
     /// duplicates nor drops a message.
     fn sync_model_for_next_turn(&mut self) {
@@ -2346,7 +2359,15 @@ impl CompletionRunner {
             );
             self.req.raw_history.clear();
             self.pending_tool_call_raw_history_start = None;
-            self.req.chat_history = self.chat_history.clone();
+            // `reserve_chat_history` seeds `chat_history` with messages that are also in the
+            // request, so skip the prefix when it is already at the front.
+            let mut history =
+                Vec::with_capacity(self.history_prefix.len() + self.chat_history.len());
+            if !self.chat_history.starts_with(&self.history_prefix) {
+                history.extend(self.history_prefix.iter().cloned());
+            }
+            history.extend(self.chat_history.iter().cloned());
+            self.req.chat_history = history;
         }
 
         self.model = model;
@@ -6596,6 +6617,16 @@ mod tests {
         let mut runner = ctx.clone().completion_iter(
             CompletionRequest {
                 prompt: "hello".to_string(),
+                // A resumed conversation: the caller seeds the request with the persisted
+                // history. It is cleared after the first turn and lives on only in the raw
+                // history, so the replay has to bring it back.
+                chat_history: vec![Message {
+                    role: "user".to_string(),
+                    content: vec![ContentPart::Text {
+                        text: "earlier turn".to_string(),
+                    }],
+                    ..Default::default()
+                }],
                 ..Default::default()
             },
             Vec::new(),
@@ -6622,7 +6653,8 @@ mod tests {
         let seen = requests.lock().unwrap();
         let switched = seen.last().unwrap();
         assert!(switched.raw_history.is_empty());
-        // ...and the conversation is replayed to it in the neutral format instead.
+        // ...and the whole conversation is replayed to it in the neutral format instead,
+        // starting with the history the caller seeded the request with.
         assert_eq!(
             switched
                 .chat_history
@@ -6633,7 +6665,7 @@ mod tests {
                     _ => None,
                 })
                 .collect::<Vec<_>>(),
-            vec!["provider_a replied"]
+            vec!["earlier turn", "provider_a replied"]
         );
     }
 
