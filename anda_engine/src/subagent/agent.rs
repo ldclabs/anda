@@ -199,65 +199,19 @@ impl Agent<AgentCtx> for SubAgent {
             // Enforce the subagent's tool whitelist at execution time, not just
             // in the definitions sent to the model.
             let allowed = self.allowed_callables();
-            let rt = if let Some(recorder) = ctx.base.get_state::<SubAgentConversationRecorder>() {
-                let mut conversation = recorder
-                    .start(&ctx, self, "blocking", None, &req, input_resources)
-                    .await?;
-                let mut runner = ctx.clone().completion_iter(req, Vec::new());
-                runner.set_allowed_callables(Some(allowed));
-                let mut last: Option<AgentOutput> = None;
-
-                loop {
-                    match runner.next().await {
-                        Ok(Some(mut output)) => {
-                            let status = if output.failed_reason.is_some() {
-                                ConversationStatus::Failed
-                            } else if runner.is_done() {
-                                ConversationStatus::Completed
-                            } else {
-                                ConversationStatus::Working
-                            };
-                            conversation.record_output(&mut output, status).await;
-                            let terminal = runner.is_done() || output.failed_reason.is_some();
-                            last = Some(output);
-                            if terminal {
-                                break;
-                            }
-                        }
-                        Ok(None) => break,
-                        Err(err) => {
-                            conversation.record_failure(err.to_string()).await;
-                            return Err(err);
-                        }
-                    }
-                }
-
-                match last {
-                    Some(output) => output,
-                    None => {
-                        let reason = "completion runner returned no output".to_string();
-                        conversation.record_failure(reason.clone()).await;
-                        return Err(reason.into());
-                    }
-                }
-            } else {
-                let mut runner = ctx.clone().completion_iter(req, Vec::new());
-                runner.set_allowed_callables(Some(allowed));
-                let mut last: Option<AgentOutput> = None;
-                while let Some(step) = runner.next().await? {
-                    let terminal = step.failed_reason.is_some();
-                    last = Some(step);
-                    if terminal {
-                        break;
-                    }
-                }
-                last.ok_or_else(|| -> BoxError { "completion runner returned no output".into() })?
+            let mut conversation = match ctx.base.get_state::<SubAgentConversationRecorder>() {
+                Some(recorder) => Some(
+                    recorder
+                        .start(&ctx, self, "blocking", None, &req, input_resources)
+                        .await?,
+                ),
+                None => None,
             };
+            let mut runner = ctx.clone().completion_iter(req, Vec::new());
+            runner.set_allowed_callables(Some(allowed));
+            let rt = drive_to_completion(&mut runner, conversation.as_mut()).await?;
 
-            if let Some(hook) = &agent_hook {
-                return hook.after_agent_run(&ctx, rt).await;
-            }
-            return Ok(rt);
+            return finish_with_hook(&agent_hook, &ctx, rt).await;
         }
 
         let agent = self.name();
@@ -296,10 +250,7 @@ impl Agent<AgentCtx> for SubAgent {
                     ..Default::default()
                 },
             };
-            if let Some(hook) = &agent_hook {
-                return hook.after_agent_run(&ctx, rt).await;
-            }
-            return Ok(rt);
+            return finish_with_hook(&agent_hook, &ctx, rt).await;
         }
 
         // `/stop_task <task_id>` stops a single background task running inside the session (a nested
@@ -350,10 +301,7 @@ impl Agent<AgentCtx> for SubAgent {
                     ..Default::default()
                 },
             };
-            if let Some(hook) = &agent_hook {
-                return hook.after_agent_run(&ctx, rt).await;
-            }
-            return Ok(rt);
+            return finish_with_hook(&agent_hook, &ctx, rt).await;
         }
 
         // Join the active session when one exists, otherwise atomically claim the session ID.
@@ -375,10 +323,7 @@ impl Agent<AgentCtx> for SubAgent {
                             session: Some(session_id.clone()),
                             ..Default::default()
                         };
-                        if let Some(hook) = &agent_hook {
-                            return hook.after_agent_run(&ctx, rt).await;
-                        }
-                        return Ok(rt);
+                        return finish_with_hook(&agent_hook, &ctx, rt).await;
                     }
                     Err(err) => {
                         log::warn!(
@@ -409,10 +354,7 @@ impl Agent<AgentCtx> for SubAgent {
                     session: Some(session_id.clone()),
                     ..Default::default()
                 };
-                if let Some(hook) = &agent_hook {
-                    return hook.after_agent_run(&ctx, rt).await;
-                }
-                return Ok(rt);
+                return finish_with_hook(&agent_hook, &ctx, rt).await;
             }
 
             let (sender, rx) = tokio::sync::mpsc::channel::<SubAgentInput>(42);
@@ -679,5 +621,67 @@ impl Agent<AgentCtx> for SubAgent {
         });
 
         Ok(rt)
+    }
+}
+
+/// Drives a runner until it finishes or fails, optionally recording each step
+/// into a conversation log. This is the single blocking drive loop shared by
+/// recorded and unrecorded subagent calls.
+async fn drive_to_completion(
+    runner: &mut CompletionRunner,
+    mut conversation: Option<&mut SubAgentConversationLog>,
+) -> Result<AgentOutput, BoxError> {
+    let mut last: Option<AgentOutput> = None;
+    loop {
+        match runner.next().await {
+            Ok(Some(mut output)) => {
+                let terminal = runner.is_done() || output.failed_reason.is_some();
+                if let Some(conversation) = conversation.as_deref_mut() {
+                    let status = if output.failed_reason.is_some() {
+                        ConversationStatus::Failed
+                    } else if runner.is_done() {
+                        ConversationStatus::Completed
+                    } else {
+                        ConversationStatus::Working
+                    };
+                    conversation.record_output(&mut output, status).await;
+                }
+                last = Some(output);
+                if terminal {
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(err) => {
+                if let Some(conversation) = conversation.as_deref_mut() {
+                    conversation.record_failure(err.to_string()).await;
+                }
+                return Err(err);
+            }
+        }
+    }
+
+    match last {
+        Some(output) => Ok(output),
+        None => {
+            let reason = "completion runner returned no output".to_string();
+            if let Some(conversation) = conversation {
+                conversation.record_failure(reason.clone()).await;
+            }
+            Err(reason.into())
+        }
+    }
+}
+
+/// Applies the optional agent hook's `after_agent_run` transform to a finished
+/// output — the shared tail of every synchronous subagent return path.
+async fn finish_with_hook(
+    agent_hook: &Option<DynAgentHook>,
+    ctx: &AgentCtx,
+    rt: AgentOutput,
+) -> Result<AgentOutput, BoxError> {
+    match agent_hook {
+        Some(hook) => hook.after_agent_run(ctx, rt).await,
+        None => Ok(rt),
     }
 }

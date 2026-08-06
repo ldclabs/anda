@@ -17,19 +17,15 @@ use anda_core::{
     Message, Usage as ModelUsage, inline_data_from_data_url, normalize_strict_schema,
     part_to_data_url,
 };
-use log::{Level::Debug, log_enabled};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, json};
 use std::collections::{BTreeMap, HashMap};
 
 pub mod types;
 
-use super::{
-    CompletionFeaturesDyn, ModelEffort, execute_completion_request_with_retry,
-    read_completion_response_bytes, read_sse_json_events, request_client_builder,
-    streaming_completion_request,
-};
-use crate::{rfc3339_datetime, unix_ms};
+use super::driver::{SamplingOptions, WireFormat, drive_completion};
+use super::{CompletionFeaturesDyn, ModelEffort, request_client_builder};
+use crate::unix_ms;
 
 // ================================================================
 // Main OpenAI Client
@@ -877,7 +873,7 @@ pub struct Choice {
 }
 
 #[derive(Debug, Deserialize)]
-struct ChatCompletionStreamChunk {
+pub(crate) struct ChatCompletionStreamChunk {
     #[serde(default)]
     id: String,
     #[serde(default)]
@@ -1573,178 +1569,145 @@ impl CompletionFeaturesDyn for CompletionModel {
         self.model.clone()
     }
 
-    fn completion(&self, mut req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
+    fn completion(&self, req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
+        let model = self.model.clone();
         let client = self.client.clone();
         let mut r = self.default_request.clone();
-        r.model = self.model.clone();
+        r.model = model.clone();
 
         Box::pin(async move {
-            let timestamp = unix_ms();
-            let mut chat_history: Vec<Message> = Vec::new();
-
-            if !req.instructions.is_empty() {
-                r.messages.push(json!(MessageInput {
-                    role: "system".into(),
-                    content: req.instructions.clone().into(),
-                    ..Default::default()
-                }));
-            };
-
-            r.messages.append(&mut req.raw_history);
-            let skip_raw = r.messages.len();
-
-            for msg in req.chat_history {
-                for input in to_message_inputs(&msg) {
-                    r.messages.push(serde_json::to_value(input)?);
-                }
-            }
-
-            if let Some(mut msg) = req
-                .documents
-                .to_message(&rfc3339_datetime(timestamp).unwrap())
-            {
-                msg.timestamp = Some(timestamp);
-                for input in to_message_inputs(&msg) {
-                    r.messages.push(serde_json::to_value(input)?);
-                }
-                chat_history.push(msg);
-            }
-
-            let mut content = req.content;
-            if !req.prompt.is_empty() {
-                content.insert(0, req.prompt.into());
-            }
-            if !content.is_empty() {
-                let msg = Message {
-                    role: req.role.unwrap_or_else(|| "user".to_string()),
-                    content,
-                    timestamp: Some(timestamp),
-                    ..Default::default()
-                };
-
-                for input in to_message_inputs(&msg) {
-                    r.messages.push(serde_json::to_value(input)?);
-                }
-                chat_history.push(msg);
-            }
-
-            if let Some(temperature) = req.temperature {
-                r.temperature = Some(temperature);
-            }
-
-            if let Some(max_tokens) = req.max_output_tokens {
-                r.max_tokens = Some(max_tokens as u64);
-            }
-
-            if let Some(effort) = req.effort {
-                r.reasoning_effort = Some(effort.into());
-            }
-
-            if let Some(output_schema) = req.output_schema {
-                // The Chat Completions API requires the `json_schema` field to be
-                // a `{name, schema, strict?}` wrapper, not a bare JSON schema.
-                // Mirror the v2 (Responses) path so structured-output requests are
-                // well-formed on the Chat path too.
-                let json_schema = serde_json::to_value(JsonSchemaResponseFormat {
-                    name: "structured_output".to_string(),
-                    description: None,
-                    schema: normalize_strict_schema(output_schema)
-                        .as_object()
-                        .cloned()
-                        .unwrap_or_default(),
-                    strict: Some(true),
-                })?;
-                r.response_format = Some(ResponseFormat::JsonSchema { json_schema });
-            }
-
-            if let Some(stop) = req.stop {
-                r.stop = Some(Stop::Strings(stop));
-            }
-
-            if !req.tools.is_empty() {
-                r.tools = req
-                    .tools
-                    .into_iter()
-                    .map(ToolDefinition::from)
-                    .collect::<Vec<_>>();
-                if !r.model.starts_with("deepseek") {
-                    r.tool_choice = Some(if req.tool_choice_required {
-                        ChatCompletionToolChoice::Mode(ChatCompletionToolChoiceMode::Required)
-                    } else {
-                        ChatCompletionToolChoice::Mode(ChatCompletionToolChoiceMode::Auto)
-                    });
-                }
-            };
-
-            // Real OpenAI streaming omits usage unless `stream_options.include_usage`
-            // is requested, which would leave billing and context budgeting at 0.
-            if r.stream == Some(true) && r.stream_options.is_none() {
-                r.stream_options = Some(ChatCompletionStreamOptions {
-                    include_usage: Some(true),
-                    ..Default::default()
-                });
-            }
-
-            if log_enabled!(Debug)
-                && let Ok(val) = serde_json::to_string(&r)
-            {
-                log::debug!(request = val; "OpenAI completions request");
-            }
-
-            let res = execute_completion_request_with_retry(
-                &r.model,
-                || {
-                    let mut request = client.post("/chat/completions").json(&r);
-                    if r.stream == Some(true) {
-                        request = streaming_completion_request(request);
-                    }
-                    request
-                },
-                |response| async {
-                    let res = if r.stream == Some(true) {
-                        let chunks = read_sse_json_events(response, &r.model).await?;
-                        chat_completion_response_from_stream_chunks(chunks)?
-                    } else {
-                        let data = read_completion_response_bytes(response, &r.model).await?;
-                        match serde_json::from_slice::<CompletionResponse>(&data) {
-                            Ok(mut res) => {
-                                res.parse_output();
-                                res
-                            }
-                            Err(err) => {
-                                return Err(format!(
-                                    "Invalid completion response, model: {}, error: {}, body: {}",
-                                    r.model,
-                                    err,
-                                    String::from_utf8_lossy(&data)
-                                )
-                                .into());
-                            }
-                        }
-                    };
-                    Ok(res)
-                },
-            )
-            .await?;
-
-            if log_enabled!(Debug) {
-                log::debug!(
-                    model = r.model,
-                    request:serde = r,
-                    response:serde = res;
-                    "Completion response");
-            } else if res.maybe_failed() {
-                log::warn!(
-                    model = r.model,
-                    request:serde = r,
-                    response:serde = res;
-                    "Completion maybe failed");
-            }
-            if skip_raw > 0 {
-                r.messages.drain(0..skip_raw);
-            }
-            res.try_into(r.messages, chat_history)
+            drive_completion::<CompletionModel>(model, move |path| client.post(path), r, req).await
         })
+    }
+}
+
+impl WireFormat for CompletionModel {
+    type Request = ChatCompletionRequest;
+    type Response = CompletionResponse;
+    type StreamItem = ChatCompletionStreamChunk;
+
+    fn set_instructions(r: &mut Self::Request, instructions: String) {
+        // Instructions ride in the message container itself, ahead of the
+        // raw-history append, so the skip point excludes them.
+        r.messages.push(json!(MessageInput {
+            role: "system".into(),
+            content: instructions.into(),
+            ..Default::default()
+        }));
+    }
+
+    fn append_raw_history(r: &mut Self::Request, mut raw_history: Vec<Json>) -> usize {
+        r.messages.append(&mut raw_history);
+        r.messages.len()
+    }
+
+    fn push_message(r: &mut Self::Request, msg: Message) -> Result<(), BoxError> {
+        for input in to_message_inputs(&msg) {
+            r.messages.push(serde_json::to_value(input)?);
+        }
+        Ok(())
+    }
+
+    fn apply_sampling(r: &mut Self::Request, options: SamplingOptions) -> Result<(), BoxError> {
+        if let Some(temperature) = options.temperature {
+            r.temperature = Some(temperature);
+        }
+        if let Some(max_tokens) = options.max_output_tokens {
+            r.max_tokens = Some(max_tokens as u64);
+        }
+        if let Some(effort) = options.effort {
+            r.reasoning_effort = Some(effort.into());
+        }
+        if let Some(output_schema) = options.output_schema {
+            // The Chat Completions API requires the `json_schema` field to be
+            // a `{name, schema, strict?}` wrapper, not a bare JSON schema.
+            // Mirror the v2 (Responses) path so structured-output requests are
+            // well-formed on the Chat path too.
+            let json_schema = serde_json::to_value(JsonSchemaResponseFormat {
+                name: "structured_output".to_string(),
+                description: None,
+                schema: normalize_strict_schema(output_schema)
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default(),
+                strict: Some(true),
+            })?;
+            r.response_format = Some(ResponseFormat::JsonSchema { json_schema });
+        }
+        if let Some(stop) = options.stop {
+            r.stop = Some(Stop::Strings(stop));
+        }
+        Ok(())
+    }
+
+    fn apply_tools(r: &mut Self::Request, tools: Vec<FunctionDefinition>, required: bool) {
+        r.tools = tools.into_iter().map(ToolDefinition::from).collect();
+        if !r.model.starts_with("deepseek") {
+            r.tool_choice = Some(if required {
+                ChatCompletionToolChoice::Mode(ChatCompletionToolChoiceMode::Required)
+            } else {
+                ChatCompletionToolChoice::Mode(ChatCompletionToolChoiceMode::Auto)
+            });
+        }
+    }
+
+    fn finalize_request(r: &mut Self::Request) {
+        // Real OpenAI streaming omits usage unless `stream_options.include_usage`
+        // is requested, which would leave billing and context budgeting at 0.
+        if r.stream == Some(true) && r.stream_options.is_none() {
+            r.stream_options = Some(ChatCompletionStreamOptions {
+                include_usage: Some(true),
+                ..Default::default()
+            });
+        }
+    }
+
+    fn is_stream(r: &Self::Request) -> bool {
+        r.stream == Some(true)
+    }
+
+    fn endpoint(_r: &Self::Request, _model: &str) -> String {
+        "/chat/completions".to_string()
+    }
+
+    fn aggregate_stream(items: Vec<Self::StreamItem>) -> Result<Self::Response, BoxError> {
+        chat_completion_response_from_stream_chunks(items)
+    }
+
+    fn parse_response(model: &str, data: &[u8]) -> Result<(Self::Response, Option<Json>), BoxError> {
+        match serde_json::from_slice::<CompletionResponse>(data) {
+            Ok(mut res) => {
+                res.parse_output();
+                Ok((res, None))
+            }
+            Err(err) => Err(format!(
+                "Invalid completion response, model: {}, error: {}, body: {}",
+                model,
+                err,
+                String::from_utf8_lossy(data)
+            )
+            .into()),
+        }
+    }
+
+    fn maybe_failed(res: &Self::Response) -> bool {
+        res.maybe_failed()
+    }
+
+    fn sent_messages(mut r: Self::Request, skip_raw: usize) -> Vec<Json> {
+        if skip_raw > 0 {
+            r.messages.drain(0..skip_raw);
+        }
+        r.messages
+    }
+
+    fn into_output(
+        res: Self::Response,
+        sent_messages: Vec<Json>,
+        chat_history: Vec<Message>,
+        _assistant_raw_message: Option<Json>,
+    ) -> Result<AgentOutput, BoxError> {
+        res.try_into(sent_messages, chat_history)
     }
 }
 
@@ -1815,175 +1778,144 @@ impl CompletionFeaturesDyn for CompletionModelV2 {
     }
 
     fn completion(&self, req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
+        let model = self.model.clone();
         let client = self.client.clone();
         let mut r = self.default_request.clone();
-        r.model = self.model.clone();
+        r.model = model.clone();
+
+        Box::pin(async move {
+            drive_completion::<CompletionModelV2>(model, move |path| client.post(path), r, req)
+                .await
+        })
+    }
+}
+
+impl WireFormat for CompletionModelV2 {
+    type Request = types::CompletionRequest;
+    type Response = types::CompletionResponse;
+    type StreamItem = types::StreamEvent;
+
+    fn set_instructions(r: &mut Self::Request, instructions: String) {
+        r.instructions = Some(instructions);
+    }
+
+    fn append_raw_history(r: &mut Self::Request, raw_history: Vec<Json>) -> usize {
+        for raw in raw_history {
+            r.input.extend(types::raw_history_into(raw));
+        }
+        r.input.len()
+    }
+
+    fn push_message(r: &mut Self::Request, msg: Message) -> Result<(), BoxError> {
+        r.input.extend(types::message_into(msg));
+        Ok(())
+    }
+
+    fn apply_sampling(r: &mut Self::Request, options: SamplingOptions) -> Result<(), BoxError> {
+        if let Some(temperature) = options.temperature {
+            r.temperature = Some(temperature);
+        }
+        if let Some(max_tokens) = options.max_output_tokens {
+            r.max_output_tokens = Some(max_tokens as u64);
+        }
+        if let Some(effort) = options.effort {
+            let reasoning = r
+                .additional_parameters
+                .reasoning
+                .get_or_insert(types::Reasoning {
+                    effort: None,
+                    generate_summary: None,
+                    summary: None,
+                });
+            reasoning.effort = Some(effort.into());
+        }
+        if let Some(output_schema) = options.output_schema {
+            r.additional_parameters.text = Some(types::TextConfig::structured_output(
+                "structured_output".to_string(),
+                output_schema,
+            ));
+        }
+        Ok(())
+    }
+
+    fn apply_tools(r: &mut Self::Request, tools: Vec<FunctionDefinition>, required: bool) {
+        r.tools = tools
+            .into_iter()
+            .map(|v| {
+                let v = v.normalize_strict_parameters();
+                types::ToolDefinition::Function {
+                    name: v.name,
+                    description: if v.description.is_empty() {
+                        None
+                    } else {
+                        Some(v.description)
+                    },
+                    parameters: v.parameters,
+                    strict: v.strict.unwrap_or_default(),
+                    defer_loading: None,
+                }
+            })
+            .collect::<Vec<_>>();
+        r.tool_choice = Some(if required {
+            types::ToolChoice::required()
+        } else {
+            types::ToolChoice::auto()
+        });
+    }
+
+    fn finalize_request(r: &mut Self::Request) {
         // The Responses API adapter always streams and never stores responses,
         // regardless of `with_stream` or `with_default_request` overrides.
         r.stream = Some(true);
         r.additional_parameters.store = Some(false);
+    }
 
-        Box::pin(async move {
-            let timestamp = unix_ms();
-            let mut chat_history: Vec<Message> = Vec::new();
+    fn is_stream(r: &Self::Request) -> bool {
+        r.stream == Some(true)
+    }
 
-            if !req.instructions.is_empty() {
-                r.instructions = Some(req.instructions);
-            };
+    fn endpoint(_r: &Self::Request, _model: &str) -> String {
+        "/responses".to_string()
+    }
 
-            for raw in req.raw_history {
-                r.input.extend(types::raw_history_into(raw));
+    fn aggregate_stream(items: Vec<Self::StreamItem>) -> Result<Self::Response, BoxError> {
+        responses_response_from_stream_events(items)
+    }
+
+    fn parse_response(model: &str, data: &[u8]) -> Result<(Self::Response, Option<Json>), BoxError> {
+        match serde_json::from_slice::<types::CompletionResponse>(data) {
+            Ok(mut res) => {
+                res.parse_output();
+                Ok((res, None))
             }
-            let skip_raw = r.input.len();
-
-            for msg in req.chat_history {
-                let vals = types::message_into(msg);
-                r.input.extend(vals);
-            }
-
-            if let Some(mut msg) = req
-                .documents
-                .to_message(&rfc3339_datetime(timestamp).unwrap())
-            {
-                msg.timestamp = Some(timestamp);
-                chat_history.push(msg.clone());
-                let vals = types::message_into(msg);
-                r.input.extend(vals);
-            }
-
-            let mut content = req.content;
-            if !req.prompt.is_empty() {
-                content.insert(0, req.prompt.into());
-            }
-            if !content.is_empty() {
-                let msg = Message {
-                    role: req.role.unwrap_or_else(|| "user".to_string()),
-                    content,
-                    timestamp: Some(timestamp),
-                    ..Default::default()
-                };
-                chat_history.push(msg.clone());
-                let vals = types::message_into(msg);
-                r.input.extend(vals);
-            }
-
-            if let Some(temperature) = req.temperature {
-                r.temperature = Some(temperature);
-            }
-
-            if let Some(max_tokens) = req.max_output_tokens {
-                r.max_output_tokens = Some(max_tokens as u64);
-            }
-
-            if let Some(effort) = req.effort {
-                let reasoning = r
-                    .additional_parameters
-                    .reasoning
-                    .get_or_insert(types::Reasoning {
-                        effort: None,
-                        generate_summary: None,
-                        summary: None,
-                    });
-                reasoning.effort = Some(effort.into());
-            }
-
-            if let Some(output_schema) = req.output_schema {
-                r.additional_parameters.text = Some(types::TextConfig::structured_output(
-                    "structured_output".to_string(),
-                    output_schema,
-                ));
-            }
-
-            if !req.tools.is_empty() {
-                r.tools = req
-                    .tools
-                    .into_iter()
-                    .map(|v| {
-                        let v = v.normalize_strict_parameters();
-                        types::ToolDefinition::Function {
-                            name: v.name,
-                            description: if v.description.is_empty() {
-                                None
-                            } else {
-                                Some(v.description)
-                            },
-                            parameters: v.parameters,
-                            strict: v.strict.unwrap_or_default(),
-                            defer_loading: None,
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                r.tool_choice = Some(if req.tool_choice_required {
-                    types::ToolChoice::required()
-                } else {
-                    types::ToolChoice::auto()
-                });
-            };
-
-            if log_enabled!(Debug)
-                && let Ok(val) = serde_json::to_string(&r)
-            {
-                log::debug!(request = val; "Completion request");
-            }
-
-            let res = execute_completion_request_with_retry(
-                &r.model,
-                || {
-                    let mut request = client.post("/responses").json(&r);
-                    if r.stream == Some(true) {
-                        request = streaming_completion_request(request);
-                    }
-                    request
-                },
-                |response| async {
-                    let res = if r.stream == Some(true) {
-                        let events = read_sse_json_events(response, &r.model).await?;
-                        responses_response_from_stream_events(events)?
-                    } else {
-                        let data = read_completion_response_bytes(response, &r.model).await?;
-                        match serde_json::from_slice::<types::CompletionResponse>(&data) {
-                            Ok(mut res) => {
-                                res.parse_output();
-                                res
-                            }
-                            Err(err) => {
-                                return Err(format!(
-                                    "Invalid completion response, model: {}, error: {}, body: {}",
-                                    r.model,
-                                    err,
-                                    String::from_utf8_lossy(&data)
-                                )
-                                .into());
-                            }
-                        }
-                    };
-                    Ok(res)
-                },
+            Err(err) => Err(format!(
+                "Invalid completion response, model: {}, error: {}, body: {}",
+                model,
+                err,
+                String::from_utf8_lossy(data)
             )
-            .await?;
+            .into()),
+        }
+    }
 
-            if log_enabled!(Debug) {
-                log::debug!(
-                        model = r.model,
-                        request:serde = r,
-                        response:serde = res;
-                        "Completion response");
-            } else if res.maybe_failed() {
-                log::warn!(
-                        model = r.model,
-                        request:serde = r,
-                        response:serde = res;
-                        "Completion maybe failed");
-            }
+    fn maybe_failed(res: &Self::Response) -> bool {
+        res.maybe_failed()
+    }
 
-            if skip_raw > 0 {
-                r.input.drain(0..skip_raw);
-            }
-            res.try_into(
-                r.input.into_iter().map(|v| json!(v)).collect(),
-                chat_history,
-            )
-        })
+    fn sent_messages(mut r: Self::Request, skip_raw: usize) -> Vec<Json> {
+        if skip_raw > 0 {
+            r.input.drain(0..skip_raw);
+        }
+        r.input.into_iter().map(|v| json!(v)).collect()
+    }
+
+    fn into_output(
+        res: Self::Response,
+        sent_messages: Vec<Json>,
+        chat_history: Vec<Message>,
+        _assistant_raw_message: Option<Json>,
+    ) -> Result<AgentOutput, BoxError> {
+        res.try_into(sent_messages, chat_history)
     }
 }
 

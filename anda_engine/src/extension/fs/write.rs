@@ -12,9 +12,8 @@ use serde_json::json;
 use std::{path::PathBuf, str::FromStr};
 
 use super::{
-    BASE64_ENCODING, FileTextEncodeError, atomic_write_file, default_write_encoding,
-    encode_file_text, ensure_regular_file, format_workspaces, normalize_workspaces,
-    resolve_write_path_in_workspaces, tool_workspaces,
+    BASE64_ENCODING, FileTextEncodeError, WorkspaceScope, default_write_encoding,
+    encode_file_text, format_workspaces, normalize_workspaces,
 };
 use crate::{
     context::BaseCtx,
@@ -154,60 +153,20 @@ impl Tool<BaseCtx> for WriteFileTool {
             args
         };
 
-        let workspaces = tool_workspaces(ctx.meta(), &self.workspaces).await;
-        let resolved = resolve_write_path_in_workspaces(&workspaces, &args.path).await?;
-        let workspace_display = resolved.workspace.display().to_string();
-        let resolved_path = resolved.path;
+        let scope = WorkspaceScope::for_call(ctx.meta(), &self.workspaces).await;
+        let target = scope.open_write(&args.path).await?;
+        let workspace_display = target.workspace.display().to_string();
 
         let data = decode_content(
             args.content,
             &args.encoding,
             &args.path,
             &workspace_display,
-            &resolved_path,
+            &target.path,
         )?;
 
-        let existing_permissions = match tokio::fs::metadata(&resolved_path).await {
-            Ok(meta) => {
-                ensure_regular_file(
-                    &meta,
-                    &resolved_path,
-                    "Writing multiply-linked files is not allowed",
-                )?;
-
-                Some(meta.permissions())
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                if let Some(parent) = resolved_path.parent() {
-                    // Ensure parent directories exist for newly created files.
-                    tokio::fs::create_dir_all(parent)
-                        .await
-                        .map_err(|err| {
-                            format!(
-                                "Failed to create parent directories (workspace: {}, requested_path: {}, resolved_path: {}, parent_path: {}): {err}",
-                                workspace_display,
-                                args.path,
-                                resolved_path.display(),
-                                parent.display()
-                            )
-                        })?;
-                }
-
-                None
-            }
-            Err(err) => {
-                return Err(format!(
-                    "Failed to read file metadata (workspace: {}, requested_path: {}, resolved_path: {}): {err}",
-                    workspace_display,
-                    args.path,
-                    resolved_path.display()
-                )
-                .into())
-            }
-        };
-
         let size = data.len() as u64;
-        atomic_write_file(&resolved_path, &data, existing_permissions.as_ref()).await?;
+        target.write_atomic(&data).await?;
 
         if let Some(hook) = &hook {
             return hook

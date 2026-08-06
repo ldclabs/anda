@@ -6,17 +6,12 @@
 //! - Response parsing and conversion to Anda's internal formats
 
 use anda_core::{
-    AgentOutput, BoxError, BoxPinFut, CompletionFeatures, CompletionRequest, Message, Resource,
+    AgentOutput, BoxError, BoxPinFut, CompletionRequest, FunctionDefinition, Json, Message,
 };
-use log::{Level::Debug, log_enabled};
 use std::collections::BTreeMap;
 
-use super::{
-    CompletionFeaturesDyn, ModelEffort, execute_completion_request_with_retry,
-    read_completion_response_bytes, read_sse_json_events, request_client_builder,
-    streaming_completion_request,
-};
-use crate::{rfc3339_datetime, unix_ms};
+use super::driver::{SamplingOptions, WireFormat, drive_completion};
+use super::{CompletionFeaturesDyn, ModelEffort, request_client_builder};
 
 pub mod types;
 
@@ -259,192 +254,142 @@ fn response_from_stream_chunks(
     })
 }
 
-impl CompletionFeatures for CompletionModel {
-    fn model_name(&self) -> String {
-        self.model.clone()
-    }
-
-    async fn completion(
-        &self,
-        req: CompletionRequest,
-        _resources: Vec<Resource>,
-    ) -> Result<AgentOutput, BoxError> {
-        CompletionFeaturesDyn::completion(self, req).await
-    }
-}
-
 impl CompletionFeaturesDyn for CompletionModel {
     fn model_name(&self) -> String {
         self.model.clone()
     }
 
-    fn completion(&self, mut req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
+    fn completion(&self, req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
         let model = self.model.clone();
         let client = self.client.clone();
-        let mut r = self.default_request.clone();
+        let r = self.default_request.clone();
 
         Box::pin(async move {
-            let timestamp = unix_ms();
-            let mut chat_history: Vec<Message> = Vec::new();
-
-            if !req.instructions.is_empty() {
-                r.system_instruction = Some(types::Content {
-                    role: Some(types::Role::Model),
-                    parts: vec![types::Part {
-                        data: types::PartKind::Text(req.instructions),
-                        ..Default::default()
-                    }],
-                });
-            };
-
-            r.contents.append(&mut req.raw_history);
-            let skip_raw = r.contents.len();
-            for msg in req.chat_history {
-                let val = types::Content::from(msg);
-                let val = serde_json::to_value(val)?;
-                r.contents.push(val);
-            }
-
-            if let Some(mut msg) = req
-                .documents
-                .to_message(&rfc3339_datetime(timestamp).unwrap())
-            {
-                msg.timestamp = Some(timestamp);
-                chat_history.push(msg.clone());
-                let val = types::Content::from(msg);
-                let val = serde_json::to_value(val)?;
-                r.contents.push(val);
-            }
-
-            let mut content = req.content;
-            if !req.prompt.is_empty() {
-                content.insert(0, req.prompt.into());
-            }
-            if !content.is_empty() {
-                let msg = Message {
-                    role: req.role.unwrap_or_else(|| "user".to_string()),
-                    content,
-                    timestamp: Some(timestamp),
-                    ..Default::default()
-                };
-
-                chat_history.push(msg.clone());
-                let val = types::Content::from(msg);
-                let val = serde_json::to_value(val)?;
-                r.contents.push(val);
-            }
-
-            if let Some(temperature) = req.temperature {
-                r.generation_config.temperature = Some(temperature);
-            }
-
-            if let Some(max_tokens) = req.max_output_tokens {
-                r.generation_config.max_output_tokens = Some(max_tokens as i32);
-            }
-
-            if let Some(effort) = req.effort {
-                let thinking_config = r
-                    .generation_config
-                    .thinking_config
-                    .get_or_insert_with(types::ThinkingConfig::default);
-                thinking_config.thinking_level = Some(effort.into());
-            }
-
-            if let Some(output_schema) = req.output_schema {
-                r.generation_config.response_mime_type = Some("application/json".to_string());
-                r.generation_config.response_schema = Some(output_schema);
-            }
-
-            if let Some(stop) = req.stop {
-                r.generation_config.stop_sequences = Some(stop);
-            }
-
-            if !req.tools.is_empty() {
-                r.tools = vec![req.tools.into()];
-                // Honor forced tool choice: `Any` constrains the model to emit a
-                // function call, matching the OpenAI/Anthropic adapters.
-                let mode = if req.tool_choice_required {
-                    types::FunctionCallingMode::Any
-                } else {
-                    types::FunctionCallingMode::Auto
-                };
-                r.tool_config = Some(types::ToolConfig {
-                    function_calling_config: types::FunctionCallingConfig {
-                        mode,
-                        allowed_function_names: None,
-                    },
-                });
-            };
-
-            if log_enabled!(Debug)
-                && let Ok(val) = serde_json::to_string(&r)
-            {
-                log::debug!(request = val; "Completion request");
-            }
-
-            let path = if r.stream {
-                format!("/{}:streamGenerateContent?alt=sse", model)
-            } else {
-                format!("/{}:generateContent", model)
-            };
-            let res = execute_completion_request_with_retry(
-                &model,
-                || {
-                    let mut request = client.post(&path).json(&r);
-                    if r.stream {
-                        request = streaming_completion_request(request);
-                    }
-                    request
-                },
-                |response| async {
-                    let res = if r.stream {
-                        let chunks = read_sse_json_events(response, &model).await?;
-                        response_from_stream_chunks(chunks)?
-                    } else {
-                        let data = read_completion_response_bytes(response, &model).await?;
-
-                        match serde_json::from_slice::<types::GenerateContentResponse>(&data) {
-                            Ok(res) => res,
-                            Err(err) => {
-                                return Err(format!(
-                                    "Invalid completion response, model: {}, error: {}, body: {}",
-                                    model,
-                                    err,
-                                    String::from_utf8_lossy(&data)
-                                )
-                                .into());
-                            }
-                        }
-                    };
-                    Ok(res)
-                },
-            )
-            .await?;
-
-            if log_enabled!(Debug) || res.maybe_failed() {
-                let mut logged_request = r.clone();
-                logged_request.system_instruction = None;
-                if log_enabled!(Debug) {
-                    log::debug!(
-                        model = model,
-                        request:serde = logged_request,
-                        response:serde = res;
-                        "Completion response");
-                } else {
-                    log::warn!(
-                        model = model,
-                        request:serde = logged_request,
-                        response:serde = res;
-                        "Completion maybe failed");
-                }
-            }
-
-            if skip_raw > 0 {
-                r.contents.drain(0..skip_raw);
-            }
-
-            res.try_into(r.contents, chat_history)
+            drive_completion::<CompletionModel>(model, move |path| client.post(path), r, req).await
         })
+    }
+}
+
+impl WireFormat for CompletionModel {
+    type Request = types::GenerateContentRequest;
+    type Response = types::GenerateContentResponse;
+    type StreamItem = types::GenerateContentResponse;
+
+    fn set_instructions(r: &mut Self::Request, instructions: String) {
+        r.system_instruction = Some(types::Content {
+            role: Some(types::Role::Model),
+            parts: vec![types::Part {
+                data: types::PartKind::Text(instructions),
+                ..Default::default()
+            }],
+        });
+    }
+
+    fn append_raw_history(r: &mut Self::Request, mut raw_history: Vec<Json>) -> usize {
+        r.contents.append(&mut raw_history);
+        r.contents.len()
+    }
+
+    fn push_message(r: &mut Self::Request, msg: Message) -> Result<(), BoxError> {
+        let val = types::Content::from(msg);
+        r.contents.push(serde_json::to_value(val)?);
+        Ok(())
+    }
+
+    fn apply_sampling(r: &mut Self::Request, options: SamplingOptions) -> Result<(), BoxError> {
+        if let Some(temperature) = options.temperature {
+            r.generation_config.temperature = Some(temperature);
+        }
+        if let Some(max_tokens) = options.max_output_tokens {
+            r.generation_config.max_output_tokens = Some(max_tokens as i32);
+        }
+        if let Some(effort) = options.effort {
+            let thinking_config = r
+                .generation_config
+                .thinking_config
+                .get_or_insert_with(types::ThinkingConfig::default);
+            thinking_config.thinking_level = Some(effort.into());
+        }
+        if let Some(output_schema) = options.output_schema {
+            r.generation_config.response_mime_type = Some("application/json".to_string());
+            r.generation_config.response_schema = Some(output_schema);
+        }
+        if let Some(stop) = options.stop {
+            r.generation_config.stop_sequences = Some(stop);
+        }
+        Ok(())
+    }
+
+    fn apply_tools(r: &mut Self::Request, tools: Vec<FunctionDefinition>, required: bool) {
+        r.tools = vec![tools.into()];
+        // Honor forced tool choice: `Any` constrains the model to emit a
+        // function call, matching the OpenAI/Anthropic adapters.
+        let mode = if required {
+            types::FunctionCallingMode::Any
+        } else {
+            types::FunctionCallingMode::Auto
+        };
+        r.tool_config = Some(types::ToolConfig {
+            function_calling_config: types::FunctionCallingConfig {
+                mode,
+                allowed_function_names: None,
+            },
+        });
+    }
+
+    fn is_stream(r: &Self::Request) -> bool {
+        r.stream
+    }
+
+    fn endpoint(r: &Self::Request, model: &str) -> String {
+        if r.stream {
+            format!("/{}:streamGenerateContent?alt=sse", model)
+        } else {
+            format!("/{}:generateContent", model)
+        }
+    }
+
+    fn aggregate_stream(items: Vec<Self::StreamItem>) -> Result<Self::Response, BoxError> {
+        response_from_stream_chunks(items)
+    }
+
+    fn parse_response(model: &str, data: &[u8]) -> Result<(Self::Response, Option<Json>), BoxError> {
+        match serde_json::from_slice::<types::GenerateContentResponse>(data) {
+            Ok(res) => Ok((res, None)),
+            Err(err) => Err(format!(
+                "Invalid completion response, model: {}, error: {}, body: {}",
+                model,
+                err,
+                String::from_utf8_lossy(data)
+            )
+            .into()),
+        }
+    }
+
+    fn maybe_failed(res: &Self::Response) -> bool {
+        res.maybe_failed()
+    }
+
+    fn redacted_for_log(r: &Self::Request) -> Self::Request {
+        let mut logged = r.clone();
+        logged.system_instruction = None;
+        logged
+    }
+
+    fn sent_messages(mut r: Self::Request, skip_raw: usize) -> Vec<Json> {
+        if skip_raw > 0 {
+            r.contents.drain(0..skip_raw);
+        }
+        r.contents
+    }
+
+    fn into_output(
+        res: Self::Response,
+        sent_messages: Vec<Json>,
+        chat_history: Vec<Message>,
+        _assistant_raw_message: Option<Json>,
+    ) -> Result<AgentOutput, BoxError> {
+        res.try_into(sent_messages, chat_history)
     }
 }
 
@@ -511,10 +456,6 @@ mod tests {
 
         let default_model = empty_endpoint_client.completion_model("");
         assert_eq!(default_model.model, DEFAULT_COMPLETION_MODEL);
-        assert_eq!(
-            CompletionFeatures::model_name(&default_model),
-            DEFAULT_COMPLETION_MODEL
-        );
         assert_eq!(
             CompletionFeaturesDyn::model_name(&default_model),
             DEFAULT_COMPLETION_MODEL

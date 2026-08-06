@@ -11,9 +11,8 @@ use serde_json::json;
 use std::path::PathBuf;
 
 use super::{
-    FileTextEncodeError, MAX_FILE_SIZE_BYTES, atomic_write_file, decode_file_text,
-    encode_file_text, ensure_file_size_within_limit, ensure_regular_file, format_workspaces,
-    normalize_workspaces, resolve_write_path_in_workspaces, tool_workspaces,
+    FileTextEncodeError, MAX_FILE_SIZE_BYTES, WorkspaceScope, decode_file_text, encode_file_text,
+    format_workspaces, normalize_workspaces,
 };
 use crate::{
     context::BaseCtx,
@@ -153,48 +152,20 @@ impl Tool<BaseCtx> for EditFileTool {
             args
         };
 
-        let workspaces = tool_workspaces(ctx.meta(), &self.workspaces).await;
-        let workspace_display = format_workspaces(&workspaces);
+        let scope = WorkspaceScope::for_call(ctx.meta(), &self.workspaces).await;
 
         if args.old_string.is_empty() {
             return Err(format!(
                 "Old string must not be empty (workspace: {}, path: {})",
-                workspace_display, args.path
+                scope.display(),
+                args.path
             )
             .into());
         }
 
-        let resolved = resolve_write_path_in_workspaces(&workspaces, &args.path).await?;
-        let workspace_display = resolved.workspace.display().to_string();
-        let resolved_path = resolved.path;
-        let meta = match tokio::fs::metadata(&resolved_path).await {
-            Ok(meta) => meta,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return Err(format!(
-                    "Path does not point to an existing file (workspace: {}, requested_path: {}, resolved_path: {})",
-                    workspace_display,
-                    args.path,
-                    resolved_path.display()
-                )
-                .into());
-            }
-            Err(err) => {
-                return Err(format!(
-                    "Failed to read file metadata (workspace: {}, requested_path: {}, resolved_path: {}): {err}",
-                    workspace_display,
-                    args.path,
-                    resolved_path.display()
-                )
-                .into())
-            }
-        };
-
-        ensure_regular_file(
-            &meta,
-            &resolved_path,
-            "Editing multiply-linked files is not allowed",
-        )?;
-        ensure_file_size_within_limit(&meta, &resolved_path, MAX_FILE_SIZE_BYTES)?;
+        let target = scope.open_edit(&args.path).await?;
+        let workspace_display = target.workspace.display().to_string();
+        let resolved_path = target.path.clone();
 
         let data = tokio::fs::read(&resolved_path).await.map_err(|err| {
             format!(
@@ -271,7 +242,7 @@ impl Tool<BaseCtx> for EditFileTool {
                 ),
             })?;
             let size = updated_bytes.len() as u64;
-            atomic_write_file(&resolved_path, &updated_bytes, Some(&meta.permissions())).await?;
+            target.write_atomic(&updated_bytes).await?;
             EditFileOutput {
                 replacements,
                 total_matches,

@@ -13,9 +13,8 @@ use serde_json::json;
 use std::path::PathBuf;
 
 use super::{
-    BASE64_ENCODING, MAX_FILE_SIZE_BYTES, MAX_INLINE_CONTENT_BYTES, UTF8_ENCODING,
-    decode_file_text, ensure_file_size_within_limit, ensure_regular_file, format_workspaces,
-    normalize_workspaces, resolve_read_path_in_workspaces, tool_workspaces, truncate_inline_text,
+    BASE64_ENCODING, MAX_INLINE_CONTENT_BYTES, UTF8_ENCODING, WorkspaceScope, decode_file_text,
+    format_workspaces, normalize_workspaces, truncate_inline_text,
 };
 use crate::{
     context::BaseCtx,
@@ -160,28 +159,11 @@ impl Tool<BaseCtx> for ReadFileTool {
             args
         };
 
-        let workspaces = tool_workspaces(ctx.meta(), &self.workspaces).await;
-        let resolved = resolve_read_path_in_workspaces(&workspaces, &args.path).await?;
-        let workspace_display = resolved.workspace.display().to_string();
-        let resolved_path = resolved.path;
-
-        let meta = tokio::fs::metadata(&resolved_path)
-            .await
-            .map_err(|err| {
-                format!(
-                    "Failed to read file metadata (workspace: {}, requested_path: {}, resolved_path: {}): {err}",
-                    workspace_display,
-                    args.path,
-                    resolved_path.display()
-                )
-            })?;
-
-        ensure_regular_file(
-            &meta,
-            &resolved_path,
-            "Reading multiply-linked file is not allowed",
-        )?;
-        ensure_file_size_within_limit(&meta, &resolved_path, MAX_FILE_SIZE_BYTES)?;
+        let scope = WorkspaceScope::for_call(ctx.meta(), &self.workspaces).await;
+        let target = scope.open_read(&args.path).await?;
+        let workspace_display = target.workspace.display().to_string();
+        let meta = target.metadata;
+        let resolved_path = target.path;
 
         let data = tokio::fs::read(&resolved_path).await.map_err(|err| {
             format!(

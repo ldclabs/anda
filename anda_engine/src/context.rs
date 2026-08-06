@@ -10,11 +10,16 @@ mod agent;
 mod base;
 mod cache;
 mod engine;
+mod runner;
 mod tool;
 mod web3;
+
+#[cfg(test)]
+pub(crate) mod test_fixtures;
 
 pub use agent::*;
 pub use base::*;
 pub use engine::*;
+pub use runner::*;
 pub use tool::*;
 pub use web3::*;

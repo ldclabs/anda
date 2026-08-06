@@ -12,10 +12,9 @@ use serde_json::json;
 use std::path::{Component, Path, PathBuf};
 
 use super::{
-    ensure_path_in_workspace, ensure_path_in_workspace_namespace, format_workspaces,
-    nearest_existing_ancestor, normalize_relative_path, normalize_workspaces,
-    path_contains_parent_reference, resolve_workspace_path, tool_workspaces,
-    workspace_access_error,
+    WorkspaceScope, ensure_path_in_workspace, ensure_path_in_workspace_namespace,
+    format_workspaces, nearest_existing_ancestor, normalize_relative_path, normalize_workspaces,
+    path_contains_parent_reference, resolve_workspace_path, workspace_access_error,
 };
 use crate::{
     context::BaseCtx,
@@ -158,7 +157,7 @@ impl Tool<BaseCtx> for SearchFileTool {
             args
         };
 
-        let workspaces = tool_workspaces(ctx.meta(), &self.workspaces).await;
+        let scope = WorkspaceScope::for_call(ctx.meta(), &self.workspaces).await;
         let mut paths = Vec::new();
         let mut errors = Vec::new();
         let mut searched_any_workspace = false;
@@ -166,7 +165,7 @@ impl Tool<BaseCtx> for SearchFileTool {
         let mut scanned = 0usize;
         let cancellation_token = ctx.cancellation_token();
 
-        'workspaces: for workspace in &workspaces {
+        'workspaces: for workspace in scope.roots() {
             let workspace_display = workspace.display().to_string();
             let (resolved_workspace, pattern, restrict_to_workspace_targets) =
                 match resolve_glob_pattern(workspace, &args.pattern).await {
@@ -262,7 +261,7 @@ impl Tool<BaseCtx> for SearchFileTool {
                 "Glob pattern",
                 "requested_pattern",
                 &args.pattern,
-                &workspaces,
+                scope.roots(),
                 errors,
             ));
         }

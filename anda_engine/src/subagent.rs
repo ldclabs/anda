@@ -43,7 +43,7 @@ mod session;
 
 pub use self::agent::SubAgent;
 pub use self::args::{SubAgentArgs, SubAgentManagerArgs};
-pub use self::conversation::SubAgentConversationRecorder;
+pub use self::conversation::{ConversationRecords, SubAgentConversationRecorder};
 pub use self::manager::{SubAgentManager, SubAgentSet, SubAgentSetManager};
 pub use self::session::{BackgroundTaskInfo, SubSession, SubSessionStatus, SubSessions};
 

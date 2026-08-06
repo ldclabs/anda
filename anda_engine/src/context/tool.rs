@@ -6,7 +6,7 @@
 
 use anda_core::{
     Agent, AgentContext, AgentOutput, BoxError, CompletionFeatures, CompletionRequest,
-    FunctionDefinition, Resource, ToolGroup,
+    FunctionDefinition, Json, Resource, ToolGroup,
 };
 use anda_db_tfs::{TokenizerChain, collect_tokens, jieba_tokenizer};
 use serde::{Deserialize, Serialize};
@@ -53,6 +53,157 @@ pub struct ToolsOutput {
     /// Total number of callables to the current model turn.
     #[serde(default)]
     pub total_tools: usize,
+}
+
+/// Upper bound on discovered tool definitions injected into request tool lists.
+const MAX_DISCOVERED_REQUEST_TOOLS: usize = 16;
+
+/// Runner-side state and policy for tool discovery.
+///
+/// Owns everything the completion runner must otherwise know about the
+/// discovery agents: which tool names perform discovery, the shape of their
+/// output, when discovered definitions get merged into later request tool
+/// lists, and how discovery output is compacted once merged. The runner holds
+/// one of these and delegates, so the discovery vocabulary lives entirely in
+/// this module.
+///
+/// The merge policy is `Some(true)` to force request-side merging,
+/// `Some(false)` to keep schemas only in discovery-tool output context, and
+/// `None` to probe: a tool selected twice through `tools_select` signals that
+/// the current model needs request-side merging.
+#[derive(Debug, Clone, Default)]
+pub struct DiscoveredTools {
+    definitions: BTreeMap<String, FunctionDefinition>,
+    selection_counts: BTreeMap<String, usize>,
+    merge: Option<bool>,
+}
+
+impl DiscoveredTools {
+    /// Returns the current merge policy.
+    pub fn merge_policy(&self) -> Option<bool> {
+        self.merge
+    }
+
+    /// Sets the merge policy (see the type docs for the three states).
+    pub fn set_merge_policy(&mut self, merge: Option<bool>) {
+        self.merge = merge;
+    }
+
+    /// Whether the lowercased name was legitimately discovered this round.
+    pub fn contains(&self, lowercase_name: &str) -> bool {
+        self.definitions.contains_key(lowercase_name)
+    }
+
+    /// Forgets accumulated definitions and probe counts, keeping the policy.
+    pub fn reset_definitions(&mut self) {
+        self.definitions.clear();
+        self.selection_counts.clear();
+    }
+
+    /// Records definitions returned by a discovery tool's output.
+    ///
+    /// Non-discovery tools and outputs that do not parse as [`ToolsOutput`]
+    /// are ignored. In probe mode (`None`), a repeated `tools_select` of the
+    /// same name flips the policy to `Some(true)`.
+    pub fn observe_output(&mut self, tool_name: &str, output: &Json) {
+        if self.merge == Some(false)
+            || (!tool_name.eq_ignore_ascii_case(TOOLS_SELECT_NAME)
+                && !tool_name.eq_ignore_ascii_case(TOOLS_SEARCH_NAME))
+        {
+            return;
+        }
+
+        let Ok(tools_output) = ToolsOutput::deserialize(output) else {
+            return;
+        };
+
+        let count_selection =
+            tool_name.eq_ignore_ascii_case(TOOLS_SELECT_NAME) && self.merge.is_none();
+        let mut added = 0;
+        for definition in tools_output.tools {
+            if definition.name.trim().is_empty() {
+                continue;
+            }
+
+            let key = definition.name.to_ascii_lowercase();
+            if count_selection {
+                let count = self
+                    .selection_counts
+                    .entry(key.clone())
+                    .and_modify(|count| *count += 1)
+                    .or_insert(1);
+                if *count >= 2 {
+                    self.merge = Some(true);
+                }
+            }
+            self.definitions.entry(key).or_insert(definition);
+            added += 1;
+            if added >= MAX_DISCOVERED_REQUEST_TOOLS {
+                break;
+            }
+        }
+    }
+
+    /// Adds discovered definitions to the request tool list when merging is on.
+    pub fn merge_into_request(&self, req: &mut CompletionRequest) {
+        if self.merge != Some(true) || self.definitions.is_empty() {
+            return;
+        }
+
+        let mut seen: BTreeSet<String> = req
+            .tools
+            .iter()
+            .map(|tool| tool.name.to_ascii_lowercase())
+            .collect();
+        for (name, definition) in &self.definitions {
+            if seen.insert(name.clone()) {
+                req.tools.push(definition.clone());
+            }
+        }
+    }
+
+    /// Compacts a discovery tool output in place once discovered definitions
+    /// are merged into the request tools, so full schemas are not duplicated
+    /// in the conversation context. Non-discovery outputs are left untouched.
+    pub fn compact_output_for_context(&self, tool_name: &str, output: &mut Json) {
+        if self.merge != Some(true) {
+            return;
+        }
+
+        let keep_description = if tool_name.eq_ignore_ascii_case(TOOLS_SEARCH_NAME) {
+            true
+        } else if tool_name.eq_ignore_ascii_case(TOOLS_SELECT_NAME) {
+            false
+        } else {
+            return;
+        };
+
+        let Ok(tools_output) = ToolsOutput::deserialize(&*output) else {
+            return;
+        };
+
+        let tools = tools_output
+            .tools
+            .into_iter()
+            .map(|definition| {
+                if keep_description {
+                    json!({
+                        "name": definition.name,
+                        "description": definition.description,
+                    })
+                } else {
+                    json!({
+                        "name": definition.name,
+                    })
+                }
+            })
+            .collect::<Vec<_>>();
+
+        *output = json!({
+            "tools": tools,
+            "total_tools": tools_output.total_tools,
+        });
+    }
 }
 
 /// Searches the callable surface currently available to the model.

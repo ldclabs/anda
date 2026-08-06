@@ -24,6 +24,7 @@ use anda_db::{
 };
 use anda_db_schema::{AndaDBSchema, Ft, Fv, Json};
 use anda_db_tfs::jieba_tokenizer;
+use async_trait::async_trait;
 use anda_kip::{
     DescribeTarget, KipError, META_SYSTEM_NAME, MetaCommand, PERSON_TYPE, Request, Response,
 };
@@ -550,7 +551,20 @@ impl fmt::Display for ConversationStatus {
 #[derive(Debug, Clone)]
 pub struct Conversations {
     /// Underlying AndaDB collection.
-    pub conversations: Arc<Collection>,
+    conversations: Arc<Collection>,
+}
+
+#[async_trait]
+impl crate::subagent::ConversationRecords for Conversations {
+    async fn create(&self, conversation: ConversationRef<'_>) -> Result<u64, BoxError> {
+        Ok(self.add_conversation(conversation).await?)
+    }
+
+    async fn update(&self, conversation: &Conversation) -> Result<(), BoxError> {
+        let changes = conversation.to_runner_changes()?;
+        self.update_conversation(conversation._id, changes).await?;
+        Ok(())
+    }
 }
 
 impl Conversations {
@@ -789,13 +803,13 @@ async fn next_expired_batch(conversations: &Collection, period: u64) -> Result<V
 #[derive(Debug, Clone)]
 pub struct MemoryManagement {
     /// Shared Cognitive Nexus used for KIP execution.
-    pub nexus: Arc<CognitiveNexus>,
+    nexus: Arc<CognitiveNexus>,
     /// Conversation collection.
-    pub conversations: Arc<Collection>,
+    conversations: Arc<Collection>,
     /// Resource collection.
-    pub resources: Arc<Collection>,
+    resources: Arc<Collection>,
     /// Function definition exposed for the writable KIP tool.
-    pub kip_function_definitions: FunctionDefinition,
+    kip_function_definitions: FunctionDefinition,
 }
 
 impl MemoryManagement {

@@ -1,18 +1,48 @@
 use super::*;
 
+/// Persistence seam for subagent conversation records.
+///
+/// The recorder needs exactly two operations; everything about the backing
+/// store — schema, indexes, field encoding, and its error types — stays behind
+/// this trait. [`Conversations`](crate::memory::Conversations) is the AndaDB
+/// adapter; tests and alternative runtimes can supply their own implementation
+/// via [`SubAgentConversationRecorder::with_store`].
+#[async_trait]
+pub trait ConversationRecords: Send + Sync {
+    /// Persists a new conversation record and returns its id.
+    async fn create(&self, conversation: ConversationRef<'_>) -> Result<u64, BoxError>;
+
+    /// Persists the runner-owned fields of an existing record (messages,
+    /// status, usage, artifacts, failure reason, extra), leaving inbound
+    /// queue fields owned by the memory API untouched.
+    async fn update(&self, conversation: &Conversation) -> Result<(), BoxError>;
+}
+
 /// Persistent conversation recorder used by subagents when installed in context state.
 ///
 /// Engines that do not configure this recorder keep the existing in-memory-only subagent
 /// behavior. When configured, each blocking subagent call and each background subagent session is
 /// stored as a [`Conversation`] for operational visibility and later audit.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct SubAgentConversationRecorder {
-    conversations: Conversations,
+    conversations: Arc<dyn ConversationRecords>,
+}
+
+impl std::fmt::Debug for SubAgentConversationRecorder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SubAgentConversationRecorder")
+            .finish_non_exhaustive()
+    }
 }
 
 impl SubAgentConversationRecorder {
-    /// Creates a recorder backed by the shared conversation store.
+    /// Creates a recorder backed by the shared AndaDB conversation store.
     pub fn new(conversations: Conversations) -> Self {
+        Self::with_store(Arc::new(conversations))
+    }
+
+    /// Creates a recorder backed by a custom [`ConversationRecords`] store.
+    pub fn with_store(conversations: Arc<dyn ConversationRecords>) -> Self {
         Self { conversations }
     }
 
@@ -54,7 +84,7 @@ impl SubAgentConversationRecorder {
 
         let id = self
             .conversations
-            .add_conversation(ConversationRef::from(&conversation))
+            .create(ConversationRef::from(&conversation))
             .await?;
         conversation._id = id;
 
@@ -123,26 +153,16 @@ impl SubAgentConversationLog {
     }
 
     async fn persist(&self) {
-        match self.conversation.to_runner_changes() {
-            Ok(changes) => {
-                if let Err(err) = self
-                    .recorder
-                    .conversations
-                    .update_conversation(self.conversation._id, changes)
-                    .await
-                {
-                    log::warn!(
-                        "failed to update subagent conversation {}: {err}",
-                        self.conversation._id
-                    );
-                }
-            }
-            Err(err) => {
-                log::warn!(
-                    "failed to encode subagent conversation {} changes: {err}",
-                    self.conversation._id
-                );
-            }
+        if let Err(err) = self
+            .recorder
+            .conversations
+            .update(&self.conversation)
+            .await
+        {
+            log::warn!(
+                "failed to update subagent conversation {}: {err}",
+                self.conversation._id
+            );
         }
     }
 }

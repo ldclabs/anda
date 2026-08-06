@@ -124,6 +124,27 @@ impl Engine {
         self.default_agent.clone()
     }
 
+    /// Validates request metadata shared by every execution entry point:
+    /// the engine id must match this engine when present, and a user name
+    /// must be trimmed, non-empty, and at most 96 bytes.
+    fn validate_request_meta(&self, meta: &RequestMeta) -> Result<(), BoxError> {
+        if meta.engine.is_some() && meta.engine != Some(self.id) {
+            return Err(format!(
+                "invalid engine ID, expected {}, got {:?}",
+                self.id.to_text(),
+                meta.engine
+            )
+            .into());
+        }
+        if let Some(user) = &meta.user {
+            let u = user.trim();
+            if u.is_empty() || u != user || u.len() > 96 {
+                return Err(format!("invalid user name {:?}", user).into());
+            }
+        }
+        Ok(())
+    }
+
     /// Cancels all tasks in the engine by triggering the cancellation token.
     pub fn cancel(&self) {
         self.ctx.base.cancellation_token.cancel()
@@ -241,20 +262,7 @@ impl Engine {
         mut input: AgentInput,
     ) -> Result<AgentOutput, BoxError> {
         let meta = input.meta.unwrap_or_default();
-        if meta.engine.is_some() && meta.engine != Some(self.id) {
-            return Err(format!(
-                "invalid engine ID, expected {}, got {:?}",
-                self.id.to_text(),
-                meta.engine
-            )
-            .into());
-        }
-        if let Some(user) = &meta.user {
-            let u = user.trim();
-            if u.is_empty() || u != user || u.len() > 96 {
-                return Err(format!("invalid user name {:?}", user).into());
-            }
-        }
+        self.validate_request_meta(&meta)?;
 
         input.name = if input.name.is_empty() {
             self.default_agent.clone()
@@ -316,20 +324,7 @@ impl Engine {
     ) -> Result<ToolOutput<Json>, BoxError> {
         input.name.make_ascii_lowercase();
         let meta = input.meta.take().unwrap_or_default();
-        if meta.engine.is_some() && meta.engine != Some(self.id) {
-            return Err(format!(
-                "invalid engine ID, expected {}, got {:?}",
-                self.id.to_text(),
-                meta.engine
-            )
-            .into());
-        }
-        if let Some(user) = &meta.user {
-            let u = user.trim();
-            if u.is_empty() || u != user || u.len() > 96 {
-                return Err(format!("invalid user name {:?}", user).into());
-            }
-        }
+        self.validate_request_meta(&meta)?;
 
         // manager can call any tool
         if !self.export_tools.contains(&input.name) && !self.management.is_manager(&caller) {
@@ -762,90 +757,7 @@ impl EngineBuilder {
     /// This is mainly useful for tests or management-only engines. Most
     /// production engines should use [`EngineBuilder::build`].
     pub async fn empty(self) -> Result<Engine, BoxError> {
-        self.check_exports()?;
-        let id = self.web3.as_ref().get_principal();
-        let mut names: BTreeSet<Path> = self
-            .tools
-            .set
-            .keys()
-            .map(|p| Path::from(tool_context_path(p)))
-            .chain(
-                self.agents
-                    .set
-                    .keys()
-                    .map(|p| Path::from(agent_context_path(p))),
-            )
-            .collect();
-        names.insert(Path::from(SYSTEM_PATH));
-        // The root `BaseCtx` uses the empty path; register it so root-level
-        // cache lookups (e.g. dynamic remote-engine resolution) can hit memory
-        // instead of always falling through to the store backend.
-        names.insert(Path::default());
-
-        // Register the same remote engines `build` does. Dropping them here would silently
-        // discard every `register_remote_engine` call, so remote tools and agents would go
-        // missing with no error at build time.
-        let mut remote = RemoteEngines::new();
-        for (_, engine) in self.remote {
-            remote.register(self.web3.as_ref(), engine).await?;
-        }
-
-        let ctx = BaseCtx::new(
-            id,
-            self.info.name.clone(),
-            "".to_string(),
-            self.cancellation_token,
-            names,
-            self.web3,
-            self.store,
-            Arc::new(remote),
-        );
-
-        let tools = Arc::new(self.tools);
-        let tool_providers = Arc::new(self.tool_providers);
-        let agents = Arc::new(self.agents);
-
-        let ctx = AgentCtx::new(
-            ctx,
-            self.models,
-            tools.clone(),
-            tool_providers.clone(),
-            agents.clone(),
-            Arc::new(self.subagents),
-        );
-        if let Some(recorder) = &self.subagent_conversation_recorder {
-            ctx.base.set_state(recorder.clone());
-        }
-
-        let meta = RequestMeta::default();
-        for (name, tool) in &tools.set {
-            let ct = ctx.child_base_with(id, "", name, meta.clone())?;
-            tool.init(ct).await?;
-        }
-
-        tool_providers.init_all(ctx.base.clone()).await?;
-
-        for (name, agent) in &agents.set {
-            let ct = ctx.child_with(id, name, agent.label(), meta.clone())?;
-            agent.init(ct).await?;
-        }
-
-        Ok(Engine {
-            id,
-            ctx,
-            info: self.info,
-            default_agent: String::new(),
-            export_agents: self.export_agents,
-            export_tools: self.export_tools,
-            hooks: self.hooks,
-            management: self.management.unwrap_or_else(|| {
-                Arc::new(BaseManagement {
-                    controller: id,
-                    managers: BTreeSet::new(),
-                    visibility: Visibility::Private, // default visibility
-                })
-            }),
-        })
+        self.assemble(String::new()).await
     }
 
     /// Finalizes the builder and creates an engine with a default agent.
@@ -861,26 +773,20 @@ impl EngineBuilder {
         self.export_agents.insert(default_agent.clone());
 
         self.info.validate()?;
+        self.assemble(default_agent).await
+    }
+
+    /// Single assembly path shared by [`EngineBuilder::build`] and
+    /// [`EngineBuilder::empty`]. An empty `default_agent` means no default
+    /// agent is selected.
+    async fn assemble(self, default_agent: String) -> Result<Engine, BoxError> {
         self.check_exports()?;
         let id = self.web3.as_ref().get_principal();
-        let mut names: BTreeSet<Path> = self
-            .tools
-            .set
-            .keys()
-            .map(|p| Path::from(tool_context_path(p)))
-            .chain(
-                self.agents
-                    .set
-                    .keys()
-                    .map(|p| Path::from(agent_context_path(p))),
-            )
-            .collect();
-        names.insert(Path::from(SYSTEM_PATH));
-        // The root `BaseCtx` uses the empty path; register it so root-level
-        // cache lookups (e.g. dynamic remote-engine resolution) can hit memory
-        // instead of always falling through to the store backend.
-        names.insert(Path::default());
+        let names = self.context_names();
 
+        // Register remote engines on every assembly path. Dropping them would silently
+        // discard every `register_remote_engine` call, so remote tools and agents would go
+        // missing with no error at build time.
         let mut remote = RemoteEngines::new();
         for (_, engine) in self.remote {
             remote.register(self.web3.as_ref(), engine).await?;
@@ -944,10 +850,9 @@ impl EngineBuilder {
         })
     }
 
-    /// Creates a mock agent context for tests and examples.
-    // #[cfg(test)]
-    pub fn mock_ctx(self) -> AgentCtx {
-        let subagent_conversation_recorder = self.subagent_conversation_recorder.clone();
+    /// Context namespaces registered for the engine's cache service: one per
+    /// tool, one per agent, the system namespace, and the root namespace.
+    fn context_names(&self) -> BTreeSet<Path> {
         let mut names: BTreeSet<Path> = self
             .tools
             .set
@@ -965,6 +870,17 @@ impl EngineBuilder {
         // cache lookups (e.g. dynamic remote-engine resolution) can hit memory
         // instead of always falling through to the store backend.
         names.insert(Path::default());
+        names
+    }
+
+    /// Creates a fully in-process [`AgentCtx`] for tests and examples.
+    ///
+    /// This is the supported way for agent and tool authors to obtain an
+    /// execution context in their own test suites without standing up a full
+    /// engine: anonymous identity, in-memory store, no remote engines. Not
+    /// intended for production paths.
+    pub fn mock_ctx(self) -> AgentCtx {
+        let names = self.context_names();
         let ctx = BaseCtx::new(
             Principal::anonymous(),
             "Mocker".to_string(),
@@ -984,7 +900,7 @@ impl EngineBuilder {
             Arc::new(self.agents),
             Arc::new(self.subagents),
         );
-        if let Some(recorder) = subagent_conversation_recorder {
+        if let Some(recorder) = self.subagent_conversation_recorder {
             ctx.base.set_state(recorder);
         }
         ctx

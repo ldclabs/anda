@@ -931,6 +931,70 @@ fn resolve_idle_timeout_ms_applies_default_and_clamps() {
     );
 }
 
+/// In-memory [`ConversationRecords`] double proving the recorder needs no
+/// AndaDB: the port's two operations are the whole persistence contract.
+#[derive(Default, Debug)]
+struct RecordedConversations {
+    next_id: AtomicU64,
+    records: Mutex<BTreeMap<u64, Conversation>>,
+}
+
+#[async_trait]
+impl ConversationRecords for RecordedConversations {
+    async fn create(&self, conversation: ConversationRef<'_>) -> Result<u64, BoxError> {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst) + 1;
+        let record = Conversation {
+            _id: id,
+            user: *conversation.user,
+            messages: conversation.messages.to_vec(),
+            resources: conversation.resources.to_vec(),
+            status: conversation.status.clone(),
+            label: conversation.label.clone(),
+            ..Default::default()
+        };
+        self.records.lock().insert(id, record);
+        Ok(id)
+    }
+
+    async fn update(&self, conversation: &Conversation) -> Result<(), BoxError> {
+        self.records
+            .lock()
+            .insert(conversation._id, conversation.clone());
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn subagent_records_conversation_through_custom_store() {
+    let store = Arc::new(RecordedConversations::default());
+    let ctx = EngineBuilder::new()
+        .with_model(Model::with_completer(Arc::new(HistoryCompleter)))
+        .with_subagent_conversation_recorder(SubAgentConversationRecorder::with_store(
+            store.clone(),
+        ))
+        .mock_ctx();
+    let agent = SubAgent {
+        name: "auditor".to_string(),
+        description: "Audits work.".to_string(),
+        instructions: "Return the task result.".to_string(),
+        model: "history".to_string(),
+        ..Default::default()
+    };
+
+    let output = Agent::<AgentCtx>::run(&agent, ctx, "inspect ported task".to_string(), Vec::new())
+        .await
+        .unwrap();
+
+    let conversation_id = output.conversation.expect("conversation id");
+    let records = store.records.lock();
+    let conversation = records.get(&conversation_id).expect("recorded conversation");
+    assert_eq!(conversation.status, ConversationStatus::Completed);
+    assert_eq!(conversation.label.as_deref(), Some("subagent:auditor"));
+    let messages = serde_json::to_string(&conversation.messages).unwrap();
+    assert!(messages.contains("inspect ported task"));
+    assert!(messages.contains("done: inspect ported task"));
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn subagent_blocking_persists_conversation() {
     let conversations = test_conversations("subagent_blocking_persists_conversation").await;

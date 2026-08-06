@@ -2,6 +2,78 @@
 
 All notable changes to the Anda project will be documented in this file.
 
+## [Unreleased]
+
+Deep-module restructuring of `anda_engine` guided by a full design review; the
+review itself, including per-item rationale and the remaining roadmap, lives in
+`anda_engine/DESIGN_REVIEW.md`. Behavior is preserved except where noted below.
+Contains breaking API changes — the next `anda_engine` release should be a
+minor version bump.
+
+### Changed — anda_engine (breaking)
+
+- **Provider seam unified on `CompletionFeaturesDyn`** — The delegating
+  `anda_core::CompletionFeatures` impls on the Anthropic and Gemini
+  `CompletionModel`s are removed (they ignored `resources` and merely forwarded;
+  OpenAI's models never had them). Code that called the models through that
+  trait should call `CompletionFeaturesDyn::completion` instead.
+- **Memory internals no longer public** — The `Arc<Collection>` fields on
+  `memory::Conversations` and `memory::MemoryManagement` are now private, so the
+  storage abstraction can no longer be bypassed; use the methods, or the new
+  `ConversationRecords` port (below).
+
+### Changed — anda_engine
+
+- **One completion driver for all providers** — The four provider adapters
+  (Anthropic, Gemini, OpenAI Chat, OpenAI Responses) now share a single
+  `drive_completion` algorithm behind an internal `WireFormat` seam; each
+  adapter contributes only its wire mapping. The raw-history ordering and
+  skip/drain invariants are enforced structurally instead of being hand-copied
+  four times. Only observable difference: the Chat adapter's request debug log
+  message is now `"Completion request"` like the other adapters.
+- **Raw-history pruning moved behind the provider seam** —
+  `CompletionFeaturesDyn` gains `prune_unanswered_tool_calls` /
+  `prune_tool_interactions` with conservative default implementations; the
+  completion runner no longer hard-codes any provider's wire shapes. Custom
+  providers can override both with their own typed knowledge.
+- **Workspace sandbox is one implementation** — The filesystem tools now
+  resolve every path through an internal `WorkspaceScope`; the shell runtime's
+  separate narrowing logic is gone and shell now honors the same
+  `workspace`/`workspaces` request hints (string, path, or array forms) as the
+  filesystem tools — a strict widening, still bounded by the configured root.
+  The path-resolution helpers other modules could previously call directly are
+  now private to the filesystem module.
+- **Module layout** — `context/agent.rs` (6.7k lines) is split into
+  `context/agent.rs`, `context/runner.rs`, and shared test fixtures;
+  `extension/mcp.rs` (3.6k lines) into `mcp/auth.rs` (OAuth protocol),
+  `mcp/session.rs` (transports and lifecycle), and `mcp/router.rs` (name
+  mapping and call rounds); the background-task registry moves from `hook.rs`
+  to a new `background` module. All previous public paths keep working through
+  re-exports.
+- **Single engine assembly path** — `EngineBuilder::build`, `::empty`, and
+  `::mock_ctx` share one assembly routine, removing three hand-synced copies.
+  `mock_ctx` is now documented as the supported way for downstream agent and
+  tool authors to obtain an `AgentCtx` in their own tests.
+- **`MockImplemented::model_name()`** now returns `"mock_implemented"` instead
+  of `"not_implemented"`, so mocks and the null model are distinguishable (the
+  runner compares model names to detect live model switches).
+
+### Added — anda_engine
+
+- **`model::testing::ScriptedCompleter`** — A programmable completion double
+  (queued replies, closures, error injection, request recording, echo
+  fallback) available to downstream crates, replacing the need to hand-roll a
+  fake provider per test.
+- **`subagent::ConversationRecords`** — The two-method persistence port the
+  subagent conversation recorder actually needs (`create` / `update`).
+  `memory::Conversations` is its AndaDB adapter; AndaDB field encoding no
+  longer crosses into the subagent layer, and
+  `SubAgentConversationRecorder::with_store` accepts custom implementations,
+  so subagent persistence is testable without AndaDB.
+- **`context::DiscoveredTools`** — Discovery-tool policy (observation, merge
+  probing, output compaction) extracted from the completion runner into the
+  module that owns the discovery vocabulary.
+
 ## [0.14.6] — 2026-08-06
 
 ### Added — anda_engine v0.14.6

@@ -186,30 +186,17 @@ impl NativeRuntime {
 
     /// Resolves the working directory for a command.
     ///
-    /// `RequestMeta.extra` is flattened straight off the RPC body, so a requested workspace is
-    /// caller-controlled. It is honored only when it resolves inside the configured workspace,
-    /// so a request can narrow the working directory but never escape the sandbox.
+    /// Delegates to [`fs::WorkspaceScope`], so shell shares the filesystem
+    /// tools' narrowing rules exactly: a caller-controlled `workspace` /
+    /// `workspaces` hint from `RequestMeta.extra` is honored only when it
+    /// resolves inside the configured workspace, narrowing the working
+    /// directory but never escaping the sandbox.
     async fn requested_workspace(&self, ctx: &BaseCtx) -> Cow<'_, PathBuf> {
-        let Some(requested) = ctx.meta().get_extra_as::<String>("workspace") else {
-            return Cow::Borrowed(&self.workspace);
-        };
-
-        let requested = PathBuf::from(requested);
-        match (
-            fs::resolve_workspace_path(&requested).await,
-            fs::resolve_workspace_path(&self.workspace).await,
-        ) {
-            (Ok(resolved), Ok(root)) if fs::ensure_path_in_workspace(&root, &resolved).is_ok() => {
-                Cow::Owned(requested)
-            }
-            _ => {
-                log::warn!(
-                    "ignoring requested workspace {:?} outside the configured workspace {:?}",
-                    requested.display().to_string(),
-                    self.workspace.display().to_string(),
-                );
-                Cow::Borrowed(&self.workspace)
-            }
+        let scope =
+            fs::WorkspaceScope::for_call(ctx.meta(), std::slice::from_ref(&self.workspace)).await;
+        match scope.into_primary() {
+            Some(primary) if primary != self.workspace => Cow::Owned(primary),
+            _ => Cow::Borrowed(&self.workspace),
         }
     }
 

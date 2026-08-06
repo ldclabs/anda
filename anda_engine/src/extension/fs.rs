@@ -89,7 +89,209 @@ pub(crate) struct ResolvedFilePath {
     pub(crate) path: PathBuf,
 }
 
-pub(crate) fn normalize_workspaces<I>(workspaces: I) -> Vec<PathBuf>
+/// Sandboxed workspace roots for one tool call, in priority order.
+///
+/// Built once per call from the tool's configured roots plus the request's
+/// untrusted narrowing hints ([`RequestMeta.extra`]), so a request can
+/// prioritize a subdirectory of a configured root but never escape it. Every
+/// filesystem operation the workspace tools perform goes through this scope:
+/// multi-root resolution order, symlink and hard-link re-checks, size limits,
+/// and error text all live behind it.
+#[derive(Debug, Clone)]
+pub(crate) struct WorkspaceScope {
+    workspaces: Vec<PathBuf>,
+}
+
+/// An existing regular file resolved inside a workspace.
+///
+/// Produced by [`WorkspaceScope::open_read`] / [`WorkspaceScope::open_edit`]
+/// with the regular-file, hard-link, and size-limit checks already applied.
+#[derive(Debug)]
+pub(crate) struct ReadTarget {
+    pub(crate) workspace: PathBuf,
+    pub(crate) path: PathBuf,
+    pub(crate) metadata: Metadata,
+}
+
+/// A write destination resolved inside a workspace.
+///
+/// Produced by [`WorkspaceScope::open_write`]; `existing` carries the current
+/// file's metadata when the destination already exists (its permissions are
+/// preserved by [`WriteTarget::write_atomic`]).
+#[derive(Debug)]
+pub(crate) struct WriteTarget {
+    pub(crate) workspace: PathBuf,
+    pub(crate) path: PathBuf,
+    pub(crate) existing: Option<Metadata>,
+    requested: String,
+}
+
+impl WorkspaceScope {
+    /// Resolves the workspace roots for one tool call from the configured
+    /// defaults and the request's narrowing hints.
+    pub(crate) async fn for_call(meta: &RequestMeta, defaults: &[PathBuf]) -> Self {
+        Self {
+            workspaces: tool_workspaces(meta, defaults).await,
+        }
+    }
+
+    /// The workspace roots in priority order.
+    pub(crate) fn roots(&self) -> &[PathBuf] {
+        &self.workspaces
+    }
+
+    /// Consumes the scope and returns the highest-priority root, if any.
+    pub(crate) fn into_primary(self) -> Option<PathBuf> {
+        self.workspaces.into_iter().next()
+    }
+
+    /// Human-readable list of the roots for descriptions and error text.
+    pub(crate) fn display(&self) -> String {
+        format_workspaces(&self.workspaces)
+    }
+
+    /// Opens an existing file for reading.
+    ///
+    /// Resolves `user_path` against the roots in priority order (following the
+    /// read rules: the target must exist and canonicalize inside a root), then
+    /// enforces the regular-file, hard-link, and size-limit checks.
+    pub(crate) async fn open_read(&self, user_path: &str) -> Result<ReadTarget, BoxError> {
+        let resolved = resolve_read_path_in_workspaces(&self.workspaces, user_path).await?;
+        let metadata = read_target_metadata(&resolved, user_path).await?;
+        ensure_regular_file(
+            &metadata,
+            &resolved.path,
+            "Reading multiply-linked file is not allowed",
+        )?;
+        ensure_file_size_within_limit(&metadata, &resolved.path, MAX_FILE_SIZE_BYTES)?;
+
+        Ok(ReadTarget {
+            workspace: resolved.workspace,
+            path: resolved.path,
+            metadata,
+        })
+    }
+
+    /// Opens an existing file for in-place editing.
+    ///
+    /// Resolves `user_path` with the write rules (symlink targets are refused)
+    /// but requires the destination to already exist, then enforces the
+    /// regular-file, hard-link, and size-limit checks.
+    pub(crate) async fn open_edit(&self, user_path: &str) -> Result<ReadTarget, BoxError> {
+        let resolved = resolve_write_path_in_workspaces(&self.workspaces, user_path).await?;
+        let metadata = match tokio::fs::metadata(&resolved.path).await {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Err(format!(
+                    "Path does not point to an existing file (workspace: {}, requested_path: {}, resolved_path: {})",
+                    resolved.workspace.display(),
+                    user_path,
+                    resolved.path.display()
+                )
+                .into());
+            }
+            Err(err) => {
+                return Err(metadata_error(&resolved, user_path, err));
+            }
+        };
+
+        ensure_regular_file(
+            &metadata,
+            &resolved.path,
+            "Editing multiply-linked files is not allowed",
+        )?;
+        ensure_file_size_within_limit(&metadata, &resolved.path, MAX_FILE_SIZE_BYTES)?;
+
+        Ok(ReadTarget {
+            workspace: resolved.workspace,
+            path: resolved.path,
+            metadata,
+        })
+    }
+
+    /// Opens a write destination, existing or not.
+    ///
+    /// Resolves `user_path` with the write rules; when the destination exists
+    /// it must be a regular, singly-linked file whose permissions are carried
+    /// into [`WriteTarget::write_atomic`].
+    pub(crate) async fn open_write(&self, user_path: &str) -> Result<WriteTarget, BoxError> {
+        let resolved = resolve_write_path_in_workspaces(&self.workspaces, user_path).await?;
+        let existing = match tokio::fs::metadata(&resolved.path).await {
+            Ok(metadata) => {
+                ensure_regular_file(
+                    &metadata,
+                    &resolved.path,
+                    "Writing multiply-linked files is not allowed",
+                )?;
+                Some(metadata)
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => {
+                return Err(metadata_error(&resolved, user_path, err));
+            }
+        };
+
+        Ok(WriteTarget {
+            workspace: resolved.workspace,
+            path: resolved.path,
+            existing,
+            requested: user_path.to_string(),
+        })
+    }
+}
+
+async fn read_target_metadata(
+    resolved: &ResolvedFilePath,
+    user_path: &str,
+) -> Result<Metadata, BoxError> {
+    tokio::fs::metadata(&resolved.path)
+        .await
+        .map_err(|err| metadata_error(resolved, user_path, err))
+}
+
+fn metadata_error(resolved: &ResolvedFilePath, user_path: &str, err: std::io::Error) -> BoxError {
+    format!(
+        "Failed to read file metadata (workspace: {}, requested_path: {}, resolved_path: {}): {err}",
+        resolved.workspace.display(),
+        user_path,
+        resolved.path.display()
+    )
+    .into()
+}
+
+impl ReadTarget {
+    /// Atomically replaces the file's content, preserving its permissions.
+    pub(crate) async fn write_atomic(&self, data: &[u8]) -> Result<(), BoxError> {
+        atomic_write_file(&self.path, data, Some(&self.metadata.permissions())).await
+    }
+}
+
+impl WriteTarget {
+    /// Atomically writes the destination.
+    ///
+    /// For a new file the missing parent directories are created first and the
+    /// file gets default permissions; an existing file keeps its permissions.
+    pub(crate) async fn write_atomic(&self, data: &[u8]) -> Result<(), BoxError> {
+        if self.existing.is_none()
+            && let Some(parent) = self.path.parent()
+        {
+            tokio::fs::create_dir_all(parent).await.map_err(|err| {
+                format!(
+                    "Failed to create parent directories (workspace: {}, requested_path: {}, resolved_path: {}, parent_path: {}): {err}",
+                    self.workspace.display(),
+                    self.requested,
+                    self.path.display(),
+                    parent.display()
+                )
+            })?;
+        }
+
+        let permissions = self.existing.as_ref().map(|metadata| metadata.permissions());
+        atomic_write_file(&self.path, data, permissions.as_ref()).await
+    }
+}
+
+fn normalize_workspaces<I>(workspaces: I) -> Vec<PathBuf>
 where
     I: IntoIterator<Item = PathBuf>,
 {
@@ -107,7 +309,7 @@ where
 /// caller-controlled and untrusted. A request may only ever *narrow* the configured roots by
 /// prioritizing a subdirectory of one of them; a requested root that does not resolve inside a
 /// configured root is dropped, so the configured roots always bound what the tool can reach.
-pub(crate) async fn tool_workspaces(meta: &RequestMeta, defaults: &[PathBuf]) -> Vec<PathBuf> {
+async fn tool_workspaces(meta: &RequestMeta, defaults: &[PathBuf]) -> Vec<PathBuf> {
     let mut requested = Vec::new();
 
     if let Some(workspace) = meta.get_extra_as::<PathBuf>("workspace") {
@@ -172,7 +374,7 @@ async fn is_within_workspaces(candidate: &Path, resolved_workspaces: &[PathBuf])
         .any(|root| ensure_path_in_workspace(root, &resolved).is_ok())
 }
 
-pub(crate) fn format_workspaces(workspaces: &[PathBuf]) -> String {
+fn format_workspaces(workspaces: &[PathBuf]) -> String {
     if workspaces.is_empty() {
         return "<none>".to_string();
     }
@@ -194,7 +396,7 @@ fn push_workspace(workspaces: &mut Vec<PathBuf>, workspace: PathBuf) {
     }
 }
 
-pub(crate) async fn resolve_read_path_in_workspaces(
+async fn resolve_read_path_in_workspaces(
     workspaces: &[PathBuf],
     user_path: &str,
 ) -> Result<ResolvedFilePath, BoxError> {
@@ -221,7 +423,7 @@ pub(crate) async fn resolve_read_path_in_workspaces(
     ))
 }
 
-pub(crate) async fn resolve_write_path_in_workspaces(
+async fn resolve_write_path_in_workspaces(
     workspaces: &[PathBuf],
     user_path: &str,
 ) -> Result<ResolvedFilePath, BoxError> {
@@ -274,7 +476,7 @@ pub(crate) async fn resolve_write_path_in_workspaces(
     ))
 }
 
-pub(crate) fn workspace_access_error(
+fn workspace_access_error(
     subject: &str,
     request_label: &str,
     requested_value: &str,
@@ -399,7 +601,7 @@ pub async fn resolve_write_path(workspace: &Path, user_path: &str) -> Result<Pat
     }
 }
 
-pub(crate) async fn resolve_workspace_path(workspace: &Path) -> Result<PathBuf, BoxError> {
+async fn resolve_workspace_path(workspace: &Path) -> Result<PathBuf, BoxError> {
     tokio::fs::canonicalize(workspace).await.map_err(|err| {
         format!(
             "Failed to resolve workspace path (workspace: {}): {err}",
@@ -409,7 +611,7 @@ pub(crate) async fn resolve_workspace_path(workspace: &Path) -> Result<PathBuf, 
     })
 }
 
-pub(crate) fn ensure_path_in_workspace(
+fn ensure_path_in_workspace(
     resolved_workspace: &Path,
     resolved_path: &Path,
 ) -> Result<(), BoxError> {
@@ -426,13 +628,13 @@ pub(crate) fn ensure_path_in_workspace(
 }
 
 /// Returns true when the requested path contains a parent directory traversal.
-pub(crate) fn path_contains_parent_reference(path: &Path) -> bool {
+fn path_contains_parent_reference(path: &Path) -> bool {
     path.components()
         .any(|component| matches!(component, Component::ParentDir))
 }
 
 /// Ensures the requested path stays within the workspace namespace before following symlinks.
-pub(crate) fn ensure_path_in_workspace_namespace(
+fn ensure_path_in_workspace_namespace(
     workspace: &Path,
     resolved_workspace: &Path,
     requested_path: &Path,
@@ -730,7 +932,7 @@ fn atomic_temp_path(target_path: &Path) -> Result<PathBuf, BoxError> {
 }
 
 /// Finds the nearest existing path component and returns the missing tail components.
-pub(crate) async fn nearest_existing_ancestor(
+async fn nearest_existing_ancestor(
     path: &Path,
 ) -> Result<(PathBuf, Vec<OsString>), BoxError> {
     let mut current = path.to_path_buf();

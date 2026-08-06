@@ -12,7 +12,9 @@
 //! Custom providers can implement [`CompletionFeaturesDyn`] and be wrapped with
 //! [`Model::with_completer`].
 
-use anda_core::{AgentOutput, BoxError, BoxPinFut, CONTENT_TYPE_JSON, CompletionRequest, ToolCall};
+use anda_core::{
+    AgentOutput, BoxError, BoxPinFut, CONTENT_TYPE_JSON, CompletionRequest, Json, ToolCall,
+};
 use arc_swap::ArcSwap;
 use futures_util::StreamExt;
 use serde::de::DeserializeOwned;
@@ -27,10 +29,13 @@ use std::{
 };
 
 pub mod anthropic;
+pub(crate) mod driver;
 pub mod gemini;
 pub mod openai;
+pub(crate) mod raw;
 #[cfg(test)]
 pub(crate) mod test_support;
+pub mod testing;
 
 /// Deserializes a JSON `null` as the type's default value, so providers that
 /// send explicit nulls for optional counters/objects do not fail typed parses.
@@ -441,6 +446,36 @@ pub trait CompletionFeaturesDyn: Send + Sync + 'static {
 
     /// Returns the provider model name used for diagnostics and usage reports.
     fn model_name(&self) -> String;
+
+    /// Removes unanswered tool-call requests from `raw_history[start..]`.
+    ///
+    /// `raw_history` holds this provider's own message JSON, so only the
+    /// provider can classify its items reliably. The runner calls this after an
+    /// interrupt (steering, discard, stop) so the next request does not inherit
+    /// a tool-call requirement the provider would reject as unanswered. Visible
+    /// text and reasoning must stay untouched.
+    ///
+    /// The default implementation is a conservative union over the built-in
+    /// provider wire shapes; override it when your provider's raw items are not
+    /// covered by it.
+    fn prune_unanswered_tool_calls(&self, raw_history: &mut Vec<Json>, start: usize) {
+        raw::prune_unanswered_tool_calls(raw_history, start);
+    }
+
+    /// Removes completed tool interactions (calls and results) from `raw_history`.
+    ///
+    /// Long-lived callers invoke this at an idle boundary to reclaim
+    /// context-window budget from tool payloads the model has already consumed.
+    /// Visible text and reasoning must stay untouched, and provider ordering
+    /// constraints (for example a reasoning item that must precede its sibling)
+    /// must be preserved.
+    ///
+    /// The default implementation is a conservative union over the built-in
+    /// provider wire shapes; override it when your provider's raw items are not
+    /// covered by it.
+    fn prune_tool_interactions(&self, raw_history: &mut Vec<Json>) {
+        raw::prune_tool_interactions(raw_history);
+    }
 }
 
 /// Placeholder implementation that returns errors for completion requests.
@@ -463,7 +498,7 @@ pub struct MockImplemented;
 
 impl CompletionFeaturesDyn for MockImplemented {
     fn model_name(&self) -> String {
-        "not_implemented".to_string()
+        "mock_implemented".to_string()
     }
 
     fn completion(&self, req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
@@ -546,6 +581,22 @@ impl Model {
     /// Executes a completion request with the underlying provider.
     pub async fn completion(&self, req: CompletionRequest) -> Result<AgentOutput, BoxError> {
         self.completer.completion(req).await
+    }
+
+    /// Removes unanswered tool-call requests from `raw_history[start..]` using
+    /// the provider's own wire-format knowledge.
+    ///
+    /// See [`CompletionFeaturesDyn::prune_unanswered_tool_calls`].
+    pub fn prune_unanswered_tool_calls(&self, raw_history: &mut Vec<Json>, start: usize) {
+        self.completer.prune_unanswered_tool_calls(raw_history, start);
+    }
+
+    /// Removes completed tool interactions from `raw_history` using the
+    /// provider's own wire-format knowledge.
+    ///
+    /// See [`CompletionFeaturesDyn::prune_tool_interactions`].
+    pub fn prune_tool_interactions(&self, raw_history: &mut Vec<Json>) {
+        self.completer.prune_tool_interactions(raw_history);
     }
 }
 
@@ -642,6 +693,13 @@ fn find_in_error_chain<T>(
 }
 
 /// Returns true if the error chain carries a retryable model error signal.
+///
+/// This function and its siblings ([`is_retryable_box_error`],
+/// [`model_error_status`], [`model_error_retry_after`]) are the public
+/// inspection surface of [`ModelError`] for embedding applications: built-in
+/// adapters have already exhausted their own transport retries when they
+/// return one, and the engine deliberately does not retry again on its own —
+/// whether to schedule a delayed retry is an application-level policy.
 pub fn is_retryable_model_error(error: &(dyn Error + 'static)) -> bool {
     find_in_error_chain(error, |error| {
         let retryable = error
@@ -1607,7 +1665,7 @@ mod tests {
         assert!(err.to_string().contains("not implemented"));
 
         let mock = Model::mock_implemented().with_labels(vec!["mock".into()]);
-        assert_eq!(mock.model_name(), "not_implemented");
+        assert_eq!(mock.model_name(), "mock_implemented");
         let output = mock
             .completion(CompletionRequest {
                 prompt: "{\"q\":\"anda\"}".to_string(),

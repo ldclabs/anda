@@ -6,18 +6,13 @@
 //! - Response parsing and conversion to Anda's internal formats
 
 use anda_core::{
-    AgentOutput, BoxError, BoxPinFut, CompletionFeatures, CompletionRequest, Message, Resource,
+    AgentOutput, BoxError, BoxPinFut, CompletionRequest, FunctionDefinition, Json, Message,
 };
-use log::{Level::Debug, log_enabled};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-use super::{
-    CompletionFeaturesDyn, ModelEffort, ModelError, execute_completion_request_with_retry,
-    read_completion_response_bytes, read_sse_json_events, request_client_builder,
-    streaming_completion_request,
-};
-use crate::{rfc3339_datetime, unix_ms};
+use super::driver::{SamplingOptions, WireFormat, drive_completion};
+use super::{CompletionFeaturesDyn, ModelEffort, ModelError, request_client_builder};
 
 pub mod types;
 
@@ -432,186 +427,137 @@ fn response_from_stream_events(
     })
 }
 
-impl CompletionFeatures for CompletionModel {
-    fn model_name(&self) -> String {
-        self.model.clone()
-    }
-
-    async fn completion(
-        &self,
-        req: CompletionRequest,
-        _resources: Vec<Resource>,
-    ) -> Result<AgentOutput, BoxError> {
-        CompletionFeaturesDyn::completion(self, req).await
-    }
-}
-
 impl CompletionFeaturesDyn for CompletionModel {
     fn model_name(&self) -> String {
         self.model.clone()
     }
 
-    fn completion(&self, mut req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
+    fn completion(&self, req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
         let model = self.model.clone();
         let client = self.client.clone();
         let mut r = self.default_request.clone();
         r.model = model.clone();
 
         Box::pin(async move {
-            let timestamp = unix_ms();
-            let mut chat_history: Vec<Message> = Vec::new();
-
-            if !req.instructions.is_empty() {
-                r.system = Some(req.instructions.into());
-            }
-
-            r.messages.append(&mut req.raw_history);
-            let skip_raw = r.messages.len();
-            for msg in req.chat_history {
-                let val = types::Message::from(msg);
-                let val = serde_json::to_value(val)?;
-                r.messages.push(val);
-            }
-
-            if let Some(mut msg) = req
-                .documents
-                .to_message(&rfc3339_datetime(timestamp).unwrap())
-            {
-                msg.timestamp = Some(timestamp);
-                chat_history.push(msg.clone());
-                let val = types::Message::from(msg);
-                let val = serde_json::to_value(val)?;
-                r.messages.push(val);
-            }
-
-            let mut content = req.content;
-            if !req.prompt.is_empty() {
-                content.insert(0, req.prompt.into());
-            }
-            if !content.is_empty() {
-                let msg = Message {
-                    role: req.role.unwrap_or_else(|| "user".to_string()),
-                    content,
-                    timestamp: Some(timestamp),
-                    ..Default::default()
-                };
-
-                chat_history.push(msg.clone());
-                let val = types::Message::from(msg);
-                let val = serde_json::to_value(val)?;
-                r.messages.push(val);
-            }
-
-            if let Some(temperature) = req.temperature {
-                r.temperature = Some(temperature as f32);
-            }
-
-            if let Some(max_tokens) = req.max_output_tokens {
-                r.max_tokens = max_tokens as u32;
-            }
-
-            if let Some(effort) = req.effort {
-                r.output_config.get_or_insert_default().effort = Some(effort.into());
-            }
-
-            if let Some(output_schema) = req.output_schema {
-                r.output_config.get_or_insert_default().format = Some(types::JsonOutputFormat {
-                    schema: output_schema,
-                    r#type: types::JsonOutputFormatType::JsonSchema,
-                });
-            }
-
-            if let Some(stop) = req.stop {
-                r.stop_sequences = Some(stop);
-            }
-
-            if !req.tools.is_empty() {
-                r.tools = Some(req.tools.into_iter().map(|v| v.into()).collect());
-                if req.tool_choice_required {
-                    r.tool_choice = Some(types::ToolChoice::any());
-                } else {
-                    r.tool_choice = Some(types::ToolChoice::auto());
-                }
-            }
-
-            if log_enabled!(Debug)
-                && let Ok(val) = serde_json::to_string(&r)
-            {
-                log::debug!(request = val; "Completion request");
-            }
-
-            let (res, assistant_raw_message) = execute_completion_request_with_retry(
-                &model,
-                || {
-                    let mut request = client.post("/messages").json(&r);
-                    if r.stream == Some(true) {
-                        request = streaming_completion_request(request);
-                    }
-                    request
-                },
-                |response| async {
-                    let mut assistant_raw_message = None;
-                    let res = if r.stream == Some(true) {
-                        let events = read_sse_json_events(response, &model).await?;
-                        response_from_stream_events(events)?
-                    } else {
-                        let data = read_completion_response_bytes(response, &model).await?;
-
-                        let raw_response = match serde_json::from_slice::<Value>(&data) {
-                            Ok(value) => value,
-                            Err(err) => {
-                                return Err(format!(
-                                    "Completion error, model: {}, error: {}, body: {}",
-                                    model,
-                                    err,
-                                    String::from_utf8_lossy(&data)
-                                )
-                                .into());
-                            }
-                        };
-                        assistant_raw_message = types::assistant_raw_history_message(&raw_response);
-
-                        match serde_json::from_value::<types::CreateMessageResponse>(raw_response) {
-                            Ok(res) => res,
-                            Err(err) => {
-                                return Err(format!(
-                                    "Completion error, model: {}, error: {}, body: {}",
-                                    model,
-                                    err,
-                                    String::from_utf8_lossy(&data)
-                                )
-                                .into());
-                            }
-                        }
-                    };
-                    Ok((res, assistant_raw_message))
-                },
-            )
-            .await?;
-
-            if log_enabled!(Debug) || res.maybe_failed() {
-                let mut logged_request = r.clone();
-                logged_request.system = None;
-                if log_enabled!(Debug) {
-                    log::debug!(
-                        model = model,
-                        request:serde = logged_request,
-                        response:serde = res;
-                        "Completion response");
-                } else {
-                    log::warn!(
-                        model = model,
-                        request:serde = logged_request,
-                        response:serde = res;
-                        "Completion maybe failed");
-                }
-            }
-            if skip_raw > 0 {
-                r.messages.drain(0..skip_raw);
-            }
-
-            res.try_into_with_raw(r.messages, chat_history, assistant_raw_message)
+            drive_completion::<CompletionModel>(model, move |path| client.post(path), r, req).await
         })
+    }
+}
+
+impl WireFormat for CompletionModel {
+    type Request = types::CreateMessageParams;
+    type Response = types::CreateMessageResponse;
+    type StreamItem = types::StreamEvent;
+
+    fn set_instructions(r: &mut Self::Request, instructions: String) {
+        r.system = Some(instructions.into());
+    }
+
+    fn append_raw_history(r: &mut Self::Request, mut raw_history: Vec<Json>) -> usize {
+        r.messages.append(&mut raw_history);
+        r.messages.len()
+    }
+
+    fn push_message(r: &mut Self::Request, msg: Message) -> Result<(), BoxError> {
+        let val = types::Message::from(msg);
+        r.messages.push(serde_json::to_value(val)?);
+        Ok(())
+    }
+
+    fn apply_sampling(r: &mut Self::Request, options: SamplingOptions) -> Result<(), BoxError> {
+        if let Some(temperature) = options.temperature {
+            r.temperature = Some(temperature as f32);
+        }
+        if let Some(max_tokens) = options.max_output_tokens {
+            r.max_tokens = max_tokens as u32;
+        }
+        if let Some(effort) = options.effort {
+            r.output_config.get_or_insert_default().effort = Some(effort.into());
+        }
+        if let Some(output_schema) = options.output_schema {
+            r.output_config.get_or_insert_default().format = Some(types::JsonOutputFormat {
+                schema: output_schema,
+                r#type: types::JsonOutputFormatType::JsonSchema,
+            });
+        }
+        if let Some(stop) = options.stop {
+            r.stop_sequences = Some(stop);
+        }
+        Ok(())
+    }
+
+    fn apply_tools(r: &mut Self::Request, tools: Vec<FunctionDefinition>, required: bool) {
+        r.tools = Some(tools.into_iter().map(|v| v.into()).collect());
+        r.tool_choice = Some(if required {
+            types::ToolChoice::any()
+        } else {
+            types::ToolChoice::auto()
+        });
+    }
+
+    fn is_stream(r: &Self::Request) -> bool {
+        r.stream == Some(true)
+    }
+
+    fn endpoint(_r: &Self::Request, _model: &str) -> String {
+        "/messages".to_string()
+    }
+
+    fn aggregate_stream(items: Vec<Self::StreamItem>) -> Result<Self::Response, BoxError> {
+        response_from_stream_events(items)
+    }
+
+    fn parse_response(model: &str, data: &[u8]) -> Result<(Self::Response, Option<Json>), BoxError> {
+        let raw_response = match serde_json::from_slice::<Value>(data) {
+            Ok(value) => value,
+            Err(err) => {
+                return Err(format!(
+                    "Completion error, model: {}, error: {}, body: {}",
+                    model,
+                    err,
+                    String::from_utf8_lossy(data)
+                )
+                .into());
+            }
+        };
+        let assistant_raw_message = types::assistant_raw_history_message(&raw_response);
+
+        match serde_json::from_value::<types::CreateMessageResponse>(raw_response) {
+            Ok(res) => Ok((res, assistant_raw_message)),
+            Err(err) => Err(format!(
+                "Completion error, model: {}, error: {}, body: {}",
+                model,
+                err,
+                String::from_utf8_lossy(data)
+            )
+            .into()),
+        }
+    }
+
+    fn maybe_failed(res: &Self::Response) -> bool {
+        res.maybe_failed()
+    }
+
+    fn redacted_for_log(r: &Self::Request) -> Self::Request {
+        let mut logged = r.clone();
+        logged.system = None;
+        logged
+    }
+
+    fn sent_messages(mut r: Self::Request, skip_raw: usize) -> Vec<Json> {
+        if skip_raw > 0 {
+            r.messages.drain(0..skip_raw);
+        }
+        r.messages
+    }
+
+    fn into_output(
+        res: Self::Response,
+        sent_messages: Vec<Json>,
+        chat_history: Vec<Message>,
+        assistant_raw_message: Option<Json>,
+    ) -> Result<AgentOutput, BoxError> {
+        res.try_into_with_raw(sent_messages, chat_history, assistant_raw_message)
     }
 }
 
@@ -676,10 +622,6 @@ mod tests {
 
         let default_model = empty_endpoint_client.completion_model("");
         assert_eq!(default_model.model, DEFAULT_COMPLETION_MODEL);
-        assert_eq!(
-            CompletionFeatures::model_name(&default_model),
-            DEFAULT_COMPLETION_MODEL
-        );
         assert_eq!(
             CompletionFeaturesDyn::model_name(&default_model),
             DEFAULT_COMPLETION_MODEL

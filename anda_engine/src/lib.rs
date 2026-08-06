@@ -23,6 +23,7 @@ use chrono::prelude::*;
 use rand::RngExt;
 use unicode_segmentation::UnicodeSegmentation;
 
+pub mod background;
 pub mod context;
 pub mod engine;
 pub mod extension;

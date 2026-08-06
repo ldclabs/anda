@@ -102,130 +102,70 @@
 //! ```
 
 use anda_core::{
-    BoxError, BoxFut, FunctionDefinition, Json, ToolGroup, ToolInput, ToolOutput, ToolProvider,
-    Usage, validate_function_name,
+    BoxError, BoxFut, FunctionDefinition, Json, ToolGroup, ToolInput, ToolOutput, ToolProvider, validate_function_name,
 };
-use async_trait::async_trait;
-use http::{HeaderName, HeaderValue};
 use parking_lot::{Mutex as SyncMutex, RwLock};
 use reqwest::Client as ReqwestClient;
 use rmcp::{
-    ClientHandler, Peer, RoleClient,
+    Peer, RoleClient,
     model::{
-        CallToolRequestParams, CallToolResponse, CallToolResult, CancelTaskParams, ClientInfo,
-        ContentBlock, CreateTaskResult, DEFAULT_MRTR_MAX_ROUNDS, ExtensionCapabilities,
-        GetTaskParams, Implementation, InputRequiredResult, ProtocolVersion, ServerNotification,
-        ServerPeerInfo, SubscriptionFilter, TASKS_EXTENSION_ID, TaskPayload, Tool as McpTool,
+        CallToolRequestParams,
+        ServerPeerInfo, Tool as McpTool,
     },
     serve_client_with_lifecycle,
-    service::{ClientInitializeError, ClientLifecycleMode, RunningService, Subscription},
+    service::ClientLifecycleMode,
     transport::{
-        AuthClient, AuthError, AuthorizationManager, ClientCredentialsConfig, CredentialStore,
+        AuthClient, AuthorizationManager,
         StreamableHttpClientTransport, TokioChildProcess,
-        auth::{AuthorizationCallback, AuthorizationMetadataSource, OAuthClientConfig, OAuthState},
-        streamable_http_client::StreamableHttpClientTransportConfig,
     },
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, json};
+use serde_json::Map;
 
 /// Re-exported from `rmcp`: the OAuth credentials an [`McpCredentialStore`]
 /// persists on behalf of a server. Carries the (possibly dynamically
 /// registered) `client_id` and the token response including the refresh token.
 pub use rmcp::transport::StoredCredentials;
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, hash_map::DefaultHasher},
-    future::Future,
-    hash::{Hash, Hasher},
-    path::PathBuf,
+    collections::{BTreeMap, BTreeSet, HashMap},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
-use tokio::{process::Command, sync::Mutex};
+use tokio::sync::Mutex;
 
 use crate::context::BaseCtx;
 
+
+mod auth;
+mod router;
+mod session;
+
+pub use auth::{
+    InMemoryMcpCredentialStore, McpAuthorizationRequired, McpCredentialStore, McpOAuthConfig,
+    McpOAuthMetadata, OAuthAuthorizationCodeConfig, OAuthClientCredentialsConfig,
+};
+pub use router::McpToolRoute;
+pub use session::{McpStdioTransport, McpStreamableHttpTransport, McpTransportConfig};
+
+use auth::{
+    ScopedCredentialStore, authorization_required_hint,
+    is_authorization_error,
+};
+use router::{
+    DEFAULT_TASK_MAX_WAIT_SECS, MAX_LOCAL_NAME_ATTEMPTS, MAX_TASK_MAX_WAIT_SECS, call_tool_rounds,
+    mcp_result_to_tool_output, sanitize_name_part, shorten_with_hash,
+};
+use session::{
+    AndaMcpClient, DISCOVERY_PROBE_TIMEOUT, McpSession, SUBSCRIPTION_ACK_TIMEOUT,
+    legacy_protocol_version, needs_tool_subscription, preferred_protocol_versions,
+    pump_tool_subscription, serve_bounded, tool_subscription_filter,
+};
+
 /// Default model-facing prefix for MCP-backed tools.
 pub const DEFAULT_MCP_TOOL_PREFIX: &str = "mcp";
-
-/// How many times to re-derive a local tool name before giving up on a collision.
-const MAX_LOCAL_NAME_ATTEMPTS: usize = 8;
-
-/// How far ahead of a client-credentials token's expiry to re-establish the session.
-///
-/// Comfortably wider than rmcp's own 30s refresh buffer, so the reconnect happens before any
-/// request can fail with `AuthorizationRequired`.
-const CLIENT_CREDENTIALS_RENEW_BUFFER: Duration = Duration::from_secs(120);
-
-/// Minimum buffer that stays just ahead of rmcp's 30-second proactive refresh threshold.
-const CLIENT_CREDENTIALS_MIN_RENEW_BUFFER: Duration = Duration::from_secs(31);
-
-/// How long a `server/discover` opener may go unanswered before the attempt is
-/// abandoned.
-///
-/// A server that predates `2026-07-28` is not obliged to reject an unknown
-/// method: plenty of them read the line, match nothing, and wait for the next
-/// one, which would leave the handshake pending forever. Bounding the probe turns
-/// that into a fallback ([`McpLifecycle::Auto`]) or an error
-/// ([`McpLifecycle::Discover`]). Pin `initialize` to skip the wait entirely.
-const DISCOVERY_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// How long to wait for a `subscriptions/listen` acknowledgment before giving up
-/// on live `tools/list_changed` delivery for that session.
-const SUBSCRIPTION_ACK_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Delay before reopening a `subscriptions/listen` stream that ended while the
-/// session is still usable. The streams are not resumable, so reopening is the
-/// only way back to live `tools/list_changed` delivery.
-const SUBSCRIPTION_REOPEN_DELAY: Duration = Duration::from_secs(2);
-
-/// How long a subscription stream must last to count as working. Above this, a
-/// server is just recycling idle streams and reopening is expected; below it,
-/// the peer is ending streams as fast as they are opened.
-const SUBSCRIPTION_HEALTHY_LIFETIME: Duration = Duration::from_secs(30);
-
-/// Consecutive short-lived streams tolerated before the pump stops reopening.
-const MAX_SHORT_LIVED_SUBSCRIPTIONS: usize = 5;
-
-/// Pause between MRTR rounds that carry only `requestState`, i.e. the server
-/// asking to be polled rather than asking for input.
-const MRTR_STATE_ROUND_DELAY: Duration = Duration::from_millis(200);
-
-/// Poll interval used when a task suggests none, plus the bounds applied to a
-/// server-suggested one. A remote server controls `pollIntervalMs`, so it is
-/// clamped instead of trusted.
-const TASK_POLL_INTERVAL: Duration = Duration::from_secs(1);
-const TASK_POLL_INTERVAL_MIN: Duration = Duration::from_millis(250);
-const TASK_POLL_INTERVAL_MAX: Duration = Duration::from_secs(10);
-
-/// Default ceiling on how long one tool call waits for a task to finish.
-const DEFAULT_TASK_MAX_WAIT_SECS: u64 = 300;
-
-/// Hard ceiling on a configured `max_wait_secs`.
-///
-/// A tool call blocks for the whole wait, so a day is already far past anything
-/// sane; the bound also keeps the poll deadline from overflowing `Instant`.
-const MAX_TASK_MAX_WAIT_SECS: u64 = 24 * 60 * 60;
-
-/// Protocol revisions this host offers `server/discover`, newest first.
-///
-/// `2025-11-25` stays in the list so a peer that implements the discovery RPC but
-/// not the stateless revision still negotiates a usable version.
-fn preferred_protocol_versions() -> Vec<ProtocolVersion> {
-    vec![ProtocolVersion::V_2026_07_28, ProtocolVersion::V_2025_11_25]
-}
-
-/// Revision proposed by the legacy `initialize` handshake.
-///
-/// `2026-07-28` is deliberately not proposed here: it is only negotiated through
-/// `server/discover`, which proves the peer implements the stateless lifecycle
-/// rather than relying on it echoing back a version it does not serve.
-fn legacy_protocol_version() -> ProtocolVersion {
-    ProtocolVersion::V_2025_11_25
-}
 
 /// Dynamic tool provider backed by one or more MCP servers.
 #[derive(Clone)]
@@ -545,7 +485,8 @@ impl McpToolProvider {
                     // Headless: obtain a token at connection time, no human loop. The grant
                     // issues no refresh token, so the session carries the token's deadline
                     // and reconnects to mint a new one.
-                    let (manager, deadline) = self.authorize_client_credentials(http, cc).await?;
+                    let (manager, deadline) =
+                        auth::authorize_client_credentials(http.url.as_str(), cc).await?;
                     expires_at = deadline;
                     let transport = StreamableHttpClientTransport::with_client(
                         AuthClient::new(ReqwestClient::new(), manager),
@@ -560,7 +501,12 @@ impl McpToolProvider {
                 Some(McpOAuthConfig::AuthorizationCode(_)) => {
                     // Interactive: reuse credentials persisted by a prior
                     // begin/complete_authorization; refresh happens on demand.
-                    let manager = self.authorize_from_store(&config.id, http).await?;
+                    let manager = auth::authorize_from_store(
+                        &config.id,
+                        http.url.as_str(),
+                        self.scoped_store(&config.id),
+                    )
+                    .await?;
                     let transport = StreamableHttpClientTransport::with_client(
                         AuthClient::new(ReqwestClient::new(), manager),
                         http.base_transport_config()?,
@@ -647,16 +593,7 @@ impl McpToolProvider {
     /// decide, from a bare URL, whether to connect directly or run the
     /// authorization flow.
     pub async fn discover_http_oauth(url: &str) -> Result<Option<McpOAuthMetadata>, BoxError> {
-        let manager = AuthorizationManager::new(url).await?;
-        let resolution = manager.resolve_metadata().await?;
-        if resolution.source == AuthorizationMetadataSource::LegacyEndpointFallback {
-            return Ok(None);
-        }
-        let metadata = resolution.metadata;
-        Ok(Some(McpOAuthMetadata {
-            scopes_supported: metadata.scopes_supported.unwrap_or_default(),
-            registration_supported: metadata.registration_endpoint.is_some(),
-        }))
+        auth::discover_http_oauth(url).await
     }
 
     /// Starts the interactive OAuth Authorization Code flow for `server_id` and
@@ -683,34 +620,12 @@ impl McpToolProvider {
             .into());
         };
 
-        let mut manager = AuthorizationManager::new(http.url.as_str()).await?;
-        manager.set_credential_store(self.scoped_store(server_id));
-        let metadata = manager.resolve_metadata().await?.metadata;
-        manager.set_metadata(metadata);
-
-        let scope_refs: Vec<&str> = ac.scopes.iter().map(String::as_str).collect();
-        let client_config = match &ac.client_id {
-            // Pre-registered public client.
-            Some(client_id) => {
-                let mut cfg = OAuthClientConfig::new(client_id.clone(), ac.redirect_uri.clone());
-                if !ac.scopes.is_empty() {
-                    cfg = cfg.with_scopes(ac.scopes.clone());
-                }
-                cfg
-            }
-            // Dynamic client registration (RFC 7591).
-            None => {
-                manager
-                    .register_client(
-                        ac.client_name.as_deref().unwrap_or("Anda Engine MCP Host"),
-                        &ac.redirect_uri,
-                        &scope_refs,
-                    )
-                    .await?
-            }
-        };
-        manager.configure_client(client_config)?;
-        let auth_url = manager.get_authorization_url(&scope_refs).await?;
+        let (manager, auth_url) = auth::begin_authorization_manager(
+            http.url.as_str(),
+            ac,
+            self.scoped_store(server_id),
+        )
+        .await?;
 
         self.inner
             .pending_auth
@@ -747,14 +662,7 @@ impl McpToolProvider {
             .remove(server_id)
             .ok_or_else(|| format!("no pending OAuth authorization for MCP server {server_id}"))?;
 
-        let callback = AuthorizationCallback::from_redirect_url(redirect_url)?;
-        manager
-            .exchange_code_for_token_with_issuer(
-                &callback.code,
-                &callback.csrf_token,
-                callback.issuer.as_deref(),
-            )
-            .await?;
+        auth::complete_authorization_exchange(manager, redirect_url).await?;
         self.disconnect_server(server_id).await;
         Ok(())
     }
@@ -813,68 +721,6 @@ impl McpToolProvider {
             server_id: server_id.to_string(),
             inner: self.inner.credential_store.clone(),
         }
-    }
-
-    /// Rebuilds an authorized manager from persisted Authorization Code
-    /// credentials, refreshing on demand. Errors with [`McpAuthorizationRequired`]
-    /// when no usable credentials exist yet, so the caller can trigger the
-    /// interactive flow.
-    async fn authorize_from_store(
-        &self,
-        server_id: &str,
-        http: &McpStreamableHttpTransport,
-    ) -> Result<AuthorizationManager, BoxError> {
-        let mut manager = AuthorizationManager::new(http.url.as_str()).await?;
-        manager.set_credential_store(self.scoped_store(server_id));
-        if !manager.initialize_from_store().await? {
-            return Err(McpAuthorizationRequired {
-                server_id: server_id.to_string(),
-            }
-            .into());
-        }
-        Ok(manager)
-    }
-
-    /// Obtains an authorized manager via the headless Client Credentials flow.
-    /// Runs the headless Client Credentials exchange and reports when the token expires.
-    ///
-    /// RFC 6749 §4.4.3 says a client-credentials grant SHOULD NOT issue a refresh token, and
-    /// rmcp's only renewal path is `refresh_token`. Once the access token expires, every
-    /// request fails with `AuthorizationRequired` and nothing re-runs this exchange. The
-    /// returned deadline lets the session expire itself slightly early so `ensure_session`
-    /// reconnects and mints a fresh token instead of failing permanently.
-    async fn authorize_client_credentials(
-        &self,
-        http: &McpStreamableHttpTransport,
-        config: &OAuthClientCredentialsConfig,
-    ) -> Result<(AuthorizationManager, Option<Instant>), BoxError> {
-        let mut state = OAuthState::new(http.url.as_str(), Some(ReqwestClient::new())).await?;
-        state
-            .authenticate_client_credentials(ClientCredentialsConfig::ClientSecret {
-                client_id: config.client_id.clone(),
-                client_secret: config.client_secret.clone(),
-                scopes: config.scopes.clone(),
-                resource: config.resource.clone(),
-            })
-            .await?;
-
-        // Renew before rmcp's own 30s refresh buffer would kick in and fail. `expires_in` is
-        // read through the token response's `Serialize` impl so this does not depend on
-        // `oauth2` directly, which would risk a version skew with the one rmcp uses.
-        let expires_at = match state.get_credentials().await {
-            Ok((_, Some(token))) => serde_json::to_value(&token)
-                .ok()
-                .and_then(|token| token.get("expires_in").and_then(Json::as_u64))
-                .and_then(|secs| {
-                    client_credentials_deadline(Instant::now(), Duration::from_secs(secs))
-                }),
-            _ => None,
-        };
-
-        let manager = state
-            .into_authorization_manager()
-            .ok_or("MCP client_credentials authorization did not complete")?;
-        Ok((manager, expires_at))
     }
 
     async fn refresh_if_dirty(&self, server_id: &str) -> Result<(), BoxError> {
@@ -1079,150 +925,6 @@ impl McpToolProvider {
     }
 }
 
-/// Drives one `tools/call` until the server produces a result.
-///
-/// Before `2026-07-28` that took a single round trip. The revision adds two
-/// intermediate answers: an MRTR `input_required` result (SEP-2322) and a task
-/// handle (SEP-2663). Both are resolved here so the caller still sees one
-/// [`CallToolResult`].
-async fn call_tool_rounds(
-    route: &McpToolRoute,
-    peer: &Peer<RoleClient>,
-    mut params: CallToolRequestParams,
-    tasks: Option<&McpTasksConfig>,
-) -> Result<CallToolResult, BoxError> {
-    for _ in 0..DEFAULT_MRTR_MAX_ROUNDS {
-        match peer.call_tool_once(params.clone()).await? {
-            CallToolResponse::Complete(result) => return Ok(result),
-            CallToolResponse::InputRequired(result) => {
-                // A round carrying actual `inputRequests` wants Sampling,
-                // Elicitation, or Roots, none of which this host advertises. Report
-                // it as a tool-level error the model can act on instead of failing
-                // the turn. A round with only `requestState` is the server asking to
-                // be polled: echo the state back and continue.
-                if result
-                    .input_requests
-                    .as_ref()
-                    .is_some_and(|requests| !requests.is_empty())
-                {
-                    return Ok(input_required_error(route, &result));
-                }
-                let Some(request_state) = result.request_state else {
-                    return Err(format!(
-                        "MCP tool {} returned an input_required result with neither \
-                         input requests nor request state",
-                        route.name
-                    )
-                    .into());
-                };
-                params.request_state = Some(request_state);
-                params.input_responses = None;
-                tokio::time::sleep(MRTR_STATE_ROUND_DELAY).await;
-            }
-            CallToolResponse::Task(task) => {
-                return await_task(route, peer, task, tasks).await;
-            }
-            other => {
-                return Err(format!(
-                    "MCP tool {} returned an unsupported response: {other:?}",
-                    route.name
-                )
-                .into());
-            }
-        }
-    }
-
-    Err(format!(
-        "MCP tool {} did not complete within {DEFAULT_MRTR_MAX_ROUNDS} input_required rounds",
-        route.name
-    )
-    .into())
-}
-
-/// Polls a SEP-2663 task to a terminal state and returns its tool result.
-///
-/// The task is cancelled best-effort whenever this host walks away from it, so
-/// an abandoned task does not keep running on the server.
-async fn await_task(
-    route: &McpToolRoute,
-    peer: &Peer<RoleClient>,
-    created: CreateTaskResult,
-    tasks: Option<&McpTasksConfig>,
-) -> Result<CallToolResult, BoxError> {
-    let task_id = created.task.task_id.clone();
-    let Some(tasks) = tasks else {
-        cancel_task(peer, &task_id).await;
-        return Err(format!(
-            "MCP tool {} returned a task handle, but the tasks extension is not enabled \
-             for server {}",
-            route.name, route.server_id
-        )
-        .into());
-    };
-
-    let max_wait = tasks.max_wait();
-    let deadline = Instant::now() + max_wait;
-    let mut interval = task_poll_interval(created.task.poll_interval_ms);
-    loop {
-        if Instant::now() + interval > deadline {
-            cancel_task(peer, &task_id).await;
-            return Err(format!(
-                "MCP tool {} task {task_id} did not finish within {}s",
-                route.name,
-                max_wait.as_secs()
-            )
-            .into());
-        }
-        tokio::time::sleep(interval).await;
-
-        let task = peer
-            .get_task(GetTaskParams::new(task_id.clone()))
-            .await?
-            .task;
-        interval = task_poll_interval(task.task.poll_interval_ms);
-        match task.payload {
-            TaskPayload::Working => continue,
-            TaskPayload::Completed { result } => {
-                // The payload mirrors the result of the original request, so it
-                // deserializes as the `tools/call` result it stands in for.
-                return serde_json::from_value(Json::Object(result)).map_err(|err| {
-                    format!(
-                        "MCP tool {} returned an unreadable task result: {err}",
-                        route.name
-                    )
-                    .into()
-                });
-            }
-            TaskPayload::Failed { error } => {
-                return Err(format!(
-                    "MCP tool {} task {task_id} failed: {}",
-                    route.name,
-                    Json::Object(error)
-                )
-                .into());
-            }
-            TaskPayload::Cancelled => {
-                return Err(format!("MCP tool {} task {task_id} was cancelled", route.name).into());
-            }
-            TaskPayload::InputRequired { input_requests } => {
-                // Same reasoning as the MRTR round above: nothing here can answer a
-                // sampling, elicitation, or roots request.
-                cancel_task(peer, &task_id).await;
-                return Ok(unsupported_input_error(
-                    route,
-                    input_requests.keys().map(String::as_str),
-                ));
-            }
-            _ => {
-                return Err(format!(
-                    "MCP tool {} task {task_id} reported an unsupported status",
-                    route.name
-                )
-                .into());
-            }
-        }
-    }
-}
 
 impl ToolProvider<BaseCtx> for McpToolProvider {
     fn name(&self) -> String {
@@ -1530,118 +1232,6 @@ fn non_empty(value: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Computes the reconnect deadline for a client-credentials token.
-///
-/// Long-lived tokens renew 120 seconds early. Shorter tokens keep at least half their useful
-/// lifetime while still staying ahead of rmcp's 30-second proactive refresh threshold. A remote
-/// authorization server controls `expires_in`, so `checked_add` turns an unrepresentable duration
-/// into "no local deadline" instead of panicking the process.
-fn client_credentials_deadline(now: Instant, ttl: Duration) -> Option<Instant> {
-    let buffer = if ttl >= CLIENT_CREDENTIALS_RENEW_BUFFER.saturating_mul(2) {
-        CLIENT_CREDENTIALS_RENEW_BUFFER
-    } else {
-        (ttl / 2).max(CLIENT_CREDENTIALS_MIN_RENEW_BUFFER).min(ttl)
-    };
-    now.checked_add(ttl.saturating_sub(buffer))
-}
-
-/// One Anda-facing route to an MCP tool.
-#[derive(Debug, Clone)]
-pub struct McpToolRoute {
-    /// Anda-facing tool name.
-    pub name: String,
-    /// Configured MCP server id.
-    pub server_id: String,
-    /// Original MCP tool name.
-    pub remote_name: String,
-    /// Model-facing function definition.
-    pub definition: FunctionDefinition,
-}
-
-struct McpSession {
-    service: Mutex<RunningService<RoleClient, AndaMcpClient>>,
-    dirty: Arc<AtomicBool>,
-    /// Deadline after which the session's credentials are stale and it must be re-established.
-    ///
-    /// Only set for the Client Credentials flow, whose grant issues no refresh token.
-    expires_at: Option<Instant>,
-    /// Task draining the `subscriptions/listen` stream, for peers that require one
-    /// to deliver `tools/list_changed` (2026-07-28 and newer).
-    subscription: Option<tokio::task::JoinHandle<()>>,
-}
-
-impl Drop for McpSession {
-    fn drop(&mut self) {
-        // The pump holds a peer clone and would otherwise outlive the session it
-        // feeds; dropping its `Subscription` also cancels the server-side stream.
-        if let Some(subscription) = &self.subscription {
-            subscription.abort();
-        }
-    }
-}
-
-impl McpSession {
-    /// Reports whether the session can still carry requests.
-    ///
-    /// `RunningService::is_closed` only reflects a *locally* initiated shutdown: it is
-    /// `handle.is_none() || cancellation_token.is_cancelled()`, and rmcp's serve loop exits
-    /// with `QuitReason::Closed` on a peer-initiated close without cancelling that token. A
-    /// crashed or exited MCP server would therefore look alive forever and every later call
-    /// would fail with `TransportClosed` instead of triggering a reconnect. The peer's
-    /// transport state is what actually flips, so check both — plus the credential deadline,
-    /// since an expired token makes the session unusable while the transport is still open.
-    async fn is_closed(&self) -> bool {
-        if self
-            .expires_at
-            .is_some_and(|deadline| Instant::now() >= deadline)
-        {
-            return true;
-        }
-
-        let service = self.service.lock().await;
-        service.is_closed() || service.peer().is_transport_closed()
-    }
-}
-
-#[derive(Debug, Clone)]
-struct AndaMcpClient {
-    info: ClientInfo,
-    dirty: Arc<AtomicBool>,
-}
-
-impl AndaMcpClient {
-    fn new(dirty: Arc<AtomicBool>, tasks: bool) -> Self {
-        let mut info = ClientInfo::default();
-        info.client_info = Implementation::new("anda_engine", env!("CARGO_PKG_VERSION"))
-            .with_title("Anda Engine MCP Host");
-        // Only the legacy handshake reads this; the discovery lifecycle proposes
-        // `preferred_protocol_versions` instead. Capabilities are sent either way —
-        // in the `initialize` params, or in each request's `_meta` when the peer
-        // negotiated the stateless revision.
-        info.protocol_version = legacy_protocol_version();
-        if tasks {
-            info.capabilities
-                .extensions
-                .get_or_insert_with(ExtensionCapabilities::new)
-                .insert(TASKS_EXTENSION_ID.to_string(), Map::new());
-        }
-        Self { info, dirty }
-    }
-}
-
-impl ClientHandler for AndaMcpClient {
-    fn get_info(&self) -> ClientInfo {
-        self.info.clone()
-    }
-
-    fn on_tool_list_changed(
-        &self,
-        _context: rmcp::service::NotificationContext<RoleClient>,
-    ) -> impl Future<Output = ()> + Send + '_ {
-        self.dirty.store(true, Ordering::SeqCst);
-        std::future::ready(())
-    }
-}
 
 /// MCP server configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1777,666 +1367,22 @@ impl McpTasksConfig {
     }
 }
 
-/// MCP transport configuration.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum McpTransportConfig {
-    /// stdio child process transport.
-    Stdio(McpStdioTransport),
-    /// Streamable HTTP transport.
-    StreamableHttp(McpStreamableHttpTransport),
-}
-
-impl McpTransportConfig {
-    fn validate(&self) -> Result<(), BoxError> {
-        match self {
-            Self::Stdio(config) => config.validate(),
-            Self::StreamableHttp(config) => config.validate(),
-        }
-    }
-}
-
-/// stdio child process transport configuration.
-#[derive(Clone, Default, Deserialize, Serialize)]
-pub struct McpStdioTransport {
-    /// Executable to spawn.
-    pub command: String,
-    /// Command arguments. These are passed without shell interpolation.
-    #[serde(default)]
-    pub args: Vec<String>,
-    /// Additional environment variables.
-    ///
-    /// This is where a host application expands per-server secrets (API keys and the like),
-    /// so the values are redacted from [`Debug`] output.
-    #[serde(default)]
-    pub env: BTreeMap<String, String>,
-    /// Optional working directory.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cwd: Option<PathBuf>,
-}
-
-// Custom `Debug` to keep expanded environment secrets out of logs and error output. Keys are
-// kept because they are useful for diagnosing a misconfigured server; only values are hidden.
-impl std::fmt::Debug for McpStdioTransport {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("McpStdioTransport")
-            .field("command", &self.command)
-            .field("args", &self.args)
-            .field(
-                "env",
-                &self
-                    .env
-                    .keys()
-                    .map(|key| (key, "[REDACTED]"))
-                    .collect::<BTreeMap<_, _>>(),
-            )
-            .field("cwd", &self.cwd)
-            .finish()
-    }
-}
-
-impl McpStdioTransport {
-    fn validate(&self) -> Result<(), BoxError> {
-        if self.command.trim().is_empty() {
-            return Err("MCP stdio command must not be empty".into());
-        }
-        Ok(())
-    }
-
-    fn command(&self) -> Command {
-        let mut command = Command::new(&self.command);
-        command.args(&self.args);
-        command.envs(&self.env);
-        if let Some(cwd) = &self.cwd {
-            command.current_dir(cwd);
-        }
-        command
-    }
-}
-
-/// Streamable HTTP transport configuration.
-#[derive(Clone, Default, Deserialize, Serialize)]
-pub struct McpStreamableHttpTransport {
-    /// MCP endpoint URL.
-    pub url: String,
-    /// Bearer token value, without the `Bearer ` prefix. Mutually exclusive with
-    /// [`auth`]: setting both is a validation error.
-    ///
-    /// [`auth`]: Self::auth
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bearer_token: Option<String>,
-    /// Custom HTTP headers sent with every request, including OAuth-authorized
-    /// requests.
-    #[serde(default)]
-    pub headers: BTreeMap<String, String>,
-    /// Optional OAuth 2.1 authorization. Mutually exclusive with [`bearer_token`]
-    /// (setting both is a validation error); access tokens are obtained and
-    /// refreshed through the configured flow.
-    ///
-    /// [`bearer_token`]: Self::bearer_token
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auth: Option<McpOAuthConfig>,
-}
-
-// Custom `Debug` to keep the static bearer token out of logs and error output.
-// The `auth` field redacts its own secrets (see `OAuthClientCredentialsConfig`).
-impl std::fmt::Debug for McpStreamableHttpTransport {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("McpStreamableHttpTransport")
-            .field("url", &self.url)
-            .field(
-                "bearer_token",
-                &self.bearer_token.as_ref().map(|_| "[REDACTED]"),
-            )
-            .field("headers", &self.headers)
-            .field("auth", &self.auth)
-            .finish()
-    }
-}
-
-impl McpStreamableHttpTransport {
-    fn validate(&self) -> Result<(), BoxError> {
-        if self.url.trim().is_empty() {
-            return Err("MCP HTTP URL must not be empty".into());
-        }
-        if let Some(auth) = &self.auth {
-            if self.bearer_token.is_some() {
-                return Err("MCP HTTP transport cannot set both `bearer_token` and `auth`".into());
-            }
-            auth.validate()?;
-        }
-        Ok(())
-    }
-
-    /// Custom headers applied to every request regardless of auth mode.
-    fn custom_headers(&self) -> Result<HashMap<HeaderName, HeaderValue>, BoxError> {
-        let mut headers = HashMap::new();
-        for (name, value) in &self.headers {
-            headers.insert(
-                HeaderName::from_bytes(name.as_bytes())?,
-                HeaderValue::from_str(value)?,
-            );
-        }
-        Ok(headers)
-    }
-
-    /// Base transport config (URI + custom headers) without a static bearer
-    /// header, so an [`AuthClient`] can inject the OAuth access token instead.
-    fn base_transport_config(&self) -> Result<StreamableHttpClientTransportConfig, BoxError> {
-        Ok(
-            StreamableHttpClientTransportConfig::with_uri(self.url.clone())
-                .custom_headers(self.custom_headers()?),
-        )
-    }
-
-    /// Transport config for the static (non-OAuth) path, attaching the optional
-    /// bearer token as the `Authorization` header.
-    fn transport_config(&self) -> Result<StreamableHttpClientTransportConfig, BoxError> {
-        let mut config = self.base_transport_config()?;
-        if let Some(token) = self
-            .bearer_token
-            .as_ref()
-            .map(|token| token.trim())
-            .filter(|token| !token.is_empty())
-        {
-            config = config.auth_header(token.to_string());
-        }
-        Ok(config)
-    }
-}
-
-/// OAuth 2.1 authorization for a Streamable HTTP MCP server.
-///
-/// `anda_engine` is a library: it drives the OAuth *protocol* and exposes the
-/// seams, but never opens a browser, runs a callback server, or decides where
-/// tokens live. The consuming application owns those concerns (see
-/// [`McpToolProvider::begin_authorization`] and [`McpCredentialStore`]).
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(tag = "flow", rename_all = "snake_case")]
-pub enum McpOAuthConfig {
-    /// Interactive Authorization Code flow with PKCE. Requires a one-time,
-    /// out-of-band browser authorization that persists credentials; afterwards
-    /// sessions are established from the stored refresh token with no human in
-    /// the loop.
-    AuthorizationCode(OAuthAuthorizationCodeConfig),
-    /// Server-to-server Client Credentials flow (SEP-1046). Fully headless:
-    /// tokens are obtained at connection time with no human interaction.
-    ClientCredentials(OAuthClientCredentialsConfig),
-}
-
-impl McpOAuthConfig {
-    fn validate(&self) -> Result<(), BoxError> {
-        match self {
-            Self::AuthorizationCode(config) => config.validate(),
-            Self::ClientCredentials(config) => config.validate(),
-        }
-    }
-}
-
-/// Configuration for the interactive OAuth Authorization Code flow.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct OAuthAuthorizationCodeConfig {
-    /// Redirect URI registered/used for the authorization request. The consuming
-    /// application decides how the redirect is received (loopback, a server
-    /// route, or manual paste) and passes the resulting URL back through
-    /// [`McpToolProvider::complete_authorization`].
-    pub redirect_uri: String,
-    /// Requested OAuth scopes.
-    #[serde(default)]
-    pub scopes: Vec<String>,
-    /// Client name advertised during dynamic client registration.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub client_name: Option<String>,
-    /// Pre-registered public `client_id`. When omitted, the client is registered
-    /// dynamically (RFC 7591 DCR) at authorization time.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub client_id: Option<String>,
-}
-
-impl OAuthAuthorizationCodeConfig {
-    fn validate(&self) -> Result<(), BoxError> {
-        if self.redirect_uri.trim().is_empty() {
-            return Err("MCP OAuth authorization_code redirect_uri must not be empty".into());
-        }
-        Ok(())
-    }
-}
-
-/// Configuration for the headless OAuth Client Credentials flow.
-#[derive(Clone, Deserialize, Serialize)]
-pub struct OAuthClientCredentialsConfig {
-    /// Confidential client id.
-    pub client_id: String,
-    /// Confidential client secret.
-    pub client_secret: String,
-    /// Requested OAuth scopes.
-    #[serde(default)]
-    pub scopes: Vec<String>,
-    /// Optional explicit resource indicator (RFC 8707).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resource: Option<String>,
-}
-
-// Custom `Debug` to keep the client secret out of logs and error output, matching
-// how `rmcp` redacts its own credential types.
-impl std::fmt::Debug for OAuthClientCredentialsConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OAuthClientCredentialsConfig")
-            .field("client_id", &self.client_id)
-            .field("client_secret", &"[REDACTED]")
-            .field("scopes", &self.scopes)
-            .field("resource", &self.resource)
-            .finish()
-    }
-}
-
-impl OAuthClientCredentialsConfig {
-    fn validate(&self) -> Result<(), BoxError> {
-        if self.client_id.trim().is_empty() {
-            return Err("MCP OAuth client_credentials client_id must not be empty".into());
-        }
-        if self.client_secret.trim().is_empty() {
-            return Err("MCP OAuth client_credentials client_secret must not be empty".into());
-        }
-        Ok(())
-    }
-}
-
-/// Outcome of [`McpToolProvider::discover_http_oauth`]: the OAuth capabilities
-/// an HTTP MCP endpoint advertises.
-#[derive(Debug, Clone)]
-pub struct McpOAuthMetadata {
-    /// Scopes the authorization server advertises (may be empty).
-    pub scopes_supported: Vec<String>,
-    /// Whether the server supports dynamic client registration (RFC 7591).
-    pub registration_supported: bool,
-}
-
-/// Pluggable persistence for MCP OAuth credentials, keyed by server id.
-///
-/// The library never decides where tokens live; the consuming application
-/// supplies an implementation (e.g. backed by an encrypted store) through
-/// [`McpToolProviderBuilder::credential_store`]. Refresh tokens are secrets and
-/// must be persisted securely.
-#[async_trait]
-pub trait McpCredentialStore: Send + Sync {
-    /// Loads the stored credentials for `server_id`, if any.
-    async fn load(&self, server_id: &str) -> Result<Option<StoredCredentials>, BoxError>;
-    /// Persists credentials for `server_id`, replacing any previous value.
-    async fn save(&self, server_id: &str, credentials: StoredCredentials) -> Result<(), BoxError>;
-    /// Removes any stored credentials for `server_id`.
-    async fn clear(&self, server_id: &str) -> Result<(), BoxError>;
-}
-
-/// Default in-memory [`McpCredentialStore`]. Credentials do not survive a
-/// process restart; supply a persistent implementation in production.
-#[derive(Debug, Default)]
-pub struct InMemoryMcpCredentialStore {
-    credentials: RwLock<HashMap<String, StoredCredentials>>,
-}
-
-impl InMemoryMcpCredentialStore {
-    /// Creates an empty in-memory credential store.
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
-#[async_trait]
-impl McpCredentialStore for InMemoryMcpCredentialStore {
-    async fn load(&self, server_id: &str) -> Result<Option<StoredCredentials>, BoxError> {
-        Ok(self.credentials.read().get(server_id).cloned())
-    }
-
-    async fn save(&self, server_id: &str, credentials: StoredCredentials) -> Result<(), BoxError> {
-        self.credentials
-            .write()
-            .insert(server_id.to_string(), credentials);
-        Ok(())
-    }
-
-    async fn clear(&self, server_id: &str) -> Result<(), BoxError> {
-        self.credentials.write().remove(server_id);
-        Ok(())
-    }
-}
-
-/// Adapts a keyed [`McpCredentialStore`] to rmcp's per-manager (keyless)
-/// `CredentialStore`, bound to a single server id.
-struct ScopedCredentialStore {
-    server_id: String,
-    inner: Arc<dyn McpCredentialStore>,
-}
-
-#[async_trait]
-impl CredentialStore for ScopedCredentialStore {
-    async fn load(&self) -> Result<Option<StoredCredentials>, AuthError> {
-        self.inner
-            .load(&self.server_id)
-            .await
-            .map_err(|err| AuthError::InternalError(err.to_string()))
-    }
-
-    async fn save(&self, credentials: StoredCredentials) -> Result<(), AuthError> {
-        self.inner
-            .save(&self.server_id, credentials)
-            .await
-            .map_err(|err| AuthError::InternalError(err.to_string()))
-    }
-
-    async fn clear(&self) -> Result<(), AuthError> {
-        self.inner
-            .clear(&self.server_id)
-            .await
-            .map_err(|err| AuthError::InternalError(err.to_string()))
-    }
-}
-
-/// Error returned when establishing a session for a server configured with the
-/// OAuth Authorization Code flow, but no usable stored credentials exist yet.
-///
-/// The consuming application should catch this (via [`BoxError`] downcast) and
-/// run [`McpToolProvider::begin_authorization`] /
-/// [`McpToolProvider::complete_authorization`] before retrying.
-#[derive(Debug, Clone)]
-pub struct McpAuthorizationRequired {
-    /// The MCP server id that needs interactive authorization.
-    pub server_id: String,
-}
-
-impl std::fmt::Display for McpAuthorizationRequired {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "MCP server {} requires interactive OAuth authorization; \
-             call begin_authorization/complete_authorization first",
-            self.server_id
-        )
-    }
-}
-
-impl std::error::Error for McpAuthorizationRequired {}
-
-/// Whether a peer only delivers `tools/list_changed` on a subscription stream.
-///
-/// `2026-07-28` removed unsolicited server pushes, so from that revision on the
-/// notification requires an explicit `subscriptions/listen` opt-in — and only if
-/// the server advertises `tools.listChanged` at all.
-fn needs_tool_subscription(info: Option<&ServerPeerInfo>) -> bool {
-    let Some(info) = info else {
-        return false;
-    };
-    info.protocol_version.as_str() >= ProtocolVersion::V_2026_07_28.as_str()
-        && info
-            .capabilities
-            .tools
-            .as_ref()
-            .is_some_and(|tools| tools.list_changed == Some(true))
-}
-
-fn tool_subscription_filter() -> SubscriptionFilter {
-    SubscriptionFilter::builder().tools_list_changed().build()
-}
-
-/// Drains one server's `tools/list_changed` subscription for the life of a session.
-///
-/// Subscription streams are not resumable, so an ended stream is replaced while
-/// the transport is still up, and the session is marked dirty across the gap: a
-/// change announced while nothing was listening must not leave the routes stale.
-///
-/// Reopening is bounded. A stream that survives [`SUBSCRIPTION_HEALTHY_LIFETIME`]
-/// is treated as working — a server closing idle streams periodically keeps its
-/// subscription forever — but a peer that acknowledges and immediately ends the
-/// stream would otherwise spin here for the life of the process, re-listing on
-/// every tool call, so it gets a limited number of consecutive attempts.
-async fn pump_tool_subscription(
-    server_id: String,
-    peer: Peer<RoleClient>,
-    mut subscription: Subscription,
-    dirty: Arc<AtomicBool>,
-) {
-    let mut short_lived = 0usize;
-    loop {
-        let opened_at = Instant::now();
-        loop {
-            match subscription.next().await {
-                Ok(Some(ServerNotification::ToolListChangedNotification(_))) => {
-                    dirty.store(true, Ordering::SeqCst);
-                }
-                Ok(Some(_)) => {}
-                Ok(None) => break,
-                Err(err) => {
-                    log::debug!("MCP server {server_id}: tools subscription failed: {err}");
-                    break;
-                }
-            }
-        }
-
-        dirty.store(true, Ordering::SeqCst);
-        if peer.is_transport_closed() {
-            return;
-        }
-
-        short_lived = if opened_at.elapsed() >= SUBSCRIPTION_HEALTHY_LIFETIME {
-            0
-        } else {
-            short_lived + 1
-        };
-        if short_lived > MAX_SHORT_LIVED_SUBSCRIPTIONS {
-            log::warn!(
-                "MCP server {server_id}: tools/list_changed stream ended immediately \
-                 {short_lived} times; giving up on live tool updates"
-            );
-            return;
-        }
-
-        tokio::time::sleep(SUBSCRIPTION_REOPEN_DELAY).await;
-        if peer.is_transport_closed() {
-            return;
-        }
-
-        // Bounded like the initial subscription: a peer that accepts the request
-        // and never acknowledges it must not park this task forever.
-        subscription = match tokio::time::timeout(
-            SUBSCRIPTION_ACK_TIMEOUT,
-            peer.listen(tool_subscription_filter()),
-        )
-        .await
-        {
-            Ok(Ok(subscription)) => subscription,
-            Ok(Err(err)) => {
-                log::warn!(
-                    "MCP server {server_id}: could not reopen the tools/list_changed \
-                     subscription: {err}"
-                );
-                return;
-            }
-            Err(_) => {
-                log::warn!(
-                    "MCP server {server_id}: reopened tools/list_changed subscription was not \
-                     acknowledged within {}s",
-                    SUBSCRIPTION_ACK_TIMEOUT.as_secs()
-                );
-                return;
-            }
-        };
-    }
-}
-
-/// Awaits a client handshake, optionally bounding how long it may stay pending.
-async fn serve_bounded<F, S>(handshake: F, timeout: Option<Duration>) -> Result<S, BoxError>
-where
-    F: Future<Output = Result<S, ClientInitializeError>>,
-{
-    match timeout {
-        None => Ok(handshake.await?),
-        Some(limit) => match tokio::time::timeout(limit, handshake).await {
-            Ok(result) => Ok(result?),
-            Err(_) => Err(format!(
-                "the MCP server did not answer the server/discover probe within {}s",
-                limit.as_secs()
-            )
-            .into()),
-        },
-    }
-}
-
-/// Whether a failed connection attempt was about credentials rather than the
-/// lifecycle, in which case retrying with a different opener cannot help.
-fn is_authorization_error(err: &(dyn std::error::Error + 'static)) -> bool {
-    if err.is::<McpAuthorizationRequired>() {
-        return true;
-    }
-    // Credential acquisition reports a revoked or unusable grant directly, before
-    // any transport exists; the handshake reports it wrapped in a transport error.
-    if matches!(
-        err.downcast_ref::<AuthError>(),
-        Some(AuthError::AuthorizationRequired | AuthError::TokenRefreshRejected(_))
-    ) {
-        return true;
-    }
-    err.downcast_ref::<ClientInitializeError>()
-        .is_some_and(ClientInitializeError::is_authorization_required)
-}
-
-/// Re-labels a credential failure on an interactive server as
-/// [`McpAuthorizationRequired`], the signal applications are told to act on.
-///
-/// [`authorize_from_store`] raises that error when nothing is stored, but a grant
-/// the authorization server has since revoked only shows up later, as a rejected
-/// refresh or a `401` during the handshake. Both mean the same thing to the
-/// caller — run the interactive flow again — so both are reported the same way.
-/// The underlying cause is logged rather than dropped silently.
-///
-/// [`authorize_from_store`]: McpToolProvider::authorize_from_store
-fn authorization_required_hint(config: &McpServerConfig, err: BoxError) -> BoxError {
-    if err.is::<McpAuthorizationRequired>() || !is_authorization_error(err.as_ref()) {
-        return err;
-    }
-    let McpTransportConfig::StreamableHttp(http) = &config.transport else {
-        return err;
-    };
-    if !matches!(&http.auth, Some(McpOAuthConfig::AuthorizationCode(_))) {
-        return err;
-    }
-
-    log::warn!(
-        "MCP server {}: stored authorization is no longer usable ({err}); interactive \
-         authorization must run again",
-        config.id
-    );
-    McpAuthorizationRequired {
-        server_id: config.id.clone(),
-    }
-    .into()
-}
-
-/// Clamps a server-suggested `tasks/get` poll interval into a sane range.
-fn task_poll_interval(poll_interval_ms: Option<u64>) -> Duration {
-    poll_interval_ms
-        .map(Duration::from_millis)
-        .unwrap_or(TASK_POLL_INTERVAL)
-        .clamp(TASK_POLL_INTERVAL_MIN, TASK_POLL_INTERVAL_MAX)
-}
-
-/// Abandons a task this host will not wait for, so the server can release it.
-async fn cancel_task(peer: &Peer<RoleClient>, task_id: &str) {
-    if let Err(err) = peer.cancel_task(CancelTaskParams::new(task_id)).await {
-        log::debug!("MCP task {task_id} could not be cancelled: {err}");
-    }
-}
-
-fn input_required_error(route: &McpToolRoute, result: &InputRequiredResult) -> CallToolResult {
-    let keys = result
-        .input_requests
-        .iter()
-        .flat_map(|requests| requests.keys().map(String::as_str));
-    unsupported_input_error(route, keys)
-}
-
-/// Tool-level error for a server round this host cannot answer.
-///
-/// Anda advertises neither Sampling, Elicitation, nor Roots, so an MRTR round
-/// asking for them is a dead end. Returning it as a failed tool result — rather
-/// than an error that aborts the turn — lets the model choose another path.
-fn unsupported_input_error<'a>(
-    route: &McpToolRoute,
-    request_keys: impl Iterator<Item = &'a str>,
-) -> CallToolResult {
-    let keys: Vec<&str> = request_keys.collect();
-    let requested = if keys.is_empty() {
-        String::new()
-    } else {
-        format!(" (requests: {})", keys.join(", "))
-    };
-    CallToolResult::error(vec![ContentBlock::text(format!(
-        "MCP tool {} on server {} requires client-side input{requested}, which this host \
-         does not provide: sampling, elicitation, and roots are not supported. Call the tool \
-         with complete arguments, or use a different tool.",
-        route.remote_name, route.server_id
-    ))])
-}
-
-fn mcp_result_to_tool_output(route: &McpToolRoute, result: CallToolResult) -> ToolOutput<Json> {
-    let mut output = ToolOutput::new(json!({
-        "server_id": route.server_id,
-        "tool": route.remote_name,
-        "structured_content": result.structured_content,
-        "content": result.content,
-        "_meta": result.meta,
-    }));
-    output.is_error = result.is_error;
-    output.usage = Usage {
-        requests: 1,
-        ..Usage::default()
-    };
-    output
-}
-
-fn sanitize_name_part(input: &str) -> String {
-    let mut out = String::new();
-    let mut previous_underscore = false;
-    for c in input.chars() {
-        let c = c.to_ascii_lowercase();
-        let valid = matches!(c, 'a'..='z' | '0'..='9');
-        if valid {
-            out.push(c);
-            previous_underscore = false;
-        } else if !previous_underscore {
-            out.push('_');
-            previous_underscore = true;
-        }
-    }
-    let trimmed = out.trim_matches('_').to_string();
-    let mut normalized = if trimmed.is_empty() {
-        "x".to_string()
-    } else {
-        trimmed
-    };
-    if !normalized
-        .chars()
-        .next()
-        .is_some_and(|c: char| c.is_ascii_lowercase())
-    {
-        normalized.insert(0, 'x');
-    }
-    normalized
-}
-
-fn shorten_with_hash(base: &str, key: &str) -> String {
-    let mut hasher = DefaultHasher::new();
-    key.hash(&mut hasher);
-    let suffix = format!("{:08x}", hasher.finish() as u32);
-    let max_prefix = 64usize.saturating_sub(suffix.len() + 1);
-    let mut prefix = base.chars().take(max_prefix).collect::<String>();
-    prefix = prefix.trim_end_matches('_').to_string();
-    format!("{}_{}", prefix, suffix)
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rmcp::model::{CallToolResult, InputRequiredResult, ProtocolVersion};
+    use rmcp::transport::AuthError;
+    use serde_json::json;
     use std::borrow::Cow;
+    use std::path::PathBuf;
+
+    use super::auth::client_credentials_deadline;
+    use super::router::{
+        TASK_POLL_INTERVAL, TASK_POLL_INTERVAL_MAX, TASK_POLL_INTERVAL_MIN, input_required_error,
+        task_poll_interval,
+    };
+    use std::time::Instant;
 
     fn tool(name: &'static str, description: &'static str) -> McpTool {
         McpTool::new(
