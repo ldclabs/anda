@@ -98,6 +98,19 @@ pub struct SkillContentOutput {
     pub content: String,
 }
 
+/// Decides which skills on disk this manager is allowed to hold.
+///
+/// Returning `false` drops the skill entirely: it is not loaded, not readable through the
+/// [`SkillManager`] tool, absent from the resident catalog in the tool description, and not
+/// callable. That all-or-nothing scope is the point — a host that hides a skill from the user
+/// should not leave it reachable by name.
+///
+/// The manager owns loading; the predicate is where a host expresses whatever policy sits on top,
+/// such as a user-facing enable/disable switch. It receives the parsed [`Skill`], whose `base_dir`
+/// identifies which copy of a shadowed name this is. It runs while holding the manager's internal
+/// locks, so it must not call back into the manager.
+pub type SkillFilter = Arc<dyn Fn(&Skill) -> bool + Send + Sync>;
+
 /// Manages skills loaded from `SKILL.md` files on disk.
 ///
 /// [`SkillManager`] implements [`Tool<BaseCtx>`] so that LLMs can read skill files at runtime and
@@ -115,6 +128,8 @@ pub struct SkillManager {
     /// out clones of one stable instance. Rebuilding a `SubAgent` per lookup would give every
     /// caller a fresh empty registry, and a running session could never be found again.
     subagents: RwLock<BTreeMap<String, SubAgent>>,
+    /// Host policy over which skills are admissible; `None` admits every skill.
+    filter: RwLock<Option<SkillFilter>>,
     description: String,
     default_skill_tools: Vec<String>,
 }
@@ -191,6 +206,7 @@ impl SkillManager {
         Self {
             skills: RwLock::new(BTreeMap::new()),
             subagents: RwLock::new(BTreeMap::new()),
+            filter: RwLock::new(None),
             description: build_description(&default_skills_dir, &skills_dirs),
             default_skills_dir,
             skills_dirs,
@@ -218,6 +234,46 @@ impl SkillManager {
     pub fn with_default_skill_tools(mut self, tools: Vec<String>) -> Self {
         self.default_skill_tools = tools;
         self
+    }
+
+    /// Installs the [`SkillFilter`] deciding which skills are admissible; `None` admits every one.
+    ///
+    /// Anything the new predicate rejects is dropped immediately, so the manager never holds an
+    /// inadmissible skill and the caller does not have to remember to reload. Skills the previous
+    /// filter had rejected stay gone until the next [`Self::load`] re-reads them from disk.
+    pub fn set_skill_filter(&self, filter: Option<SkillFilter>) {
+        // One lock order everywhere: `filter`, then `subagents`, then `skills` — the order
+        // `replace_skills` and `upsert_skill` take. Holding `filter` for the whole prune is also
+        // what stops a concurrent reload or read from reinstating what this prune removes: both
+        // hold it as a reader across their own insert, so they land either wholly before this
+        // swap or wholly after it, never straddling it.
+        let mut current = self.filter.write();
+        *current = filter;
+        let Some(filter) = current.as_ref() else {
+            return;
+        };
+
+        let mut subagents = self.subagents.write();
+        let mut skills = self.skills.write();
+        skills.retain(|name, skill| {
+            let admitted = filter(skill);
+            if !admitted {
+                subagents.remove(name);
+            }
+            admitted
+        });
+    }
+
+    /// Whether `skill` passes the installed [`SkillFilter`], as of this instant.
+    ///
+    /// The verdict is stale the moment the lock drops, so this is only for deciding whether to
+    /// keep reading — anything that *writes* to the registry must hold `filter` across its own
+    /// insert instead, the way [`Self::upsert_skill`] and [`Self::replace_skills`] do.
+    fn admits(&self, skill: &Skill) -> bool {
+        match self.filter.read().as_ref() {
+            Some(filter) => filter(skill),
+            None => true,
+        }
     }
 
     /// Materializes a skill into its callable [`SubAgent`].
@@ -258,19 +314,35 @@ impl SkillManager {
         })
     }
 
+    /// Index of the configured root `base_dir` sits under, or `skills_dirs.len()` when it sits
+    /// under none — an unplaceable directory sorts last and never wins a priority contest.
+    fn skills_dir_rank(&self, base_dir: &Path) -> usize {
+        self.skills_dirs
+            .iter()
+            .position(|root| base_dir.starts_with(root))
+            .unwrap_or(self.skills_dirs.len())
+    }
+
     async fn find_skill_dir(&self, name: &str) -> Result<Option<PathBuf>, BoxError> {
         validate_skill_name(name)?;
 
-        let mut matches = Vec::new();
+        // Candidates carry the rank of the root they came from so a name present in several
+        // roots resolves the way [`Self::load`] resolves it — highest-priority root wins. Only an
+        // ambiguity *within* one root is unresolvable, since there the tie-break would be
+        // directory iteration order.
+        let mut matches: Vec<(usize, PathBuf)> = Vec::new();
+        let push = |base_dir: PathBuf, matches: &mut Vec<(usize, PathBuf)>| {
+            if !matches.iter().any(|(_, path)| path == &base_dir) {
+                matches.push((self.skills_dir_rank(&base_dir), base_dir));
+            }
+        };
 
         {
             let skills = self.skills.read();
             for skill in skills.values() {
                 let dir_name_matches = skill.base_dir.file_name() == Some(OsStr::new(name));
-                if (skill.frontmatter.name == name || dir_name_matches)
-                    && !matches.iter().any(|path| path == &skill.base_dir)
-                {
-                    matches.push(skill.base_dir.clone());
+                if skill.frontmatter.name == name || dir_name_matches {
+                    push(skill.base_dir.clone(), &mut matches);
                 }
             }
         }
@@ -283,37 +355,44 @@ impl SkillManager {
                     };
                     let base_dir = base_dir.to_path_buf();
                     let dir_name_matches = base_dir.file_name() == Some(OsStr::new(name));
-                    let frontmatter_name_matches = if dir_name_matches {
-                        true
-                    } else if let Ok(content) =
-                        self.read_text_file(&path, MAX_SKILL_FILE_BYTES).await
-                    {
-                        parse_skill_md(base_dir.clone(), &content)
-                            .map(|skill| skill.frontmatter.name == name)
-                            .unwrap_or(false)
-                    } else {
-                        false
+                    // Always parse: the filter votes on the parsed skill, so a directory whose
+                    // name alone matches cannot be admitted on the strength of that name.
+                    let parsed = match self.read_text_file(&path, MAX_SKILL_FILE_BYTES).await {
+                        Ok(content) => parse_skill_md(base_dir.clone(), &content).ok(),
+                        Err(_) => None,
                     };
-
-                    if frontmatter_name_matches
-                        && !matches.iter().any(|candidate| candidate == &base_dir)
-                    {
-                        matches.push(base_dir);
+                    match parsed {
+                        Some(skill) => {
+                            if (skill.frontmatter.name == name || dir_name_matches)
+                                && self.admits(&skill)
+                            {
+                                push(base_dir, &mut matches);
+                            }
+                        }
+                        // Unreadable or malformed: still take a directory named after the skill,
+                        // so the read path reports what is wrong with the file rather than
+                        // claiming the skill does not exist.
+                        None if dir_name_matches => push(base_dir, &mut matches),
+                        None => {}
                     }
                 }
             }
         }
 
-        match matches.len() {
-            0 => Ok(None),
-            1 => Ok(matches.pop()),
-            _ => Err(format!(
+        let Some(best) = matches.iter().map(|(rank, _)| *rank).min() else {
+            return Ok(None);
+        };
+        let mut winners = matches.into_iter().filter(|(rank, _)| *rank == best);
+        let winner = winners.next().map(|(_, path)| path);
+        if winners.next().is_some() {
+            return Err(format!(
                 "multiple skills named {:?} exist under configured skills directories: {}",
                 name,
                 format_path_list(&self.skills_dirs)
             )
-            .into()),
+            .into());
         }
+        Ok(winner)
     }
 
     fn display_path(&self, path: &Path) -> String {
@@ -346,6 +425,12 @@ impl SkillManager {
 
         let content = self.read_text_file(&target, MAX_SKILL_FILE_BYTES).await?;
         let skill = parse_skill_md(skill_dir, &content)?;
+        // `find_skill_dir` falls back to scanning disk, so a skill the filter rejects is still
+        // sitting there to be found by name. It has to read as absent, or hiding a skill would
+        // amount to hiding it only from the catalog.
+        if !self.admits(&skill) {
+            return Err(format!("skill {:?} not found", args.name).into());
+        }
         if skill.frontmatter.name != args.name {
             return Err(format!(
                 "SKILL.md frontmatter name {:?} must match requested skill name {:?}",
@@ -386,6 +471,12 @@ impl SkillManager {
 
             loaded_dirs += 1;
             for (agent_name, skill) in load_skills_from_dir(skills_dir).await? {
+                // Filter before the duplicate check, not after: rejecting the copy in the
+                // higher-priority directory has to promote the next one, the way a host's
+                // enable/disable switch is expected to behave.
+                if !self.admits(&skill) {
+                    continue;
+                }
                 #[allow(clippy::map_entry)]
                 if skills.contains_key(&agent_name) {
                     log::warn!(
@@ -418,7 +509,15 @@ impl SkillManager {
     ///
     /// Only skills that opted into [`SkillExecution::Subagent`] become callables; inline skills
     /// are loaded and readable but never appear in the model's tool list.
-    fn replace_skills(&self, skills: BTreeMap<String, Skill>) {
+    fn replace_skills(&self, mut skills: BTreeMap<String, Skill>) {
+        // `load` filtered while reading disk, but a `set_skill_filter` can land in between. Hold
+        // the filter across the swap and re-apply whichever policy is installed when it lands,
+        // or a reload in flight would silently reinstate a skill the host just disabled.
+        let filter = self.filter.read();
+        if let Some(filter) = filter.as_ref() {
+            skills.retain(|_, skill| filter(skill));
+        }
+
         let mut subagents = self.subagents.write();
         let rebuilt = skills
             .iter()
@@ -442,6 +541,15 @@ impl SkillManager {
     /// any live sessions already owned by that skill, and drop the callable when the skill on disk
     /// switched back to inline execution.
     fn upsert_skill(&self, skill: Skill) {
+        // Keeps "the registry never holds a skill the filter rejects" true at the one place that
+        // inserts, independently of every caller remembering to check. The filter stays held
+        // across the insert so a `set_skill_filter` racing this read cannot be undone by it.
+        let filter = self.filter.read();
+        if let Some(filter) = filter.as_ref()
+            && !filter(&skill)
+        {
+            return;
+        }
         let name = skill.agent_name.clone();
         let mut subagents = self.subagents.write();
         if skill.is_subagent() {
@@ -1314,5 +1422,155 @@ Body.
         let tool = SkillManager::new(tmp.clone());
         let engine = EngineBuilder::new().empty().await.unwrap();
         assert!(engine.sub_agents_manager().insert(Arc::new(tool)).is_none());
+    }
+
+    /// Writes `<root>/<dir>/SKILL.md` for a subagent skill named `name`.
+    async fn write_subagent_skill(root: &Path, dir: &str, name: &str, body: &str) {
+        let skill_dir = root.join(dir);
+        tokio::fs::create_dir_all(&skill_dir).await.unwrap();
+        tokio::fs::write(
+            skill_dir.join("SKILL.md"),
+            skill_md(
+                name,
+                &format!("{name} skill for filter testing."),
+                body,
+                &["execution: subagent"],
+            ),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_rejected_skill_is_invisible_everywhere() {
+        let root =
+            std::env::temp_dir().join(format!("anda-skills-filter-{:016x}", rand::random::<u64>()));
+        write_subagent_skill(&root, "kept", "kept", "Kept instructions.").await;
+        write_subagent_skill(&root, "hidden", "hidden", "Hidden instructions.").await;
+
+        let mgr = SkillManager::new(root.clone());
+        mgr.set_skill_filter(Some(Arc::new(|skill: &Skill| {
+            skill.frontmatter.name != "hidden"
+        })));
+        mgr.load().await.unwrap();
+
+        assert!(mgr.list().contains_key("skill_kept"));
+        assert!(mgr.contains_lowercase("skill_kept"));
+
+        // Not loaded, not callable, absent from the resident catalog, and — because
+        // `find_skill_dir` would otherwise turn it up on disk — not readable by name either.
+        assert!(!mgr.list().contains_key("skill_hidden"));
+        assert!(!mgr.contains_lowercase("skill_hidden"));
+        assert!(mgr.get_skill("skill_hidden").is_none());
+        assert!(!mgr.description().contains("hidden"));
+        let err = mgr
+            .call_raw(mock_ctx(), json!({ "name": "hidden" }), Vec::new())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not found"), "{err}");
+        // A rejected read must not sneak the skill back in through `upsert_skill`.
+        assert!(!mgr.contains_lowercase("skill_hidden"));
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rejecting_the_winning_copy_promotes_the_next_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "anda-skills-filter-shadow-{:016x}",
+            rand::random::<u64>()
+        ));
+        let personal = root.join("personal");
+        let bundled = root.join("bundled");
+        write_subagent_skill(&personal, "dup", "dup", "Personal instructions.").await;
+        write_subagent_skill(&bundled, "dup", "dup", "Bundled instructions.").await;
+
+        let mgr = SkillManager::new_with_dirs(personal.clone(), vec![bundled.clone()]);
+        mgr.load().await.unwrap();
+        assert!(
+            mgr.get_lowercase("skill_dup")
+                .unwrap()
+                .instructions
+                .contains("Personal instructions.")
+        );
+
+        // The filter runs before the duplicate check, so rejecting the higher-priority copy hands
+        // the name to the next directory instead of dropping the skill entirely.
+        let personal_dir = personal.join("dup");
+        mgr.set_skill_filter(Some(Arc::new(move |skill: &Skill| {
+            skill.base_dir != personal_dir
+        })));
+        mgr.load().await.unwrap();
+        assert!(
+            mgr.get_lowercase("skill_dup")
+                .unwrap()
+                .instructions
+                .contains("Bundled instructions.")
+        );
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reading_a_shadowed_name_resolves_by_directory_priority() {
+        let root = std::env::temp_dir().join(format!(
+            "anda-skills-read-shadow-{:016x}",
+            rand::random::<u64>()
+        ));
+        let personal = root.join("personal");
+        let bundled = root.join("bundled");
+        write_subagent_skill(&personal, "dup", "dup", "Personal instructions.").await;
+        write_subagent_skill(&bundled, "dup", "dup", "Bundled instructions.").await;
+
+        let mgr = SkillManager::new_with_dirs(personal.clone(), vec![bundled.clone()]);
+        mgr.load().await.unwrap();
+
+        // The same name in two roots is what shadowing *is*; `load` already resolves it by
+        // priority, so reading it by name must not report it as an unresolvable duplicate.
+        let read = mgr
+            .call_raw(mock_ctx(), json!({ "name": "dup" }), Vec::new())
+            .await
+            .unwrap();
+        assert!(
+            read.output["content"]
+                .as_str()
+                .unwrap()
+                .contains("Personal instructions.")
+        );
+
+        // Two copies inside one root stay ambiguous: there is no priority to break the tie.
+        write_subagent_skill(&personal, "dup-alias", "dup", "Second personal copy.").await;
+        let err = mgr
+            .call_raw(mock_ctx(), json!({ "name": "dup" }), Vec::new())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("multiple skills named"), "{err}");
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn installing_a_filter_drops_what_it_rejects_without_a_reload() {
+        let root = std::env::temp_dir().join(format!(
+            "anda-skills-filter-prune-{:016x}",
+            rand::random::<u64>()
+        ));
+        write_subagent_skill(&root, "alpha", "alpha", "Alpha instructions.").await;
+
+        let mgr = SkillManager::new(root.clone());
+        mgr.load().await.unwrap();
+        assert!(mgr.contains_lowercase("skill_alpha"));
+
+        mgr.set_skill_filter(Some(Arc::new(|_: &Skill| false)));
+        assert!(mgr.list().is_empty());
+        assert!(!mgr.contains_lowercase("skill_alpha"));
+
+        // Clearing the filter does not resurrect anything on its own; the next load re-reads disk.
+        mgr.set_skill_filter(None);
+        assert!(mgr.list().is_empty());
+        mgr.load().await.unwrap();
+        assert!(mgr.contains_lowercase("skill_alpha"));
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
     }
 }

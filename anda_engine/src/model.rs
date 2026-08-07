@@ -124,7 +124,7 @@ const MAX_COMPLETION_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 /// leaks through `{:?}` logging.
 #[derive(Default, Clone, Deserialize, Serialize)]
 pub struct ModelConfig {
-    /// Provider family, such as `gemini`, `anthropic`, or `openai`.
+    /// Provider family, such as `gemini`, `anthropic`, `openai-response` or `openai`.
     pub family: String,
 
     /// Provider-specific model name.
@@ -232,6 +232,15 @@ impl ModelConfig {
                 }
                 Model::with_completer(Arc::new(
                     cli.completion_model(&self.model)
+                        .with_stream(self.stream)
+                        .with_effort(self.effort),
+                ))
+            }
+            "openai-response" => {
+                let cli = openai::Client::new(&self.api_key, Some(self.api_base.clone()))
+                    .with_client(http_client);
+                Model::with_completer(Arc::new(
+                    cli.completion_model_v2(&self.model)
                         .with_stream(self.stream)
                         .with_effort(self.effort),
                 ))

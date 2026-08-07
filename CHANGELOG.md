@@ -2,6 +2,18 @@
 
 All notable changes to the Anda project will be documented in this file.
 
+## [0.15.1] — 2026-08-07
+
+### Added — anda_engine v0.15.1
+
+- **`SkillManager::set_skill_filter`** — A host can now install a `SkillFilter` predicate deciding which skills on disk the manager may hold. Rejecting a skill drops it everywhere at once: not loaded, not callable, absent from the resident catalog in the tool description, and reported as not found by the reader tool — so an application-level enable/disable switch cannot leave a hidden skill reachable by name. The predicate runs during `load` *before* duplicate resolution, so rejecting the copy in a higher-priority directory promotes the next directory's copy instead of dropping the name. Installing a filter also prunes what it rejects immediately, so the registry is never inconsistent with the policy while waiting for a reload. This exists so an embedding application does not have to keep a second skill registry of its own, which would inevitably disagree with this one about what is dispatchable.
+
+- **`openai-response` provider family** — `ModelConfig` gains a new `family` that always routes through the OpenAI Responses API (`completion_model_v2`) with streaming and effort support, where the existing `openai` family decides by model name (`gpt*` → Responses API, otherwise Chat Completions). A config that must pin the Responses API no longer depends on a `gpt`-prefixed model name.
+
+### Fixed — anda_engine v0.15.1
+
+- **Reading a shadowed skill by name no longer fails as ambiguous** — `skills_manager` resolved a name present in several configured skill directories by refusing it, while `load` had already resolved the same collision by directory priority. A personal skill shadowing a bundled one was therefore loaded and callable but unreadable, which under the inline execution default means unusable. The read path now applies the same priority rule; an ambiguity *within* one directory still errors, since there is no priority there to break the tie.
+
 ## [0.15.0] — 2026-08-07
 
 This release folds in the entries previously staged as `0.14.6`, which was
