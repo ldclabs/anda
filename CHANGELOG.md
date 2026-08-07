@@ -4,11 +4,10 @@ All notable changes to the Anda project will be documented in this file.
 
 ## [Unreleased]
 
-Deep-module restructuring of `anda_engine` guided by a full design review; the
-review itself, including per-item rationale and the remaining roadmap, lives in
-`anda_engine/DESIGN_REVIEW.md`. Behavior is preserved except where noted below.
-Contains breaking API changes — the next `anda_engine` release should be a
-minor version bump.
+Deep-module restructuring of `anda_engine` guided by a full design review
+(kept as an internal working document, not part of the repository). Behavior
+is preserved except where noted below. Contains breaking API changes — the
+next `anda_engine` release should be a minor version bump.
 
 ### Changed — anda_engine (breaking)
 
@@ -57,6 +56,33 @@ minor version bump.
 - **`MockImplemented::model_name()`** now returns `"mock_implemented"` instead
   of `"not_implemented"`, so mocks and the null model are distinguishable (the
   runner compares model names to detect live model switches).
+- **One tool-call protocol for the built-in extension tools** — The nine
+  extension tools (fetch, the four filesystem tools, todo, note, shell,
+  skills manager) and the six memory tools now share
+  `extension::tool_definition` (parameter schema derived from the typed
+  argument struct, `strict: Some(true)`) and `extension::hooked_call`
+  (cancellation gate plus `DynToolHook` before/after wiring), replacing ten
+  hand-written `json!` schemas and seven copies of the hook boilerplate. The
+  two memory schemas that stay hand-built have hard reasons recorded in
+  comments (KIP definitions come from outside; `memory_api` flattens an
+  internally tagged enum that `schemars` would render as `anyOf`).
+  Observable differences:
+  - Every tool now rejects a call whose context is already cancelled
+    (previously only `search_file` and the shell background path honored the
+    token); the fetch, skills-manager, and memory tools gain hook support
+    (new `FetchToolHook` / `SkillToolHook` aliases; the two KIP tools share
+    the `DynToolHook<Request, Response>` slot since hooks are keyed by
+    argument/output types).
+  - The note tool's failed operations (missing items, size limit, unknown op)
+    and the shell tool's executor-failure and timeout outcomes still resolve
+    to `Ok` with the same typed output, but are now flagged with
+    `is_error: Some(true)` so hooks, providers, and telemetry see the failure
+    signal. A shell command that runs and exits non-zero remains regular
+    output.
+  - Derived schemas carry additional metadata the hand-written ones lacked
+    (`default` values from serde defaults, `minimum: 0` on unsigned integers,
+    descriptions on nested item objects); property shapes, enums, and
+    required lists are unchanged.
 
 ### Added — anda_engine
 
@@ -76,6 +102,13 @@ minor version bump.
 
 ### Fixed — anda_engine
 
+- **The OpenAI Chat adapter no longer discards the assistant message on a
+  failure verdict** — A non-success `finish_reason` (`length`,
+  `content_filter`, …) previously dropped the whole turn: the truncated text,
+  reasoning, and tool calls vanished and only `failed_reason` survived. The
+  Chat adapter now matches the Anthropic and Gemini adapters: the message is
+  preserved in both `raw_history` and `chat_history`, while the extracted
+  `content`/`thoughts`/`tool_calls` remain gated on success.
 - **Interrupted tool calls no longer strand an OpenAI Responses `reasoning`
   item** — Dropping unanswered tool-call requests (after steering, discard, or
   stop) now takes the reasoning item that must immediately precede a pruned

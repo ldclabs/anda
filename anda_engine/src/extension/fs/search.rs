@@ -7,8 +7,8 @@ use anda_core::{
     BoxError, FunctionDefinition, Resource, StateFeatures, Tool, ToolGroupInfo, ToolOutput,
 };
 use glob::{MatchOptions, glob_with};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use std::path::{Component, Path, PathBuf};
 
 use super::{
@@ -18,7 +18,8 @@ use super::{
 };
 use crate::{
     context::BaseCtx,
-    hook::{DynToolHook, ToolHook},
+    extension::{hooked_call, tool_definition},
+    hook::DynToolHook,
 };
 
 const DEFAULT_LIMIT: usize = 1000;
@@ -35,11 +36,11 @@ const MAX_GLOB_MATCHES: usize = 10_000;
 const MAX_GLOB_SCANNED: usize = 200_000;
 
 /// Arguments for filesystem glob operations.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 pub struct SearchFileArgs {
-    /// Relative or absolute glob pattern inside the workspace namespace.
+    /// Relative or absolute glob pattern. Relative patterns are expanded in all configured workspace namespaces; absolute patterns must be inside one configured workspace.
     pub pattern: String,
-    /// Maximum number of matches to return. Defaults to 1000.
+    /// Maximum number of matches to return (default: 1000)
     #[serde(default)]
     pub limit: usize,
 }
@@ -121,26 +122,7 @@ impl Tool<BaseCtx> for SearchFileTool {
     }
 
     fn definition(&self) -> FunctionDefinition {
-        FunctionDefinition {
-            name: self.name(),
-            description: self.description(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "pattern": {
-                        "type": "string",
-                        "description": "Relative or absolute glob pattern. Relative patterns are expanded in all configured workspace namespaces; absolute patterns must be inside one configured workspace."
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum number of matches to return (default: 1000)"
-                    }
-                },
-                "required": ["pattern", "limit"],
-                "additionalProperties": false
-            }),
-            strict: Some(true),
-        }
+        tool_definition::<Self::Args>(self.name(), self.description())
     }
 
     async fn call(
@@ -149,14 +131,8 @@ impl Tool<BaseCtx> for SearchFileTool {
         args: Self::Args,
         _resources: Vec<Resource>,
     ) -> Result<ToolOutput<Self::Output>, BoxError> {
-        let hook = ctx.get_state::<SearchFileHook>();
-
-        let args = if let Some(hook) = &hook {
-            hook.before_tool_call(&ctx, args).await?
-        } else {
-            args
-        };
-
+        let ctx = &ctx;
+        hooked_call(ctx, args, |args| async move {
         let scope = WorkspaceScope::for_call(ctx.meta(), &self.workspaces).await;
         let mut paths = Vec::new();
         let mut errors = Vec::new();
@@ -282,11 +258,9 @@ impl Tool<BaseCtx> for SearchFileTool {
             scan_truncated,
         };
 
-        if let Some(hook) = &hook {
-            return hook.after_tool_call(&ctx, ToolOutput::new(output)).await;
-        }
-
         Ok(ToolOutput::new(output))
+        })
+        .await
     }
 }
 
@@ -396,7 +370,7 @@ fn relative_match_path(path: &Path, workspace: &Path, resolved_workspace: &Path)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::EngineBuilder;
+    use crate::{engine::EngineBuilder, hook::ToolHook};
     use serde_json::json;
     use std::{
         path::{Path, PathBuf},

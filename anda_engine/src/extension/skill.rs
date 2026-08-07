@@ -38,8 +38,8 @@ use anda_core::{
     Agent, BoxError, FunctionDefinition, Resource, Tool, ToolOutput, select_resources,
 };
 use parking_lot::RwLock;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use std::{
     any::Any,
     collections::BTreeMap,
@@ -50,7 +50,11 @@ use std::{
 
 use crate::{
     context::{BaseCtx, SUB_AGENT_PREFIX},
-    extension::fs::{ensure_file_size_within_limit, ensure_regular_file, normalize_relative_path},
+    extension::{
+        fs::{ensure_file_size_within_limit, ensure_regular_file, normalize_relative_path},
+        hooked_call, tool_definition,
+    },
+    hook::DynToolHook,
     subagent::{SubAgent, SubAgentSet},
 };
 
@@ -64,13 +68,15 @@ pub use types::*;
 const MAX_SKILL_FILE_BYTES: u64 = 512 * 1024;
 
 /// Arguments for reading a skill via the [`SkillManager`] tool.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SkillArgs {
-    /// Skill name in kebab-case (e.g. `pdf-processing`). 1-64 chars,
-    /// lowercase alphanumeric and hyphens only.
+    /// Skill name in kebab-case (e.g. 'pdf-processing'). Returns the matching SKILL.md content. When `execution` is `inline`, follow that content yourself; when it is `subagent`, call the returned `callable` with a self-contained prompt instead.
     pub name: String,
 }
+
+/// Typed hook for skills-manager tool calls.
+pub type SkillToolHook = DynToolHook<SkillArgs, SkillContentOutput>;
 
 /// Content returned by the [`SkillManager`] tool.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -551,32 +557,21 @@ impl Tool<BaseCtx> for SkillManager {
     }
 
     fn definition(&self) -> FunctionDefinition {
-        FunctionDefinition {
-            name: self.name(),
-            description: self.description(),
-            parameters: json!({
-                "type": "object",
-                "description": "Read a reusable skill's SKILL.md file content by skill name. Create or update skills by editing files directly with shell or file tools, then reload the manager.",
-                "properties": {
-                    "name": {
-                        "type": "string",
-                        "description": "Skill name in kebab-case (e.g. 'pdf-processing'). Returns the matching SKILL.md content. When `execution` is `inline`, follow that content yourself; when it is `subagent`, call the returned `callable` with a self-contained prompt instead."
-                    }
-                },
-                "required": ["name"],
-                "additionalProperties": false
-            }),
-            strict: Some(true),
-        }
+        let mut definition = tool_definition::<Self::Args>(self.name(), self.description());
+        definition.parameters["description"] = "Read a reusable skill's SKILL.md file content by skill name. Create or update skills by editing files directly with shell or file tools, then reload the manager.".into();
+        definition
     }
 
     async fn call(
         &self,
-        _ctx: BaseCtx,
+        ctx: BaseCtx,
         args: Self::Args,
         _resources: Vec<Resource>,
     ) -> Result<ToolOutput<Self::Output>, BoxError> {
-        Ok(ToolOutput::new(self.read_skill_action(args).await?))
+        hooked_call(&ctx, args, |args| async move {
+            Ok(ToolOutput::new(self.read_skill_action(args).await?))
+        })
+        .await
     }
 }
 
@@ -588,6 +583,7 @@ impl Tool<BaseCtx> for SkillManager {
 mod tests {
     use super::*;
     use crate::{context::BaseCtx, engine::EngineBuilder, subagent::SubAgentSet};
+    use serde_json::json;
     use std::sync::Arc;
 
     fn mock_ctx() -> BaseCtx {

@@ -7,8 +7,8 @@ use anda_core::{
     BoxError, FunctionDefinition, Resource, StateFeatures, Tool, ToolGroupInfo, ToolOutput,
 };
 use ic_auth_types::ByteBufB64;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use std::{path::PathBuf, str::FromStr};
 
 use super::{
@@ -17,17 +17,18 @@ use super::{
 };
 use crate::{
     context::BaseCtx,
-    hook::{DynToolHook, ToolHook},
+    extension::{hooked_call, tool_definition},
+    hook::DynToolHook,
 };
 
 /// Arguments for filesystem write operations.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct WriteFileArgs {
-    /// Relative or absolute path to a file inside the workspace.
+    /// Path to the file. Relative paths resolve from the configured workspaces in priority order; absolute paths must be inside one configured workspace.
     pub path: String,
-    /// File content encoded as text or base64, depending on `encoding`.
+    /// Content to write to the file. If encoding is 'base64', this should be base64-encoded data; otherwise it is text encoded with the requested encoding.
     pub content: String,
-    /// Content encoding. Supported values are `utf8`, `base64`, and text encodings such as `gbk`.
+    /// Encoding of the content. Can be 'utf8', 'base64', or a supported text encoding such as 'gbk'. Defaults to 'utf8'.
     #[serde(default = "default_write_encoding")]
     pub encoding: String,
 }
@@ -113,30 +114,7 @@ impl Tool<BaseCtx> for WriteFileTool {
     }
 
     fn definition(&self) -> FunctionDefinition {
-        FunctionDefinition {
-            name: self.name(),
-            description: self.description(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Path to the file. Relative paths resolve from the configured workspaces in priority order; absolute paths must be inside one configured workspace."
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "Content to write to the file. If encoding is 'base64', this should be base64-encoded data; otherwise it is text encoded with the requested encoding."
-                    },
-                    "encoding": {
-                        "type": "string",
-                        "description": "Encoding of the content. Can be 'utf8', 'base64', or a supported text encoding such as 'gbk'. Defaults to 'utf8'."
-                    }
-                },
-                "required": ["path", "content", "encoding"],
-                "additionalProperties": false
-            }),
-            strict: Some(true),
-        }
+        tool_definition::<Self::Args>(self.name(), self.description())
     }
 
     async fn call(
@@ -145,36 +123,26 @@ impl Tool<BaseCtx> for WriteFileTool {
         args: Self::Args,
         _resources: Vec<Resource>,
     ) -> Result<ToolOutput<Self::Output>, BoxError> {
-        let hook = ctx.get_state::<WriteFileHook>();
+        let ctx = &ctx;
+        hooked_call(ctx, args, |args| async move {
+            let scope = WorkspaceScope::for_call(ctx.meta(), &self.workspaces).await;
+            let target = scope.open_write(&args.path).await?;
+            let workspace_display = target.workspace.display().to_string();
 
-        let args = if let Some(hook) = &hook {
-            hook.before_tool_call(&ctx, args).await?
-        } else {
-            args
-        };
+            let data = decode_content(
+                args.content,
+                &args.encoding,
+                &args.path,
+                &workspace_display,
+                &target.path,
+            )?;
 
-        let scope = WorkspaceScope::for_call(ctx.meta(), &self.workspaces).await;
-        let target = scope.open_write(&args.path).await?;
-        let workspace_display = target.workspace.display().to_string();
+            let size = data.len() as u64;
+            target.write_atomic(&data).await?;
 
-        let data = decode_content(
-            args.content,
-            &args.encoding,
-            &args.path,
-            &workspace_display,
-            &target.path,
-        )?;
-
-        let size = data.len() as u64;
-        target.write_atomic(&data).await?;
-
-        if let Some(hook) = &hook {
-            return hook
-                .after_tool_call(&ctx, ToolOutput::new(WriteFileOutput { size }))
-                .await;
-        }
-
-        Ok(ToolOutput::new(WriteFileOutput { size }))
+            Ok(ToolOutput::new(WriteFileOutput { size }))
+        })
+        .await
     }
 }
 /// Decodes content according to the requested encoding.
@@ -224,6 +192,7 @@ mod tests {
     use crate::{
         engine::EngineBuilder,
         extension::fs::{UTF8_ENCODING, commit_atomic_replace, write_temp_file_for_atomic_replace},
+        hook::ToolHook,
     };
     use serde_json::json;
     use std::{

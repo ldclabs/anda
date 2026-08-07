@@ -220,26 +220,36 @@ impl CompletionResponse {
         };
 
         let choice = self.choices.pop().ok_or("No completion choice")?;
-        if !is_success_finish_reason(&choice.finish_reason) {
+        let success = is_success_finish_reason(&choice.finish_reason);
+        if !success {
             output.failed_reason = Some(choice.finish_reason);
-        } else {
-            output.raw_history.push(choice.message);
-            let timestamp = unix_ms();
-            let msg = choice
-                .parsed_message
-                .ok_or("Failed to parse message output")?;
+        }
 
-            if let Some(refusal) = msg.refusal() {
-                output.failed_reason = Some(refusal.to_string());
+        // Like the Anthropic and Gemini adapters, a failure verdict (e.g.
+        // `length`, `content_filter`) still preserves whatever the model
+        // produced: the message is recorded in both histories and only the
+        // content/thoughts/tool_calls extraction is gated on success, so a
+        // truncated draft is not silently lost.
+        match choice.parsed_message {
+            None if !success => {}
+            None => return Err("Failed to parse message output".into()),
+            Some(msg) => {
+                output.raw_history.push(choice.message);
+
+                if success && let Some(refusal) = msg.refusal() {
+                    output.failed_reason = Some(refusal.to_string());
+                }
+
+                let mut msg: Message = msg.into();
+                msg.name = Some(self.model);
+                msg.timestamp = Some(unix_ms());
+                if success {
+                    output.content = msg.text().unwrap_or_default();
+                    output.thoughts = msg.thoughts();
+                    output.tool_calls = msg.tool_calls();
+                }
+                output.chat_history.push(msg);
             }
-
-            let mut msg: Message = msg.into();
-            msg.name = Some(self.model);
-            msg.timestamp = Some(timestamp);
-            output.content = msg.text().unwrap_or_default();
-            output.thoughts = msg.thoughts();
-            output.tool_calls = msg.tool_calls();
-            output.chat_history.push(msg);
         }
 
         Ok(output)
@@ -277,8 +287,8 @@ pub(crate) fn parse_tool_arguments(arguments: &str) -> Json {
 /// An empty string means the provider omitted the field or sent `null` (both map to `""` via
 /// `null_default`), and a stream can also end without any chunk carrying one. That is an
 /// absent verdict, not a failure verdict — several OpenAI-compatible providers omit it — so
-/// it is treated as success. Classifying it as a failure would discard the assistant message
-/// (text, reasoning, and tool calls) and abort the run with a blank reason.
+/// it is treated as success. Classifying it as a failure would abort the run with a blank
+/// failure reason and withhold the turn's text, reasoning, and tool calls from the output.
 fn is_success_finish_reason(reason: &str) -> bool {
     matches!(
         reason,
@@ -3231,7 +3241,7 @@ mod tests {
             "model": "gpt-failed",
             "choices": [{
                 "index": 0,
-                "message": {"role": "assistant", "content": "discarded"},
+                "message": {"role": "assistant", "content": "partial draft"},
                 "finish_reason": "length"
             }]
         }))
@@ -3240,7 +3250,15 @@ mod tests {
         assert!(failed.maybe_failed());
         let output = failed.try_into(vec![], vec![]).unwrap();
         assert_eq!(output.failed_reason.as_deref(), Some("length"));
-        assert!(output.raw_history.is_empty());
+        // The failure verdict withholds the extracted content but must keep the
+        // truncated draft in both histories, matching Anthropic and Gemini.
+        assert!(output.content.is_empty());
+        assert_eq!(output.raw_history.len(), 1);
+        assert_eq!(output.chat_history.len(), 1);
+        assert_eq!(
+            output.chat_history[0].text().as_deref(),
+            Some("partial draft")
+        );
 
         let msg: Message = serde_json::from_value::<MessageOutput>(json!({
             "role": "assistant",
@@ -3427,8 +3445,8 @@ mod tests {
     #[test]
     fn absent_finish_reason_keeps_the_assistant_message() {
         // Several OpenAI-compatible providers omit `finish_reason` or send `null`; both
-        // deserialize to `""`. Treating that as a failure verdict would discard the whole
-        // assistant message and abort the run with a blank reason.
+        // deserialize to `""`. Treating that as a failure verdict would abort the run
+        // with a blank reason and withhold the turn's output.
         for finish_reason in [json!(null), Json::Null] {
             let mut response: CompletionResponse = serde_json::from_value(json!({
                 "id": "chatcmpl_no_finish",
@@ -3463,7 +3481,8 @@ mod tests {
             assert_eq!(output.raw_history.len(), 1, "the message must be recorded");
         }
 
-        // A real failure verdict is still reported.
+        // A real failure verdict is still reported, and the truncated message
+        // is preserved instead of extracted.
         let mut response: CompletionResponse = serde_json::from_value(json!({
             "id": "chatcmpl_len",
             "object": "chat.completion",
@@ -3479,5 +3498,7 @@ mod tests {
         response.parse_output();
         let output = response.try_into(vec![], vec![]).unwrap();
         assert_eq!(output.failed_reason.as_deref(), Some("length"));
+        assert!(output.content.is_empty());
+        assert_eq!(output.chat_history[0].text().as_deref(), Some("truncated"));
     }
 }

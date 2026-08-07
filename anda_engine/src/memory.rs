@@ -13,7 +13,7 @@
 use anda_cognitive_nexus::{CognitiveNexus, ConceptPK};
 use anda_core::{
     BoxError, ContentPart, Document, Documents, FunctionDefinition, Message, Resource, ResourceRef,
-    StateFeatures, Tool, ToolGroupInfo, ToolOutput, Usage, Xid, gen_schema_for,
+    StateFeatures, Tool, ToolGroupInfo, ToolOutput, Usage, Xid,
 };
 use anda_db::{
     collection::{Collection, CollectionConfig},
@@ -40,7 +40,11 @@ use std::{
     sync::{Arc, LazyLock},
 };
 
-use crate::{context::BaseCtx, extension::fetch::FetchWebResourcesTool, rfc3339_datetime, unix_ms};
+use crate::{
+    context::BaseCtx,
+    extension::{fetch::FetchWebResourcesTool, hooked_call, tool_definition},
+    rfc3339_datetime, unix_ms,
+};
 
 /// Stable id of the persistent memory capability group.
 pub const MEMORY_TOOL_GROUP_ID: &str = "memory";
@@ -1150,22 +1154,25 @@ impl Tool<BaseCtx> for MemoryManagement {
 
     async fn call(
         &self,
-        _ctx: BaseCtx,
+        ctx: BaseCtx,
         request: Self::Args,
         _resources: Vec<Resource>,
     ) -> Result<ToolOutput<Self::Output>, BoxError> {
-        let (_, res) = request.execute(self.nexus.as_ref()).await;
-        Ok(ToolOutput {
-            is_error: if matches!(res, Response::Err { .. }) {
-                Some(true)
-            } else {
-                None
-            },
-            output: res,
-            artifacts: Vec::new(),
-            usage: Usage::default(),
-            tools_usage: HashMap::new(),
+        hooked_call(&ctx, request, |request| async move {
+            let (_, res) = request.execute(self.nexus.as_ref()).await;
+            Ok(ToolOutput {
+                is_error: if matches!(res, Response::Err { .. }) {
+                    Some(true)
+                } else {
+                    None
+                },
+                output: res,
+                artifacts: Vec::new(),
+                usage: Usage::default(),
+                tools_usage: HashMap::new(),
+            })
         })
+        .await
     }
 }
 
@@ -1212,22 +1219,28 @@ impl Tool<BaseCtx> for MemoryReadonly {
 
     async fn call(
         &self,
-        _ctx: BaseCtx,
-        mut request: Self::Args,
+        ctx: BaseCtx,
+        request: Self::Args,
         _resources: Vec<Resource>,
     ) -> Result<ToolOutput<Self::Output>, BoxError> {
-        let (_, res) = request.readonly().execute(self.memory.nexus.as_ref()).await;
-        Ok(ToolOutput {
-            is_error: if matches!(res, Response::Err { .. }) {
-                Some(true)
-            } else {
-                None
-            },
-            output: res,
-            artifacts: Vec::new(),
-            usage: Usage::default(),
-            tools_usage: HashMap::new(),
+        // Note: this tool shares `DynToolHook<Request, Response>` with
+        // `execute_kip` — the hook state is keyed by argument/output types. A
+        // hook that must tell them apart can inspect the context path.
+        hooked_call(&ctx, request, |mut request| async move {
+            let (_, res) = request.readonly().execute(self.memory.nexus.as_ref()).await;
+            Ok(ToolOutput {
+                is_error: if matches!(res, Response::Err { .. }) {
+                    Some(true)
+                } else {
+                    None
+                },
+                output: res,
+                artifacts: Vec::new(),
+                usage: Usage::default(),
+                tools_usage: HashMap::new(),
+            })
         })
+        .await
     }
 }
 
@@ -1244,7 +1257,6 @@ pub struct GetResourceContentArgs {
 #[derive(Debug, Clone)]
 pub struct GetResourceContentTool {
     memory: Arc<MemoryManagement>,
-    schema: Json,
 }
 
 impl GetResourceContentTool {
@@ -1253,8 +1265,7 @@ impl GetResourceContentTool {
 
     /// Creates a new GetResourceContentTool instance
     pub fn new(memory: Arc<MemoryManagement>) -> Self {
-        let schema = gen_schema_for::<GetResourceContentArgs>();
-        Self { memory, schema }
+        Self { memory }
     }
 }
 
@@ -1275,12 +1286,7 @@ impl Tool<BaseCtx> for GetResourceContentTool {
     }
 
     fn definition(&self) -> FunctionDefinition {
-        FunctionDefinition {
-            name: self.name(),
-            description: self.description(),
-            parameters: self.schema.clone(),
-            strict: Some(true),
-        }
+        tool_definition::<Self::Args>(self.name(), self.description())
     }
 
     async fn call(
@@ -1289,32 +1295,36 @@ impl Tool<BaseCtx> for GetResourceContentTool {
         args: Self::Args,
         _resources: Vec<Resource>,
     ) -> Result<ToolOutput<Self::Output>, BoxError> {
-        let res = self
-            .memory
-            .get_resource_for(ctx.caller(), args.conversation, args._id)
-            .await?;
-        let text = match res.blob {
-            Some(blob) => match String::from_utf8(blob.0) {
-                Ok(s) => s,
-                Err(e) => ByteBufB64(e.into_bytes()).to_string(),
-            },
-            None => match res.uri {
-                Some(uri) => FetchWebResourcesTool::fetch_as_text(&ctx, &uri).await?,
-                None => Err(format!("Invalid resource {}, no blob or uri", args._id))?,
-            },
-        };
+        let ctx = &ctx;
+        hooked_call(ctx, args, |args| async move {
+            let res = self
+                .memory
+                .get_resource_for(ctx.caller(), args.conversation, args._id)
+                .await?;
+            let text = match res.blob {
+                Some(blob) => match String::from_utf8(blob.0) {
+                    Ok(s) => s,
+                    Err(e) => ByteBufB64(e.into_bytes()).to_string(),
+                },
+                None => match res.uri {
+                    Some(uri) => FetchWebResourcesTool::fetch_as_text(ctx, &uri).await?,
+                    None => Err(format!("Invalid resource {}, no blob or uri", args._id))?,
+                },
+            };
 
-        Ok(ToolOutput::new(Response::ok(text.into())))
+            Ok(ToolOutput::new(Response::ok(text.into())))
+        })
+        .await
     }
 }
 
 /// Arguments for "list_previous_conversations" tool
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 pub struct ListConversationsArgs {
-    /// The cursor for pagination
+    /// The cursor for pagination, returned from the previous call. Use an empty string for the first page.
     #[serde(default)]
     pub cursor: String,
-    /// The limit for pagination, max 100
+    /// The maximum number of conversations to return, between 1 and 100. Default is 10.
     #[serde(default)]
     pub limit: usize,
 }
@@ -1359,26 +1369,7 @@ impl Tool<BaseCtx> for ListConversationsTool {
     }
 
     fn definition(&self) -> FunctionDefinition {
-        FunctionDefinition {
-            name: self.name(),
-            description: self.description.clone(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "cursor": {
-                        "type": "string",
-                        "description": "The cursor for pagination, returned from the previous call. Use an empty string for the first page."
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "The maximum number of conversations to return, between 1 and 100. Default is 10."
-                    }
-                },
-                "required": ["cursor", "limit"],
-                "additionalProperties": false
-            }),
-            strict: Some(true),
-        }
+        tool_definition::<Self::Args>(self.name(), self.description())
     }
 
     async fn call(
@@ -1387,36 +1378,40 @@ impl Tool<BaseCtx> for ListConversationsTool {
         args: Self::Args,
         _resources: Vec<Resource>,
     ) -> Result<ToolOutput<Self::Output>, BoxError> {
-        let (conversations, next_cursor) = self
-            .conversations
-            .list_conversations_by_user(
-                ctx.caller(),
-                if args.cursor.is_empty() {
-                    None
-                } else {
-                    Some(args.cursor)
-                },
-                if args.limit == 0 {
-                    None
-                } else {
-                    Some(args.limit)
-                },
-            )
-            .await?;
-        let docs: Vec<Document> = conversations.into_iter().map(Document::from).collect();
-        Ok(ToolOutput::new(Response::Ok {
-            result: Documents::from(docs).to_string().into(),
-            next_cursor,
-        }))
+        let ctx = &ctx;
+        hooked_call(ctx, args, |args| async move {
+            let (conversations, next_cursor) = self
+                .conversations
+                .list_conversations_by_user(
+                    ctx.caller(),
+                    if args.cursor.is_empty() {
+                        None
+                    } else {
+                        Some(args.cursor)
+                    },
+                    if args.limit == 0 {
+                        None
+                    } else {
+                        Some(args.limit)
+                    },
+                )
+                .await?;
+            let docs: Vec<Document> = conversations.into_iter().map(Document::from).collect();
+            Ok(ToolOutput::new(Response::Ok {
+                result: Documents::from(docs).to_string().into(),
+                next_cursor,
+            }))
+        })
+        .await
     }
 }
 
 /// Arguments for "search_conversations" tool
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 pub struct SearchConversationsArgs {
-    /// The query string to search
+    /// The query string to search for in the conversation history.
     pub query: String,
-    /// The max number of conversations to return, max 100
+    /// The maximum number of conversations to return, between 1 and 100. Default is 10.
     #[serde(default)]
     pub limit: usize,
 }
@@ -1461,26 +1456,7 @@ impl Tool<BaseCtx> for SearchConversationsTool {
     }
 
     fn definition(&self) -> FunctionDefinition {
-        FunctionDefinition {
-            name: self.name(),
-            description: self.description.clone(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "The query string to search for in the conversation history."
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "The maximum number of conversations to return, between 1 and 100. Default is 10."
-                    }
-                },
-                "required": ["query", "limit"],
-                "additionalProperties": false
-            }),
-            strict: Some(true),
-        }
+        tool_definition::<Self::Args>(self.name(), self.description())
     }
 
     async fn call(
@@ -1489,24 +1465,28 @@ impl Tool<BaseCtx> for SearchConversationsTool {
         args: Self::Args,
         _resources: Vec<Resource>,
     ) -> Result<ToolOutput<Self::Output>, BoxError> {
-        let conversations = self
-            .conversations
-            .search_conversations(
-                ctx.caller(),
-                args.query,
-                if args.limit == 0 {
-                    None
-                } else {
-                    Some(args.limit)
-                },
-            )
-            .await?;
+        let ctx = &ctx;
+        hooked_call(ctx, args, |args| async move {
+            let conversations = self
+                .conversations
+                .search_conversations(
+                    ctx.caller(),
+                    args.query,
+                    if args.limit == 0 {
+                        None
+                    } else {
+                        Some(args.limit)
+                    },
+                )
+                .await?;
 
-        let docs: Vec<Document> = conversations.into_iter().map(Document::from).collect();
-        Ok(ToolOutput::new(Response::Ok {
-            result: Documents::from(docs).to_string().into(),
-            next_cursor: None,
-        }))
+            let docs: Vec<Document> = conversations.into_iter().map(Document::from).collect();
+            Ok(ToolOutput::new(Response::Ok {
+                result: Documents::from(docs).to_string().into(),
+                next_cursor: None,
+            }))
+        })
+        .await
     }
 }
 
@@ -1579,7 +1559,6 @@ pub enum MemoryToolArgs {
 #[derive(Debug, Clone)]
 pub struct MemoryTool {
     memory: Arc<MemoryManagement>,
-    schema: Json,
 }
 
 impl MemoryTool {
@@ -1588,11 +1567,17 @@ impl MemoryTool {
 
     /// Creates a new SearchConversationsTool instance
     pub fn new(memory: Arc<MemoryManagement>) -> Self {
-        let schema = memory_tool_schema();
-        Self { memory, schema }
+        Self { memory }
     }
 }
 
+/// Hand-flattened schema for [`MemoryToolArgs`].
+///
+/// The argument type is an internally tagged enum, which `schemars` renders as
+/// an `anyOf` of per-variant schemas — a shape strict function-calling
+/// providers reject. This flattens every variant's fields into one closed
+/// object with nullable fields plus the `type` discriminator; serde's tagged
+/// deserialization accepts it unchanged. Keep the two in sync by hand.
 fn memory_tool_schema() -> Json {
     json!({
         "type": "object",
@@ -1681,7 +1666,7 @@ impl Tool<BaseCtx> for MemoryTool {
         FunctionDefinition {
             name: self.name(),
             description: self.description(),
-            parameters: self.schema.clone(),
+            parameters: memory_tool_schema(),
             strict: Some(true),
         }
     }
@@ -1692,173 +1677,178 @@ impl Tool<BaseCtx> for MemoryTool {
         args: Self::Args,
         _resources: Vec<Resource>,
     ) -> Result<ToolOutput<Self::Output>, BoxError> {
-        match args {
-            MemoryToolArgs::GetResource { _id, conversation } => {
-                let mut res = self
-                    .memory
-                    .get_resource_for(ctx.caller(), conversation, _id)
-                    .await?;
-                if res.blob.is_none()
-                    && let Some(uri) = &res.uri
-                {
-                    res.blob = FetchWebResourcesTool::fetch_as_bytes(&ctx, uri).await.ok();
-                }
+        let ctx = &ctx;
+        hooked_call(ctx, args, |args| async move {
+            match args {
+                MemoryToolArgs::GetResource { _id, conversation } => {
+                    let mut res = self
+                        .memory
+                        .get_resource_for(ctx.caller(), conversation, _id)
+                        .await?;
+                    if res.blob.is_none()
+                        && let Some(uri) = &res.uri
+                    {
+                        res.blob = FetchWebResourcesTool::fetch_as_bytes(ctx, uri).await.ok();
+                    }
 
-                Ok(ToolOutput::new(Response::Ok {
-                    result: json!(res),
-                    next_cursor: None,
-                }))
-            }
-            MemoryToolArgs::GetConversation { _id } => {
-                let conversation = self.memory.get_conversation(_id).await?;
-                if &conversation.user != ctx.caller() {
-                    return Err("permission denied".into());
+                    Ok(ToolOutput::new(Response::Ok {
+                        result: json!(res),
+                        next_cursor: None,
+                    }))
                 }
+                MemoryToolArgs::GetConversation { _id } => {
+                    let conversation = self.memory.get_conversation(_id).await?;
+                    if &conversation.user != ctx.caller() {
+                        return Err("permission denied".into());
+                    }
 
-                Ok(ToolOutput::new(Response::Ok {
-                    result: json!(conversation),
-                    next_cursor: None,
-                }))
-            }
-            MemoryToolArgs::GetConversationDelta {
-                _id,
-                messages_offset,
-                artifacts_offset,
-            } => {
-                let conversation = self.memory.get_conversation(_id).await?;
-                if &conversation.user != ctx.caller() {
-                    return Err("permission denied".into());
+                    Ok(ToolOutput::new(Response::Ok {
+                        result: json!(conversation),
+                        next_cursor: None,
+                    }))
                 }
+                MemoryToolArgs::GetConversationDelta {
+                    _id,
+                    messages_offset,
+                    artifacts_offset,
+                } => {
+                    let conversation = self.memory.get_conversation(_id).await?;
+                    if &conversation.user != ctx.caller() {
+                        return Err("permission denied".into());
+                    }
 
-                Ok(ToolOutput::new(Response::Ok {
-                    result: json!(conversation.into_delta(messages_offset, artifacts_offset)),
-                    next_cursor: None,
-                }))
-            }
-            MemoryToolArgs::StopConversation { _id } => {
-                let mut conversation = self.memory.get_conversation(_id).await?;
-                if &conversation.user != ctx.caller() {
-                    return Err("permission denied".into());
+                    Ok(ToolOutput::new(Response::Ok {
+                        result: json!(conversation.into_delta(messages_offset, artifacts_offset)),
+                        next_cursor: None,
+                    }))
                 }
+                MemoryToolArgs::StopConversation { _id } => {
+                    let mut conversation = self.memory.get_conversation(_id).await?;
+                    if &conversation.user != ctx.caller() {
+                        return Err("permission denied".into());
+                    }
 
-                if conversation.status == ConversationStatus::Working
-                    || conversation.status == ConversationStatus::Submitted
-                {
-                    conversation.status = ConversationStatus::Cancelled;
+                    if conversation.status == ConversationStatus::Working
+                        || conversation.status == ConversationStatus::Submitted
+                    {
+                        conversation.status = ConversationStatus::Cancelled;
+                        conversation.updated_at = unix_ms();
+                        let changes = BTreeMap::from([
+                            (
+                                "status".to_string(),
+                                Fv::Text(conversation.status.to_string()),
+                            ),
+                            ("updated_at".to_string(), Fv::U64(conversation.updated_at)),
+                        ]);
+                        self.memory.update_conversation(_id, changes).await?;
+                    }
+
+                    Ok(ToolOutput::new(Response::Ok {
+                        result: json!(conversation),
+                        next_cursor: None,
+                    }))
+                }
+                MemoryToolArgs::SteerConversation { _id, message } => {
+                    if message.trim().is_empty() {
+                        return Err("steering message cannot be empty".into());
+                    }
+
+                    let mut conversation = self.memory.get_conversation(_id).await?;
+                    if &conversation.user != ctx.caller() {
+                        return Err("permission denied".into());
+                    }
+
+                    let steering_messages =
+                        if let Some(msg) = conversation.steering_messages.clone() {
+                            let mut msgs = msg;
+                            msgs.push(message.clone());
+                            msgs
+                        } else {
+                            vec![message.clone()]
+                        };
+                    conversation.steering_messages = Some(steering_messages.clone());
                     conversation.updated_at = unix_ms();
                     let changes = BTreeMap::from([
-                        (
-                            "status".to_string(),
-                            Fv::Text(conversation.status.to_string()),
-                        ),
+                        ("steering_messages".to_string(), steering_messages.into()),
                         ("updated_at".to_string(), Fv::U64(conversation.updated_at)),
                     ]);
                     self.memory.update_conversation(_id, changes).await?;
+
+                    Ok(ToolOutput::new(Response::Ok {
+                        result: json!(conversation),
+                        next_cursor: None,
+                    }))
                 }
+                MemoryToolArgs::FollowUpConversation { _id, message } => {
+                    if message.trim().is_empty() {
+                        return Err("follow-up message cannot be empty".into());
+                    }
 
-                Ok(ToolOutput::new(Response::Ok {
-                    result: json!(conversation),
-                    next_cursor: None,
-                }))
-            }
-            MemoryToolArgs::SteerConversation { _id, message } => {
-                if message.trim().is_empty() {
-                    return Err("steering message cannot be empty".into());
+                    let mut conversation = self.memory.get_conversation(_id).await?;
+                    if &conversation.user != ctx.caller() {
+                        return Err("permission denied".into());
+                    }
+
+                    let follow_up_messages =
+                        if let Some(msg) = conversation.follow_up_messages.clone() {
+                            let mut msgs = msg;
+                            msgs.push(message.clone());
+                            msgs
+                        } else {
+                            vec![message.clone()]
+                        };
+                    conversation.follow_up_messages = Some(follow_up_messages.clone());
+                    conversation.updated_at = unix_ms();
+                    let changes = BTreeMap::from([
+                        ("follow_up_messages".to_string(), follow_up_messages.into()),
+                        ("updated_at".to_string(), Fv::U64(conversation.updated_at)),
+                    ]);
+                    self.memory.update_conversation(_id, changes).await?;
+
+                    Ok(ToolOutput::new(Response::Ok {
+                        result: json!(conversation),
+                        next_cursor: None,
+                    }))
                 }
+                MemoryToolArgs::DeleteConversation { _id } => {
+                    let conversation = self.memory.get_conversation(_id).await?;
+                    if &conversation.user != ctx.caller() {
+                        return Err("permission denied".into());
+                    }
 
-                let mut conversation = self.memory.get_conversation(_id).await?;
-                if &conversation.user != ctx.caller() {
-                    return Err("permission denied".into());
+                    let deleted = self.memory.delete_conversation(_id).await?;
+                    Ok(ToolOutput::new(Response::Ok {
+                        result: json!({ "deleted": deleted }),
+                        next_cursor: None,
+                    }))
                 }
+                MemoryToolArgs::ListPrevConversations { cursor, limit } => {
+                    // Models often send "" instead of null for the first page.
+                    let cursor = cursor.filter(|cursor| !cursor.is_empty());
+                    let (conversations, next_cursor) = self
+                        .memory
+                        .list_conversations_by_user(ctx.caller(), cursor, limit)
+                        .await?;
 
-                let steering_messages = if let Some(msg) = conversation.steering_messages.clone() {
-                    let mut msgs = msg;
-                    msgs.push(message.clone());
-                    msgs
-                } else {
-                    vec![message.clone()]
-                };
-                conversation.steering_messages = Some(steering_messages.clone());
-                conversation.updated_at = unix_ms();
-                let changes = BTreeMap::from([
-                    ("steering_messages".to_string(), steering_messages.into()),
-                    ("updated_at".to_string(), Fv::U64(conversation.updated_at)),
-                ]);
-                self.memory.update_conversation(_id, changes).await?;
-
-                Ok(ToolOutput::new(Response::Ok {
-                    result: json!(conversation),
-                    next_cursor: None,
-                }))
-            }
-            MemoryToolArgs::FollowUpConversation { _id, message } => {
-                if message.trim().is_empty() {
-                    return Err("follow-up message cannot be empty".into());
+                    Ok(ToolOutput::new(Response::Ok {
+                        result: json!(conversations),
+                        next_cursor,
+                    }))
                 }
+                MemoryToolArgs::SearchConversations { query, limit } => {
+                    let conversations = self
+                        .memory
+                        .search_conversations(ctx.caller(), query, limit)
+                        .await?;
 
-                let mut conversation = self.memory.get_conversation(_id).await?;
-                if &conversation.user != ctx.caller() {
-                    return Err("permission denied".into());
+                    Ok(ToolOutput::new(Response::Ok {
+                        result: json!(conversations),
+                        next_cursor: None,
+                    }))
                 }
-
-                let follow_up_messages = if let Some(msg) = conversation.follow_up_messages.clone()
-                {
-                    let mut msgs = msg;
-                    msgs.push(message.clone());
-                    msgs
-                } else {
-                    vec![message.clone()]
-                };
-                conversation.follow_up_messages = Some(follow_up_messages.clone());
-                conversation.updated_at = unix_ms();
-                let changes = BTreeMap::from([
-                    ("follow_up_messages".to_string(), follow_up_messages.into()),
-                    ("updated_at".to_string(), Fv::U64(conversation.updated_at)),
-                ]);
-                self.memory.update_conversation(_id, changes).await?;
-
-                Ok(ToolOutput::new(Response::Ok {
-                    result: json!(conversation),
-                    next_cursor: None,
-                }))
             }
-            MemoryToolArgs::DeleteConversation { _id } => {
-                let conversation = self.memory.get_conversation(_id).await?;
-                if &conversation.user != ctx.caller() {
-                    return Err("permission denied".into());
-                }
-
-                let deleted = self.memory.delete_conversation(_id).await?;
-                Ok(ToolOutput::new(Response::Ok {
-                    result: json!({ "deleted": deleted }),
-                    next_cursor: None,
-                }))
-            }
-            MemoryToolArgs::ListPrevConversations { cursor, limit } => {
-                // Models often send "" instead of null for the first page.
-                let cursor = cursor.filter(|cursor| !cursor.is_empty());
-                let (conversations, next_cursor) = self
-                    .memory
-                    .list_conversations_by_user(ctx.caller(), cursor, limit)
-                    .await?;
-
-                Ok(ToolOutput::new(Response::Ok {
-                    result: json!(conversations),
-                    next_cursor,
-                }))
-            }
-            MemoryToolArgs::SearchConversations { query, limit } => {
-                let conversations = self
-                    .memory
-                    .search_conversations(ctx.caller(), query, limit)
-                    .await?;
-
-                Ok(ToolOutput::new(Response::Ok {
-                    result: json!(conversations),
-                    next_cursor: None,
-                }))
-            }
-        }
+        })
+        .await
     }
 }
 

@@ -125,9 +125,18 @@ pub trait ToolBackgroundHook: Send + Sync {
 }
 
 /// Cloneable type-erased wrapper for a typed [`ToolHook`].
-#[derive(Clone)]
 pub struct DynToolHook<I, O> {
     inner: Arc<dyn ToolHook<I, O>>,
+}
+
+// Manual impl: the derive would needlessly require `I: Clone + O: Clone`,
+// while only the inner `Arc` is cloned.
+impl<I, O> Clone for DynToolHook<I, O> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
 }
 
 impl<I, O> DynToolHook<I, O>

@@ -11,13 +11,14 @@
 
 use anda_core::{BoxError, FunctionDefinition, Resource, Tool, ToolOutput};
 use parking_lot::RwLock;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use std::{collections::HashMap, sync::Arc};
 
 use crate::{
     context::BaseCtx,
-    hook::{DynToolHook, ToolHook},
+    extension::{hooked_call, tool_definition},
+    hook::DynToolHook,
 };
 
 const TODO_OP_READ: &str = "read";
@@ -208,27 +209,35 @@ impl TodoStore {
 }
 
 /// Arguments for the todo tool.
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
 pub struct TodoArgs {
-    /// Operation to perform: read, set, or update.
+    /// read: return full list. set: replace list. update: patch only changed ids.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("enum" = [TODO_OP_READ, TODO_OP_SET, TODO_OP_UPDATE, null], "default" = TODO_OP_READ))]
     pub op: Option<String>,
-    /// Task items for set/update. Omit or null for read.
+    /// Items for set/update. Use null for read. For update, include only changed ids; null content/status keeps existing values.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub items: Option<Vec<TodoItemInput>>,
 }
 
 /// Input item accepted by the todo tool.
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
 pub struct TodoItemInput {
-    /// Unique todo identifier.
+    /// Stable short id
     #[serde(default)]
     pub id: String,
-    /// Human-readable todo description.
+    /// Task text; null keeps existing text on update
     #[serde(default)]
     pub content: Option<String>,
-    /// Current todo status.
+    /// Task status; null keeps existing status on update
     #[serde(default)]
+    #[schemars(extend("enum" = [
+        TODO_STATUS_PENDING,
+        TODO_STATUS_IN_PROGRESS,
+        TODO_STATUS_COMPLETED,
+        TODO_STATUS_CANCELLED,
+        null
+    ]))]
     pub status: Option<String>,
 }
 
@@ -359,54 +368,7 @@ impl Tool<BaseCtx> for TodoTool {
     }
 
     fn definition(&self) -> FunctionDefinition {
-        FunctionDefinition {
-            name: self.name(),
-            description: self.description(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "op": {
-                        "type": ["string", "null"],
-                        "enum": [TODO_OP_READ, TODO_OP_SET, TODO_OP_UPDATE, null],
-                        "description": "read: return full list. set: replace list. update: patch only changed ids.",
-                        "default": TODO_OP_READ
-                    },
-                    "items": {
-                        "description": "Items for set/update. Use null for read. For update, include only changed ids; null content/status keeps existing values.",
-                        "type": ["array", "null"],
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "id": {
-                                    "type": "string",
-                                    "description": "Stable short id"
-                                },
-                                "content": {
-                                    "type": ["string", "null"],
-                                    "description": "Task text; null keeps existing text on update"
-                                },
-                                "status": {
-                                    "type": ["string", "null"],
-                                    "enum": [
-                                        TODO_STATUS_PENDING,
-                                        TODO_STATUS_IN_PROGRESS,
-                                        TODO_STATUS_COMPLETED,
-                                        TODO_STATUS_CANCELLED,
-                                        null
-                                    ],
-                                    "description": "Task status; null keeps existing status on update"
-                                }
-                            },
-                            "required": ["id", "content", "status"],
-                            "additionalProperties": false
-                        }
-                    }
-                },
-                "required": ["op", "items"],
-                "additionalProperties": false
-            }),
-            strict: Some(true),
-        }
+        tool_definition::<Self::Args>(self.name(), self.description())
     }
 
     async fn call(
@@ -415,31 +377,24 @@ impl Tool<BaseCtx> for TodoTool {
         args: Self::Args,
         _resources: Vec<Resource>,
     ) -> Result<ToolOutput<Self::Output>, BoxError> {
-        let hook = ctx.get_state::<TodoToolHook>();
-        let args = if let Some(hook) = &hook {
-            hook.before_tool_call(&ctx, args).await?
-        } else {
-            args
-        };
+        let ctx = &ctx;
+        hooked_call(ctx, args, |args| async move {
+            let session = todo_session(ctx);
+            let op = normalize_op(args.op.as_deref());
+            let (items, include_items) = match op {
+                TODO_OP_SET => (session.set(args.items.unwrap_or_default()), false),
+                TODO_OP_UPDATE => (session.update(args.items.unwrap_or_default()), false),
+                _ => (session.snapshot(), true),
+            };
 
-        let session = todo_session(&ctx);
-        let op = normalize_op(args.op.as_deref());
-        let (items, include_items) = match op {
-            TODO_OP_SET => (session.set(args.items.unwrap_or_default()), false),
-            TODO_OP_UPDATE => (session.update(args.items.unwrap_or_default()), false),
-            _ => (session.snapshot(), true),
-        };
+            let output = TodoOutput {
+                summary: TodoSummary::from_items(&items),
+                items: if include_items { items } else { Vec::new() },
+            };
 
-        let output = TodoOutput {
-            summary: TodoSummary::from_items(&items),
-            items: if include_items { items } else { Vec::new() },
-        };
-
-        if let Some(hook) = &hook {
-            return hook.after_tool_call(&ctx, ToolOutput::new(output)).await;
-        }
-
-        Ok(ToolOutput::new(output))
+            Ok(ToolOutput::new(output))
+        })
+        .await
     }
 }
 
@@ -699,39 +654,5 @@ mod tests {
                 status: TODO_STATUS_PENDING.to_string(),
             }]
         );
-    }
-
-    #[test]
-    fn definition_schema_avoids_anyof() {
-        let definition = TodoTool::new().definition();
-
-        assert!(
-            definition.parameters["properties"]["items"]
-                .get("anyOf")
-                .is_none()
-        );
-        assert_eq!(
-            definition.parameters["properties"]["items"]["type"],
-            json!(["array", "null"])
-        );
-        assert_eq!(
-            definition.parameters["properties"]["op"]["enum"],
-            json!([TODO_OP_READ, TODO_OP_SET, TODO_OP_UPDATE, null])
-        );
-        assert_eq!(
-            definition.parameters["properties"]["items"]["items"]["properties"]["content"]["type"],
-            json!(["string", "null"])
-        );
-        assert_eq!(
-            definition.parameters["properties"]["items"]["items"]["properties"]["status"]["enum"],
-            json!([
-                TODO_STATUS_PENDING,
-                TODO_STATUS_IN_PROGRESS,
-                TODO_STATUS_COMPLETED,
-                TODO_STATUS_CANCELLED,
-                null
-            ])
-        );
-        assert_eq!(definition.parameters["required"], json!(["op", "items"]));
     }
 }

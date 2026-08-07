@@ -16,8 +16,8 @@ use anda_core::windows_code_page_encoding;
 use anda_core::{BoxError, FunctionDefinition, Resource, Tool, ToolOutput};
 use async_trait::async_trait;
 use encoding_rs::{Encoding, UTF_8};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -33,7 +33,8 @@ pub use native::NativeRuntime;
 
 use crate::{
     context::BaseCtx,
-    hook::{DynToolHook, ToolHook},
+    extension::{hooked_call, tool_definition},
+    hook::DynToolHook,
 };
 
 // Re-export the shared, grapheme-cluster-safe truncation helper so the historical
@@ -108,9 +109,12 @@ pub trait Executor: Send + Sync {
 }
 
 /// Arguments for shell process execution.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+///
+/// The schema descriptions for `env_keys` and `background` are
+/// instance-dependent and are patched in [`ShellTool`]'s `definition()`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 pub struct ExecArgs {
-    /// Shell command to execute.
+    /// The shell command to execute
     pub command: String,
 
     /// Additional custom environment variable keys to expose to the command.
@@ -362,40 +366,14 @@ impl Tool<BaseCtx> for ShellTool {
     }
 
     fn definition(&self) -> FunctionDefinition {
-        let env_keys_description = self.env_keys_parameter_description();
-        let background_description = format!(
+        let mut definition = tool_definition::<Self::Args>(self.name(), self.description());
+        definition.parameters["properties"]["env_keys"]["description"] =
+            self.env_keys_parameter_description().into();
+        definition.parameters["properties"]["background"]["description"] = format!(
             "Whether to run the command in the background immediately (non-blocking). If false, native commands still running after {SHELL_AUTO_BACKGROUND_SECS} seconds are moved to the background automatically instead of returning a timeout error. New stdout/stderr output is pushed through background progress hooks as line-based progress: plain output is emitted as complete lines, multibyte character split boundaries are preserved, and terminal-style rewritten progress regions are normalized to their latest changed visible lines. The final output is pushed through background end hooks when the task completes."
-        );
-
-        FunctionDefinition {
-            name: self.name(),
-            description: self.description(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "description": "The shell command to execute"
-                    },
-                    "env_keys": {
-                        "type": "array",
-                        "items": {
-                            "type": "string"
-                        },
-                        "description": env_keys_description,
-                        "default": []
-                    },
-                    "background": {
-                        "type": "boolean",
-                        "description": background_description,
-                        "default": false
-                    }
-                },
-                "required": ["command", "env_keys", "background"],
-                "additionalProperties": false
-            }),
-            strict: Some(true),
-        }
+        )
+        .into();
+        definition
     }
 
     /// Execute a shell command and return structured output.
@@ -408,52 +386,53 @@ impl Tool<BaseCtx> for ShellTool {
     /// # Returns
     /// A [`ToolOutput`] containing [`ExecOutput`].
     ///
-    /// Runtime failures and timeout events are converted into a successful tool
-    /// call with `stderr` populated, so callers can handle command errors as
-    /// regular tool output.
+    /// Runtime failures and timeout events still resolve to `Ok` with a typed
+    /// [`ExecOutput`] (`stderr` populated, `exit_status` absent) so the model
+    /// can react to them as regular tool output, but they are flagged with
+    /// `is_error: Some(true)` for hooks, providers, and telemetry. A command
+    /// that runs and exits non-zero is regular output, not a tool error.
     async fn call(
         &self,
         ctx: BaseCtx,
         args: Self::Args,
         _resources: Vec<Resource>,
     ) -> Result<ToolOutput<Self::Output>, BoxError> {
-        let hook = ctx.get_state::<ShellToolHook>();
-        let args = if let Some(hook) = &hook {
-            hook.before_tool_call(&ctx, args).await?
-        } else {
-            args
-        };
+        let ctx = &ctx;
+        hooked_call(ctx, args, |args| async move {
+            let command = args.command.clone();
+            let envs = self.collect_shell_env_vars(&args.env_keys);
 
-        let command = args.command.clone();
-        let envs = self.collect_shell_env_vars(&args.env_keys);
+            let result = tokio::time::timeout(
+                Duration::from_secs(SHELL_TIMEOUT_SECS),
+                self.runtime.execute(ctx.clone(), args, envs),
+            )
+            .await;
 
-        let result = tokio::time::timeout(
-            Duration::from_secs(SHELL_TIMEOUT_SECS),
-            self.runtime.execute(ctx.clone(), args, envs),
-        )
-        .await;
+            let rt = match result {
+                Ok(Ok(output)) => ToolOutput::new(output),
+                Ok(Err(err)) => ToolOutput {
+                    is_error: Some(true),
+                    ..ToolOutput::new(ExecOutput {
+                        stderr: Some(format!(
+                            "Failed to execute command: {command}, error: {err}"
+                        )),
+                        ..Default::default()
+                    })
+                },
+                Err(_) => ToolOutput {
+                    is_error: Some(true),
+                    ..ToolOutput::new(ExecOutput {
+                        stderr: Some(format!(
+                            "Failed to execute command: {command}, error: timed out after {SHELL_TIMEOUT_SECS}s and was killed"
+                        )),
+                        ..Default::default()
+                    })
+                },
+            };
 
-        let rt = match result {
-            Ok(Ok(output)) => ToolOutput::new(output),
-            Ok(Err(err)) => ToolOutput::new(ExecOutput {
-                stderr: Some(format!(
-                    "Failed to execute command: {command}, error: {err}"
-                )),
-                ..Default::default()
-            }),
-            Err(_) => ToolOutput::new(ExecOutput {
-                stderr: Some(format!(
-                    "Failed to execute command: {command}, error: timed out after {SHELL_TIMEOUT_SECS}s and was killed"
-                )),
-                ..Default::default()
-            }),
-        };
-
-        if let Some(hook) = &hook {
-            hook.after_tool_call(&ctx, rt).await
-        } else {
             Ok(rt)
-        }
+        })
+        .await
     }
 }
 

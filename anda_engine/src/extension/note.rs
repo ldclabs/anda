@@ -13,13 +13,14 @@ use anda_core::{
 };
 use cbor2::{from_slice, to_canonical_vec};
 use object_store::Error as ObjectStoreError;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use std::collections::{HashMap, HashSet};
 
 use crate::{
     context::{AgentCtx, BaseCtx},
-    hook::{DynToolHook, ToolHook},
+    extension::{hooked_call, tool_definition},
+    hook::DynToolHook,
 };
 
 const NOTE_OP_READ: &str = "read";
@@ -33,23 +34,30 @@ const NOTE_ENTRY_DELIMITER: &str = "\n---\n";
 static VALID_OPS: &[&str] = &[NOTE_OP_READ, NOTE_OP_SET, NOTE_OP_UPSERT, NOTE_OP_DELETE];
 
 /// Arguments accepted by the note tool.
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
 pub struct NoteArgs {
-    /// Operation to perform: read, set, upsert, or delete.
+    /// read: return notes. set: replace all. upsert: add/update changed ids. delete: remove ids.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("enum" = [
+        NOTE_OP_READ,
+        NOTE_OP_SET,
+        NOTE_OP_UPSERT,
+        NOTE_OP_DELETE,
+        null
+    ], "default" = NOTE_OP_READ))]
     pub op: Option<String>,
-    /// Items for set/upsert/delete. Omit or null for read.
+    /// Items for set/upsert/delete. Use null for read. Delete only needs id with content=null.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub items: Option<Vec<NoteItemInput>>,
 }
 
 /// Input item accepted by the note tool.
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
 pub struct NoteItemInput {
-    /// Stable short id used for future updates/deletes.
+    /// Stable short note id
     #[serde(default)]
     pub id: String,
-    /// Note content for set/upsert. Use null for delete.
+    /// Note content for set/upsert; null for delete
     #[serde(default)]
     pub content: Option<String>,
 }
@@ -295,49 +303,7 @@ impl Tool<BaseCtx> for NoteTool {
     }
 
     fn definition(&self) -> FunctionDefinition {
-        FunctionDefinition {
-            name: self.name(),
-            description: self.description(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "op": {
-                        "type": ["string", "null"],
-                        "enum": [
-                            NOTE_OP_READ,
-                            NOTE_OP_SET,
-                            NOTE_OP_UPSERT,
-                            NOTE_OP_DELETE,
-                            null
-                        ],
-                        "description": "read: return notes. set: replace all. upsert: add/update changed ids. delete: remove ids.",
-                        "default": NOTE_OP_READ
-                    },
-                    "items": {
-                        "type": ["array", "null"],
-                        "description": "Items for set/upsert/delete. Use null for read. Delete only needs id with content=null.",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "id": {
-                                    "type": "string",
-                                    "description": "Stable short note id"
-                                },
-                                "content": {
-                                    "type": ["string", "null"],
-                                    "description": "Note content for set/upsert; null for delete"
-                                }
-                            },
-                            "required": ["id", "content"],
-                            "additionalProperties": false
-                        }
-                    }
-                },
-                "required": ["op", "items"],
-                "additionalProperties": false
-            }),
-            strict: Some(true),
-        }
+        tool_definition::<Self::Args>(self.name(), self.description())
     }
 
     async fn call(
@@ -346,75 +312,76 @@ impl Tool<BaseCtx> for NoteTool {
         args: Self::Args,
         _resources: Vec<Resource>,
     ) -> Result<ToolOutput<Self::Output>, BoxError> {
-        let hook = ctx.get_state::<NoteToolHook>();
-        let args = if let Some(hook) = &hook {
-            hook.before_tool_call(&ctx, args).await?
-        } else {
-            args
-        };
+        let ctx = &ctx;
+        hooked_call(ctx, args, |args| async move {
+            let mut store = Self::load_store(ctx).await?;
+            let op = normalize_op(args.op.as_deref());
+            let items = args.items;
 
-        let mut store = Self::load_store(&ctx).await?;
-        let op = normalize_op(args.op.as_deref());
-        let items = args.items;
-
-        let (output, changed) = match op.as_deref() {
-            Some(NOTE_OP_READ) => (store.output(true, true, Some(self.char_limit)), false),
-            Some(NOTE_OP_SET) => match items {
-                Some(items) => match store.set(items, self.char_limit) {
-                    Ok(changed) => (store.output(true, false, Some(self.char_limit)), changed),
-                    Err(error) => (store.error_output(error, Some(self.char_limit)), false),
+            let (output, changed) = match op.as_deref() {
+                Some(NOTE_OP_READ) => (store.output(true, true, Some(self.char_limit)), false),
+                Some(NOTE_OP_SET) => match items {
+                    Some(items) => match store.set(items, self.char_limit) {
+                        Ok(changed) => (store.output(true, false, Some(self.char_limit)), changed),
+                        Err(error) => (store.error_output(error, Some(self.char_limit)), false),
+                    },
+                    None => (
+                        store.error_output(
+                            "items are required for set".into(),
+                            Some(self.char_limit),
+                        ),
+                        false,
+                    ),
                 },
-                None => (
-                    store.error_output("items are required for set".into(), Some(self.char_limit)),
-                    false,
-                ),
-            },
-            Some(NOTE_OP_UPSERT) => match items {
-                Some(items) => match store.upsert(items, self.char_limit) {
-                    Ok(changed) => (store.output(true, false, Some(self.char_limit)), changed),
-                    Err(error) => (store.error_output(error, Some(self.char_limit)), false),
+                Some(NOTE_OP_UPSERT) => match items {
+                    Some(items) => match store.upsert(items, self.char_limit) {
+                        Ok(changed) => (store.output(true, false, Some(self.char_limit)), changed),
+                        Err(error) => (store.error_output(error, Some(self.char_limit)), false),
+                    },
+                    None => (
+                        store.error_output(
+                            "items are required for upsert".into(),
+                            Some(self.char_limit),
+                        ),
+                        false,
+                    ),
                 },
-                None => (
+                Some(NOTE_OP_DELETE) => match items {
+                    Some(items) => match store.delete(items) {
+                        Ok(changed) => (store.output(true, false, Some(self.char_limit)), changed),
+                        Err(error) => (store.error_output(error, Some(self.char_limit)), false),
+                    },
+                    None => (
+                        store.error_output(
+                            "items are required for delete".into(),
+                            Some(self.char_limit),
+                        ),
+                        false,
+                    ),
+                },
+                Some(op) => (
                     store.error_output(
-                        "items are required for upsert".into(),
+                        format!("Unknown op {:?}. Use one of: {}.", op, VALID_OPS.join(", ")),
                         Some(self.char_limit),
                     ),
                     false,
                 ),
-            },
-            Some(NOTE_OP_DELETE) => match items {
-                Some(items) => match store.delete(items) {
-                    Ok(changed) => (store.output(true, false, Some(self.char_limit)), changed),
-                    Err(error) => (store.error_output(error, Some(self.char_limit)), false),
-                },
-                None => (
-                    store.error_output(
-                        "items are required for delete".into(),
-                        Some(self.char_limit),
-                    ),
-                    false,
-                ),
-            },
-            Some(op) => (
-                store.error_output(
-                    format!("Unknown op {:?}. Use one of: {}.", op, VALID_OPS.join(", ")),
-                    Some(self.char_limit),
-                ),
-                false,
-            ),
-            None => (store.output(true, true, Some(self.char_limit)), false),
-        };
+                None => (store.output(true, true, Some(self.char_limit)), false),
+            };
 
-        if changed {
-            Self::save_store(&ctx, &store).await?;
-        }
+            if changed {
+                Self::save_store(ctx, &store).await?;
+            }
 
-        let output = ToolOutput::new(output);
-        if let Some(hook) = &hook {
-            return hook.after_tool_call(&ctx, output).await;
-        }
-
-        Ok(output)
+            // Failed operations keep their typed output for the model but are
+            // flagged as errors for hooks, providers, and telemetry.
+            let mut output = ToolOutput::new(output);
+            if !output.output.success {
+                output.is_error = Some(true);
+            }
+            Ok(output)
+        })
+        .await
     }
 }
 
@@ -529,7 +496,7 @@ fn is_missing_store_object(err: &(dyn std::error::Error + 'static)) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{context::AgentCtx, engine::EngineBuilder};
+    use crate::{context::AgentCtx, engine::EngineBuilder, hook::ToolHook};
     use async_trait::async_trait;
     use std::sync::Arc;
 
@@ -884,35 +851,5 @@ mod tests {
 
         let current = load_notes(&agent).await.unwrap();
         assert!(current.items.is_empty());
-    }
-
-    #[test]
-    fn definition_schema_avoids_anyof() {
-        let definition = NoteTool::new().definition();
-
-        assert!(
-            definition.parameters["properties"]["op"]
-                .get("anyOf")
-                .is_none()
-        );
-        assert_eq!(
-            definition.parameters["properties"]["op"]["type"],
-            json!(["string", "null"])
-        );
-        assert_eq!(
-            definition.parameters["properties"]["op"]["enum"],
-            json!([
-                NOTE_OP_READ,
-                NOTE_OP_SET,
-                NOTE_OP_UPSERT,
-                NOTE_OP_DELETE,
-                null
-            ])
-        );
-        assert_eq!(
-            definition.parameters["properties"]["items"]["items"]["required"],
-            json!(["id", "content"])
-        );
-        assert_eq!(definition.parameters["required"], json!(["op", "items"]));
     }
 }

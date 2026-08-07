@@ -8,8 +8,8 @@ use anda_core::{
     BoxError, FunctionDefinition, Resource, StateFeatures, Tool, ToolGroupInfo, ToolOutput,
 };
 use ic_auth_types::ByteBufB64;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use std::path::PathBuf;
 
 use super::{
@@ -18,18 +18,19 @@ use super::{
 };
 use crate::{
     context::BaseCtx,
-    hook::{DynToolHook, ToolHook},
+    extension::{hooked_call, tool_definition},
+    hook::DynToolHook,
 };
 
 /// Arguments for filesystem read operations.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 pub struct ReadFileArgs {
-    /// Relative or absolute path to a file inside the workspace.
+    /// Path to the file. Relative paths resolve from the configured workspaces in priority order; absolute paths must be inside one configured workspace.
     pub path: String,
-    /// Zero-based line offset for text output.
+    /// Zero-based line offset for decoded text output (default: 0)
     #[serde(default)]
     pub offset: usize,
-    /// Maximum number of text lines to return. `0` means all remaining lines.
+    /// Maximum number of decoded text lines to return (default: 0, all remaining lines). Responses are capped at 256KiB and marked with `truncated: true` when cut; use offset and limit to page through large files.
     #[serde(default)]
     pub limit: usize,
 }
@@ -119,30 +120,7 @@ impl Tool<BaseCtx> for ReadFileTool {
     }
 
     fn definition(&self) -> FunctionDefinition {
-        FunctionDefinition {
-            name: self.name(),
-            description: self.description(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Path to the file. Relative paths resolve from the configured workspaces in priority order; absolute paths must be inside one configured workspace."
-                    },
-                    "offset": {
-                        "type": "integer",
-                        "description": "Zero-based line offset for decoded text output (default: 0)"
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum number of decoded text lines to return (default: 0, all remaining lines). Responses are capped at 256KiB and marked with `truncated: true` when cut; use offset and limit to page through large files."
-                    }
-                },
-                "required": ["path", "offset", "limit"],
-                "additionalProperties": false
-            }),
-            strict: Some(true),
-        }
+        tool_definition::<Self::Args>(self.name(), self.description())
     }
 
     async fn call(
@@ -151,86 +129,78 @@ impl Tool<BaseCtx> for ReadFileTool {
         args: Self::Args,
         _resources: Vec<Resource>,
     ) -> Result<ToolOutput<Self::Output>, BoxError> {
-        let hook = ctx.get_state::<ReadFileHook>();
+        let ctx = &ctx;
+        hooked_call(ctx, args, |args| async move {
+            let scope = WorkspaceScope::for_call(ctx.meta(), &self.workspaces).await;
+            let target = scope.open_read(&args.path).await?;
+            let workspace_display = target.workspace.display().to_string();
+            let meta = target.metadata;
+            let resolved_path = target.path;
 
-        let args = if let Some(hook) = &hook {
-            hook.before_tool_call(&ctx, args).await?
-        } else {
-            args
-        };
-
-        let scope = WorkspaceScope::for_call(ctx.meta(), &self.workspaces).await;
-        let target = scope.open_read(&args.path).await?;
-        let workspace_display = target.workspace.display().to_string();
-        let meta = target.metadata;
-        let resolved_path = target.path;
-
-        let data = tokio::fs::read(&resolved_path).await.map_err(|err| {
-            format!(
-                "Failed to read file (workspace: {}, requested_path: {}, resolved_path: {}): {err}",
-                workspace_display,
-                args.path,
-                resolved_path.display()
-            )
-        })?;
-        let mut output = ReadFileOutput {
-            content: String::new(),
-            encoding: UTF8_ENCODING.to_string(),
-            size: meta.len(),
-            ..Default::default()
-        };
-        if let Some(kind) = infer2::get(&data) {
-            output.mime_type = Some(kind.mime_type().to_string());
-        }
-        match decode_file_text(data) {
-            Ok(decoded) => {
-                output.encoding = decoded.encoding;
-                let text = decoded.text;
-                output.total_lines = Some(text.lines().count());
-                if args.offset == 0 && args.limit == 0 {
-                    output.content = text;
-                } else if args.limit == 0 {
-                    output.content = text
-                        .lines()
-                        .skip(args.offset)
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                } else {
-                    output.content = text
-                        .lines()
-                        .skip(args.offset)
-                        .take(args.limit)
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                }
-                output.truncated =
-                    truncate_inline_text(&mut output.content, MAX_INLINE_CONTENT_BYTES);
+            let data = tokio::fs::read(&resolved_path).await.map_err(|err| {
+                format!(
+                    "Failed to read file (workspace: {}, requested_path: {}, resolved_path: {}): {err}",
+                    workspace_display,
+                    args.path,
+                    resolved_path.display()
+                )
+            })?;
+            let mut output = ReadFileOutput {
+                content: String::new(),
+                encoding: UTF8_ENCODING.to_string(),
+                size: meta.len(),
+                ..Default::default()
+            };
+            if let Some(kind) = infer2::get(&data) {
+                output.mime_type = Some(kind.mime_type().to_string());
             }
-            Err(mut bytes) => {
-                // Cap binary previews as well; keep the length a multiple of 3 so the
-                // base64 prefix decodes cleanly.
-                let max_raw_bytes = MAX_INLINE_CONTENT_BYTES / 4 * 3;
-                if bytes.len() > max_raw_bytes {
-                    bytes.truncate(max_raw_bytes);
-                    output.truncated = true;
+            match decode_file_text(data) {
+                Ok(decoded) => {
+                    output.encoding = decoded.encoding;
+                    let text = decoded.text;
+                    output.total_lines = Some(text.lines().count());
+                    if args.offset == 0 && args.limit == 0 {
+                        output.content = text;
+                    } else if args.limit == 0 {
+                        output.content = text
+                            .lines()
+                            .skip(args.offset)
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                    } else {
+                        output.content = text
+                            .lines()
+                            .skip(args.offset)
+                            .take(args.limit)
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                    }
+                    output.truncated =
+                        truncate_inline_text(&mut output.content, MAX_INLINE_CONTENT_BYTES);
                 }
-                output.content = ByteBufB64(bytes).to_base64();
-                output.encoding = BASE64_ENCODING.to_string();
+                Err(mut bytes) => {
+                    // Cap binary previews as well; keep the length a multiple of 3 so the
+                    // base64 prefix decodes cleanly.
+                    let max_raw_bytes = MAX_INLINE_CONTENT_BYTES / 4 * 3;
+                    if bytes.len() > max_raw_bytes {
+                        bytes.truncate(max_raw_bytes);
+                        output.truncated = true;
+                    }
+                    output.content = ByteBufB64(bytes).to_base64();
+                    output.encoding = BASE64_ENCODING.to_string();
+                }
             }
-        }
 
-        if let Some(hook) = &hook {
-            return hook.after_tool_call(&ctx, ToolOutput::new(output)).await;
-        }
-
-        Ok(ToolOutput::new(output))
+            Ok(ToolOutput::new(output))
+        })
+        .await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::EngineBuilder;
+    use crate::{engine::EngineBuilder, hook::ToolHook};
     use serde_json::json;
     use std::{
         path::{Path, PathBuf},

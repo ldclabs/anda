@@ -22,9 +22,7 @@
 //!     .build("default_agent".to_string())?;
 //! ```
 
-use anda_core::{
-    BoxError, FunctionDefinition, HttpFeatures, Json, Resource, Tool, ToolOutput, gen_schema_for,
-};
+use anda_core::{BoxError, FunctionDefinition, HttpFeatures, Resource, Tool, ToolOutput};
 use encoding_rs::Encoding;
 use futures_util::StreamExt;
 use http::header;
@@ -34,7 +32,11 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 
-use crate::context::BaseCtx;
+use crate::{
+    context::BaseCtx,
+    extension::{hooked_call, tool_definition},
+    hook::DynToolHook,
+};
 
 /// Maximum response body size accepted by [`FetchWebResourcesTool::fetch`].
 ///
@@ -127,6 +129,9 @@ pub struct FetchWebResourcesArgs {
     pub url: String,
 }
 
+/// Typed hook for fetch tool calls.
+pub type FetchToolHook = DynToolHook<FetchWebResourcesArgs, String>;
+
 /// Fetch Resources Tool implementation
 ///
 /// Provides functionality to fetch content from web URLs and return it as a string.
@@ -141,17 +146,8 @@ pub struct FetchWebResourcesArgs {
 /// - Uses GET method for all requests
 /// - Sets appropriate Accept headers for broad compatibility
 /// - Handles HTTP status codes and error responses
-#[derive(Debug, Clone)]
-pub struct FetchWebResourcesTool {
-    /// JSON schema for the fetch arguments
-    schema: Json,
-}
-
-impl Default for FetchWebResourcesTool {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+#[derive(Debug, Clone, Default)]
+pub struct FetchWebResourcesTool;
 
 impl FetchWebResourcesTool {
     /// Function name used when registering the fetch tool.
@@ -159,8 +155,7 @@ impl FetchWebResourcesTool {
 
     /// Creates a new FetchWebResourcesTool instance
     pub fn new() -> Self {
-        let schema = gen_schema_for::<FetchWebResourcesArgs>();
-        Self { schema }
+        Self
     }
 
     /// Fetches content from the specified URL
@@ -300,12 +295,7 @@ impl Tool<BaseCtx> for FetchWebResourcesTool {
     }
 
     fn definition(&self) -> FunctionDefinition {
-        FunctionDefinition {
-            name: self.name(),
-            description: self.description(),
-            parameters: self.schema.clone(),
-            strict: Some(true),
-        }
+        tool_definition::<Self::Args>(self.name(), self.description())
     }
 
     /// Executes the fetch operation
@@ -323,10 +313,15 @@ impl Tool<BaseCtx> for FetchWebResourcesTool {
         args: Self::Args,
         _resources: Vec<Resource>,
     ) -> Result<ToolOutput<Self::Output>, BoxError> {
-        // The URL here is model-controlled, so reject internal/metadata targets before fetching.
-        validate_public_url(&args.url).await?;
-        let text = FetchWebResourcesTool::fetch_as_text(&ctx, &args.url).await?;
-        Ok(ToolOutput::new(text))
+        let ctx = &ctx;
+        hooked_call(ctx, args, |args| async move {
+            // The URL here is model-controlled, so reject internal/metadata targets
+            // before fetching.
+            validate_public_url(&args.url).await?;
+            let text = FetchWebResourcesTool::fetch_as_text(ctx, &args.url).await?;
+            Ok(ToolOutput::new(text))
+        })
+        .await
     }
 }
 
@@ -507,7 +502,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn fetch_tool_definition_and_http_error_paths_are_stable() {
-        let tool = FetchWebResourcesTool::default();
+        let tool = FetchWebResourcesTool::new();
         assert_eq!(tool.name(), FetchWebResourcesTool::NAME);
         assert!(tool.description().contains("Fetches resources"));
         let definition = tool.definition();

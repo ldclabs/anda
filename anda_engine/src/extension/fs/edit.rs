@@ -6,8 +6,8 @@
 use anda_core::{
     BoxError, FunctionDefinition, Resource, StateFeatures, Tool, ToolGroupInfo, ToolOutput,
 };
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use std::path::PathBuf;
 
 use super::{
@@ -16,19 +16,20 @@ use super::{
 };
 use crate::{
     context::BaseCtx,
-    hook::{DynToolHook, ToolHook},
+    extension::{hooked_call, tool_definition},
+    hook::DynToolHook,
 };
 
 /// Arguments for filesystem edit operations.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 pub struct EditFileArgs {
-    /// Relative or absolute path to a text file inside the workspace.
+    /// Path to the text file. Relative paths resolve from the configured workspaces in priority order; absolute paths must be inside one configured workspace.
     pub path: String,
-    /// The old string to replace.
+    /// Old decoded text string to replace.
     pub old_string: String,
-    /// The replacement string.
+    /// Replacement decoded text string.
     pub new_string: String,
-    /// Maximum number of replacements to apply. `0` means replace all matches.
+    /// Maximum number of replacements to apply (default: 0, replace all matches).
     #[serde(default)]
     pub limit: usize,
 }
@@ -108,34 +109,7 @@ impl Tool<BaseCtx> for EditFileTool {
     }
 
     fn definition(&self) -> FunctionDefinition {
-        FunctionDefinition {
-            name: self.name(),
-            description: self.description(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Path to the text file. Relative paths resolve from the configured workspaces in priority order; absolute paths must be inside one configured workspace."
-                    },
-                    "old_string": {
-                        "type": "string",
-                        "description": "Old decoded text string to replace."
-                    },
-                    "new_string": {
-                        "type": "string",
-                        "description": "Replacement decoded text string."
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum number of replacements to apply (default: 0, replace all matches)."
-                    }
-                },
-                "required": ["path", "old_string", "new_string", "limit"],
-                "additionalProperties": false
-            }),
-            strict: Some(true),
-        }
+        tool_definition::<Self::Args>(self.name(), self.description())
     }
 
     async fn call(
@@ -144,14 +118,8 @@ impl Tool<BaseCtx> for EditFileTool {
         args: Self::Args,
         _resources: Vec<Resource>,
     ) -> Result<ToolOutput<Self::Output>, BoxError> {
-        let hook = ctx.get_state::<EditFileHook>();
-
-        let args = if let Some(hook) = &hook {
-            hook.before_tool_call(&ctx, args).await?
-        } else {
-            args
-        };
-
+        let ctx = &ctx;
+        hooked_call(ctx, args, |args| async move {
         let scope = WorkspaceScope::for_call(ctx.meta(), &self.workspaces).await;
 
         if args.old_string.is_empty() {
@@ -250,18 +218,16 @@ impl Tool<BaseCtx> for EditFileTool {
             }
         };
 
-        if let Some(hook) = &hook {
-            return hook.after_tool_call(&ctx, ToolOutput::new(output)).await;
-        }
-
         Ok(ToolOutput::new(output))
+        })
+        .await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::EngineBuilder;
+    use crate::{engine::EngineBuilder, hook::ToolHook};
     use serde_json::json;
     use std::{
         path::{Path, PathBuf},
