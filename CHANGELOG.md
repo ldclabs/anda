@@ -72,7 +72,8 @@ next `anda_engine` release should be a minor version bump.
     token); the fetch, skills-manager, and memory tools gain hook support
     (new `FetchToolHook` / `SkillToolHook` aliases; the two KIP tools share
     the `DynToolHook<Request, Response>` slot since hooks are keyed by
-    argument/output types).
+    argument/output types — a hook tells them apart through the new
+    `BaseCtx::path()`).
   - The note tool's failed operations (missing items, size limit, unknown op)
     and the shell tool's executor-failure and timeout outcomes still resolve
     to `Ok` with the same typed output, but are now flagged with
@@ -99,6 +100,10 @@ next `anda_engine` release should be a minor version bump.
 - **`context::DiscoveredTools`** — Discovery-tool policy (observation, merge
   probing, output compaction) extracted from the completion runner into the
   module that owns the discovery vocabulary.
+- **`BaseCtx::path()`** — Public accessor for the context namespace path
+  (`a_<agent>` for an agent call, `t_<tool>` for a tool call). Tool hooks are
+  keyed by argument/output types, so two tools with identical `Args`/`Output`
+  share one hook slot; this is how a hook identifies which one invoked it.
 
 ### Fixed — anda_engine
 

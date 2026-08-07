@@ -744,6 +744,10 @@ mod tests {
             missing_items.output.error.as_deref(),
             Some("items are required for upsert")
         );
+        // A domain failure keeps its typed output but is flagged for hooks,
+        // providers, and telemetry.
+        assert!(!missing_items.output.success);
+        assert_eq!(missing_items.is_error, Some(true));
         assert_eq!(missing_items.output.summary.limit, Some(32));
 
         let missing_content = tool
@@ -761,6 +765,7 @@ mod tests {
             missing_content.output.error.as_deref(),
             Some("items[0].content is required")
         );
+        assert_eq!(missing_content.is_error, Some(true));
 
         let unknown = tool
             .call(
@@ -780,12 +785,16 @@ mod tests {
                 .as_deref()
                 .is_some_and(|error| error.contains("Unknown op"))
         );
+        assert_eq!(unknown.is_error, Some(true));
 
         let read = tool
             .call(ctx, NoteArgs::default(), Vec::new())
             .await
             .unwrap();
         assert!(read.output.items.is_empty());
+        // A successful read is never flagged.
+        assert!(read.output.success);
+        assert_eq!(read.is_error, None);
     }
 
     #[tokio::test]

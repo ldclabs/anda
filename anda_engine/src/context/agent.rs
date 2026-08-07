@@ -1161,6 +1161,17 @@ mod tests {
             tool_ctx.get_state::<String>().as_deref(),
             Some("parent-state")
         );
+
+        // Tools sharing one `DynToolHook` slot (same argument/output types) are
+        // distinguishable only through the public context path.
+        assert_eq!(
+            child.child_base("execute_kip").unwrap().path().as_ref(),
+            "t_execute_kip"
+        );
+        assert_eq!(
+            child.child_base("memory_readonly").unwrap().path().as_ref(),
+            "t_memory_readonly"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -120,105 +120,105 @@ impl Tool<BaseCtx> for EditFileTool {
     ) -> Result<ToolOutput<Self::Output>, BoxError> {
         let ctx = &ctx;
         hooked_call(ctx, args, |args| async move {
-        let scope = WorkspaceScope::for_call(ctx.meta(), &self.workspaces).await;
+            let scope = WorkspaceScope::for_call(ctx.meta(), &self.workspaces).await;
 
-        if args.old_string.is_empty() {
-            return Err(format!(
-                "Old string must not be empty (workspace: {}, path: {})",
-                scope.display(),
-                args.path
-            )
-            .into());
-        }
-
-        let target = scope.open_edit(&args.path).await?;
-        let workspace_display = target.workspace.display().to_string();
-        let resolved_path = &target.path;
-
-        let data = tokio::fs::read(resolved_path).await.map_err(|err| {
-            format!(
-                "Failed to read file (workspace: {}, requested_path: {}, resolved_path: {}): {err}",
-                workspace_display,
-                args.path,
-                resolved_path.display()
-            )
-        })?;
-        let original_size = data.len() as u64;
-        let decoded = decode_file_text(data).map_err(|_| {
-            format!(
-                "Editing binary or unsupported-encoding files is not supported (workspace: {}, requested_path: {}, resolved_path: {})",
-                workspace_display,
-                args.path,
-                resolved_path.display()
-            )
-        })?;
-        let encoding = decoded.encoding;
-        let text = decoded.text;
-        let total_matches = text.match_indices(&args.old_string).count();
-
-        let replacements = if args.limit == 0 {
-            total_matches
-        } else {
-            total_matches.min(args.limit)
-        };
-
-        let output = if total_matches == 0 || args.old_string == args.new_string {
-            EditFileOutput {
-                replacements,
-                total_matches,
-                size: original_size,
-            }
-        } else {
-            // `old_string`, `new_string`, and `limit` are all model-supplied, so the
-            // replacement can expand the file without bound: 10 MiB of single-byte matches
-            // against an 8 KiB replacement is ~85 GiB, and an allocation failure aborts the
-            // whole process rather than failing this one call. The input cap bounds the
-            // input, so bound the output the same way and reject before allocating.
-            let projected_len = text
-                .len()
-                .saturating_sub(replacements.saturating_mul(args.old_string.len()))
-                .saturating_add(replacements.saturating_mul(args.new_string.len()));
-            if projected_len as u64 > MAX_FILE_SIZE_BYTES {
+            if args.old_string.is_empty() {
                 return Err(format!(
-                    "Edit result exceeds the maximum file size (workspace: {}, requested_path: {}, resolved_path: {}, projected_size: {projected_len}, max_size: {MAX_FILE_SIZE_BYTES}, replacements: {replacements})",
-                    workspace_display,
-                    args.path,
-                    resolved_path.display(),
+                    "Old string must not be empty (workspace: {}, path: {})",
+                    scope.display(),
+                    args.path
                 )
                 .into());
             }
 
-            let updated = if args.limit == 0 {
-                text.replace(&args.old_string, &args.new_string)
-            } else {
-                text.replacen(&args.old_string, &args.new_string, args.limit)
-            };
-            let updated_bytes = encode_file_text(&updated, &encoding).map_err(|err| match err {
-                FileTextEncodeError::UnsupportedEncoding => format!(
-                    "Unsupported text encoding while editing file (workspace: {}, requested_path: {}, resolved_path: {}, encoding: {})",
-                    workspace_display,
-                    args.path,
-                    resolved_path.display(),
-                    encoding
-                ),
-                FileTextEncodeError::UnmappableCharacters => format!(
-                    "Failed to encode edited file (workspace: {}, requested_path: {}, resolved_path: {}, encoding: {}): {err}",
-                    workspace_display,
-                    args.path,
-                    resolved_path.display(),
-                    encoding
-                ),
-            })?;
-            let size = updated_bytes.len() as u64;
-            target.write_atomic(&updated_bytes).await?;
-            EditFileOutput {
-                replacements,
-                total_matches,
-                size,
-            }
-        };
+            let target = scope.open_edit(&args.path).await?;
+            let workspace_display = target.workspace.display().to_string();
+            let resolved_path = &target.path;
 
-        Ok(ToolOutput::new(output))
+            let data = tokio::fs::read(resolved_path).await.map_err(|err| {
+                format!(
+                    "Failed to read file (workspace: {}, requested_path: {}, resolved_path: {}): {err}",
+                    workspace_display,
+                    args.path,
+                    resolved_path.display()
+                )
+            })?;
+            let original_size = data.len() as u64;
+            let decoded = decode_file_text(data).map_err(|_| {
+                format!(
+                    "Editing binary or unsupported-encoding files is not supported (workspace: {}, requested_path: {}, resolved_path: {})",
+                    workspace_display,
+                    args.path,
+                    resolved_path.display()
+                )
+            })?;
+            let encoding = decoded.encoding;
+            let text = decoded.text;
+            let total_matches = text.match_indices(&args.old_string).count();
+
+            let replacements = if args.limit == 0 {
+                total_matches
+            } else {
+                total_matches.min(args.limit)
+            };
+
+            let output = if total_matches == 0 || args.old_string == args.new_string {
+                EditFileOutput {
+                    replacements,
+                    total_matches,
+                    size: original_size,
+                }
+            } else {
+                // `old_string`, `new_string`, and `limit` are all model-supplied, so the
+                // replacement can expand the file without bound: 10 MiB of single-byte matches
+                // against an 8 KiB replacement is ~85 GiB, and an allocation failure aborts the
+                // whole process rather than failing this one call. The input cap bounds the
+                // input, so bound the output the same way and reject before allocating.
+                let projected_len = text
+                    .len()
+                    .saturating_sub(replacements.saturating_mul(args.old_string.len()))
+                    .saturating_add(replacements.saturating_mul(args.new_string.len()));
+                if projected_len as u64 > MAX_FILE_SIZE_BYTES {
+                    return Err(format!(
+                        "Edit result exceeds the maximum file size (workspace: {}, requested_path: {}, resolved_path: {}, projected_size: {projected_len}, max_size: {MAX_FILE_SIZE_BYTES}, replacements: {replacements})",
+                        workspace_display,
+                        args.path,
+                        resolved_path.display(),
+                    )
+                    .into());
+                }
+
+                let updated = if args.limit == 0 {
+                    text.replace(&args.old_string, &args.new_string)
+                } else {
+                    text.replacen(&args.old_string, &args.new_string, args.limit)
+                };
+                let updated_bytes = encode_file_text(&updated, &encoding).map_err(|err| match err {
+                    FileTextEncodeError::UnsupportedEncoding => format!(
+                        "Unsupported text encoding while editing file (workspace: {}, requested_path: {}, resolved_path: {}, encoding: {})",
+                        workspace_display,
+                        args.path,
+                        resolved_path.display(),
+                        encoding
+                    ),
+                    FileTextEncodeError::UnmappableCharacters => format!(
+                        "Failed to encode edited file (workspace: {}, requested_path: {}, resolved_path: {}, encoding: {}): {err}",
+                        workspace_display,
+                        args.path,
+                        resolved_path.display(),
+                        encoding
+                    ),
+                })?;
+                let size = updated_bytes.len() as u64;
+                target.write_atomic(&updated_bytes).await?;
+                EditFileOutput {
+                    replacements,
+                    total_matches,
+                    size,
+                }
+            };
+
+            Ok(ToolOutput::new(output))
         })
         .await
     }

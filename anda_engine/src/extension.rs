@@ -121,6 +121,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::EngineBuilder;
     use crate::extension::{
         fetch::FetchWebResourcesTool,
         fs::{EditFileTool, ReadFileTool, SearchFileTool, WriteFileTool},
@@ -313,5 +314,56 @@ mod tests {
                 .unwrap()
                 .contains("SKILL.md file content")
         );
+    }
+
+    struct RewritingHook;
+
+    #[async_trait]
+    impl ToolHook<String, String> for RewritingHook {
+        async fn before_tool_call(&self, _ctx: &BaseCtx, args: String) -> Result<String, BoxError> {
+            Ok(format!("{args}+before"))
+        }
+
+        async fn after_tool_call(
+            &self,
+            _ctx: &BaseCtx,
+            output: ToolOutput<String>,
+        ) -> Result<ToolOutput<String>, BoxError> {
+            Ok(ToolOutput::new(format!("{}+after", output.output)))
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hooked_call_applies_the_hook_and_gates_on_cancellation() {
+        let ctx = EngineBuilder::new().mock_ctx().base;
+
+        // No hook registered: the body runs and its output passes through.
+        let output = hooked_call(&ctx, "args".to_string(), |args| async move {
+            Ok(ToolOutput::new(format!("{args}+run")))
+        })
+        .await
+        .unwrap();
+        assert_eq!(output.output, "args+run");
+
+        // With a hook: arguments are rewritten before the body, output after.
+        ctx.set_state(DynToolHook::new(
+            Arc::new(RewritingHook) as Arc<dyn ToolHook<String, String>>
+        ));
+        let output = hooked_call(&ctx, "args".to_string(), |args| async move {
+            Ok(ToolOutput::new(format!("{args}+run")))
+        })
+        .await
+        .unwrap();
+        assert_eq!(output.output, "args+before+run+after");
+
+        // An already-cancelled context fails before the hook or the body run.
+        ctx.cancellation_token().cancel();
+        let err = hooked_call(&ctx, "args".to_string(), |_args: String| async move {
+            unreachable!("the body must not run on a cancelled context")
+                as Result<ToolOutput<String>, BoxError>
+        })
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("cancelled"));
     }
 }

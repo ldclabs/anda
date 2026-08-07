@@ -236,6 +236,18 @@ impl BaseCtx {
         self.state.write().insert(v)
     }
 
+    /// Returns this context's namespace path.
+    ///
+    /// The last segment identifies what the context was created for: `a_<agent
+    /// name>` for an agent call and `t_<tool name>` for a tool call, both
+    /// lowercased. This is how a [`ToolHook`](crate::hook::ToolHook) tells apart
+    /// two tools that share one hook slot — hooks are keyed by argument/output
+    /// types, so tools with identical `Args`/`Output` (for example the two KIP
+    /// tools, `execute_kip` and `memory_readonly`) receive the same hook.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// Strips this context's path prefix from `path` when it is present.
     pub fn try_strip_prefix_path<'a>(&'a self, path: &'a Path) -> Cow<'a, Path> {
         if let Some(p) = path.prefix_match(&self.path) {
@@ -673,6 +685,7 @@ mod tests {
             .child("worker_agent".to_string(), "Worker/Path".to_string())
             .unwrap();
         assert_eq!(agent_child.path.as_ref(), "worker/path");
+        assert_eq!(agent_child.path(), &agent_child.path);
         assert_eq!(agent_child.agent, "worker_agent");
         assert_eq!(agent_child.caller, Principal::anonymous());
         assert_eq!(agent_child.depth, 1);

@@ -1225,7 +1225,8 @@ impl Tool<BaseCtx> for MemoryReadonly {
     ) -> Result<ToolOutput<Self::Output>, BoxError> {
         // Note: this tool shares `DynToolHook<Request, Response>` with
         // `execute_kip` — the hook state is keyed by argument/output types. A
-        // hook that must tell them apart can inspect the context path.
+        // hook that must tell them apart can compare `BaseCtx::path()`, whose
+        // last segment is `t_memory_readonly` here and `t_execute_kip` there.
         hooked_call(&ctx, request, |mut request| async move {
             let (_, res) = request.readonly().execute(self.memory.nexus.as_ref()).await;
             Ok(ToolOutput {
@@ -1324,7 +1325,7 @@ pub struct ListConversationsArgs {
     /// The cursor for pagination, returned from the previous call. Use an empty string for the first page.
     #[serde(default)]
     pub cursor: String,
-    /// The maximum number of conversations to return, between 1 and 100. Default is 10.
+    /// The maximum number of conversations to return, clamped to 1-100 (default: 0, which applies the built-in default of 10)
     #[serde(default)]
     pub limit: usize,
 }
@@ -1411,7 +1412,7 @@ impl Tool<BaseCtx> for ListConversationsTool {
 pub struct SearchConversationsArgs {
     /// The query string to search for in the conversation history.
     pub query: String,
-    /// The maximum number of conversations to return, between 1 and 100. Default is 10.
+    /// The maximum number of conversations to return, clamped to 1-100 (default: 0, which applies the built-in default of 10)
     #[serde(default)]
     pub limit: usize,
 }

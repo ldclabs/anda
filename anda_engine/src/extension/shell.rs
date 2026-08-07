@@ -765,6 +765,103 @@ mod tests {
         }
     }
 
+    /// Executor whose `execute` either fails or succeeds, so the tool's error
+    /// policy can be observed without spawning a process.
+    struct ScriptedRuntime {
+        workspace: PathBuf,
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl Executor for ScriptedRuntime {
+        fn name(&self) -> &str {
+            "scripted"
+        }
+
+        fn workspace(&self) -> &PathBuf {
+            &self.workspace
+        }
+
+        fn shell(&self) -> &str {
+            "sh"
+        }
+
+        async fn execute(
+            &self,
+            _ctx: BaseCtx,
+            _input: ExecArgs,
+            _envs: HashMap<String, String>,
+        ) -> Result<ExecOutput, BoxError> {
+            if self.fail {
+                return Err("spawn refused".into());
+            }
+            // A command that ran and exited non-zero is regular output.
+            Ok(ExecOutput {
+                exit_status: Some("exit status: 1".to_string()),
+                stderr: Some("boom".to_string()),
+                ..Default::default()
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn executor_failure_keeps_typed_output_and_flags_is_error() {
+        let ctx = crate::engine::EngineBuilder::new().mock_ctx().base;
+        let workspace = std::env::temp_dir();
+
+        let failing = ShellTool::new(
+            Arc::new(ScriptedRuntime {
+                workspace: workspace.clone(),
+                fail: true,
+            }),
+            HashMap::new(),
+            None,
+        );
+        let output = failing
+            .call(
+                ctx.clone(),
+                ExecArgs {
+                    command: "true".to_string(),
+                    ..Default::default()
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.is_error, Some(true));
+        assert!(
+            output
+                .output
+                .stderr
+                .as_deref()
+                .is_some_and(|stderr| stderr.contains("spawn refused"))
+        );
+        assert_eq!(output.output.exit_status, None);
+
+        // A command that runs and exits non-zero stays regular output.
+        let running = ShellTool::new(
+            Arc::new(ScriptedRuntime {
+                workspace,
+                fail: false,
+            }),
+            HashMap::new(),
+            None,
+        );
+        let output = running
+            .call(
+                ctx,
+                ExecArgs {
+                    command: "false".to_string(),
+                    ..Default::default()
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.is_error, None);
+        assert_eq!(output.output.exit_status.as_deref(), Some("exit status: 1"));
+    }
+
     struct TestTempDir(PathBuf);
 
     impl TestTempDir {
