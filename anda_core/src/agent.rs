@@ -14,18 +14,13 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::{
-    any::Any,
-    collections::{BTreeMap, BTreeSet},
-    future::Future,
-    marker::PhantomData,
-    sync::Arc,
-};
+use std::{any::Any, collections::BTreeMap, future::Future, marker::PhantomData, sync::Arc};
 
 use crate::{
     BoxError, BoxPinFut, Function, ToolGroup, ToolGroupInfo,
     context::AgentContext,
     model::{AgentOutput, FunctionDefinition, Resource},
+    registry::{collect_groups, select_by_names},
     select_resources, validate_function_name,
 };
 
@@ -288,12 +283,10 @@ where
 pub struct AgentSet<C: AgentContext> {
     /// Registered agents keyed by their lowercase function names.
     ///
-    /// # Invariant
-    /// Keys must be lowercase names satisfying [`validate_function_name`] and
-    /// must equal the agent's own lowercased name. [`AgentSet::add`] enforces
-    /// this; code that mutates this map directly is responsible for upholding it,
-    /// since lookup and dispatch assume lowercase keys.
-    pub set: BTreeMap<String, Arc<dyn DynAgent<C>>>,
+    /// Keys are lowercase names satisfying [`validate_function_name`] and equal
+    /// each agent's own lowercased name; [`AgentSet::add_dyn`] is the only
+    /// insert path, so lookup and dispatch can assume lowercase keys.
+    set: BTreeMap<String, Arc<dyn DynAgent<C>>>,
 }
 
 impl<C> AgentSet<C>
@@ -329,24 +322,7 @@ where
     /// that group, sorted for determinism. Group metadata is taken from the
     /// first agent (by lowercase name order) that declares the id.
     pub fn groups(&self) -> Vec<ToolGroup> {
-        let mut grouped: BTreeMap<String, (ToolGroupInfo, Vec<String>)> = BTreeMap::new();
-        for (name, agent) in &self.set {
-            if let Some(info) = agent.group() {
-                grouped
-                    .entry(info.id.clone())
-                    .or_insert_with(|| (info, Vec::new()))
-                    .1
-                    .push(name.clone());
-            }
-        }
-
-        grouped
-            .into_values()
-            .map(|(info, mut members)| {
-                members.sort();
-                ToolGroup::from_info(info, members)
-            })
-            .collect()
+        collect_groups(self.set.iter().map(|(name, agent)| (name, agent.group())))
     }
 
     /// Returns the function definition for a specific agent.
@@ -358,32 +334,20 @@ where
 
     /// Returns function definitions for all agents or the selected names.
     ///
+    /// Requested names are matched case-insensitively and deduplicated.
+    ///
     /// # Arguments
     /// - `names`: Optional slice of agent names to filter by.
     ///
     /// # Returns
     /// A vector of agent definitions.
     pub fn definitions(&self, names: Option<&[String]>) -> Vec<FunctionDefinition> {
-        match names {
-            None => self.set.values().map(|agent| agent.definition()).collect(),
-            Some(names) => {
-                // Deduplicate by lowercase name so repeated requested names do
-                // not emit duplicate schemas (some providers reject those).
-                let mut seen = BTreeSet::new();
-                names
-                    .iter()
-                    .filter_map(|name| {
-                        let key = name.to_ascii_lowercase();
-                        self.set
-                            .get(&key)
-                            .and_then(|agent| seen.insert(key).then(|| agent.definition()))
-                    })
-                    .collect()
-            }
-        }
+        select_by_names(&self.set, names, |agent| agent.definition())
     }
 
     /// Returns function metadata for all agents or the selected names.
+    ///
+    /// Requested names are matched case-insensitively and deduplicated.
     ///
     /// # Arguments
     /// - `names`: Optional slice of agent names to filter by.
@@ -391,32 +355,10 @@ where
     /// # Returns
     /// A vector of agent function metadata.
     pub fn functions(&self, names: Option<&[String]>) -> Vec<Function> {
-        match names {
-            None => self
-                .set
-                .values()
-                .map(|agent| Function {
-                    definition: agent.definition(),
-                    supported_resource_tags: agent.supported_resource_tags(),
-                })
-                .collect(),
-            Some(names) => {
-                // Deduplicate by lowercase name (see `definitions`).
-                let mut seen = BTreeSet::new();
-                names
-                    .iter()
-                    .filter_map(|name| {
-                        let key = name.to_ascii_lowercase();
-                        self.set.get(&key).and_then(|agent| {
-                            seen.insert(key).then(|| Function {
-                                definition: agent.definition(),
-                                supported_resource_tags: agent.supported_resource_tags(),
-                            })
-                        })
-                    })
-                    .collect()
-            }
-        }
+        select_by_names(&self.set, names, |agent| Function {
+            definition: agent.definition(),
+            supported_resource_tags: agent.supported_resource_tags(),
+        })
     }
 
     /// Removes and returns resources supported by the named agent.
@@ -438,23 +380,37 @@ where
     ///
     /// # Arguments
     /// - `agent`: The agent to register.
+    /// - `label`: Optional context label; defaults to the lowercase agent name.
     pub fn add<T>(&mut self, agent: Arc<T>, label: Option<String>) -> Result<(), BoxError>
     where
         T: Agent<C> + Send + Sync + 'static,
     {
+        let label = label.unwrap_or_else(|| agent.name().to_ascii_lowercase());
+        self.add_dyn(Arc::new(AgentWrapper {
+            inner: agent,
+            label,
+            _phantom: PhantomData,
+        }))
+    }
+
+    /// Registers a type-erased agent, e.g. one drained from another set.
+    ///
+    /// The registry key is the agent's lowercase name; it must satisfy
+    /// [`validate_function_name`] and be unique within the set.
+    pub fn add_dyn(&mut self, agent: Arc<dyn DynAgent<C>>) -> Result<(), BoxError> {
         let name = agent.name().to_ascii_lowercase();
         validate_function_name(&name)?;
         if self.set.contains_key(&name) {
             return Err(format!("agent {} already exists", name).into());
         }
 
-        let agent_dyn = AgentWrapper {
-            inner: agent,
-            label: label.unwrap_or_else(|| name.clone()),
-            _phantom: PhantomData,
-        };
-        self.set.insert(name, Arc::new(agent_dyn));
+        self.set.insert(name, agent);
         Ok(())
+    }
+
+    /// Iterates registered agents as `(lowercase_name, agent)` pairs in name order.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &Arc<dyn DynAgent<C>>)> {
+        self.set.iter().map(|(name, agent)| (name.as_str(), agent))
     }
 
     /// Returns an agent by name.
@@ -468,351 +424,23 @@ where
     }
 }
 
+impl<C> IntoIterator for AgentSet<C>
+where
+    C: AgentContext + Send + Sync + 'static,
+{
+    type Item = Arc<dyn DynAgent<C>>;
+    type IntoIter = std::collections::btree_map::IntoValues<String, Arc<dyn DynAgent<C>>>;
+
+    /// Consumes the set, yielding agents in lowercase-name order.
+    fn into_iter(self) -> Self::IntoIter {
+        self.set.into_values()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candid::Principal;
-    use std::time::Duration;
-
-    use crate::{
-        AgentInput, BaseContext, CacheExpiry, CacheFeatures, CancellationToken, CompletionFeatures,
-        CompletionRequest, HttpFeatures, Json, KeysFeatures, ObjectMeta, Path, PutMode, PutResult,
-        RequestMeta, StateFeatures, StoreFeatures, ToolInput, ToolOutput,
-    };
-
-    #[derive(Clone)]
-    struct TestAgentContext {
-        engine_id: Principal,
-        caller: Principal,
-        meta: RequestMeta,
-        cancellation_token: CancellationToken,
-    }
-
-    impl Default for TestAgentContext {
-        fn default() -> Self {
-            Self {
-                engine_id: Principal::management_canister(),
-                caller: Principal::anonymous(),
-                meta: RequestMeta::default(),
-                cancellation_token: CancellationToken::new(),
-            }
-        }
-    }
-
-    impl StateFeatures for TestAgentContext {
-        fn engine_id(&self) -> &Principal {
-            &self.engine_id
-        }
-
-        fn engine_name(&self) -> &str {
-            "test-engine"
-        }
-
-        fn caller(&self) -> &Principal {
-            &self.caller
-        }
-
-        fn meta(&self) -> &RequestMeta {
-            &self.meta
-        }
-
-        fn cancellation_token(&self) -> CancellationToken {
-            self.cancellation_token.clone()
-        }
-
-        fn time_elapsed(&self) -> Duration {
-            Duration::ZERO
-        }
-    }
-
-    impl KeysFeatures for TestAgentContext {
-        async fn a256gcm_key(&self, _derivation_path: Vec<Vec<u8>>) -> Result<[u8; 32], BoxError> {
-            Ok([0; 32])
-        }
-
-        async fn ed25519_sign_message(
-            &self,
-            _derivation_path: Vec<Vec<u8>>,
-            _message: &[u8],
-        ) -> Result<[u8; 64], BoxError> {
-            Ok([0; 64])
-        }
-
-        async fn ed25519_verify(
-            &self,
-            _derivation_path: Vec<Vec<u8>>,
-            _message: &[u8],
-            _signature: &[u8],
-        ) -> Result<(), BoxError> {
-            Ok(())
-        }
-
-        async fn ed25519_public_key(
-            &self,
-            _derivation_path: Vec<Vec<u8>>,
-        ) -> Result<[u8; 32], BoxError> {
-            Ok([0; 32])
-        }
-
-        async fn secp256k1_sign_message_bip340(
-            &self,
-            _derivation_path: Vec<Vec<u8>>,
-            _message: &[u8],
-        ) -> Result<[u8; 64], BoxError> {
-            Ok([0; 64])
-        }
-
-        async fn secp256k1_verify_bip340(
-            &self,
-            _derivation_path: Vec<Vec<u8>>,
-            _message: &[u8],
-            _signature: &[u8],
-        ) -> Result<(), BoxError> {
-            Ok(())
-        }
-
-        async fn secp256k1_sign_message_ecdsa(
-            &self,
-            _derivation_path: Vec<Vec<u8>>,
-            _message: &[u8],
-        ) -> Result<[u8; 64], BoxError> {
-            Ok([0; 64])
-        }
-
-        async fn secp256k1_sign_digest_ecdsa(
-            &self,
-            _derivation_path: Vec<Vec<u8>>,
-            _message_hash: &[u8],
-        ) -> Result<[u8; 64], BoxError> {
-            Ok([0; 64])
-        }
-
-        async fn secp256k1_verify_ecdsa(
-            &self,
-            _derivation_path: Vec<Vec<u8>>,
-            _message_hash: &[u8],
-            _signature: &[u8],
-        ) -> Result<(), BoxError> {
-            Ok(())
-        }
-
-        async fn secp256k1_public_key(
-            &self,
-            _derivation_path: Vec<Vec<u8>>,
-        ) -> Result<[u8; 33], BoxError> {
-            Ok([0; 33])
-        }
-    }
-
-    impl StoreFeatures for TestAgentContext {
-        async fn store_get(&self, _path: &Path) -> Result<(bytes::Bytes, ObjectMeta), BoxError> {
-            Err("not implemented".into())
-        }
-
-        async fn store_list(
-            &self,
-            _prefix: Option<&Path>,
-            _offset: &Path,
-        ) -> Result<Vec<ObjectMeta>, BoxError> {
-            Ok(Vec::new())
-        }
-
-        async fn store_put(
-            &self,
-            _path: &Path,
-            _mode: PutMode,
-            _value: bytes::Bytes,
-        ) -> Result<PutResult, BoxError> {
-            Err("not implemented".into())
-        }
-
-        async fn store_rename_if_not_exists(
-            &self,
-            _from: &Path,
-            _to: &Path,
-        ) -> Result<(), BoxError> {
-            Err("not implemented".into())
-        }
-
-        async fn store_delete(&self, _path: &Path) -> Result<(), BoxError> {
-            Ok(())
-        }
-    }
-
-    impl CacheFeatures for TestAgentContext {
-        fn cache_contains(&self, _key: &str) -> bool {
-            false
-        }
-
-        async fn cache_get<T>(&self, _key: &str) -> Result<T, BoxError>
-        where
-            T: serde::de::DeserializeOwned,
-        {
-            Err("not implemented".into())
-        }
-
-        async fn cache_get_with<T, F>(&self, _key: &str, _init: F) -> Result<T, BoxError>
-        where
-            T: Sized + serde::de::DeserializeOwned + Serialize + Send,
-            F: Future<Output = Result<(T, Option<CacheExpiry>), BoxError>> + Send + 'static,
-        {
-            Err("not implemented".into())
-        }
-
-        async fn cache_set<T>(&self, _key: &str, _val: (T, Option<CacheExpiry>))
-        where
-            T: Sized + Serialize + Send,
-        {
-        }
-
-        async fn cache_set_if_not_exists<T>(
-            &self,
-            _key: &str,
-            _val: (T, Option<CacheExpiry>),
-        ) -> bool
-        where
-            T: Sized + Serialize + Send,
-        {
-            false
-        }
-
-        async fn cache_delete(&self, _key: &str) -> bool {
-            false
-        }
-
-        fn cache_raw_iter(
-            &self,
-        ) -> impl Iterator<Item = (Arc<String>, Arc<(bytes::Bytes, Option<CacheExpiry>)>)> {
-            std::iter::empty()
-        }
-    }
-
-    impl HttpFeatures for TestAgentContext {
-        async fn https_call(
-            &self,
-            _url: &str,
-            _method: http::Method,
-            _headers: Option<http::HeaderMap>,
-            _body: Option<Vec<u8>>,
-        ) -> Result<reqwest::Response, BoxError> {
-            Err("not implemented".into())
-        }
-
-        async fn https_signed_call(
-            &self,
-            _url: &str,
-            _method: http::Method,
-            _message_digest: [u8; 32],
-            _headers: Option<http::HeaderMap>,
-            _body: Option<Vec<u8>>,
-        ) -> Result<reqwest::Response, BoxError> {
-            Err("not implemented".into())
-        }
-
-        async fn https_signed_rpc<T>(
-            &self,
-            _endpoint: &str,
-            _method: &str,
-            _args: impl Serialize + Send,
-        ) -> Result<T, BoxError>
-        where
-            T: serde::de::DeserializeOwned,
-        {
-            Err("not implemented".into())
-        }
-    }
-
-    impl crate::BaseContext for TestAgentContext {
-        async fn remote_tool_call(
-            &self,
-            _endpoint: &str,
-            _args: ToolInput<Json>,
-        ) -> Result<ToolOutput<Json>, BoxError> {
-            Err("not implemented".into())
-        }
-    }
-
-    impl CompletionFeatures for TestAgentContext {
-        async fn completion(
-            &self,
-            _req: CompletionRequest,
-            _resources: Vec<Resource>,
-        ) -> Result<AgentOutput, BoxError> {
-            Ok(AgentOutput::default())
-        }
-
-        fn model_name(&self) -> String {
-            "test-model".to_string()
-        }
-    }
-
-    impl AgentContext for TestAgentContext {
-        fn tool_definitions(&self, _names: Option<&[String]>) -> Vec<FunctionDefinition> {
-            Vec::new()
-        }
-
-        async fn remote_tool_definitions(
-            &self,
-            _endpoint: Option<&str>,
-            _names: Option<&[String]>,
-        ) -> Result<Vec<FunctionDefinition>, BoxError> {
-            Ok(Vec::new())
-        }
-
-        async fn select_tool_resources(
-            &self,
-            _name: &str,
-            _resources: &mut Vec<Resource>,
-        ) -> Vec<Resource> {
-            Vec::new()
-        }
-
-        fn agent_definitions(&self, _names: Option<&[String]>) -> Vec<FunctionDefinition> {
-            Vec::new()
-        }
-
-        async fn remote_agent_definitions(
-            &self,
-            _endpoint: Option<&str>,
-            _names: Option<&[String]>,
-        ) -> Result<Vec<FunctionDefinition>, BoxError> {
-            Ok(Vec::new())
-        }
-
-        async fn select_agent_resources(
-            &self,
-            _name: &str,
-            _resources: &mut Vec<Resource>,
-        ) -> Vec<Resource> {
-            Vec::new()
-        }
-
-        async fn definitions(&self, _names: Option<&[String]>) -> Vec<FunctionDefinition> {
-            Vec::new()
-        }
-
-        async fn tool_call(
-            &self,
-            _args: ToolInput<Json>,
-        ) -> Result<(ToolOutput<Json>, Option<Principal>), BoxError> {
-            Ok((ToolOutput::new(Json::Null), None))
-        }
-
-        async fn agent_run(
-            self,
-            _args: AgentInput,
-        ) -> Result<(AgentOutput, Option<Principal>), BoxError> {
-            Ok((AgentOutput::default(), None))
-        }
-
-        async fn remote_agent_run(
-            &self,
-            _endpoint: &str,
-            _args: AgentInput,
-        ) -> Result<AgentOutput, BoxError> {
-            Ok(AgentOutput::default())
-        }
-    }
+    use crate::test_support::{MockContext, resource};
 
     struct ExampleAgent {
         id: usize,
@@ -824,16 +452,7 @@ mod tests {
 
     struct InvalidAgent;
 
-    fn resource(id: u64, tags: &[&str]) -> Resource {
-        Resource {
-            _id: id,
-            name: format!("resource-{id}"),
-            tags: tags.iter().map(|tag| tag.to_string()).collect(),
-            ..Default::default()
-        }
-    }
-
-    impl Agent<TestAgentContext> for ExampleAgent {
+    impl Agent<MockContext> for ExampleAgent {
         fn name(&self) -> String {
             "example_agent".to_string()
         }
@@ -853,7 +472,7 @@ mod tests {
 
         async fn run(
             &self,
-            _ctx: TestAgentContext,
+            _ctx: MockContext,
             _prompt: String,
             _resources: Vec<Resource>,
         ) -> Result<AgentOutput, BoxError> {
@@ -864,7 +483,7 @@ mod tests {
         }
     }
 
-    impl Agent<TestAgentContext> for OtherAgent {
+    impl Agent<MockContext> for OtherAgent {
         fn name(&self) -> String {
             "other_agent".to_string()
         }
@@ -884,7 +503,7 @@ mod tests {
 
         async fn run(
             &self,
-            _ctx: TestAgentContext,
+            _ctx: MockContext,
             _prompt: String,
             _resources: Vec<Resource>,
         ) -> Result<AgentOutput, BoxError> {
@@ -895,7 +514,7 @@ mod tests {
         }
     }
 
-    impl Agent<TestAgentContext> for TaggedAgent {
+    impl Agent<MockContext> for TaggedAgent {
         fn name(&self) -> String {
             "tagged_agent".to_string()
         }
@@ -914,7 +533,7 @@ mod tests {
 
         async fn run(
             &self,
-            _ctx: TestAgentContext,
+            _ctx: MockContext,
             prompt: String,
             resources: Vec<Resource>,
         ) -> Result<AgentOutput, BoxError> {
@@ -925,7 +544,7 @@ mod tests {
         }
     }
 
-    impl Agent<TestAgentContext> for InvalidAgent {
+    impl Agent<MockContext> for InvalidAgent {
         fn name(&self) -> String {
             "bad.agent".to_string()
         }
@@ -936,7 +555,7 @@ mod tests {
 
         async fn run(
             &self,
-            _ctx: TestAgentContext,
+            _ctx: MockContext,
             _prompt: String,
             _resources: Vec<Resource>,
         ) -> Result<AgentOutput, BoxError> {
@@ -947,7 +566,7 @@ mod tests {
     #[test]
     fn dyn_agent_downcast_ref_returns_inner_agent() {
         let agent = Arc::new(ExampleAgent { id: 7 });
-        let mut agent_set = AgentSet::<TestAgentContext>::new();
+        let mut agent_set = AgentSet::<MockContext>::new();
         agent_set
             .add(agent, Some("test-label".to_string()))
             .unwrap();
@@ -961,7 +580,7 @@ mod tests {
 
     #[test]
     fn agent_set_collects_declared_groups() {
-        let mut agent_set = AgentSet::<TestAgentContext>::new();
+        let mut agent_set = AgentSet::<MockContext>::new();
         agent_set
             .add(Arc::new(ExampleAgent { id: 1 }), None)
             .unwrap();
@@ -986,7 +605,7 @@ mod tests {
     #[test]
     fn dyn_agent_downcast_returns_original_arc() {
         let agent = Arc::new(ExampleAgent { id: 9 });
-        let mut agent_set = AgentSet::<TestAgentContext>::new();
+        let mut agent_set = AgentSet::<MockContext>::new();
         agent_set
             .add(agent.clone(), Some("test-label".to_string()))
             .unwrap();
@@ -1004,7 +623,7 @@ mod tests {
     #[test]
     fn dyn_agent_downcast_mismatch_returns_original_arc() {
         let agent = Arc::new(ExampleAgent { id: 11 });
-        let mut agent_set = AgentSet::<TestAgentContext>::new();
+        let mut agent_set = AgentSet::<MockContext>::new();
         agent_set
             .add(agent, Some("test-label".to_string()))
             .unwrap();
@@ -1039,10 +658,10 @@ mod tests {
             assert!(agent.supported_resource_tags().is_empty());
             assert!(agent.select_resources(&mut resources).is_empty());
             assert_eq!(resources.len(), 1);
-            agent.init(TestAgentContext::default()).await.unwrap();
+            agent.init(MockContext::default()).await.unwrap();
             assert!(agent.tool_dependencies().is_empty());
 
-            let mut agent_set = AgentSet::<TestAgentContext>::new();
+            let mut agent_set = AgentSet::<MockContext>::new();
             agent_set
                 .add(agent, Some("example label".to_string()))
                 .unwrap();
@@ -1053,14 +672,10 @@ mod tests {
             assert_eq!(dyn_agent.definition().name, "example_agent");
             assert!(dyn_agent.tool_dependencies().is_empty());
             assert!(dyn_agent.supported_resource_tags().is_empty());
-            dyn_agent.init(TestAgentContext::default()).await.unwrap();
+            dyn_agent.init(MockContext::default()).await.unwrap();
 
             let output = dyn_agent
-                .run(
-                    TestAgentContext::default(),
-                    "ignored".to_string(),
-                    Vec::new(),
-                )
+                .run(MockContext::default(), "ignored".to_string(), Vec::new())
                 .await
                 .unwrap();
             assert_eq!(output.content, "42");
@@ -1075,11 +690,7 @@ mod tests {
             assert_eq!(other.description(), "Other agent used for downcast tests");
             assert_eq!(
                 other
-                    .run(
-                        TestAgentContext::default(),
-                        "prompt".to_string(),
-                        Vec::new()
-                    )
+                    .run(MockContext::default(), "prompt".to_string(), Vec::new())
                     .await
                     .unwrap()
                     .content,
@@ -1097,11 +708,7 @@ mod tests {
             assert_eq!(invalid.description(), "Invalid function name");
             assert!(
                 invalid
-                    .run(
-                        TestAgentContext::default(),
-                        "prompt".to_string(),
-                        Vec::new()
-                    )
+                    .run(MockContext::default(), "prompt".to_string(), Vec::new())
                     .await
                     .unwrap()
                     .content
@@ -1113,7 +720,7 @@ mod tests {
     #[test]
     fn agent_set_registry_filters_resources_and_reports_errors() {
         futures::executor::block_on(async {
-            let mut agent_set = AgentSet::<TestAgentContext>::new();
+            let mut agent_set = AgentSet::<MockContext>::new();
             agent_set
                 .add(Arc::new(ExampleAgent { id: 1 }), None)
                 .unwrap();
@@ -1184,7 +791,7 @@ mod tests {
             assert_eq!(dyn_agent.label(), "tagged label");
             let output = dyn_agent
                 .run(
-                    TestAgentContext::default(),
+                    MockContext::default(),
                     "prompt".to_string(),
                     vec![resource(9, &["text"])],
                 )
@@ -1201,188 +808,6 @@ mod tests {
 
             let invalid = agent_set.add(Arc::new(InvalidAgent), None).unwrap_err();
             assert!(invalid.to_string().contains("invalid character"));
-        });
-    }
-
-    #[test]
-    fn test_agent_context_mock_features_cover_default_paths() {
-        futures::executor::block_on(async {
-            let ctx = TestAgentContext::default();
-            assert_eq!(*ctx.engine_id(), Principal::management_canister());
-            assert_eq!(ctx.engine_name(), "test-engine");
-            assert_eq!(*ctx.caller(), Principal::anonymous());
-            assert!(ctx.meta().user.is_none());
-            assert!(!ctx.cancellation_token().is_cancelled());
-            assert_eq!(ctx.time_elapsed(), Duration::ZERO);
-
-            assert_eq!(ctx.a256gcm_key(Vec::new()).await.unwrap(), [0; 32]);
-            assert_eq!(
-                ctx.ed25519_sign_message(Vec::new(), b"message")
-                    .await
-                    .unwrap(),
-                [0; 64]
-            );
-            ctx.ed25519_verify(Vec::new(), b"message", &[0; 64])
-                .await
-                .unwrap();
-            assert_eq!(ctx.ed25519_public_key(Vec::new()).await.unwrap(), [0; 32]);
-            assert_eq!(
-                ctx.secp256k1_sign_message_bip340(Vec::new(), b"message")
-                    .await
-                    .unwrap(),
-                [0; 64]
-            );
-            ctx.secp256k1_verify_bip340(Vec::new(), b"message", &[0; 64])
-                .await
-                .unwrap();
-            assert_eq!(
-                ctx.secp256k1_sign_message_ecdsa(Vec::new(), b"message")
-                    .await
-                    .unwrap(),
-                [0; 64]
-            );
-            assert_eq!(
-                ctx.secp256k1_sign_digest_ecdsa(Vec::new(), &[0; 32])
-                    .await
-                    .unwrap(),
-                [0; 64]
-            );
-            ctx.secp256k1_verify_ecdsa(Vec::new(), &[0; 32], &[0; 64])
-                .await
-                .unwrap();
-            assert_eq!(ctx.secp256k1_public_key(Vec::new()).await.unwrap(), [0; 33]);
-
-            assert!(ctx.store_get(&Path::from("missing")).await.is_err());
-            assert!(
-                ctx.store_list(None, &Path::default())
-                    .await
-                    .unwrap()
-                    .is_empty()
-            );
-            assert!(
-                ctx.store_put(&Path::from("file"), PutMode::Overwrite, bytes::Bytes::new())
-                    .await
-                    .is_err()
-            );
-            assert!(
-                ctx.store_rename_if_not_exists(&Path::from("a"), &Path::from("b"))
-                    .await
-                    .is_err()
-            );
-            ctx.store_delete(&Path::from("file")).await.unwrap();
-
-            assert!(!ctx.cache_contains("key"));
-            assert!(ctx.cache_get::<String>("key").await.is_err());
-            assert!(
-                ctx.cache_get_with("key", async { Ok(("value".to_string(), None)) })
-                    .await
-                    .is_err()
-            );
-            ctx.cache_set("key", ("value".to_string(), None)).await;
-            assert!(
-                !ctx.cache_set_if_not_exists("key", ("value".to_string(), None))
-                    .await
-            );
-            assert!(!ctx.cache_delete("key").await);
-            assert_eq!(ctx.cache_raw_iter().count(), 0);
-
-            assert!(
-                ctx.https_call("https://example.test", http::Method::GET, None, None)
-                    .await
-                    .is_err()
-            );
-            assert!(
-                ctx.https_signed_call(
-                    "https://example.test",
-                    http::Method::POST,
-                    [0; 32],
-                    None,
-                    None,
-                )
-                .await
-                .is_err()
-            );
-            let rpc: Result<String, BoxError> = ctx
-                .https_signed_rpc("https://example.test", "method", &())
-                .await;
-            assert!(rpc.is_err());
-
-            assert!(
-                ctx.remote_tool_call(
-                    "https://example.test",
-                    ToolInput::new("tool".to_string(), Json::Null),
-                )
-                .await
-                .is_err()
-            );
-            assert_eq!(
-                ctx.completion(CompletionRequest::default(), Vec::new())
-                    .await
-                    .unwrap()
-                    .content,
-                ""
-            );
-            assert_eq!(ctx.model_name(), "test-model");
-            assert!(ctx.tool_definitions(None).is_empty());
-            assert!(
-                ctx.remote_tool_definitions(None, None)
-                    .await
-                    .unwrap()
-                    .is_empty()
-            );
-            assert!(
-                ctx.select_tool_resources("tool", &mut Vec::new())
-                    .await
-                    .is_empty()
-            );
-            assert!(ctx.agent_definitions(None).is_empty());
-            assert!(
-                ctx.remote_agent_definitions(None, None)
-                    .await
-                    .unwrap()
-                    .is_empty()
-            );
-            assert!(
-                ctx.select_agent_resources("agent", &mut Vec::new())
-                    .await
-                    .is_empty()
-            );
-            assert!(ctx.definitions(None).await.is_empty());
-            assert!(
-                ctx.tool_call(ToolInput::new("tool".to_string(), Json::Null))
-                    .await
-                    .unwrap()
-                    .0
-                    .output
-                    .is_null()
-            );
-            assert!(
-                ctx.clone()
-                    .agent_run(AgentInput {
-                        name: "agent".to_string(),
-                        prompt: "prompt".to_string(),
-                        ..Default::default()
-                    })
-                    .await
-                    .unwrap()
-                    .0
-                    .content
-                    .is_empty()
-            );
-            assert!(
-                ctx.remote_agent_run(
-                    "https://example.test",
-                    AgentInput {
-                        name: "agent".to_string(),
-                        prompt: "prompt".to_string(),
-                        ..Default::default()
-                    },
-                )
-                .await
-                .unwrap()
-                .content
-                .is_empty()
-            );
         });
     }
 }

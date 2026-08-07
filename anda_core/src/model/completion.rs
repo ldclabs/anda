@@ -141,13 +141,13 @@ pub struct CompletionRequest {
 impl CompletionRequest {
     /// Adds a document to the request.
     pub fn context(mut self, id: String, text: String) -> Self {
-        self.documents.docs.push(Document::from_text(&id, &text));
+        self.documents.append(Document::from_text(&id, &text));
         self
     }
 
     /// Adds multiple documents to the request.
     pub fn append_documents(mut self, docs: Documents) -> Self {
-        self.documents.docs.extend(docs.docs);
+        self.documents.extend(docs);
         self
     }
 

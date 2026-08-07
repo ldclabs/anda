@@ -27,7 +27,6 @@ use anda_core::{
     HttpFeatures, Json, KeysFeatures, ObjectMeta, Path, PutMode, PutResult, RequestMeta,
     StateFeatures, StoreFeatures, ToolInput, ToolOutput, derivation_path_with,
 };
-use bytes::Bytes;
 use candid::Principal;
 use http::Extensions;
 use parking_lot::RwLock;
@@ -571,13 +570,6 @@ impl CacheFeatures for BaseCtx {
     async fn cache_delete(&self, key: &str) -> bool {
         self.cache.delete(&self.path, key).await
     }
-
-    /// Returns an iterator over all cached items with raw value.
-    fn cache_raw_iter(
-        &self,
-    ) -> impl Iterator<Item = (Arc<String>, Arc<(Bytes, Option<CacheExpiry>)>)> {
-        self.cache.iter(&self.path)
-    }
 }
 
 impl HttpFeatures for BaseCtx {
@@ -782,7 +774,7 @@ mod tests {
         );
         assert!(!ctx.cache_set_if_not_exists("b", (3_u32, None)).await);
         assert!(ctx.cache_set_if_not_exists("c", (4_u32, None)).await);
-        assert!(ctx.cache_raw_iter().count() >= 3);
+        assert!(ctx.cache.iter(&ctx.path).count() >= 3);
         assert!(ctx.cache_delete("c").await);
         assert!(!ctx.cache_delete("c").await);
 

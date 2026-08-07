@@ -21,6 +21,9 @@ pub mod context;
 pub mod http;
 pub mod json;
 pub mod model;
+mod registry;
+#[cfg(test)]
+mod test_support;
 pub mod tool;
 
 pub use agent::*;

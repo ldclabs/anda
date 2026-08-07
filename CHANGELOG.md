@@ -9,6 +9,56 @@ Deep-module restructuring of `anda_engine` guided by a full design review
 is preserved except where noted below. Contains breaking API changes — the
 next `anda_engine` release should be a minor version bump.
 
+A follow-up pass applied the same deep-module review to `anda_core`. Its
+changes are breaking as well, so the next `anda_core` release should also be
+a minor version bump.
+
+### Changed — anda_core (breaking)
+
+- **Registries own their invariant** — The `set` map on `ToolSet`, `AgentSet`,
+  and `ToolProviderSet` is now private, so the lowercase-key invariant can no
+  longer be bypassed by direct mutation. The replacement interface: `add_dyn`
+  (validated insert of a type-erased entry), `iter()` (`(lowercase_name,
+  entry)` pairs in name order), and owned `IntoIterator` yielding entries in
+  name order. `EngineBuilder::register_tools` / `register_tool_providers` /
+  `register_agents` now merge through `add_dyn` instead of re-implementing the
+  duplicate check.
+- **`CacheFeatures::cache_raw_iter` removed** — It leaked the runtime's
+  internal cache entry representation (`(Arc<String>, Arc<(Bytes,
+  Option<CacheExpiry>)>)`) into the capability trait and had no production
+  consumers. Context implementations simply drop the method; the engine keeps
+  an equivalent test-only iterator on its internal `CacheService`.
+- **Dead text-decoding entry points removed** — `text_from` and
+  `utf8_text_from` (unused owned-`Vec` variants) are gone, and
+  `utf8_text_from_bytes` is now private (it equals
+  `text_from_bytes_with_encoding(data, None)`). Every entry point the engine
+  actually calls is untouched: `text_from_bytes_with_encoding`,
+  `text_encoding_for_label`, `text_encoding_label`, `platform_text_encoding`,
+  and `windows_code_page_encoding`. `text_from_bytes` is also retained — it has
+  no in-tree caller, but it is the only ergonomic platform-default entry point
+  (`text_from_bytes_with_encoding(data, platform_text_encoding())`) and is
+  plausibly used downstream, so it was kept rather than widening the break.
+
+### Changed — anda_core
+
+- **`model` split into cohesive submodules** — `model.rs` now hosts only the
+  call-contract types (agent/tool inputs and outputs, usage, request metadata,
+  function definitions). Chat content (`Message`, `ContentPart`, the
+  CBOR-safe wire codecs, data-URL helpers) moved to `model::content`, prompt
+  documents to `model::document`, and text decoding to `model::text`. All
+  names are still re-exported from the crate root, so existing imports are
+  unaffected.
+- **Registry mechanics deduplicated** — Group aggregation and name-filtered
+  definition/function selection are shared by `ToolSet` and `AgentSet`
+  through one internal `registry` module instead of two hand-copied
+  implementations.
+- **`Documents` implements `IntoIterator`** — Consuming iteration over the
+  contained documents; `CompletionRequest::append_documents` now uses it
+  instead of reaching into private fields.
+- **Shared test fixtures** — The two duplicated ~300-line mock contexts in
+  `agent.rs` and `tool.rs` tests are now one `MockContext` in an internal
+  test-support module, and the twin mock-coverage tests merged into one.
+
 ### Changed — anda_engine (breaking)
 
 - **Provider seam unified on `CompletionFeaturesDyn`** — The delegating
@@ -107,6 +157,10 @@ next `anda_engine` release should be a minor version bump.
 
 ### Fixed — anda_engine
 
+- **Rustdoc builds clean again** — Intra-doc links in `extension::mcp::auth`
+  and the `extension` module docs were left unresolved by the MCP/hook
+  restructuring and failed `RUSTDOCFLAGS="-D warnings" cargo doc`; they now
+  resolve.
 - **The OpenAI Chat adapter no longer discards the assistant message on a
   failure verdict** — A non-success `finish_reason` (`length`,
   `content_filter`, …) previously dropped the whole turn: the truncated text,

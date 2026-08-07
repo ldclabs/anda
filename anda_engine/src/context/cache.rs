@@ -250,9 +250,13 @@ impl CacheService {
 
     /// Returns an iterator over the cache entries for a given path.
     ///
+    /// Test-only observability seam: production code interacts with the cache
+    /// through the keyed operations above.
+    ///
     /// Moka's iterator borrows the namespace handle, which is created on demand and owned by
     /// this call, so entries are collected eagerly. Namespaces are per-agent/per-tool and
     /// capacity-bounded, so the snapshot stays small.
+    #[cfg(test)]
     pub fn iter(
         &self,
         path: &Path,

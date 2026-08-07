@@ -58,7 +58,7 @@ pub(crate) fn client_credentials_deadline(now: Instant, ttl: Duration) -> Option
 /// `anda_engine` is a library: it drives the OAuth *protocol* and exposes the
 /// seams, but never opens a browser, runs a callback server, or decides where
 /// tokens live. The consuming application owns those concerns (see
-/// [`McpToolProvider::begin_authorization`] and [`McpCredentialStore`]).
+/// [`McpToolProvider::begin_authorization`](super::McpToolProvider::begin_authorization) and [`McpCredentialStore`]).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "flow", rename_all = "snake_case")]
 pub enum McpOAuthConfig {
@@ -87,7 +87,7 @@ pub struct OAuthAuthorizationCodeConfig {
     /// Redirect URI registered/used for the authorization request. The consuming
     /// application decides how the redirect is received (loopback, a server
     /// route, or manual paste) and passes the resulting URL back through
-    /// [`McpToolProvider::complete_authorization`].
+    /// [`McpToolProvider::complete_authorization`](super::McpToolProvider::complete_authorization).
     pub redirect_uri: String,
     /// Requested OAuth scopes.
     #[serde(default)]
@@ -150,7 +150,7 @@ impl OAuthClientCredentialsConfig {
     }
 }
 
-/// Outcome of [`McpToolProvider::discover_http_oauth`]: the OAuth capabilities
+/// Outcome of [`McpToolProvider::discover_http_oauth`](super::McpToolProvider::discover_http_oauth): the OAuth capabilities
 /// an HTTP MCP endpoint advertises.
 #[derive(Debug, Clone)]
 pub struct McpOAuthMetadata {
@@ -164,7 +164,7 @@ pub struct McpOAuthMetadata {
 ///
 /// The library never decides where tokens live; the consuming application
 /// supplies an implementation (e.g. backed by an encrypted store) through
-/// [`McpToolProviderBuilder::credential_store`]. Refresh tokens are secrets and
+/// [`McpToolProviderBuilder::credential_store`](super::McpToolProviderBuilder::credential_store). Refresh tokens are secrets and
 /// must be persisted securely.
 #[async_trait]
 pub trait McpCredentialStore: Send + Sync {
@@ -244,8 +244,8 @@ impl CredentialStore for ScopedCredentialStore {
 /// OAuth Authorization Code flow, but no usable stored credentials exist yet.
 ///
 /// The consuming application should catch this (via [`BoxError`] downcast) and
-/// run [`McpToolProvider::begin_authorization`] /
-/// [`McpToolProvider::complete_authorization`] before retrying.
+/// run [`McpToolProvider::begin_authorization`](super::McpToolProvider::begin_authorization) /
+/// [`McpToolProvider::complete_authorization`](super::McpToolProvider::complete_authorization) before retrying.
 #[derive(Debug, Clone)]
 pub struct McpAuthorizationRequired {
     /// The MCP server id that needs interactive authorization.

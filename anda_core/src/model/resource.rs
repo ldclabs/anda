@@ -130,15 +130,7 @@ pub fn select_resources(resources: &mut Vec<Resource>, tags: &[String]) -> Vec<R
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn resource(id: u64, tags: &[&str]) -> Resource {
-        Resource {
-            _id: id,
-            name: format!("resource-{id}"),
-            tags: tags.iter().map(|tag| tag.to_string()).collect(),
-            ..Default::default()
-        }
-    }
+    use crate::test_support::resource;
 
     fn metadata(key: &str, value: &str) -> Map<String, Json> {
         let mut map = Map::new();

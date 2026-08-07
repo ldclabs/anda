@@ -29,7 +29,6 @@ use anda_core::{
     RequestMeta, Resource, StateFeatures, StoreFeatures, ToolGroup, ToolInput, ToolOutput,
     ToolProviderSet, ToolSet,
 };
-use bytes::Bytes;
 use candid::Principal;
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
@@ -270,7 +269,7 @@ impl AgentCtx {
             merge_visible_group(&mut groups, group, &agent_names);
         }
 
-        for provider in self.tool_providers.set.values() {
+        for (_, provider) in self.tool_providers.iter() {
             let mut provider_names = BTreeMap::new();
             for definition in provider.definitions(None) {
                 let lowercase = definition.name.to_ascii_lowercase();
@@ -982,13 +981,6 @@ impl CacheFeatures for AgentCtx {
     async fn cache_delete(&self, key: &str) -> bool {
         self.base.cache_delete(key).await
     }
-
-    /// Returns an iterator over all cached items with raw value.
-    fn cache_raw_iter(
-        &self,
-    ) -> impl Iterator<Item = (Arc<String>, Arc<(Bytes, Option<CacheExpiry>)>)> {
-        self.base.cache_raw_iter()
-    }
 }
 
 impl HttpFeatures for AgentCtx {
@@ -1374,11 +1366,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(initialized, "created");
-        let cache_keys = cache_ctx
-            .cache_raw_iter()
-            .map(|(key, _)| key.as_str().to_string())
-            .collect::<Vec<_>>();
-        assert!(cache_keys.contains(&"number".to_string()));
+        assert!(cache_ctx.cache_contains("number"));
         assert!(cache_ctx.cache_delete("number").await);
         assert!(!cache_ctx.cache_contains("number"));
 

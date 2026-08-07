@@ -597,11 +597,8 @@ impl EngineBuilder {
     /// Registers multiple tools to the engine.
     /// Returns an error if any tool already exists.
     pub fn register_tools(mut self, tools: ToolSet<BaseCtx>) -> Result<Self, BoxError> {
-        for (name, tool) in tools.set {
-            if self.tools.set.contains_key(&name) {
-                return Err(format!("tool {} already exists", name).into());
-            }
-            self.tools.set.insert(name, tool);
+        for tool in tools {
+            self.tools.add_dyn(tool)?;
         }
 
         Ok(self)
@@ -621,11 +618,8 @@ impl EngineBuilder {
         mut self,
         providers: ToolProviderSet<BaseCtx>,
     ) -> Result<Self, BoxError> {
-        for (name, provider) in providers.set {
-            if self.tool_providers.set.contains_key(&name) {
-                return Err(format!("tool provider {} already exists", name).into());
-            }
-            self.tool_providers.set.insert(name, provider);
+        for provider in providers {
+            self.tool_providers.add_dyn(provider)?;
         }
 
         Ok(self)
@@ -657,17 +651,13 @@ impl EngineBuilder {
     /// Verifies that all required tools are registered for each agent.
     /// Returns an error if any agent already exists or if any dependency is missing.
     pub fn register_agents(mut self, agents: AgentSet<AgentCtx>) -> Result<Self, BoxError> {
-        for (name, agent) in agents.set {
-            if self.agents.set.contains_key(&name) {
-                return Err(format!("agent {} already exists", name).into());
-            }
-
+        for agent in agents {
             for tool in agent.tool_dependencies() {
                 if !self.tools.contains(&tool) && !self.agents.contains(&tool) {
                     return Err(format!("dependent tool {} not found", tool).into());
                 }
             }
-            self.agents.set.insert(name, agent);
+            self.agents.add_dyn(agent)?;
         }
 
         Ok(self)
@@ -820,14 +810,14 @@ impl EngineBuilder {
         }
 
         let meta = RequestMeta::default();
-        for (name, tool) in &tools.set {
+        for (name, tool) in tools.iter() {
             let ct = ctx.child_base_with(id, &default_agent, name, meta.clone())?;
             tool.init(ct).await?;
         }
 
         tool_providers.init_all(ctx.base.clone()).await?;
 
-        for (name, agent) in &agents.set {
+        for (name, agent) in agents.iter() {
             let ct = ctx.child_with(id, name, agent.label(), meta.clone())?;
             agent.init(ct).await?;
         }
@@ -855,14 +845,12 @@ impl EngineBuilder {
     fn context_names(&self) -> BTreeSet<Path> {
         let mut names: BTreeSet<Path> = self
             .tools
-            .set
-            .keys()
-            .map(|p| Path::from(tool_context_path(p)))
+            .iter()
+            .map(|(p, _)| Path::from(tool_context_path(p)))
             .chain(
                 self.agents
-                    .set
-                    .keys()
-                    .map(|p| Path::from(agent_context_path(p))),
+                    .iter()
+                    .map(|(p, _)| Path::from(agent_context_path(p))),
             )
             .collect();
         names.insert(Path::from(SYSTEM_PATH));

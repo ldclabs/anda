@@ -30,7 +30,7 @@
 //!   descriptions computed from runtime configuration) are patched onto the
 //!   returned definition (see the shell tool).
 //! - **Hooks**: [`hooked_call`] wraps every execution with the
-//!   [`DynToolHook`](crate::hook::DynToolHook) found on [`BaseCtx`] state:
+//!   [`DynToolHook`] found on [`BaseCtx`] state:
 //!   `before_tool_call` may rewrite the arguments, `after_tool_call` may
 //!   rewrite the output.
 //! - **Cancellation**: a call whose context token is already cancelled fails

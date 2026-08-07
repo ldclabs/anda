@@ -11,17 +11,14 @@
 //! raw JSON call.
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::{
-    any::Any,
-    collections::{BTreeMap, BTreeSet},
-    future::Future,
-    marker::PhantomData,
-    sync::Arc,
-};
+use std::{any::Any, collections::BTreeMap, future::Future, marker::PhantomData, sync::Arc};
 
 use crate::{
     BoxError, BoxFut, BoxPinFut, Function, Json, Resource, ToolInput, ToolOutput,
-    context::BaseContext, model::FunctionDefinition, select_resources, validate_function_name,
+    context::BaseContext,
+    model::FunctionDefinition,
+    registry::{collect_groups, select_by_names},
+    select_resources, validate_function_name,
 };
 
 /// Strongly typed interface for an agent tool.
@@ -398,23 +395,20 @@ where
 pub struct ToolSet<C: BaseContext> {
     /// Registered tools keyed by their lowercase function names.
     ///
-    /// # Invariant
-    /// Keys must be lowercase names satisfying [`validate_function_name`] and
-    /// must equal the tool's own lowercased name. [`ToolSet::add`] enforces this;
-    /// code that mutates this map directly is responsible for upholding it, since
-    /// lookup and dispatch assume lowercase keys.
-    pub set: BTreeMap<String, Arc<dyn DynTool<C>>>,
+    /// Keys are lowercase names satisfying [`validate_function_name`] and equal
+    /// each tool's own lowercased name; [`ToolSet::add_dyn`] is the only insert
+    /// path, so lookup and dispatch can assume lowercase keys.
+    set: BTreeMap<String, Arc<dyn DynTool<C>>>,
 }
 
 /// Registry for runtime-discovered tool providers.
 #[derive(Default)]
 pub struct ToolProviderSet<C: BaseContext> {
-    /// Registered providers keyed by provider name.
+    /// Registered providers keyed by their lowercase provider names.
     ///
-    /// # Invariant
-    /// Keys must be lowercase names satisfying [`validate_function_name`].
-    /// [`ToolProviderSet::add`] enforces this; direct mutation must uphold it.
-    pub set: BTreeMap<String, Arc<dyn ToolProvider<C>>>,
+    /// Keys are lowercase names satisfying [`validate_function_name`];
+    /// [`ToolProviderSet::add_dyn`] is the only insert path.
+    set: BTreeMap<String, Arc<dyn ToolProvider<C>>>,
 }
 
 impl<C> ToolProviderSet<C>
@@ -438,6 +432,14 @@ where
     where
         T: ToolProvider<C> + Send + Sync + 'static,
     {
+        self.add_dyn(provider)
+    }
+
+    /// Registers a type-erased provider, e.g. one drained from another set.
+    ///
+    /// The registry key is the provider's lowercase name; it must satisfy
+    /// [`validate_function_name`] and be unique within the set.
+    pub fn add_dyn(&mut self, provider: Arc<dyn ToolProvider<C>>) -> Result<(), BoxError> {
         let name = provider.name().to_ascii_lowercase();
         validate_function_name(&name)?;
         if self.set.contains_key(&name) {
@@ -446,6 +448,13 @@ where
 
         self.set.insert(name, provider);
         Ok(())
+    }
+
+    /// Iterates providers as `(lowercase_name, provider)` pairs in name order.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &Arc<dyn ToolProvider<C>>)> {
+        self.set
+            .iter()
+            .map(|(name, provider)| (name.as_str(), provider))
     }
 
     /// Returns whether any provider can currently dispatch the given name.
@@ -552,6 +561,19 @@ where
     }
 }
 
+impl<C> IntoIterator for ToolProviderSet<C>
+where
+    C: BaseContext + Clone + Send + Sync + 'static,
+{
+    type Item = Arc<dyn ToolProvider<C>>;
+    type IntoIter = std::collections::btree_map::IntoValues<String, Arc<dyn ToolProvider<C>>>;
+
+    /// Consumes the set, yielding providers in lowercase-name order.
+    fn into_iter(self) -> Self::IntoIter {
+        self.set.into_values()
+    }
+}
+
 impl<C> ToolSet<C>
 where
     C: BaseContext + Send + Sync + 'static,
@@ -585,24 +607,7 @@ where
     /// that group, sorted for determinism. Group metadata is taken from the
     /// first tool (by lowercase name order) that declares the id.
     pub fn groups(&self) -> Vec<ToolGroup> {
-        let mut grouped: BTreeMap<String, (ToolGroupInfo, Vec<String>)> = BTreeMap::new();
-        for (name, tool) in &self.set {
-            if let Some(info) = tool.group() {
-                grouped
-                    .entry(info.id.clone())
-                    .or_insert_with(|| (info, Vec::new()))
-                    .1
-                    .push(name.clone());
-            }
-        }
-
-        grouped
-            .into_values()
-            .map(|(info, mut members)| {
-                members.sort();
-                ToolGroup::from_info(info, members)
-            })
-            .collect()
+        collect_groups(self.set.iter().map(|(name, tool)| (name, tool.group())))
     }
 
     /// Returns the function definition for a specific tool.
@@ -614,32 +619,20 @@ where
 
     /// Returns function definitions for all tools or the selected names.
     ///
+    /// Requested names are matched case-insensitively and deduplicated.
+    ///
     /// # Arguments
     /// - `names`: Optional slice of tool names to filter by.
     ///
     /// # Returns
     /// A vector of tool definitions.
     pub fn definitions(&self, names: Option<&[String]>) -> Vec<FunctionDefinition> {
-        match names {
-            None => self.set.values().map(|tool| tool.definition()).collect(),
-            Some(names) => {
-                // Deduplicate by lowercase name so repeated requested names do
-                // not emit duplicate schemas (some providers reject those).
-                let mut seen = BTreeSet::new();
-                names
-                    .iter()
-                    .filter_map(|name| {
-                        let key = name.to_ascii_lowercase();
-                        self.set
-                            .get(&key)
-                            .and_then(|tool| seen.insert(key).then(|| tool.definition()))
-                    })
-                    .collect()
-            }
-        }
+        select_by_names(&self.set, names, |tool| tool.definition())
     }
 
     /// Returns function metadata for all tools or the selected names.
+    ///
+    /// Requested names are matched case-insensitively and deduplicated.
     ///
     /// # Arguments
     /// - `names`: Optional slice of tool names to filter by.
@@ -647,32 +640,10 @@ where
     /// # Returns
     /// A vector of tool function metadata.
     pub fn functions(&self, names: Option<&[String]>) -> Vec<Function> {
-        match names {
-            None => self
-                .set
-                .values()
-                .map(|tool| Function {
-                    definition: tool.definition(),
-                    supported_resource_tags: tool.supported_resource_tags(),
-                })
-                .collect(),
-            Some(names) => {
-                // Deduplicate by lowercase name (see `definitions`).
-                let mut seen = BTreeSet::new();
-                names
-                    .iter()
-                    .filter_map(|name| {
-                        let key = name.to_ascii_lowercase();
-                        self.set.get(&key).and_then(|tool| {
-                            seen.insert(key).then(|| Function {
-                                definition: tool.definition(),
-                                supported_resource_tags: tool.supported_resource_tags(),
-                            })
-                        })
-                    })
-                    .collect()
-            }
-        }
+        select_by_names(&self.set, names, |tool| Function {
+            definition: tool.definition(),
+            supported_resource_tags: tool.supported_resource_tags(),
+        })
     }
 
     /// Removes and returns resources supported by the named tool.
@@ -698,15 +669,27 @@ where
     where
         T: Tool<C> + Send + Sync + 'static,
     {
+        self.add_dyn(Arc::new(ToolWrapper(tool, PhantomData)))
+    }
+
+    /// Registers a type-erased tool, e.g. one drained from another set.
+    ///
+    /// The registry key is the tool's lowercase name; it must satisfy
+    /// [`validate_function_name`] and be unique within the set.
+    pub fn add_dyn(&mut self, tool: Arc<dyn DynTool<C>>) -> Result<(), BoxError> {
         let name = tool.name().to_ascii_lowercase();
         validate_function_name(&name)?;
         if self.set.contains_key(&name) {
             return Err(format!("tool {} already exists", name).into());
         }
 
-        let tool_dyn = ToolWrapper(tool, PhantomData);
-        self.set.insert(name, Arc::new(tool_dyn));
+        self.set.insert(name, tool);
         Ok(())
+    }
+
+    /// Iterates registered tools as `(lowercase_name, tool)` pairs in name order.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &Arc<dyn DynTool<C>>)> {
+        self.set.iter().map(|(name, tool)| (name.as_str(), tool))
     }
 
     /// Returns a tool by name.
@@ -720,269 +703,24 @@ where
     }
 }
 
+impl<C> IntoIterator for ToolSet<C>
+where
+    C: BaseContext + Send + Sync + 'static,
+{
+    type Item = Arc<dyn DynTool<C>>;
+    type IntoIter = std::collections::btree_map::IntoValues<String, Arc<dyn DynTool<C>>>;
+
+    /// Consumes the set, yielding tools in lowercase-name order.
+    fn into_iter(self) -> Self::IntoIter {
+        self.set.into_values()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candid::Principal;
+    use crate::test_support::{MockContext, resource};
     use serde_json::json;
-    use std::{sync::Arc, time::Duration};
-
-    use crate::{
-        BaseContext, CacheExpiry, CacheFeatures, CancellationToken, HttpFeatures, KeysFeatures,
-        ObjectMeta, Path, PutMode, PutResult, RequestMeta, StateFeatures, StoreFeatures, ToolInput,
-    };
-
-    #[derive(Clone)]
-    struct TestContext {
-        engine_id: Principal,
-        caller: Principal,
-        meta: RequestMeta,
-        cancellation_token: CancellationToken,
-    }
-
-    impl Default for TestContext {
-        fn default() -> Self {
-            Self {
-                engine_id: Principal::management_canister(),
-                caller: Principal::anonymous(),
-                meta: RequestMeta::default(),
-                cancellation_token: CancellationToken::new(),
-            }
-        }
-    }
-
-    impl StateFeatures for TestContext {
-        fn engine_id(&self) -> &Principal {
-            &self.engine_id
-        }
-
-        fn engine_name(&self) -> &str {
-            "test-engine"
-        }
-
-        fn caller(&self) -> &Principal {
-            &self.caller
-        }
-
-        fn meta(&self) -> &RequestMeta {
-            &self.meta
-        }
-
-        fn cancellation_token(&self) -> CancellationToken {
-            self.cancellation_token.clone()
-        }
-
-        fn time_elapsed(&self) -> Duration {
-            Duration::ZERO
-        }
-    }
-
-    impl KeysFeatures for TestContext {
-        async fn a256gcm_key(&self, _derivation_path: Vec<Vec<u8>>) -> Result<[u8; 32], BoxError> {
-            Ok([0; 32])
-        }
-
-        async fn ed25519_sign_message(
-            &self,
-            _derivation_path: Vec<Vec<u8>>,
-            _message: &[u8],
-        ) -> Result<[u8; 64], BoxError> {
-            Ok([0; 64])
-        }
-
-        async fn ed25519_verify(
-            &self,
-            _derivation_path: Vec<Vec<u8>>,
-            _message: &[u8],
-            _signature: &[u8],
-        ) -> Result<(), BoxError> {
-            Ok(())
-        }
-
-        async fn ed25519_public_key(
-            &self,
-            _derivation_path: Vec<Vec<u8>>,
-        ) -> Result<[u8; 32], BoxError> {
-            Ok([0; 32])
-        }
-
-        async fn secp256k1_sign_message_bip340(
-            &self,
-            _derivation_path: Vec<Vec<u8>>,
-            _message: &[u8],
-        ) -> Result<[u8; 64], BoxError> {
-            Ok([0; 64])
-        }
-
-        async fn secp256k1_verify_bip340(
-            &self,
-            _derivation_path: Vec<Vec<u8>>,
-            _message: &[u8],
-            _signature: &[u8],
-        ) -> Result<(), BoxError> {
-            Ok(())
-        }
-
-        async fn secp256k1_sign_message_ecdsa(
-            &self,
-            _derivation_path: Vec<Vec<u8>>,
-            _message: &[u8],
-        ) -> Result<[u8; 64], BoxError> {
-            Ok([0; 64])
-        }
-
-        async fn secp256k1_sign_digest_ecdsa(
-            &self,
-            _derivation_path: Vec<Vec<u8>>,
-            _message_hash: &[u8],
-        ) -> Result<[u8; 64], BoxError> {
-            Ok([0; 64])
-        }
-
-        async fn secp256k1_verify_ecdsa(
-            &self,
-            _derivation_path: Vec<Vec<u8>>,
-            _message_hash: &[u8],
-            _signature: &[u8],
-        ) -> Result<(), BoxError> {
-            Ok(())
-        }
-
-        async fn secp256k1_public_key(
-            &self,
-            _derivation_path: Vec<Vec<u8>>,
-        ) -> Result<[u8; 33], BoxError> {
-            Ok([0; 33])
-        }
-    }
-
-    impl StoreFeatures for TestContext {
-        async fn store_get(&self, _path: &Path) -> Result<(bytes::Bytes, ObjectMeta), BoxError> {
-            Err("not implemented".into())
-        }
-
-        async fn store_list(
-            &self,
-            _prefix: Option<&Path>,
-            _offset: &Path,
-        ) -> Result<Vec<ObjectMeta>, BoxError> {
-            Ok(Vec::new())
-        }
-
-        async fn store_put(
-            &self,
-            _path: &Path,
-            _mode: PutMode,
-            _value: bytes::Bytes,
-        ) -> Result<PutResult, BoxError> {
-            Err("not implemented".into())
-        }
-
-        async fn store_rename_if_not_exists(
-            &self,
-            _from: &Path,
-            _to: &Path,
-        ) -> Result<(), BoxError> {
-            Err("not implemented".into())
-        }
-
-        async fn store_delete(&self, _path: &Path) -> Result<(), BoxError> {
-            Ok(())
-        }
-    }
-
-    impl CacheFeatures for TestContext {
-        fn cache_contains(&self, _key: &str) -> bool {
-            false
-        }
-
-        async fn cache_get<T>(&self, _key: &str) -> Result<T, BoxError>
-        where
-            T: DeserializeOwned,
-        {
-            Err("not implemented".into())
-        }
-
-        async fn cache_get_with<T, F>(&self, _key: &str, _init: F) -> Result<T, BoxError>
-        where
-            T: Sized + DeserializeOwned + Serialize + Send,
-            F: Future<Output = Result<(T, Option<CacheExpiry>), BoxError>> + Send + 'static,
-        {
-            Err("not implemented".into())
-        }
-
-        async fn cache_set<T>(&self, _key: &str, _val: (T, Option<CacheExpiry>))
-        where
-            T: Sized + Serialize + Send,
-        {
-        }
-
-        async fn cache_set_if_not_exists<T>(
-            &self,
-            _key: &str,
-            _val: (T, Option<CacheExpiry>),
-        ) -> bool
-        where
-            T: Sized + Serialize + Send,
-        {
-            false
-        }
-
-        async fn cache_delete(&self, _key: &str) -> bool {
-            false
-        }
-
-        fn cache_raw_iter(
-            &self,
-        ) -> impl Iterator<Item = (Arc<String>, Arc<(bytes::Bytes, Option<CacheExpiry>)>)> {
-            std::iter::empty()
-        }
-    }
-
-    impl HttpFeatures for TestContext {
-        async fn https_call(
-            &self,
-            _url: &str,
-            _method: http::Method,
-            _headers: Option<http::HeaderMap>,
-            _body: Option<Vec<u8>>,
-        ) -> Result<reqwest::Response, BoxError> {
-            Err("not implemented".into())
-        }
-
-        async fn https_signed_call(
-            &self,
-            _url: &str,
-            _method: http::Method,
-            _message_digest: [u8; 32],
-            _headers: Option<http::HeaderMap>,
-            _body: Option<Vec<u8>>,
-        ) -> Result<reqwest::Response, BoxError> {
-            Err("not implemented".into())
-        }
-
-        async fn https_signed_rpc<T>(
-            &self,
-            _endpoint: &str,
-            _method: &str,
-            _args: impl Serialize + Send,
-        ) -> Result<T, BoxError>
-        where
-            T: DeserializeOwned,
-        {
-            Err("not implemented".into())
-        }
-    }
-
-    impl BaseContext for TestContext {
-        async fn remote_tool_call(
-            &self,
-            _endpoint: &str,
-            _args: ToolInput<Json>,
-        ) -> Result<ToolOutput<Json>, BoxError> {
-            Err("not implemented".into())
-        }
-    }
 
     struct ExampleTool {
         id: usize,
@@ -1000,16 +738,7 @@ mod tests {
 
     struct InvalidTool;
 
-    fn resource(id: u64, tags: &[&str]) -> Resource {
-        Resource {
-            _id: id,
-            name: format!("resource-{id}"),
-            tags: tags.iter().map(|tag| tag.to_string()).collect(),
-            ..Default::default()
-        }
-    }
-
-    impl Tool<TestContext> for ExampleTool {
+    impl Tool<MockContext> for ExampleTool {
         type Args = ();
         type Output = String;
 
@@ -1037,7 +766,7 @@ mod tests {
 
         async fn call(
             &self,
-            _ctx: TestContext,
+            _ctx: MockContext,
             _args: Self::Args,
             _resources: Vec<Resource>,
         ) -> Result<ToolOutput<Self::Output>, BoxError> {
@@ -1045,7 +774,7 @@ mod tests {
         }
     }
 
-    impl Tool<TestContext> for OtherTool {
+    impl Tool<MockContext> for OtherTool {
         type Args = ();
         type Output = String;
 
@@ -1073,7 +802,7 @@ mod tests {
 
         async fn call(
             &self,
-            _ctx: TestContext,
+            _ctx: MockContext,
             _args: Self::Args,
             _resources: Vec<Resource>,
         ) -> Result<ToolOutput<Self::Output>, BoxError> {
@@ -1081,7 +810,7 @@ mod tests {
         }
     }
 
-    impl Tool<TestContext> for TaggedTool {
+    impl Tool<MockContext> for TaggedTool {
         type Args = EchoArgs;
         type Output = Json;
 
@@ -1116,7 +845,7 @@ mod tests {
 
         async fn call(
             &self,
-            _ctx: TestContext,
+            _ctx: MockContext,
             args: Self::Args,
             resources: Vec<Resource>,
         ) -> Result<ToolOutput<Self::Output>, BoxError> {
@@ -1133,7 +862,7 @@ mod tests {
         }
     }
 
-    impl Tool<TestContext> for InvalidTool {
+    impl Tool<MockContext> for InvalidTool {
         type Args = ();
         type Output = String;
 
@@ -1156,7 +885,7 @@ mod tests {
 
         async fn call(
             &self,
-            _ctx: TestContext,
+            _ctx: MockContext,
             _args: Self::Args,
             _resources: Vec<Resource>,
         ) -> Result<ToolOutput<Self::Output>, BoxError> {
@@ -1167,7 +896,7 @@ mod tests {
     #[test]
     fn dyn_tool_downcast_ref_returns_inner_tool() {
         let tool = Arc::new(ExampleTool { id: 7 });
-        let mut tool_set = ToolSet::<TestContext>::new();
+        let mut tool_set = ToolSet::<MockContext>::new();
         tool_set.add(tool).unwrap();
 
         let dyn_tool = tool_set.get("example_tool").unwrap();
@@ -1180,7 +909,7 @@ mod tests {
     #[test]
     fn dyn_tool_downcast_returns_original_arc() {
         let tool = Arc::new(ExampleTool { id: 9 });
-        let mut tool_set = ToolSet::<TestContext>::new();
+        let mut tool_set = ToolSet::<MockContext>::new();
         tool_set.add(tool.clone()).unwrap();
 
         let dyn_tool = tool_set.get("example_tool").unwrap();
@@ -1196,7 +925,7 @@ mod tests {
     #[test]
     fn dyn_tool_downcast_mismatch_returns_original_arc() {
         let tool = Arc::new(ExampleTool { id: 11 });
-        let mut tool_set = ToolSet::<TestContext>::new();
+        let mut tool_set = ToolSet::<MockContext>::new();
         tool_set.add(tool).unwrap();
 
         let dyn_tool = tool_set.get("example_tool").unwrap();
@@ -1221,7 +950,7 @@ mod tests {
             assert_eq!(definition.description, "Other tool used for downcast tests");
             assert_eq!(definition.parameters["type"], "object");
             let output = other
-                .call(TestContext::default(), (), Vec::new())
+                .call(MockContext::default(), (), Vec::new())
                 .await
                 .unwrap();
             assert_eq!(output.output, "other");
@@ -1234,7 +963,7 @@ mod tests {
             assert_eq!(definition.description, "Invalid function name");
             assert_eq!(definition.parameters["type"], "object");
             let output = invalid
-                .call(TestContext::default(), (), Vec::new())
+                .call(MockContext::default(), (), Vec::new())
                 .await
                 .unwrap();
             assert!(output.output.is_empty());
@@ -1250,32 +979,32 @@ mod tests {
             assert!(tool.supported_resource_tags().is_empty());
             assert!(tool.select_resources(&mut resources).is_empty());
             assert_eq!(resources.len(), 1);
-            tool.init(TestContext::default()).await.unwrap();
+            tool.init(MockContext::default()).await.unwrap();
 
             let raw = tool
-                .call_raw(TestContext::default(), Json::Null, Vec::new())
+                .call_raw(MockContext::default(), Json::Null, Vec::new())
                 .await
                 .unwrap();
             assert_eq!(raw.output, json!("42"));
             assert_eq!(raw.usage.requests, 1);
 
             let invalid = tool
-                .call_raw(TestContext::default(), json!({"bad": true}), Vec::new())
+                .call_raw(MockContext::default(), json!({"bad": true}), Vec::new())
                 .await
                 .unwrap_err();
             assert!(invalid.to_string().contains("invalid args"));
 
-            let mut tool_set = ToolSet::<TestContext>::new();
+            let mut tool_set = ToolSet::<MockContext>::new();
             tool_set.add(tool).unwrap();
             let dyn_tool = tool_set.get("EXAMPLE_TOOL").unwrap();
 
             assert_eq!(dyn_tool.name(), "example_tool");
             assert_eq!(dyn_tool.definition().name, "example_tool");
             assert!(dyn_tool.supported_resource_tags().is_empty());
-            dyn_tool.init(TestContext::default()).await.unwrap();
+            dyn_tool.init(MockContext::default()).await.unwrap();
 
             let output = dyn_tool
-                .call(TestContext::default(), Json::Null, Vec::new())
+                .call(MockContext::default(), Json::Null, Vec::new())
                 .await
                 .unwrap();
             assert_eq!(output.output, json!("42"));
@@ -1286,7 +1015,7 @@ mod tests {
     #[test]
     fn tool_set_registry_filters_resources_and_reports_errors() {
         futures::executor::block_on(async {
-            let mut tool_set = ToolSet::<TestContext>::new();
+            let mut tool_set = ToolSet::<MockContext>::new();
             tool_set.add(Arc::new(ExampleTool { id: 1 })).unwrap();
             tool_set.add(Arc::new(TaggedTool)).unwrap();
 
@@ -1355,7 +1084,7 @@ mod tests {
             let dyn_tool = tool_set.get_lowercase("tagged_tool").unwrap();
             let output = dyn_tool
                 .call(
-                    TestContext::default(),
+                    MockContext::default(),
                     json!({"value": "ok", "fail": false}),
                     vec![resource(9, &["text"])],
                 )
@@ -1370,7 +1099,7 @@ mod tests {
 
             let failed = dyn_tool
                 .call(
-                    TestContext::default(),
+                    MockContext::default(),
                     json!({"value": "bad", "fail": true}),
                     Vec::new(),
                 )
@@ -1386,126 +1115,12 @@ mod tests {
         });
     }
 
-    #[test]
-    fn test_tool_context_mock_features_cover_default_paths() {
-        futures::executor::block_on(async {
-            let ctx = TestContext::default();
-            assert_eq!(*ctx.engine_id(), Principal::management_canister());
-            assert_eq!(ctx.engine_name(), "test-engine");
-            assert_eq!(*ctx.caller(), Principal::anonymous());
-            assert!(ctx.meta().user.is_none());
-            assert!(!ctx.cancellation_token().is_cancelled());
-            assert_eq!(ctx.time_elapsed(), Duration::ZERO);
-
-            assert_eq!(ctx.a256gcm_key(Vec::new()).await.unwrap(), [0; 32]);
-            assert_eq!(
-                ctx.ed25519_sign_message(Vec::new(), b"message")
-                    .await
-                    .unwrap(),
-                [0; 64]
-            );
-            ctx.ed25519_verify(Vec::new(), b"message", &[0; 64])
-                .await
-                .unwrap();
-            assert_eq!(ctx.ed25519_public_key(Vec::new()).await.unwrap(), [0; 32]);
-            assert_eq!(
-                ctx.secp256k1_sign_message_bip340(Vec::new(), b"message")
-                    .await
-                    .unwrap(),
-                [0; 64]
-            );
-            ctx.secp256k1_verify_bip340(Vec::new(), b"message", &[0; 64])
-                .await
-                .unwrap();
-            assert_eq!(
-                ctx.secp256k1_sign_message_ecdsa(Vec::new(), b"message")
-                    .await
-                    .unwrap(),
-                [0; 64]
-            );
-            assert_eq!(
-                ctx.secp256k1_sign_digest_ecdsa(Vec::new(), &[0; 32])
-                    .await
-                    .unwrap(),
-                [0; 64]
-            );
-            ctx.secp256k1_verify_ecdsa(Vec::new(), &[0; 32], &[0; 64])
-                .await
-                .unwrap();
-            assert_eq!(ctx.secp256k1_public_key(Vec::new()).await.unwrap(), [0; 33]);
-
-            assert!(ctx.store_get(&Path::from("missing")).await.is_err());
-            assert!(
-                ctx.store_list(None, &Path::default())
-                    .await
-                    .unwrap()
-                    .is_empty()
-            );
-            assert!(
-                ctx.store_put(&Path::from("file"), PutMode::Overwrite, bytes::Bytes::new())
-                    .await
-                    .is_err()
-            );
-            assert!(
-                ctx.store_rename_if_not_exists(&Path::from("a"), &Path::from("b"))
-                    .await
-                    .is_err()
-            );
-            ctx.store_delete(&Path::from("file")).await.unwrap();
-
-            assert!(!ctx.cache_contains("key"));
-            assert!(ctx.cache_get::<String>("key").await.is_err());
-            assert!(
-                ctx.cache_get_with("key", async { Ok(("value".to_string(), None)) })
-                    .await
-                    .is_err()
-            );
-            ctx.cache_set("key", ("value".to_string(), None)).await;
-            assert!(
-                !ctx.cache_set_if_not_exists("key", ("value".to_string(), None))
-                    .await
-            );
-            assert!(!ctx.cache_delete("key").await);
-            assert_eq!(ctx.cache_raw_iter().count(), 0);
-
-            assert!(
-                ctx.https_call("https://example.test", http::Method::GET, None, None)
-                    .await
-                    .is_err()
-            );
-            assert!(
-                ctx.https_signed_call(
-                    "https://example.test",
-                    http::Method::POST,
-                    [0; 32],
-                    None,
-                    None,
-                )
-                .await
-                .is_err()
-            );
-            let rpc: Result<String, BoxError> = ctx
-                .https_signed_rpc("https://example.test", "method", &())
-                .await;
-            assert!(rpc.is_err());
-
-            assert!(
-                ctx.remote_tool_call(
-                    "https://example.test",
-                    ToolInput::new("tool".to_string(), Json::Null),
-                )
-                .await
-                .is_err()
-            );
-        });
-    }
-
     struct GroupedTool {
         name: &'static str,
         group: &'static str,
     }
 
-    impl Tool<TestContext> for GroupedTool {
+    impl Tool<MockContext> for GroupedTool {
         type Args = ();
         type Output = String;
 
@@ -1542,7 +1157,7 @@ mod tests {
 
         async fn call(
             &self,
-            _ctx: TestContext,
+            _ctx: MockContext,
             _args: Self::Args,
             _resources: Vec<Resource>,
         ) -> Result<ToolOutput<Self::Output>, BoxError> {
@@ -1552,7 +1167,7 @@ mod tests {
 
     #[test]
     fn tool_set_groups_aggregate_members_by_id() {
-        let mut tool_set = ToolSet::<TestContext>::new();
+        let mut tool_set = ToolSet::<MockContext>::new();
         tool_set
             .add(Arc::new(GroupedTool {
                 name: "fs_write",

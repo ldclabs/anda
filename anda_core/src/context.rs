@@ -21,10 +21,9 @@
 //! environments such as tests, embedded workers, or alternative TEE backends.
 
 use async_trait::async_trait;
-use bytes::Bytes;
 use cbor2::{from_slice, to_canonical_vec};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::{future::Future, sync::Arc, time::Duration};
+use std::{future::Future, time::Duration};
 
 pub use anda_db_schema::Json;
 pub use candid::Principal;
@@ -391,11 +390,6 @@ pub trait CacheFeatures: Sized {
 
     /// Deletes a cached value by key, returns true if key existed.
     fn cache_delete(&self, key: &str) -> impl Future<Output = bool> + Send;
-
-    /// Returns an iterator over all cached items with raw value.
-    fn cache_raw_iter(
-        &self,
-    ) -> impl Iterator<Item = (Arc<String>, Arc<(Bytes, Option<CacheExpiry>)>)>;
 }
 
 /// HTTP request capabilities available to agents and tools.
@@ -618,6 +612,7 @@ pub fn derivation_path_with(path: &Path, derivation_path: Vec<Vec<u8>>) -> Vec<V
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use futures::executor::block_on;
     use http::Extensions;
     use std::{
@@ -720,18 +715,6 @@ mod tests {
 
         async fn cache_delete(&self, key: &str) -> bool {
             self.cache.lock().unwrap().remove(key).is_some()
-        }
-
-        fn cache_raw_iter(
-            &self,
-        ) -> impl Iterator<Item = (Arc<String>, Arc<(Bytes, Option<CacheExpiry>)>)> {
-            self.cache
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|(key, value)| (Arc::new(key.clone()), value.clone()))
-                .collect::<Vec<_>>()
-                .into_iter()
         }
     }
 
@@ -943,11 +926,13 @@ mod tests {
         ));
         assert!(inserted);
 
-        let mut seen = ctx
-            .cache_raw_iter()
-            .map(|(key, value)| (key.to_string(), value.1.clone()))
+        let seen = ctx
+            .cache
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(key, value)| (key.clone(), value.1.clone()))
             .collect::<Vec<_>>();
-        seen.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(seen.len(), 2);
         let ttl_expiry = seen
             .iter()
