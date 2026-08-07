@@ -2,18 +2,43 @@
 
 All notable changes to the Anda project will be documented in this file.
 
-## [Unreleased]
+## [0.15.0] — 2026-08-07
 
-Deep-module restructuring of `anda_engine` guided by a full design review
-(kept as an internal working document, not part of the repository). Behavior
-is preserved except where noted below. Contains breaking API changes — the
-next `anda_engine` release should be a minor version bump.
+This release folds in the entries previously staged as `0.14.6`, which was
+never published, and adds a deep-module restructuring of `anda_engine` and
+`anda_core` guided by a full design review (kept as an internal working
+document, not part of the repository). Behavior is preserved across the
+restructuring except where noted below. Every workspace crate moves to
+`0.15.0` because the restructuring changes public API in `anda_core` and
+`anda_engine`.
 
-A follow-up pass applied the same deep-module review to `anda_core`. Its
-changes are breaking as well, so the next `anda_core` release should also be
-a minor version bump.
+### Added — anda_engine v0.15.0
 
-### Changed — anda_core (breaking)
+- **MCP 2026-07-28** — The MCP host now speaks the stateless revision alongside the older `initialize`-based ones. `McpServerConfig::lifecycle` picks how a server is approached: `auto` (default) probes `server/discover` and falls back to the legacy handshake — including on a fresh transport, since a pre-2026 server often drops the connection rather than answering "method not found" — while `discover` and `initialize` pin one lifecycle. `2026-07-28` is only negotiated through discovery, so a server that merely echoes a proposed version cannot pull the host onto a revision it does not implement. Discovery metadata (title, description, `instructions`) feeds the same tool groups the handshake used to.
+- **Subscription-based tool updates** — SEP-2575 removed unsolicited server pushes, so for `2026-07-28` peers that advertise `tools.listChanged` the provider opens a `subscriptions/listen` stream per session and drains it in the background. Streams are not resumable: an ended stream is reopened while the transport is up, and the session is marked dirty across the gap so a change announced while nothing was listening still triggers a re-list.
+- **MRTR and tasks handling** — A `tools/call` no longer always returns a result. An `input_required` round (SEP-2322) carrying only `requestState` is echoed back and the call continues; one that actually asks for sampling, elicitation, or roots — none of which this host advertises — comes back as a failed tool result, so the model can pick another path instead of losing the turn. The SEP-2663 tasks extension is opt-in per server through `McpServerConfig::tasks`: the provider then polls `tasks/get` at the server's suggested interval (clamped to 250 ms–10 s) up to `max_wait_secs`, and cancels any task it walks away from.
+- **MCP re-authorization** — `complete_authorization` now drops the server's live session after persisting the new grant, so re-running the OAuth flow (e.g. for updated scopes) takes effect on the next call instead of waiting for the old session to die. New `disconnect_server` drops a session while keeping the server and its routes — holding the per-server connect lock, so a reconnect already in flight cannot reinstate the retired credentials; new `clear_credentials` also deletes the persisted grant, forcing `McpAuthorizationRequired` and a fresh consent. A grant the authorization server has revoked now also surfaces as `McpAuthorizationRequired` instead of an opaque transport error, so applications learn to re-run the flow. The headless/SSH flow (present the URL as text, paste the redirect URL back) is now documented in `MCP_INTEGRATION.md`.
+- **Skill execution modes** — Skills now run inline by default: the `skills_manager` tool returns the full SKILL.md and the calling agent follows it in its own context, keeping the conversation, the user, and the turn's resources in reach. A skill can opt into isolated execution with `execution: subagent` (or `metadata.execution: subagent`) in its frontmatter, exposing it as an `SA_<agent_name>` worker for long-running, parallelisable, or context-hungry procedures. The tool response now reports `execution`, a `callable` name for subagent skills, and `base_dir` for resolving bundled files. Skills that previously ran as subagents must declare the execution mode to keep that behavior.
+- **`resource-tags` for skill subagents** — New frontmatter field narrows which offered resources a delegated skill receives; when absent it accepts every offered resource so the current turn's attachments reach it.
+- **`model::testing::ScriptedCompleter`** — A programmable completion double
+  (queued replies, closures, error injection, request recording, echo
+  fallback) available to downstream crates, replacing the need to hand-roll a
+  fake provider per test.
+- **`subagent::ConversationRecords`** — The two-method persistence port the
+  subagent conversation recorder actually needs (`create` / `update`).
+  `memory::Conversations` is its AndaDB adapter; AndaDB field encoding no
+  longer crosses into the subagent layer, and
+  `SubAgentConversationRecorder::with_store` accepts custom implementations,
+  so subagent persistence is testable without AndaDB.
+- **`context::DiscoveredTools`** — Discovery-tool policy (observation, merge
+  probing, output compaction) extracted from the completion runner into the
+  module that owns the discovery vocabulary.
+- **`BaseCtx::path()`** — Public accessor for the context namespace path
+  (`a_<agent>` for an agent call, `t_<tool>` for a tool call). Tool hooks are
+  keyed by argument/output types, so two tools with identical `Args`/`Output`
+  share one hook slot; this is how a hook identifies which one invoked it.
+
+### Changed — anda_core v0.15.0 (breaking)
 
 - **Registries own their invariant** — The `set` map on `ToolSet`, `AgentSet`,
   and `ToolProviderSet` is now private, so the lowercase-key invariant can no
@@ -39,7 +64,7 @@ a minor version bump.
   (`text_from_bytes_with_encoding(data, platform_text_encoding())`) and is
   plausibly used downstream, so it was kept rather than widening the break.
 
-### Changed — anda_core
+### Changed — anda_core v0.15.0
 
 - **`model` split into cohesive submodules** — `model.rs` now hosts only the
   call-contract types (agent/tool inputs and outputs, usage, request metadata,
@@ -59,7 +84,7 @@ a minor version bump.
   `agent.rs` and `tool.rs` tests are now one `MockContext` in an internal
   test-support module, and the twin mock-coverage tests merged into one.
 
-### Changed — anda_engine (breaking)
+### Changed — anda_engine v0.15.0 (breaking)
 
 - **Provider seam unified on `CompletionFeaturesDyn`** — The delegating
   `anda_core::CompletionFeatures` impls on the Anthropic and Gemini
@@ -71,7 +96,7 @@ a minor version bump.
   storage abstraction can no longer be bypassed; use the methods, or the new
   `ConversationRecords` port (below).
 
-### Changed — anda_engine
+### Changed — anda_engine v0.15.0
 
 - **One completion driver for all providers** — The four provider adapters
   (Anthropic, Gemini, OpenAI Chat, OpenAI Responses) now share a single
@@ -134,28 +159,9 @@ a minor version bump.
     (`default` values from serde defaults, `minimum: 0` on unsigned integers,
     descriptions on nested item objects); property shapes, enums, and
     required lists are unchanged.
+- **`allowed-tools` is now an upper bound** — A skill that declares `allowed-tools` is granted exactly those tools as a subagent; only skills that declare nothing inherit the manager's default tool set. Previously the configured defaults were merged into every skill, which could escalate a restriction written in a third-party SKILL.md.
 
-### Added — anda_engine
-
-- **`model::testing::ScriptedCompleter`** — A programmable completion double
-  (queued replies, closures, error injection, request recording, echo
-  fallback) available to downstream crates, replacing the need to hand-roll a
-  fake provider per test.
-- **`subagent::ConversationRecords`** — The two-method persistence port the
-  subagent conversation recorder actually needs (`create` / `update`).
-  `memory::Conversations` is its AndaDB adapter; AndaDB field encoding no
-  longer crosses into the subagent layer, and
-  `SubAgentConversationRecorder::with_store` accepts custom implementations,
-  so subagent persistence is testable without AndaDB.
-- **`context::DiscoveredTools`** — Discovery-tool policy (observation, merge
-  probing, output compaction) extracted from the completion runner into the
-  module that owns the discovery vocabulary.
-- **`BaseCtx::path()`** — Public accessor for the context namespace path
-  (`a_<agent>` for an agent call, `t_<tool>` for a tool call). Tool hooks are
-  keyed by argument/output types, so two tools with identical `Args`/`Output`
-  share one hook slot; this is how a hook identifies which one invoked it.
-
-### Fixed — anda_engine
+### Fixed — anda_engine v0.15.0
 
 - **Rustdoc builds clean again** — Intra-doc links in `extension::mcp::auth`
   and the `extension` module docs were left unresolved by the MCP/hook
@@ -176,24 +182,6 @@ a minor version bump.
   orphaned reasoning item in `raw_history`, and every subsequent request was
   rejected for a reasoning item without its required following item — wedging
   the conversation until the process restarted.
-
-## [0.14.6] — 2026-08-06
-
-### Added — anda_engine v0.14.6
-
-- **MCP 2026-07-28** — The MCP host now speaks the stateless revision alongside the older `initialize`-based ones. `McpServerConfig::lifecycle` picks how a server is approached: `auto` (default) probes `server/discover` and falls back to the legacy handshake — including on a fresh transport, since a pre-2026 server often drops the connection rather than answering "method not found" — while `discover` and `initialize` pin one lifecycle. `2026-07-28` is only negotiated through discovery, so a server that merely echoes a proposed version cannot pull the host onto a revision it does not implement. Discovery metadata (title, description, `instructions`) feeds the same tool groups the handshake used to.
-- **Subscription-based tool updates** — SEP-2575 removed unsolicited server pushes, so for `2026-07-28` peers that advertise `tools.listChanged` the provider opens a `subscriptions/listen` stream per session and drains it in the background. Streams are not resumable: an ended stream is reopened while the transport is up, and the session is marked dirty across the gap so a change announced while nothing was listening still triggers a re-list.
-- **MRTR and tasks handling** — A `tools/call` no longer always returns a result. An `input_required` round (SEP-2322) carrying only `requestState` is echoed back and the call continues; one that actually asks for sampling, elicitation, or roots — none of which this host advertises — comes back as a failed tool result, so the model can pick another path instead of losing the turn. The SEP-2663 tasks extension is opt-in per server through `McpServerConfig::tasks`: the provider then polls `tasks/get` at the server's suggested interval (clamped to 250 ms–10 s) up to `max_wait_secs`, and cancels any task it walks away from.
-- **MCP re-authorization** — `complete_authorization` now drops the server's live session after persisting the new grant, so re-running the OAuth flow (e.g. for updated scopes) takes effect on the next call instead of waiting for the old session to die. New `disconnect_server` drops a session while keeping the server and its routes — holding the per-server connect lock, so a reconnect already in flight cannot reinstate the retired credentials; new `clear_credentials` also deletes the persisted grant, forcing `McpAuthorizationRequired` and a fresh consent. A grant the authorization server has revoked now also surfaces as `McpAuthorizationRequired` instead of an opaque transport error, so applications learn to re-run the flow. The headless/SSH flow (present the URL as text, paste the redirect URL back) is now documented in `MCP_INTEGRATION.md`.
-- **Skill execution modes** — Skills now run inline by default: the `skills_manager` tool returns the full SKILL.md and the calling agent follows it in its own context, keeping the conversation, the user, and the turn's resources in reach. A skill can opt into isolated execution with `execution: subagent` (or `metadata.execution: subagent`) in its frontmatter, exposing it as an `SA_<agent_name>` worker for long-running, parallelisable, or context-hungry procedures. The tool response now reports `execution`, a `callable` name for subagent skills, and `base_dir` for resolving bundled files. Skills that previously ran as subagents must declare the execution mode to keep that behavior.
-- **`resource-tags` for skill subagents** — New frontmatter field narrows which offered resources a delegated skill receives; when absent it accepts every offered resource so the current turn's attachments reach it.
-
-### Changed — anda_engine v0.14.6
-
-- **`allowed-tools` is now an upper bound** — A skill that declares `allowed-tools` is granted exactly those tools as a subagent; only skills that declare nothing inherit the manager's default tool set. Previously the configured defaults were merged into every skill, which could escalate a restriction written in a third-party SKILL.md.
-
-### Fixed — anda_engine v0.14.6
-
 - **Live model switch replay** — `raw_history` belongs to the model that produced it: replaying one provider's native message JSON (OpenAI `input_text` parts, Anthropic content blocks, Gemini parts) through another provider makes the request unparseable and the provider rejects the whole call, wedging the conversation until restart. Each turn now re-resolves the routed model; when it changes, the engine drops `raw_history` and replays the provider-neutral `chat_history`.
 
 ## [0.14.5] — 2026-07-31
