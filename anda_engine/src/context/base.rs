@@ -242,7 +242,7 @@ impl BaseCtx {
     /// lowercased. This is how a [`ToolHook`](crate::hook::ToolHook) tells apart
     /// two tools that share one hook slot — hooks are keyed by argument/output
     /// types, so tools with identical `Args`/`Output` (for example the two KIP
-    /// tools, `execute_kip` and `memory_readonly`) receive the same hook.
+    /// tools, `execute_kip` and `execute_kip_readonly`) receive the same hook.
     pub fn path(&self) -> &Path {
         &self.path
     }

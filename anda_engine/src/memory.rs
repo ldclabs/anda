@@ -10,7 +10,11 @@
 //! via [`memory_tool_group_info`], so the discovery layer presents them to the
 //! model as one persistent-memory bundle.
 
-use anda_cognitive_nexus::{CognitiveNexus, ConceptPK};
+use anda_cognitive_nexus::{
+    CognitiveNexus, SpaceDraft,
+    governance::{AuthContext, rows::principal_class, store::PrincipalDraft},
+    nexus::{DEFAULT_SPACE, Session},
+};
 use anda_core::{
     BoxError, ContentPart, Document, Documents, FunctionDefinition, Message, Resource, ResourceRef,
     StateFeatures, Tool, ToolGroupInfo, ToolOutput, Usage, Xid,
@@ -25,12 +29,15 @@ use anda_db::{
 use anda_db_schema::{AndaDBSchema, Ft, Fv, Json};
 use anda_db_tfs::jieba_tokenizer;
 use anda_kip::{
-    DescribeTarget, KipError, META_SYSTEM_NAME, MetaCommand, PERSON_TYPE, Request, Response,
+    ErrorObject, Execution, KIP_FUNCTION_DEFINITION, KIP_READONLY_FUNCTION_DEFINITION, KipError,
+    KipErrorCode, Operation, OperationResult, ReadBinding, Request, RequestOptions, Response,
+    SpaceSelector, TopLevelStatus, execute_request, execute_request_readonly,
 };
 use async_trait::async_trait;
 use candid::Principal;
 use cbor2::cbor;
 use ic_auth_types::ByteBufB64;
+use moka::future::Cache;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, json};
@@ -66,30 +73,198 @@ pub fn memory_tool_group_info() -> ToolGroupInfo {
 }
 
 /// Default KIP tool function definition used by [`MemoryManagement`].
-pub static FUNCTION_DEFINITION: LazyLock<FunctionDefinition> = LazyLock::new(|| {
-    serde_json::from_value(json!({
-        "name": "execute_kip",
-        "description": "Executes one or more KIP (Knowledge Interaction Protocol) commands against the Cognitive Nexus to interact with your persistent memory.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "commands": {
-                    "type": "array",
-                    "description": "An array of KIP commands for batch execution (reduces round-trips). Commands are executed sequentially; execution stops on first KML error.",
-                    "items": {
-                        "type": "string"
-                    }
-                },
-                "parameters": {
-                    "type": "object",
-                    "description": "An optional JSON object of key-value pairs used for safe substitution of placeholders in the command string(s). Placeholders should start with ':' (e.g., :name, :limit). IMPORTANT: A placeholder must represent a complete JSON value token (e.g., name: :name). Do not embed placeholders inside quoted strings (e.g., \"Hello :name\"), because substitution uses JSON serialization."
-                },
-            },
-            "required": ["commands", "parameters"],
-            "additionalProperties": false
+///
+/// `anda_kip` ships the agent-facing definition alongside the protocol it
+/// describes, so the tool a model sees and the envelope the engine executes
+/// stay in step across protocol revisions.
+pub static FUNCTION_DEFINITION: LazyLock<FunctionDefinition> =
+    LazyLock::new(|| serde_json::from_value(KIP_FUNCTION_DEFINITION.clone()).unwrap());
+
+/// Default read-only KIP tool function definition used by [`MemoryReadonly`].
+///
+/// Not the writable definition with a different name: KIP 2.0's read-only entry
+/// point offers no write vocabulary and no `execution` modes to choose between,
+/// so reusing the writable schema would advertise a batch mode the read path
+/// has no use for.
+pub static READONLY_FUNCTION_DEFINITION: LazyLock<FunctionDefinition> =
+    LazyLock::new(|| serde_json::from_value(KIP_READONLY_FUNCTION_DEFINITION.clone()).unwrap());
+
+/// One entry of [`KipArgs::operations`].
+///
+/// The tool schema accepts a bare command string as well as an operation
+/// object, because a model batching three reads should not have to spell out
+/// three objects to do it.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum KipOperation {
+    /// Just the command text.
+    Command(String),
+    /// The full operation, with its own `op_id` and parameters.
+    Operation(Box<Operation>),
+}
+
+impl From<KipOperation> for Operation {
+    fn from(op: KipOperation) -> Self {
+        match op {
+            KipOperation::Command(command) => Operation::new(command),
+            KipOperation::Operation(operation) => *operation,
         }
-    })).unwrap()
-});
+    }
+}
+
+/// The model-facing arguments of `execute_kip` and `execute_kip_readonly`.
+///
+/// KIP 2.0's bundled tool definitions let a model send a single `command`, or an
+/// `operations` array whose items may be bare strings, and put `dry_run` at the
+/// top level. That is deliberately easier to write than the wire [`Request`],
+/// which carries the protocol tag, nests `dry_run` under `options`, and rejects
+/// unknown fields. This type is the bridge, so what the model was shown and what
+/// the engine executes are the same thing.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct KipArgs {
+    /// A single complete KIP command. Mutually exclusive with `operations`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+
+    /// Several KIP commands in one round-trip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operations: Option<Vec<KipOperation>>,
+
+    /// How the operations relate to one another.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<Execution>,
+
+    /// The read coordinate to bind every operation to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read: Option<ReadBinding>,
+
+    /// Values bound into the commands' `:placeholders`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<Map<String, Json>>,
+
+    /// Validate and plan without committing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dry_run: Option<bool>,
+}
+
+impl KipArgs {
+    /// Builds the read-only tool envelope. Its bundled schema exposes no
+    /// transaction mode, so a batch defaults to independent reads. Raw wire
+    /// requests and the writable tool keep KIP's explicit-mode requirement.
+    #[allow(clippy::result_large_err)]
+    pub fn into_readonly_request(self) -> Result<Request, KipError> {
+        let mut request = self.into_request()?;
+        if request.operations.len() > 1 && request.execution.is_none() {
+            request.execution = Some(Execution::new(anda_kip::ExecutionMode::Independent));
+        }
+        Ok(request)
+    }
+
+    /// Builds the wire envelope these arguments describe.
+    ///
+    /// The `command` / `operations` exclusion is checked here rather than left
+    /// to [`Request::validate`], because an envelope built from both would
+    /// silently run only one of them.
+    // `KipError` is the protocol's own error type and carries its registry code,
+    // hint and structured detail; boxing it here would make this one function
+    // disagree with every other KIP signature in the crate.
+    #[allow(clippy::result_large_err)]
+    pub fn into_request(self) -> Result<Request, KipError> {
+        let operations = match (self.command, self.operations) {
+            (Some(command), None) => vec![Operation::new(command)],
+            (None, Some(operations)) => operations.into_iter().map(Operation::from).collect(),
+            (Some(_), Some(_)) => {
+                return Err(KipError::invalid_request_envelope(
+                    "send either a single `command` or an `operations` batch, never both",
+                ));
+            }
+            (None, None) => {
+                return Err(KipError::invalid_request_envelope(
+                    "send a `command` or an `operations` batch",
+                ));
+            }
+        };
+
+        Ok(Request {
+            operations,
+            execution: self.execution,
+            read: self.read,
+            parameters: self.parameters,
+            options: self.dry_run.map(|dry_run| RequestOptions {
+                dry_run: Some(dry_run),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+    }
+}
+
+/// Wraps one already-computed value as a single-operation KIP response.
+///
+/// The conversation and resource tools answer from AndaDB rather than from the
+/// Nexus, but share the KIP response envelope so a caller handles one output
+/// shape across the whole memory bundle.
+fn kip_page(result: Json, next_cursor: Option<String>) -> Response {
+    Response {
+        results: vec![OperationResult::ok(result)],
+        next_cursor,
+        ..Default::default()
+    }
+}
+
+/// Reads a single-operation response as a plain result or an error.
+///
+/// A KIP failure lives at the operation level for an ordinary error and at the
+/// request level only for an envelope error, so reading just one of them would
+/// turn half of the failures into an empty success.
+#[allow(clippy::result_large_err)] // see `KipArgs::into_request`
+fn kip_result(response: Response) -> Result<Json, KipError> {
+    let error = response
+        .error
+        .or_else(|| response.results.first().and_then(|r| r.error.clone()));
+    match error {
+        Some(error) => Err(kip_error(error)),
+        None => Ok(response
+            .results
+            .into_iter()
+            .next()
+            .and_then(|r| r.result)
+            .unwrap_or(Json::Null)),
+    }
+}
+
+/// Reads the Person Concept a caller's principal keys.
+const CALLER_BY_KEY: &str =
+    r#"FIND(?person) WHERE { ?person CONCEPT {type: "Person", key: :key} } LIMIT 1"#;
+
+/// The first row of a `FIND` result, or `Json::Null` when nothing matched.
+///
+/// A miss is not an error here: "this Space holds no such Concept yet" is an
+/// ordinary answer, and raising it would make an empty memory look like a
+/// broken one.
+fn first_row(result: Json) -> Json {
+    match result {
+        Json::Array(rows) => rows.into_iter().next().unwrap_or(Json::Null),
+        other => other,
+    }
+}
+
+/// Recovers a typed [`KipError`] from a wire [`ErrorObject`].
+///
+/// An unregistered code becomes `InternalError` rather than being dropped: the
+/// message still says what happened, and inventing a category from a code this
+/// build does not know would misreport whether a retry can help.
+fn kip_error(error: ErrorObject) -> KipError {
+    let code = error
+        .code
+        .parse::<KipErrorCode>()
+        .unwrap_or(KipErrorCode::InternalError);
+    let mut err = KipError::new(code, error.message);
+    if let Some(hint) = error.hint {
+        err = err.with_hint(hint);
+    }
+    err
+}
 
 /// Conversation record stored in the memory database.
 ///
@@ -806,6 +981,50 @@ async fn next_expired_batch(conversations: &Collection, period: u64) -> Result<V
     Ok(ids)
 }
 
+/// How the KIP tools bind a call to an identity and a MemorySpace.
+///
+/// `anda_cognitive_nexus` authorizes a bare `&CognitiveNexus` as the engine's
+/// own system Principal — a real authorization, not a bypass, but one that
+/// makes *every* caller the owner of everything. That is right for the embedded
+/// case, where the process that opened the database is the owner, and wrong the
+/// moment one engine serves more than one caller.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Tenancy {
+    /// One brain, owned by the process. Every caller runs as the system
+    /// Principal against the default Space.
+    #[default]
+    Shared,
+
+    /// Each verified caller runs as its own Principal, in a MemorySpace it
+    /// owns.
+    ///
+    /// Isolation comes from ownership rather than from Grants the host has to
+    /// write and keep correct: a Space's owner is authorized in it, and nobody
+    /// is authorized in a Space they do not own. A caller therefore reaches
+    /// its own memory and no one else's, with no policy to get wrong.
+    ///
+    /// The Principal and Space are created on the caller's first KIP call. The
+    /// agent's own knowledge stays in the default Space, which the host-level
+    /// helpers ([`MemoryManagement::query`], [`MemoryManagement::execute`],
+    /// [`MemoryManagement::describe_primer`]) still reach as the system
+    /// Principal.
+    PerCallerSpace,
+}
+
+/// The Governance Principal a caller authenticates as.
+///
+/// Namespaced like the engine's own `kip:principal:system` so a caller's id
+/// cannot collide with a Principal the host registered by another route.
+fn tenant_principal(caller: &Principal) -> String {
+    format!("kip:principal:caller:{caller}")
+}
+
+/// The MemorySpace a caller owns under [`Tenancy::PerCallerSpace`].
+fn tenant_space(caller: &Principal) -> String {
+    format!("kip:space:caller:{caller}")
+}
+
 /// High-level memory manager for conversations, resources, and the Cognitive Nexus.
 #[derive(Debug, Clone)]
 pub struct MemoryManagement {
@@ -817,8 +1036,16 @@ pub struct MemoryManagement {
     resources: Arc<Collection>,
     /// Function definition exposed for the writable KIP tool.
     kip_function_definitions: FunctionDefinition,
+    /// How a caller's KIP calls are bound to identity and Space.
+    tenancy: Tenancy,
+    /// Callers this process has already provisioned, so the common case does
+    /// not re-read the Principal, Space and Schema Environment on every call.
+    /// Bounded, because the miss is only a few idempotent lookups.
+    provisioned: Cache<Principal, ()>,
 }
 
+// Preserve KIP's native structured error across the public host/tenant API.
+#[allow(clippy::result_large_err)]
 impl MemoryManagement {
     /// Opens or creates all memory collections and connects them to a nexus.
     pub async fn connect(db: Arc<AndaDB>, nexus: Arc<CognitiveNexus>) -> Result<Self, BoxError> {
@@ -855,7 +1082,23 @@ impl MemoryManagement {
             conversations,
             resources,
             kip_function_definitions: FUNCTION_DEFINITION.clone(),
+            tenancy: Tenancy::default(),
+            provisioned: Cache::builder().max_capacity(10_000).build(),
         })
+    }
+
+    /// Chooses how callers are bound to identity and Space.
+    ///
+    /// Defaults to [`Tenancy::Shared`], which is the behavior of an engine that
+    /// never called this.
+    pub fn with_tenancy(mut self, tenancy: Tenancy) -> Self {
+        self.tenancy = tenancy;
+        self
+    }
+
+    /// How this engine binds callers.
+    pub fn tenancy(&self) -> Tenancy {
+        self.tenancy
     }
 
     /// Overrides the writable KIP tool definition.
@@ -881,73 +1124,253 @@ impl MemoryManagement {
         self.conversations.max_document_id()
     }
 
+    /// The session a caller's commands run in, provisioning it if needed.
+    ///
+    /// Under [`Tenancy::Shared`] this is the engine's own system session, which
+    /// is what a bare `&CognitiveNexus` would have authorized as anyway.
+    ///
+    /// Under [`Tenancy::PerCallerSpace`] a verified caller gets a Principal and
+    /// a Space of its own, created on first use. An *anonymous* caller does not:
+    /// [`StateFeatures::caller`] returns the anonymous Principal precisely when
+    /// nothing was verified, and giving every unverified request one shared
+    /// Space would pool strangers' memories into it. It runs as the Nexus's
+    /// anonymous Principal on the default Space instead, where default deny
+    /// gives it nothing until a Space policy says otherwise.
+    pub async fn session_for(&self, caller: &Principal) -> Result<Session, KipError> {
+        Ok(self.binding(caller).await?.0)
+    }
+
+    /// The identity a caller runs as, and the Space it runs in.
+    ///
+    /// One decision returning both, because they are only correct together: a
+    /// caller authenticated as itself but pointed at another caller's Space is
+    /// precisely the failure [`Tenancy::PerCallerSpace`] exists to prevent, and
+    /// deciding them apart is how the two drift.
+    async fn binding(
+        &self,
+        caller: &Principal,
+    ) -> Result<(Session, Option<SpaceSelector>), KipError> {
+        match self.tenancy {
+            Tenancy::Shared => Ok((self.nexus.system_session(), None)),
+            Tenancy::PerCallerSpace if caller == &Principal::anonymous() => {
+                Ok((self.nexus.session(AuthContext::anonymous()), None))
+            }
+            Tenancy::PerCallerSpace => {
+                self.provision(caller).await?;
+                let session = self.nexus.session(
+                    AuthContext {
+                        auth_method: "ic-auth".to_string(),
+                        ..AuthContext::principal(tenant_principal(caller))
+                    }
+                    .with_client("anda_engine"),
+                );
+                let space = SpaceSelector {
+                    id: Some(tenant_space(caller)),
+                    uri: None,
+                };
+                Ok((session, Some(space)))
+            }
+        }
+    }
+
+    /// Creates the Principal and MemorySpace a caller owns, once per process.
+    ///
+    /// Every step is idempotent, so a cache miss after a restart re-runs them
+    /// harmlessly. The Space inherits whatever Schema Environment is in force in
+    /// the default Space: a fresh Space would otherwise hold Core alone, and a
+    /// host that installed its own vocabulary would find the same command
+    /// working for the owner and failing for every tenant.
+    async fn provision(&self, caller: &Principal) -> Result<(), KipError> {
+        if self.provisioned.get(caller).await.is_some() {
+            return Ok(());
+        }
+
+        let principal_id = tenant_principal(caller);
+        let space_id = tenant_space(caller);
+        self.nexus
+            .governance()
+            .ensure_principal(PrincipalDraft {
+                principal_id: principal_id.clone(),
+                // Recorded, never read by an authorization decision. A caller
+                // here is an ic-auth Principal, which may stand for a person or
+                // for another agent; the deployment is what knows which, and can
+                // correct the record through the Governance API.
+                principal_class: principal_class::HUMAN.to_string(),
+                display_name: caller.to_string(),
+                auth_provider: "ic-auth".to_string(),
+                auth_subject: caller.to_string(),
+            })
+            .await?;
+        self.nexus
+            .store
+            .open_or_create_space(SpaceDraft {
+                space_id: space_id.clone(),
+                name: format!("Memory of {caller}"),
+                description: "A caller's own MemorySpace.".to_string(),
+                owner_principal: principal_id,
+                ..Default::default()
+            })
+            .await?;
+        let environment = self.nexus.store.schema_environment(DEFAULT_SPACE).await?;
+        self.nexus
+            .ensure_schema(&space_id, environment.lock)
+            .await?;
+
+        self.provisioned.insert(*caller, ()).await;
+        Ok(())
+    }
+
+    /// Binds a request to the caller it runs for, returning its session.
+    ///
+    /// The Space is written here, over whatever the envelope held. [`KipArgs`]
+    /// exposes no Space field and the shipped tool schemas advertise none, so a
+    /// model cannot name one today; overwriting keeps that true if either ever
+    /// gains one, which is the difference between isolation and a convention.
+    async fn bind(&self, caller: &Principal, request: &mut Request) -> Result<Session, KipError> {
+        let (session, space) = self.binding(caller).await?;
+        request.space = space;
+        Ok(session)
+    }
+
+    /// Runs one read-only KIP command as the engine itself.
+    ///
+    /// Read-only is enforced on what the command parses to, so a mutation sent
+    /// through here is refused before the engine sees it.
+    ///
+    /// This is the *host* acting, on the default Space, under every tenancy —
+    /// use [`Self::query_as`] to read a caller's own memory.
+    pub async fn query(
+        &self,
+        command: &str,
+        parameters: Option<Map<String, Json>>,
+    ) -> Result<Json, KipError> {
+        let request = Request {
+            parameters,
+            ..Request::single(command)
+        };
+        kip_result(execute_request_readonly(&self.nexus.system_session(), &request).await)
+    }
+
+    /// Runs one state-changing KIP command as the engine itself.
+    ///
+    /// The host counterpart of [`Self::execute_as`]; see [`Self::query`].
+    pub async fn execute(
+        &self,
+        command: &str,
+        parameters: Option<Map<String, Json>>,
+    ) -> Result<Json, KipError> {
+        let request = Request {
+            parameters,
+            ..Request::single(command)
+        };
+        kip_result(execute_request(&self.nexus.system_session(), &request).await)
+    }
+
+    /// Runs one read-only KIP command in a caller's own memory.
+    pub async fn query_as(
+        &self,
+        caller: &Principal,
+        command: &str,
+        parameters: Option<Map<String, Json>>,
+    ) -> Result<Json, KipError> {
+        let mut request = Request {
+            parameters,
+            ..Request::single(command)
+        };
+        let session = self.bind(caller, &mut request).await?;
+        kip_result(execute_request_readonly(&session, &request).await)
+    }
+
+    /// Runs one state-changing KIP command in a caller's own memory.
+    pub async fn execute_as(
+        &self,
+        caller: &Principal,
+        command: &str,
+        parameters: Option<Map<String, Json>>,
+    ) -> Result<Json, KipError> {
+        let mut request = Request {
+            parameters,
+            ..Request::single(command)
+        };
+        let session = self.bind(caller, &mut request).await?;
+        kip_result(execute_request(&session, &request).await)
+    }
+
     /// Describes the Cognitive Nexus primer.
     pub async fn describe_primer(&self) -> Result<Json, KipError> {
-        let (primer, _) = self
-            .nexus
-            .execute_meta(MetaCommand::Describe(DescribeTarget::Primer))
-            .await?;
-        Ok(primer)
+        self.query("DESCRIBE PRIMER", None).await
     }
 
-    /// Describes the system identity and known domains.
-    pub async fn describe_system(&self) -> Result<Json, KipError> {
-        let system = self
-            .nexus
-            .get_concept(&ConceptPK::Object {
-                r#type: PERSON_TYPE.to_string(),
-                name: META_SYSTEM_NAME.to_string(),
-            })
+    /// Describes the agent's own model of itself, or `null` when it holds none.
+    ///
+    /// KIP 1.x answered this from a `$system` Person node carrying the engine's
+    /// principal. KIP 2.0 forbids that shape — `Person != PrincipalRecord`, and
+    /// an identity written into cognitive content to stand in for a Principal is
+    /// exactly the confusion the profile rules out — so self-knowledge lives in
+    /// a `SelfModel` Concept, which is descriptive cognition and grants nothing.
+    pub async fn describe_self(&self) -> Result<Json, KipError> {
+        let found = self
+            .query(
+                r#"FIND(?self) WHERE { ?self {type: "SelfModel"} } LIMIT 1"#,
+                None,
+            )
             .await?;
-        let (domains, _) = self
-            .nexus
-            .execute_meta(MetaCommand::Describe(DescribeTarget::Domains))
-            .await?;
-        Ok(json!({
-            "identity": system.to_concept_node(),
-            "domains": domains,
-        }))
+        Ok(first_row(found))
     }
 
-    /// Describes the caller identity stored in the nexus.
+    /// Describes the caller identity stored in the nexus, or `null` when absent.
+    ///
+    /// The caller's principal is the Concept's `key`: a semantic handle for the
+    /// person the agent is talking to, never a claim that this Concept can
+    /// authenticate as that Principal.
     pub async fn describe_caller(&self, id: &Principal) -> Result<Json, KipError> {
-        let user = self
-            .nexus
-            .get_concept(&ConceptPK::Object {
-                r#type: PERSON_TYPE.to_string(),
-                name: id.to_string(),
-            })
-            .await?;
-
-        Ok(user.to_concept_node())
+        self.query_as(
+            id,
+            CALLER_BY_KEY,
+            Some(Map::from_iter([("key".to_string(), id.to_string().into())])),
+        )
+        .await
+        .map(first_row)
     }
 
     /// Gets or initializes the caller identity concept in the nexus.
+    ///
+    /// `UPSERT ... MATCH {type, key}` is the identity-bearing form: matching on
+    /// the principal creates the Person once and resolves to the same one on
+    /// every later turn, where a name-only match would mint a second Person for
+    /// anyone who renamed themselves.
     pub async fn get_or_init_caller(
         &self,
         id: &Principal,
         name: Option<String>,
     ) -> Result<Json, KipError> {
-        let mut attributes = Map::new();
-        let mut metadata = Map::new();
-        attributes.insert("id".to_string(), id.to_string().into());
-        attributes.insert("person_class".to_string(), "Human".into());
-        if let Some(name) = name {
-            attributes.insert("name".to_string(), name.into());
-        }
-        metadata.insert("author".to_string(), "$system".into());
-        metadata.insert("status".to_string(), "active".into());
-        let user = self
-            .nexus
-            .get_or_init_concept(
-                PERSON_TYPE.to_string(),
-                id.to_string(),
-                attributes,
-                metadata,
-            )
-            .await?;
+        let key = id.to_string();
+        let parameters = Map::from_iter([
+            ("key".to_string(), key.clone().into()),
+            (
+                "name".to_string(),
+                name.unwrap_or_else(|| key.clone()).into(),
+            ),
+        ]);
+        self.execute_as(
+            id,
+            r#"UPSERT CONCEPT ?person {
+                 MATCH { type: "Person", key: :key }
+                 SET FIELDS { name: :name }
+               }"#,
+            Some(parameters),
+        )
+        .await?;
 
-        Ok(user.to_concept_node())
+        // Read back rather than returning the write receipt: callers want the
+        // Person as it now stands, which on a match is not what this call sent.
+        self.query_as(
+            id,
+            CALLER_BY_KEY,
+            Some(Map::from_iter([("key".to_string(), key.into())])),
+        )
+        .await
+        .map(first_row)
     }
 
     /// Adds one resource reference and flushes the resource collection.
@@ -1133,7 +1556,7 @@ impl MemoryManagement {
 
 /// KIP tool for memory management
 impl Tool<BaseCtx> for MemoryManagement {
-    type Args = Request;
+    type Args = KipArgs;
     type Output = Response;
 
     fn name(&self) -> String {
@@ -1158,21 +1581,37 @@ impl Tool<BaseCtx> for MemoryManagement {
         request: Self::Args,
         _resources: Vec<Resource>,
     ) -> Result<ToolOutput<Self::Output>, BoxError> {
+        let caller = *ctx.caller();
         hooked_call(&ctx, request, |request| async move {
-            let (_, res) = request.execute(self.nexus.as_ref()).await;
-            Ok(ToolOutput {
-                is_error: if matches!(res, Response::Err { .. }) {
-                    Some(true)
-                } else {
-                    None
+            let res = match request.into_request() {
+                Ok(mut request) => match self.bind(&caller, &mut request).await {
+                    Ok(session) => execute_request(&session, &request).await,
+                    Err(err) => Response::from(err),
                 },
-                output: res,
-                artifacts: Vec::new(),
-                usage: Usage::default(),
-                tools_usage: HashMap::new(),
-            })
+                Err(err) => Response::from(err),
+            };
+            Ok(kip_output(res))
         })
         .await
+    }
+}
+
+/// Wraps a KIP response as a tool output.
+///
+/// Anything short of `succeeded` is flagged as an error, `partial` included: a
+/// batch where one operation failed is not a clean result, and the per-operation
+/// detail the model needs to tell which is already in the payload.
+fn kip_output(res: Response) -> ToolOutput<Response> {
+    ToolOutput {
+        is_error: if res.status == TopLevelStatus::Succeeded {
+            None
+        } else {
+            Some(true)
+        },
+        output: res,
+        artifacts: Vec::new(),
+        usage: Usage::default(),
+        tools_usage: HashMap::new(),
     }
 }
 
@@ -1180,6 +1619,7 @@ impl Tool<BaseCtx> for MemoryManagement {
 #[derive(Debug, Clone)]
 pub struct MemoryReadonly {
     memory: Arc<MemoryManagement>,
+    kip_function_definitions: FunctionDefinition,
 }
 
 impl MemoryReadonly {
@@ -1188,20 +1628,29 @@ impl MemoryReadonly {
 
     /// Creates a new MemoryReadonly instance
     pub fn new(memory: Arc<MemoryManagement>) -> Self {
-        Self { memory }
+        Self {
+            memory,
+            kip_function_definitions: READONLY_FUNCTION_DEFINITION.clone(),
+        }
+    }
+
+    /// Overrides the read-only KIP tool definition.
+    pub fn with_kip_function_definitions(mut self, def: FunctionDefinition) -> Self {
+        self.kip_function_definitions = def;
+        self
     }
 }
 
 impl Tool<BaseCtx> for MemoryReadonly {
-    type Args = Request;
+    type Args = KipArgs;
     type Output = Response;
 
     fn name(&self) -> String {
-        Self::NAME.to_string()
+        self.kip_function_definitions.name.clone()
     }
 
     fn description(&self) -> String {
-        "Executes one or more KIP (Knowledge Interaction Protocol) commands against the Cognitive Nexus to read from your persistent memory. This tool does not allow any modifications to the memory and is safe to use for retrieval operations.".to_string()
+        self.kip_function_definitions.description.clone()
     }
 
     fn group(&self) -> Option<ToolGroupInfo> {
@@ -1209,12 +1658,7 @@ impl Tool<BaseCtx> for MemoryReadonly {
     }
 
     fn definition(&self) -> FunctionDefinition {
-        FunctionDefinition {
-            name: self.name(),
-            description: self.description(),
-            parameters: self.memory.kip_function_definitions.parameters.clone(),
-            strict: Some(true),
-        }
+        self.kip_function_definitions.clone()
     }
 
     async fn call(
@@ -1223,23 +1667,21 @@ impl Tool<BaseCtx> for MemoryReadonly {
         request: Self::Args,
         _resources: Vec<Resource>,
     ) -> Result<ToolOutput<Self::Output>, BoxError> {
-        // Note: this tool shares `DynToolHook<Request, Response>` with
+        // Note: this tool shares `DynToolHook<KipArgs, Response>` with
         // `execute_kip` — the hook state is keyed by argument/output types. A
         // hook that must tell them apart can compare `BaseCtx::path()`, whose
-        // last segment is `t_memory_readonly` here and `t_execute_kip` there.
-        hooked_call(&ctx, request, |mut request| async move {
-            let (_, res) = request.readonly().execute(self.memory.nexus.as_ref()).await;
-            Ok(ToolOutput {
-                is_error: if matches!(res, Response::Err { .. }) {
-                    Some(true)
-                } else {
-                    None
+        // last segment is `t_execute_kip_readonly` here and `t_execute_kip`
+        // there.
+        let caller = *ctx.caller();
+        hooked_call(&ctx, request, |request| async move {
+            let res = match request.into_readonly_request() {
+                Ok(mut request) => match self.memory.bind(&caller, &mut request).await {
+                    Ok(session) => execute_request_readonly(&session, &request).await,
+                    Err(err) => Response::from(err),
                 },
-                output: res,
-                artifacts: Vec::new(),
-                usage: Usage::default(),
-                tools_usage: HashMap::new(),
-            })
+                Err(err) => Response::from(err),
+            };
+            Ok(kip_output(res))
         })
         .await
     }
@@ -1398,10 +1840,10 @@ impl Tool<BaseCtx> for ListConversationsTool {
                 )
                 .await?;
             let docs: Vec<Document> = conversations.into_iter().map(Document::from).collect();
-            Ok(ToolOutput::new(Response::Ok {
-                result: Documents::from(docs).to_string().into(),
+            Ok(ToolOutput::new(kip_page(
+                Documents::from(docs).to_string().into(),
                 next_cursor,
-            }))
+            )))
         })
         .await
     }
@@ -1482,10 +1924,10 @@ impl Tool<BaseCtx> for SearchConversationsTool {
                 .await?;
 
             let docs: Vec<Document> = conversations.into_iter().map(Document::from).collect();
-            Ok(ToolOutput::new(Response::Ok {
-                result: Documents::from(docs).to_string().into(),
-                next_cursor: None,
-            }))
+            Ok(ToolOutput::new(kip_page(
+                Documents::from(docs).to_string().into(),
+                None,
+            )))
         })
         .await
     }
@@ -1692,10 +2134,7 @@ impl Tool<BaseCtx> for MemoryTool {
                         res.blob = FetchWebResourcesTool::fetch_as_bytes(ctx, uri).await.ok();
                     }
 
-                    Ok(ToolOutput::new(Response::Ok {
-                        result: json!(res),
-                        next_cursor: None,
-                    }))
+                    Ok(ToolOutput::new(kip_page(json!(res), None)))
                 }
                 MemoryToolArgs::GetConversation { _id } => {
                     let conversation = self.memory.get_conversation(_id).await?;
@@ -1703,10 +2142,7 @@ impl Tool<BaseCtx> for MemoryTool {
                         return Err("permission denied".into());
                     }
 
-                    Ok(ToolOutput::new(Response::Ok {
-                        result: json!(conversation),
-                        next_cursor: None,
-                    }))
+                    Ok(ToolOutput::new(kip_page(json!(conversation), None)))
                 }
                 MemoryToolArgs::GetConversationDelta {
                     _id,
@@ -1718,10 +2154,10 @@ impl Tool<BaseCtx> for MemoryTool {
                         return Err("permission denied".into());
                     }
 
-                    Ok(ToolOutput::new(Response::Ok {
-                        result: json!(conversation.into_delta(messages_offset, artifacts_offset)),
-                        next_cursor: None,
-                    }))
+                    Ok(ToolOutput::new(kip_page(
+                        json!(conversation.into_delta(messages_offset, artifacts_offset)),
+                        None,
+                    )))
                 }
                 MemoryToolArgs::StopConversation { _id } => {
                     let mut conversation = self.memory.get_conversation(_id).await?;
@@ -1744,10 +2180,7 @@ impl Tool<BaseCtx> for MemoryTool {
                         self.memory.update_conversation(_id, changes).await?;
                     }
 
-                    Ok(ToolOutput::new(Response::Ok {
-                        result: json!(conversation),
-                        next_cursor: None,
-                    }))
+                    Ok(ToolOutput::new(kip_page(json!(conversation), None)))
                 }
                 MemoryToolArgs::SteerConversation { _id, message } => {
                     if message.trim().is_empty() {
@@ -1775,10 +2208,7 @@ impl Tool<BaseCtx> for MemoryTool {
                     ]);
                     self.memory.update_conversation(_id, changes).await?;
 
-                    Ok(ToolOutput::new(Response::Ok {
-                        result: json!(conversation),
-                        next_cursor: None,
-                    }))
+                    Ok(ToolOutput::new(kip_page(json!(conversation), None)))
                 }
                 MemoryToolArgs::FollowUpConversation { _id, message } => {
                     if message.trim().is_empty() {
@@ -1806,10 +2236,7 @@ impl Tool<BaseCtx> for MemoryTool {
                     ]);
                     self.memory.update_conversation(_id, changes).await?;
 
-                    Ok(ToolOutput::new(Response::Ok {
-                        result: json!(conversation),
-                        next_cursor: None,
-                    }))
+                    Ok(ToolOutput::new(kip_page(json!(conversation), None)))
                 }
                 MemoryToolArgs::DeleteConversation { _id } => {
                     let conversation = self.memory.get_conversation(_id).await?;
@@ -1818,10 +2245,10 @@ impl Tool<BaseCtx> for MemoryTool {
                     }
 
                     let deleted = self.memory.delete_conversation(_id).await?;
-                    Ok(ToolOutput::new(Response::Ok {
-                        result: json!({ "deleted": deleted }),
-                        next_cursor: None,
-                    }))
+                    Ok(ToolOutput::new(kip_page(
+                        json!({ "deleted": deleted }),
+                        None,
+                    )))
                 }
                 MemoryToolArgs::ListPrevConversations { cursor, limit } => {
                     // Models often send "" instead of null for the first page.
@@ -1831,10 +2258,7 @@ impl Tool<BaseCtx> for MemoryTool {
                         .list_conversations_by_user(ctx.caller(), cursor, limit)
                         .await?;
 
-                    Ok(ToolOutput::new(Response::Ok {
-                        result: json!(conversations),
-                        next_cursor,
-                    }))
+                    Ok(ToolOutput::new(kip_page(json!(conversations), next_cursor)))
                 }
                 MemoryToolArgs::SearchConversations { query, limit } => {
                     let conversations = self
@@ -1842,10 +2266,7 @@ impl Tool<BaseCtx> for MemoryTool {
                         .search_conversations(ctx.caller(), query, limit)
                         .await?;
 
-                    Ok(ToolOutput::new(Response::Ok {
-                        result: json!(conversations),
-                        next_cursor: None,
-                    }))
+                    Ok(ToolOutput::new(kip_page(json!(conversations), None)))
                 }
             }
         })
@@ -1954,13 +2375,37 @@ mod tests {
     }
 
     async fn test_memory() -> Arc<MemoryManagement> {
+        test_memory_with(Tenancy::Shared).await
+    }
+
+    async fn test_memory_with(tenancy: Tenancy) -> Arc<MemoryManagement> {
         let db = test_db().await;
-        let nexus = Arc::new(
-            CognitiveNexus::connect(db.clone(), async |_nexus| Ok(()))
+        let nexus = CognitiveNexus::connect(db.clone()).await.unwrap();
+        // A Space that has activated nothing resolves Core alone, and Core declares
+        // no Concept types at all, so the caller-identity helpers need the baseline
+        // cognitive-memory profile in force before `Person` means anything.
+        nexus
+            .install_and_activate(
+                &[(
+                    "anda_engine",
+                    anda_cognitive_nexus::profiles::COGNITIVE_MEMORY,
+                )],
+                anda_cognitive_nexus::nexus::DEFAULT_SPACE,
+            )
+            .await
+            .unwrap();
+        Arc::new(
+            MemoryManagement::connect(db, Arc::new(nexus))
                 .await
-                .unwrap(),
-        );
-        Arc::new(MemoryManagement::connect(db, nexus).await.unwrap())
+                .unwrap()
+                .with_tenancy(tenancy),
+        )
+    }
+
+    /// The single result of a KIP response that must have succeeded.
+    fn kip_value(res: &Response) -> Json {
+        assert_eq!(res.status, TopLevelStatus::Succeeded, "{:?}", res.error);
+        res.first_result().cloned().unwrap_or(Json::Null)
     }
 
     fn test_ctx(caller: Principal) -> BaseCtx {
@@ -2482,20 +2927,31 @@ mod tests {
         );
 
         let _ = memory.nexus();
-        // The bundled genesis capsule has no `$self`, so the primer degrades the
-        // identity layer to null instead of failing the whole request.
         let primer = memory.describe_primer().await.unwrap();
-        assert_eq!(primer["identity"], json!(null));
-        assert_eq!(primer["search_modes"], json!(["keyword"]));
-        // `$system` is still absent, so describing the system identity errors.
-        assert!(memory.describe_system().await.is_err());
+        assert_eq!(primer["schema"]["environment_version"], json!(1));
+        assert!(
+            primer["schema"]["types"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r.as_str().is_some_and(|r| r.ends_with("/Person")))
+        );
+        // Nothing has written a SelfModel, and an absent one is an answer rather
+        // than a failure.
+        assert_eq!(memory.describe_self().await.unwrap(), json!(null));
+        // An unknown caller is likewise absent, not an error.
+        assert_eq!(memory.describe_caller(&user).await.unwrap(), json!(null));
         let caller = memory
             .get_or_init_caller(&user, Some("Ada".to_string()))
             .await
             .unwrap();
-        assert_eq!(caller["attributes"]["id"], json!(user.to_string()));
+        assert_eq!(caller["key"], json!(user.to_string()));
+        assert_eq!(caller["name"], json!("Ada"));
         let described = memory.describe_caller(&user).await.unwrap();
-        assert_eq!(described["attributes"]["name"], json!("Ada"));
+        assert_eq!(described["id"], caller["id"]);
+        // A second call resolves the same Person rather than minting another.
+        let again = memory.get_or_init_caller(&user, None).await.unwrap();
+        assert_eq!(again["id"], caller["id"]);
 
         let added_resource = resource("resource-a", Some(b"hello resource"));
         let resource_id = memory
@@ -2658,8 +3114,11 @@ mod tests {
 
         let readonly = MemoryReadonly::new(memory.clone());
         assert_eq!(readonly.name(), MemoryReadonly::NAME);
-        assert!(readonly.description().contains("read"));
-        assert_eq!(readonly.definition().strict, Some(true));
+        assert!(readonly.description().contains("read-only"));
+        // The KIP 2.0 schemas gate `command` against `operations` with `oneOf`,
+        // which strict structured-output mode does not accept, so neither KIP tool
+        // claims to be strict.
+        assert_eq!(readonly.definition().strict, None);
 
         let get_content = GetResourceContentTool::new(memory.clone());
         assert_eq!(get_content.name(), GetResourceContentTool::NAME);
@@ -2676,10 +3135,7 @@ mod tests {
             )
             .await
             .unwrap();
-        match output.output {
-            Response::Ok { result, .. } => assert_eq!(result, json!("plain text")),
-            other => panic!("unexpected response: {other:?}"),
-        }
+        assert_eq!(kip_value(&output.output), json!("plain text"));
         let output = get_content
             .call(
                 ctx.clone(),
@@ -2691,12 +3147,12 @@ mod tests {
             )
             .await
             .unwrap();
-        match output.output {
-            Response::Ok { result, .. } => {
-                assert!(result.as_str().unwrap().starts_with("b64:AJ-Slg"));
-            }
-            other => panic!("unexpected response: {other:?}"),
-        }
+        assert!(
+            kip_value(&output.output)
+                .as_str()
+                .unwrap()
+                .starts_with("b64:AJ-Slg")
+        );
         let err = get_content
             .call(
                 ctx.clone(),
@@ -2757,7 +3213,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(matches!(output.output, Response::Ok { .. }));
+        assert_eq!(output.output.status, TopLevelStatus::Succeeded);
         let err = list_tool
             .call(
                 ctx.clone(),
@@ -2789,7 +3245,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(matches!(output.output, Response::Ok { .. }));
+        assert_eq!(output.output.status, TopLevelStatus::Succeeded);
         let output = search_tool
             .call(
                 ctx.clone(),
@@ -2801,7 +3257,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(matches!(output.output, Response::Ok { .. }));
+        assert_eq!(output.output.status, TopLevelStatus::Succeeded);
 
         let memory_tool = MemoryTool::new(memory.clone());
         assert_eq!(memory_tool.name(), MemoryTool::NAME);
@@ -2818,7 +3274,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(matches!(output.output, Response::Ok { .. }));
+        assert_eq!(output.output.status, TopLevelStatus::Succeeded);
 
         let output = memory_tool
             .call(
@@ -2832,13 +3288,8 @@ mod tests {
             )
             .await
             .unwrap();
-        match output.output {
-            Response::Ok { result, .. } => {
-                let delta: ConversationDelta = serde_json::from_value(result).unwrap();
-                assert_eq!(delta.messages.len(), 1);
-            }
-            other => panic!("unexpected response: {other:?}"),
-        }
+        let delta: ConversationDelta = serde_json::from_value(kip_value(&output.output)).unwrap();
+        assert_eq!(delta.messages.len(), 1);
 
         let output = memory_tool
             .call(
@@ -2851,7 +3302,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(matches!(output.output, Response::Ok { .. }));
+        assert_eq!(output.output.status, TopLevelStatus::Succeeded);
 
         // A resource that the conversation does not reference must be rejected even for the
         // conversation owner.
@@ -2880,7 +3331,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(matches!(output.output, Response::Ok { .. }));
+        assert_eq!(output.output.status, TopLevelStatus::Succeeded);
 
         for args in [
             MemoryToolArgs::GetResource {
@@ -2999,7 +3450,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(matches!(output.output, Response::Ok { .. }));
+        assert_eq!(output.output.status, TopLevelStatus::Succeeded);
 
         let output = memory_tool
             .call(
@@ -3012,7 +3463,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(matches!(output.output, Response::Ok { .. }));
+        assert_eq!(output.output.status, TopLevelStatus::Succeeded);
         let output = memory_tool
             .call(
                 ctx.clone(),
@@ -3024,7 +3475,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(matches!(output.output, Response::Ok { .. }));
+        assert_eq!(output.output.status, TopLevelStatus::Succeeded);
 
         let denied = memory_tool
             .call(
@@ -3048,9 +3499,247 @@ mod tests {
             )
             .await
             .unwrap();
-        match output.output {
-            Response::Ok { result, .. } => assert_eq!(result["deleted"], json!(true)),
-            other => panic!("unexpected response: {other:?}"),
+        assert_eq!(kip_value(&output.output)["deleted"], json!(true));
+    }
+
+    /// One caller's memory is another caller's `not_authorized`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn per_caller_spaces_isolate_one_tenant_from_another() {
+        let memory = test_memory_with(Tenancy::PerCallerSpace).await;
+        let readonly = MemoryReadonly::new(memory.clone());
+        let (alice, bob) = (principal(1), principal(2));
+
+        let write = |who: Principal, name: &str| {
+            let memory = memory.clone();
+            let name = name.to_string();
+            async move {
+                memory
+                    .call(
+                        test_ctx(who),
+                        KipArgs {
+                            command: Some(
+                                r#"CREATE CONCEPT ?e {
+                                     TYPE "Event" NAME :name SET ATTRIBUTES { summary: :name }
+                                   }"#
+                                .to_string(),
+                            ),
+                            parameters: Some(Map::from_iter([("name".to_string(), name.into())])),
+                            ..Default::default()
+                        },
+                        Vec::new(),
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        let events_of = |who: Principal| {
+            let readonly = readonly.clone();
+            async move {
+                let output = readonly
+                    .call(
+                        test_ctx(who),
+                        KipArgs {
+                            command: Some(r#"FIND(?e) WHERE { ?e {type: "Event"} }"#.to_string()),
+                            ..Default::default()
+                        },
+                        Vec::new(),
+                    )
+                    .await
+                    .unwrap();
+                kip_value(&output.output)
+                    .as_array()
+                    .expect("FIND returns rows")
+                    .len()
+            }
+        };
+
+        // Each caller writes into a Space provisioned on first contact.
+        assert_eq!(write(alice, "Alice ships v2").await.is_error, None);
+        assert_eq!(write(bob, "Bob ships v3").await.is_error, None);
+
+        // Each sees exactly its own — not two, which is what one shared brain
+        // would have returned to both of them.
+        assert_eq!(events_of(alice).await, 1);
+        assert_eq!(events_of(bob).await, 1);
+
+        // The isolation is ownership, so it holds for the identity too: the
+        // Person Alice writes is not a Person Bob can find.
+        memory
+            .get_or_init_caller(&alice, Some("Alice".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(
+            memory.describe_caller(&alice).await.unwrap()["name"],
+            "Alice"
+        );
+        assert_eq!(memory.describe_caller(&bob).await.unwrap(), json!(null));
+
+        // And the host still reaches the agent's own Space, which holds neither
+        // tenant's writes.
+        let shared = memory
+            .query(r#"FIND(?e) WHERE { ?e {type: "Event"} }"#, None)
+            .await
+            .unwrap();
+        assert!(shared.as_array().unwrap().is_empty());
+
+        // An anonymous caller is unverified, so it gets no Space of its own and
+        // default deny gives it nothing on the agent's.
+        let output = readonly
+            .call(
+                test_ctx(Principal::anonymous()),
+                KipArgs {
+                    command: Some(r#"FIND(?e) WHERE { ?e {type: "Event"} }"#.to_string()),
+                    ..Default::default()
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.is_error, Some(true));
+
+        // A tenant cannot name its way out: the engine writes the Space over
+        // whatever the envelope carried.
+        let mut request = Request::single(r#"FIND(?e) WHERE { ?e {type: "Event"} }"#);
+        request.space = Some(SpaceSelector {
+            id: Some(tenant_space(&alice)),
+            uri: None,
+        });
+        memory.bind(&bob, &mut request).await.unwrap();
+        assert_eq!(request.space.unwrap().id.unwrap(), tenant_space(&bob));
+    }
+
+    #[test]
+    fn readonly_batch_default_does_not_relax_writable_wire_validation() {
+        let args = KipArgs {
+            operations: Some(vec![
+                KipOperation::Command("DESCRIBE PROTOCOL".into()),
+                KipOperation::Command("DESCRIBE CAPABILITIES".into()),
+            ]),
+            ..Default::default()
+        };
+        assert!(args.clone().into_request().unwrap().validate().is_err());
+        let request = args.clone().into_readonly_request().unwrap();
+        request.validate().unwrap();
+        assert_eq!(
+            request.execution_mode(),
+            anda_kip::ExecutionMode::Independent
+        );
+        let explicit = KipArgs {
+            execution: Some(Execution::new(anda_kip::ExecutionMode::Atomic)),
+            ..args
+        };
+        assert_eq!(
+            explicit.into_readonly_request().unwrap().execution_mode(),
+            anda_kip::ExecutionMode::Atomic
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn kip_tools_run_the_2_0_envelope_and_hold_the_readonly_line() {
+        let memory = test_memory().await;
+        let ctx = test_ctx(principal(9));
+        let readonly = MemoryReadonly::new(memory.clone());
+
+        // The model-facing shape: one bare command, no envelope boilerplate.
+        let output = memory
+            .call(
+                ctx.clone(),
+                KipArgs {
+                    command: Some("DESCRIBE PRIMER".to_string()),
+                    ..Default::default()
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.is_error, None);
+        assert!(kip_value(&output.output)["space"]["id"].is_string());
+
+        // A batch of bare strings, which the schema also allows.
+        let output = readonly
+            .call(
+                ctx.clone(),
+                KipArgs {
+                    operations: Some(vec![
+                        KipOperation::Command("DESCRIBE PROTOCOL".to_string()),
+                        KipOperation::Command("DESCRIBE CAPABILITIES".to_string()),
+                    ]),
+                    ..Default::default()
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.output.status, TopLevelStatus::Succeeded);
+        assert_eq!(output.output.results.len(), 2);
+
+        // A write lands through `execute_kip`, and parameters bind structurally.
+        let output = memory
+            .call(
+                ctx.clone(),
+                KipArgs {
+                    command: Some(
+                        r#"CREATE CONCEPT ?e {
+                             TYPE "Event" NAME :name SET ATTRIBUTES { summary: :name }
+                           }"#
+                        .to_string(),
+                    ),
+                    parameters: Some(Map::from_iter([("name".to_string(), "Deploy v2".into())])),
+                    ..Default::default()
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.is_error, None);
+
+        // The same write through the read-only tool is refused on what the
+        // command parses to, and reported as a tool error rather than silently
+        // returning an empty result.
+        let output = readonly
+            .call(
+                ctx.clone(),
+                KipArgs {
+                    command: Some(
+                        r#"CREATE CONCEPT ?e {
+                             TYPE "Event" NAME "Sneaky" SET ATTRIBUTES { summary: "Sneaky" }
+                           }"#
+                        .to_string(),
+                    ),
+                    ..Default::default()
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.is_error, Some(true));
+        assert_eq!(output.output.status, TopLevelStatus::Failed);
+        assert_eq!(
+            output.output.error.as_ref().unwrap().code,
+            KipErrorCode::ReadonlyViolation.name()
+        );
+        // ... and it did not run: only the first Event exists.
+        let events = memory
+            .query(r#"FIND(?e) WHERE { ?e {type: "Event"} }"#, None)
+            .await
+            .unwrap();
+        assert_eq!(events.as_array().unwrap().len(), 1);
+
+        // Neither half of the mutually exclusive pair is an executable request.
+        for args in [
+            KipArgs::default(),
+            KipArgs {
+                command: Some("DESCRIBE PRIMER".to_string()),
+                operations: Some(vec![KipOperation::Command("DESCRIBE PROTOCOL".to_string())]),
+                ..Default::default()
+            },
+        ] {
+            let output = memory.call(ctx.clone(), args, Vec::new()).await.unwrap();
+            assert_eq!(output.is_error, Some(true));
+            assert_eq!(
+                output.output.error.as_ref().unwrap().code,
+                KipErrorCode::InvalidRequestEnvelope.name()
+            );
         }
     }
 }

@@ -78,7 +78,7 @@ impl RemoteEngines {
             .handle
             .unwrap_or_else(|| engine.info.handle.to_ascii_lowercase());
         validate_function_name(&handle)
-            .map_err(|err| format!("invalid engine handle {:?}: {}", &handle, err))?;
+            .map_err(|err| format!("invalid engine handle {handle:?}: {err}"))?;
 
         if !args.agents.is_empty() {
             let agents: Vec<Function> = engine
@@ -183,7 +183,7 @@ impl RemoteEngines {
 
     /// Retrieves a remote engine ID by endpoint.
     pub fn get_id_by_endpoint(&self, endpoint: &str) -> Option<Principal> {
-        for (_, engine) in self.engines.iter() {
+        for engine in self.engines.values() {
             if engine.info.endpoint == endpoint {
                 return Some(engine.id);
             }
@@ -193,7 +193,7 @@ impl RemoteEngines {
 
     /// Retrieves a remote engine endpoint by ID.
     pub fn get_endpoint_by_id(&self, id: &Principal) -> Option<String> {
-        for (_, engine) in self.engines.iter() {
+        for engine in self.engines.values() {
             if &engine.id == id {
                 return Some(engine.info.endpoint.clone());
             }

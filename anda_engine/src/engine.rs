@@ -328,11 +328,11 @@ impl Engine {
 
         // manager can call any tool
         if !self.export_tools.contains(&input.name) && !self.management.is_manager(&caller) {
-            return Err(format!("tool {} not found", &input.name).into());
+            return Err(format!("tool {} not found", input.name).into());
         }
 
         if !self.ctx.has_tool_lowercase(&input.name) {
-            return Err(format!("tool {} not found", &input.name).into());
+            return Err(format!("tool {} not found", input.name).into());
         }
 
         let visibility = self.management.check_visibility(&caller)?;

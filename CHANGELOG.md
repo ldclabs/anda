@@ -2,6 +2,96 @@
 
 All notable changes to the Anda project will be documented in this file.
 
+## [Unreleased]
+
+### Changed — anda_engine
+
+- **KIP 1.0 → KIP 2.0** — Upgraded `anda_kip` and `anda_cognitive_nexus` from
+  0.11 to 0.13, the release that rewrites both crates for KIP 2.0. Neither is on
+  crates.io yet, so the workspace carries a `[patch.crates-io]` section pointing
+  the two crates — and the `anda_db*` crates they share types with — at a sibling
+  `anda-db` checkout. **The patch must be dropped once 0.13 is published.**
+
+- **The KIP tools take a model-facing argument type** — `MemoryManagement` and
+  `MemoryReadonly` previously took the wire `Request` as their `Tool::Args`,
+  which made the model write the protocol tag, nest `dry_run` under `options`,
+  and respect `deny_unknown_fields`. They now take the new `KipArgs`: a single
+  `command` *or* an `operations` batch whose items may be bare command strings,
+  with `dry_run` at the top level. `KipArgs::into_request` builds the envelope
+  and is where the `command` / `operations` exclusion is rejected, since an
+  envelope built from both would silently run only one of them. `KipOperation`
+  is the string-or-object entry of that batch. Hosts that construct these tool
+  calls themselves must migrate from `Request` to `KipArgs`.
+
+- **Tool definitions come from `anda_kip`** — `FUNCTION_DEFINITION` is now
+  deserialized from `anda_kip::KIP_FUNCTION_DEFINITION` instead of being spelled
+  out here, so the schema a model sees and the envelope the engine executes stay
+  in step across protocol revisions. The read-only tool gains its own
+  `READONLY_FUNCTION_DEFINITION` (from `KIP_READONLY_FUNCTION_DEFINITION`) rather
+  than reusing the writable schema under a different name: KIP 2.0's read-only
+  entry point offers no write vocabulary and no `execution` modes, so the shared
+  schema had been advertising a batch mode the read path has no use for.
+  `MemoryReadonly::with_kip_function_definitions` overrides it, matching the
+  writable tool.
+
+- **The read-only gate moved into the protocol crate** — the batch read-only
+  check is now `anda_kip::execute_request_readonly`, which 0.13 added. The
+  hand-rolled equivalent here parsed every operation, then let `execute_request`
+  parse them all again, and failed the whole request when any one of them did not
+  parse. The upstream gate parses once and reports an unparseable operation as
+  its own result, so a caller can still correlate it by `op_id`. Admission is
+  decided on what each command parses to, never on the `language` label an
+  operation declares, so no envelope field can talk a write past the boundary.
+
+- **Read-only batch defaults** — `KipArgs::into_readonly_request` supplies
+  `independent` mode for a multi-read tool call, because the read-only tool
+  schema does not expose execution settings. Writable calls and raw KIP wire
+  requests still require an explicit batch mode; explicit modes are preserved.
+
+- **`MemoryManagement::describe_system` → `describe_self`** — renamed for what it
+  reads: the agent's own `SelfModel` Concept, not the host system.
+
+### Added — anda_engine
+
+- **Multi-tenant persistent memory (`Tenancy`)** — `MemoryManagement::with_tenancy`
+  chooses how a caller is bound to an identity and a MemorySpace. The default,
+  `Tenancy::Shared`, is what every existing engine already did: one brain, every
+  call authorized as the engine's own system Principal. `Tenancy::PerCallerSpace`
+  is for a host serving more than one caller — each verified caller runs as its
+  own Governance Principal, in a MemorySpace it owns, created on its first KIP
+  call.
+
+  Isolation rests on ownership rather than on Grants the host has to write and
+  keep correct: a Space's owner is authorized in it and nobody is authorized in a
+  Space they do not own, so a caller reaches its own memory and no one else's
+  with no policy to get wrong. The Space is written by the engine onto every
+  request, over whatever the envelope held — `KipArgs` exposes no Space field and
+  the shipped tool schemas advertise none, and overwriting keeps that true if
+  either ever gains one.
+
+  A new tenant Space inherits the Schema Environment in force in the default
+  Space. A fresh Space otherwise resolves Core alone, and Core declares no
+  Concept types, so a host that installed its own vocabulary would find the same
+  command working for the owner and failing for every tenant.
+
+  An **anonymous** caller gets no Space of its own. `StateFeatures::caller`
+  returns the anonymous Principal precisely when nothing was verified, and one
+  shared Space for all of them would pool strangers' memories; it runs as the
+  Nexus's anonymous Principal on the default Space, where default deny gives it
+  nothing until a Space policy says otherwise.
+
+- **`MemoryManagement::query_as` / `execute_as` / `session_for`** — The
+  caller-scoped counterparts of `query` / `execute`, for a host running commands
+  on a tenant's behalf. `describe_caller` and `get_or_init_caller` now go through
+  them, so a caller's own Person Concept lands in that caller's Space.
+  `session_for` exposes the provisioned `Session` for anything else the host
+  needs.
+
+- **`MemoryManagement::query` / `execute`** — Run one KIP command and get its
+  result value back, rather than an envelope to unpack. `query` goes through the
+  read-only gate, `execute` through the state-capable one. Both are the *host*
+  acting on the default Space under every tenancy.
+
 ## [0.15.1] — 2026-08-07
 
 ### Added — anda_engine v0.15.1

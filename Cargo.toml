@@ -37,9 +37,9 @@ axum = { version = "0.8", features = [
 async-trait = "0.1"
 anda_db = { version = "0.11", features = ["full"] }
 anda_db_tfs = { version = "0.11", features = ["full"] }
-anda_cognitive_nexus = "0.11"
+anda_cognitive_nexus = "0.13"
 anda_db_schema = "0.11"
-anda_kip = "0.11"
+anda_kip = "0.13"
 arc-swap = "1.9"
 bytes = "1"
 base64 = "0.23"
@@ -105,6 +105,15 @@ libc = "0.2"
 zeroize = "1"
 
 [patch.crates-io]
+# KIP 2.0 landed in anda-db but is not published yet; build against the working tree
+# until anda_kip / anda_cognitive_nexus 0.13 are on crates.io. The anda_db* crates are
+# patched too so the nexus and this workspace share one instance of each type rather
+# than linking a crates.io copy alongside the path copy the nexus pulls in.
+anda_kip = { path = "../anda-db/rs/anda_kip" }
+anda_cognitive_nexus = { path = "../anda-db/rs/anda_cognitive_nexus" }
+anda_db = { path = "../anda-db/rs/anda_db" }
+anda_db_schema = { path = "../anda-db/rs/anda_db_schema" }
+anda_db_tfs = { path = "../anda-db/rs/anda_db_tfs" }
 
 [workspace.metadata.cargo-shear]
 ignored = ["idna", "serde_bytes"]
