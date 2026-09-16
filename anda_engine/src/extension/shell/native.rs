@@ -144,7 +144,12 @@ impl NativeRuntime {
         }
     }
 
-    /// Creates a native runtime rooted at `workspace`.
+    /// Creates a native runtime whose default working directory is `workspace`.
+    ///
+    /// Request metadata can select a directory inside this root, but cannot add
+    /// a new root. A host that has independently authorized another directory
+    /// can construct a separate runtime for that call. This only controls the
+    /// command's initial working directory: native commands are not sandboxed.
     pub fn new(workspace: PathBuf) -> Self {
         Self {
             workspace,
@@ -189,8 +194,8 @@ impl NativeRuntime {
     /// Delegates to [`fs::WorkspaceScope`], so shell shares the filesystem
     /// tools' narrowing rules exactly: a caller-controlled `workspace` /
     /// `workspaces` hint from `RequestMeta.extra` is honored only when it
-    /// resolves inside the configured workspace, narrowing the working
-    /// directory but never escaping the sandbox.
+    /// resolves inside the configured workspace, narrowing the initial working
+    /// directory. Native commands themselves are not filesystem-sandboxed.
     async fn requested_workspace(&self, ctx: &BaseCtx) -> Cow<'_, PathBuf> {
         let scope =
             fs::WorkspaceScope::for_call(ctx.meta(), std::slice::from_ref(&self.workspace)).await;

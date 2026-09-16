@@ -121,6 +121,7 @@ impl From<KipOperation> for Operation {
 /// unknown fields. This type is the bridge, so what the model was shown and what
 /// the engine executes are the same thing.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct KipArgs {
     /// A single complete KIP command. Mutually exclusive with `operations`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -255,13 +256,22 @@ fn first_row(result: Json) -> Json {
 /// message still says what happened, and inventing a category from a code this
 /// build does not know would misreport whether a retry can help.
 fn kip_error(error: ErrorObject) -> KipError {
-    let code = error
-        .code
+    let ErrorObject {
+        code,
+        message,
+        hint,
+        details,
+        ..
+    } = error;
+    let code = code
         .parse::<KipErrorCode>()
         .unwrap_or(KipErrorCode::InternalError);
-    let mut err = KipError::new(code, error.message);
-    if let Some(hint) = error.hint {
+    let mut err = KipError::new(code, message);
+    if let Some(hint) = hint {
         err = err.with_hint(hint);
+    }
+    if let Some(details) = details {
+        err = err.with_details(details);
     }
     err
 }
@@ -1124,7 +1134,11 @@ impl MemoryManagement {
         self.conversations.max_document_id()
     }
 
-    /// The session a caller's commands run in, provisioning it if needed.
+    /// Binds one request to the session and Space a caller runs in, provisioning
+    /// them if needed.
+    ///
+    /// The caller binding replaces any Space already present on `request`, so a
+    /// tenant cannot select another caller's Space through a raw envelope.
     ///
     /// Under [`Tenancy::Shared`] this is the engine's own system session, which
     /// is what a bare `&CognitiveNexus` would have authorized as anyway.
@@ -1136,8 +1150,14 @@ impl MemoryManagement {
     /// Space would pool strangers' memories into it. It runs as the Nexus's
     /// anonymous Principal on the default Space instead, where default deny
     /// gives it nothing until a Space policy says otherwise.
-    pub async fn session_for(&self, caller: &Principal) -> Result<Session, KipError> {
-        Ok(self.binding(caller).await?.0)
+    pub async fn session_for(
+        &self,
+        caller: &Principal,
+        request: &mut Request,
+    ) -> Result<Session, KipError> {
+        let (session, space) = self.binding(caller).await?;
+        request.space = space;
+        Ok(session)
     }
 
     /// The identity a caller runs as, and the Space it runs in.
@@ -1181,55 +1201,42 @@ impl MemoryManagement {
     /// host that installed its own vocabulary would find the same command
     /// working for the owner and failing for every tenant.
     async fn provision(&self, caller: &Principal) -> Result<(), KipError> {
-        if self.provisioned.get(caller).await.is_some() {
-            return Ok(());
-        }
-
-        let principal_id = tenant_principal(caller);
-        let space_id = tenant_space(caller);
-        self.nexus
-            .governance()
-            .ensure_principal(PrincipalDraft {
-                principal_id: principal_id.clone(),
-                // Recorded, never read by an authorization decision. A caller
-                // here is an ic-auth Principal, which may stand for a person or
-                // for another agent; the deployment is what knows which, and can
-                // correct the record through the Governance API.
-                principal_class: principal_class::HUMAN.to_string(),
-                display_name: caller.to_string(),
-                auth_provider: "ic-auth".to_string(),
-                auth_subject: caller.to_string(),
+        self.provisioned
+            .try_get_with_by_ref(caller, async {
+                let principal_id = tenant_principal(caller);
+                let space_id = tenant_space(caller);
+                self.nexus
+                    .governance()
+                    .ensure_principal(PrincipalDraft {
+                        principal_id: principal_id.clone(),
+                        // Recorded, never read by an authorization decision. A caller
+                        // here is an ic-auth Principal, which may stand for a person or
+                        // for another agent; the deployment is what knows which, and can
+                        // correct the record through the Governance API.
+                        principal_class: principal_class::HUMAN.to_string(),
+                        display_name: caller.to_string(),
+                        auth_provider: "ic-auth".to_string(),
+                        auth_subject: caller.to_string(),
+                    })
+                    .await?;
+                self.nexus
+                    .store
+                    .open_or_create_space(SpaceDraft {
+                        space_id: space_id.clone(),
+                        name: format!("Memory of {caller}"),
+                        description: "A caller's own MemorySpace.".to_string(),
+                        owner_principal: principal_id,
+                        ..Default::default()
+                    })
+                    .await?;
+                let environment = self.nexus.store.schema_environment(DEFAULT_SPACE).await?;
+                self.nexus
+                    .ensure_schema(&space_id, environment.lock)
+                    .await?;
+                Ok::<(), KipError>(())
             })
-            .await?;
-        self.nexus
-            .store
-            .open_or_create_space(SpaceDraft {
-                space_id: space_id.clone(),
-                name: format!("Memory of {caller}"),
-                description: "A caller's own MemorySpace.".to_string(),
-                owner_principal: principal_id,
-                ..Default::default()
-            })
-            .await?;
-        let environment = self.nexus.store.schema_environment(DEFAULT_SPACE).await?;
-        self.nexus
-            .ensure_schema(&space_id, environment.lock)
-            .await?;
-
-        self.provisioned.insert(*caller, ()).await;
-        Ok(())
-    }
-
-    /// Binds a request to the caller it runs for, returning its session.
-    ///
-    /// The Space is written here, over whatever the envelope held. [`KipArgs`]
-    /// exposes no Space field and the shipped tool schemas advertise none, so a
-    /// model cannot name one today; overwriting keeps that true if either ever
-    /// gains one, which is the difference between isolation and a convention.
-    async fn bind(&self, caller: &Principal, request: &mut Request) -> Result<Session, KipError> {
-        let (session, space) = self.binding(caller).await?;
-        request.space = space;
-        Ok(session)
+            .await
+            .map_err(|err| (*err).clone())
     }
 
     /// Runs one read-only KIP command as the engine itself.
@@ -1277,7 +1284,7 @@ impl MemoryManagement {
             parameters,
             ..Request::single(command)
         };
-        let session = self.bind(caller, &mut request).await?;
+        let session = self.session_for(caller, &mut request).await?;
         kip_result(execute_request_readonly(&session, &request).await)
     }
 
@@ -1292,7 +1299,7 @@ impl MemoryManagement {
             parameters,
             ..Request::single(command)
         };
-        let session = self.bind(caller, &mut request).await?;
+        let session = self.session_for(caller, &mut request).await?;
         kip_result(execute_request(&session, &request).await)
     }
 
@@ -1345,12 +1352,16 @@ impl MemoryManagement {
         name: Option<String>,
     ) -> Result<Json, KipError> {
         let key = id.to_string();
+        if name.is_none() {
+            let existing = self.describe_caller(id).await?;
+            if !existing.is_null() {
+                return Ok(existing);
+            }
+        }
+        let name = name.unwrap_or_else(|| key.clone());
         let parameters = Map::from_iter([
             ("key".to_string(), key.clone().into()),
-            (
-                "name".to_string(),
-                name.unwrap_or_else(|| key.clone()).into(),
-            ),
+            ("name".to_string(), name.into()),
         ]);
         self.execute_as(
             id,
@@ -1584,7 +1595,7 @@ impl Tool<BaseCtx> for MemoryManagement {
         let caller = *ctx.caller();
         hooked_call(&ctx, request, |request| async move {
             let res = match request.into_request() {
-                Ok(mut request) => match self.bind(&caller, &mut request).await {
+                Ok(mut request) => match self.session_for(&caller, &mut request).await {
                     Ok(session) => execute_request(&session, &request).await,
                     Err(err) => Response::from(err),
                 },
@@ -1675,7 +1686,7 @@ impl Tool<BaseCtx> for MemoryReadonly {
         let caller = *ctx.caller();
         hooked_call(&ctx, request, |request| async move {
             let res = match request.into_readonly_request() {
-                Ok(mut request) => match self.memory.bind(&caller, &mut request).await {
+                Ok(mut request) => match self.memory.session_for(&caller, &mut request).await {
                     Ok(session) => execute_request_readonly(&session, &request).await,
                     Err(err) => Response::from(err),
                 },
@@ -2952,6 +2963,7 @@ mod tests {
         // A second call resolves the same Person rather than minting another.
         let again = memory.get_or_init_caller(&user, None).await.unwrap();
         assert_eq!(again["id"], caller["id"]);
+        assert_eq!(again["name"], json!("Ada"));
 
         let added_resource = resource("resource-a", Some(b"hello resource"));
         let resource_id = memory
@@ -3604,8 +3616,26 @@ mod tests {
             id: Some(tenant_space(&alice)),
             uri: None,
         });
-        memory.bind(&bob, &mut request).await.unwrap();
+        memory.session_for(&bob, &mut request).await.unwrap();
         assert_eq!(request.space.unwrap().id.unwrap(), tenant_space(&bob));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn concurrent_first_calls_share_tenant_provisioning() {
+        let memory = test_memory_with(Tenancy::PerCallerSpace).await;
+        let caller = principal(8);
+        let mut first = Request::single("DESCRIBE PROTOCOL");
+        let mut second = Request::single("DESCRIBE CAPABILITIES");
+
+        let (first_session, second_session) = tokio::join!(
+            memory.session_for(&caller, &mut first),
+            memory.session_for(&caller, &mut second),
+        );
+
+        first_session.unwrap();
+        second_session.unwrap();
+        assert_eq!(first.space, second.space);
+        assert_eq!(first.space.unwrap().id.unwrap(), tenant_space(&caller));
     }
 
     #[test]
@@ -3632,6 +3662,22 @@ mod tests {
             explicit.into_readonly_request().unwrap().execution_mode(),
             anda_kip::ExecutionMode::Atomic
         );
+    }
+
+    #[test]
+    fn kip_adapter_rejects_unknown_fields_and_preserves_error_details() {
+        let args = json!({
+            "command": "CREATE CONCEPT ?c { TYPE \"Person\" NAME \"Ada\" }",
+            "options": { "dry_run": true }
+        });
+        assert!(serde_json::from_value::<KipArgs>(args).is_err());
+
+        let expected = json!({"family": "kql", "reason": "malformed"});
+        let wire: ErrorObject =
+            KipError::cursor_invalid("kql", "malformed", "invalid cursor").into();
+        let recovered = kip_error(wire);
+        assert_eq!(recovered.code, KipErrorCode::CursorInvalid);
+        assert_eq!(recovered.details, Some(expected));
     }
 
     #[tokio::test(flavor = "current_thread")]

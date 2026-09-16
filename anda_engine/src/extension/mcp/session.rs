@@ -10,7 +10,7 @@ use http::{HeaderName, HeaderValue};
 use rmcp::{
     ClientHandler, Peer, RoleClient,
     model::{
-        ClientInfo, ExtensionCapabilities, Implementation, ProtocolVersion, ServerNotification,
+        ClientConfig, ExtensionCapabilities, Implementation, ProtocolVersion, ServerNotification,
         ServerPeerInfo, SubscriptionFilter, TASKS_EXTENSION_ID,
     },
     service::{ClientInitializeError, RunningService, Subscription},
@@ -123,13 +123,13 @@ impl McpSession {
 
 #[derive(Debug, Clone)]
 pub(crate) struct AndaMcpClient {
-    pub(crate) info: ClientInfo,
+    pub(crate) info: ClientConfig,
     dirty: Arc<AtomicBool>,
 }
 
 impl AndaMcpClient {
     pub(crate) fn new(dirty: Arc<AtomicBool>, tasks: bool) -> Self {
-        let mut info = ClientInfo::default();
+        let mut info = ClientConfig::default();
         info.client_info = Implementation::new("anda_engine", env!("CARGO_PKG_VERSION"))
             .with_title("Anda Engine MCP Host");
         // Only the legacy handshake reads this; the discovery lifecycle proposes
@@ -148,7 +148,7 @@ impl AndaMcpClient {
 }
 
 impl ClientHandler for AndaMcpClient {
-    fn get_info(&self) -> ClientInfo {
+    fn get_info(&self) -> ClientConfig {
         self.info.clone()
     }
 

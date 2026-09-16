@@ -2,15 +2,27 @@
 
 All notable changes to the Anda project will be documented in this file.
 
-## [Unreleased]
+## [0.16.0] — 2026-09-16
+
+This release moves persistent memory to KIP 2.0, adds caller-isolated memory
+spaces, and aligns every workspace crate on version `0.16.0`.
+
+### Changed — workspace
+
+- **Workspace release alignment** — `anda_core`, `anda_engine`,
+  `anda_engine_server`, `anda_web3_client`, and `anda_cli` now share version
+  `0.16.0`; internal crate requirements have been raised to `0.16`.
+
+- **Published dependency upgrades** — `anda_db`, `anda_db_schema`, and
+  `anda_db_tfs` move from 0.11 to 0.13, `ic_cose` and `ic_cose_types` from 0.10
+  to 0.11, and `anda_cloud_cdk` from 0.5 to 0.6. The temporary sibling-checkout
+  patches for the KIP 2.0 stack are removed now that the 0.13 crates are
+  published.
 
 ### Changed — anda_engine
 
 - **KIP 1.0 → KIP 2.0** — Upgraded `anda_kip` and `anda_cognitive_nexus` from
-  0.11 to 0.13, the release that rewrites both crates for KIP 2.0. Neither is on
-  crates.io yet, so the workspace carries a `[patch.crates-io]` section pointing
-  the two crates — and the `anda_db*` crates they share types with — at a sibling
-  `anda-db` checkout. **The patch must be dropped once 0.13 is published.**
+  0.11 to 0.13, the release that rewrites both crates for KIP 2.0.
 
 - **The KIP tools take a model-facing argument type** — `MemoryManagement` and
   `MemoryReadonly` previously took the wire `Request` as their `Tool::Args`,
@@ -21,7 +33,8 @@ All notable changes to the Anda project will be documented in this file.
   and is where the `command` / `operations` exclusion is rejected, since an
   envelope built from both would silently run only one of them. `KipOperation`
   is the string-or-object entry of that batch. Hosts that construct these tool
-  calls themselves must migrate from `Request` to `KipArgs`.
+  calls themselves must migrate from `Request` to `KipArgs`; unknown fields are
+  rejected instead of being silently ignored.
 
 - **Tool definitions come from `anda_kip`** — `FUNCTION_DEFINITION` is now
   deserialized from `anda_kip::KIP_FUNCTION_DEFINITION` instead of being spelled
@@ -84,8 +97,8 @@ All notable changes to the Anda project will be documented in this file.
   caller-scoped counterparts of `query` / `execute`, for a host running commands
   on a tenant's behalf. `describe_caller` and `get_or_init_caller` now go through
   them, so a caller's own Person Concept lands in that caller's Space.
-  `session_for` exposes the provisioned `Session` for anything else the host
-  needs.
+  `session_for` binds a supplied request to the caller's Space and returns the
+  provisioned `Session` for executing it.
 
 - **`MemoryManagement::query` / `execute`** — Run one KIP command and get its
   result value back, rather than an envelope to unpack. `query` goes through the

@@ -28,7 +28,7 @@ const NOTE_OP_SET: &str = "set";
 const NOTE_OP_UPSERT: &str = "upsert";
 const NOTE_OP_DELETE: &str = "delete";
 const LEGACY_NOTE_STORE_PATH: &str = "notes";
-const NOTE_CHAR_LIMIT: usize = 16384;
+const NOTE_CHAR_LIMIT: usize = 163840;
 const NOTE_ENTRY_DELIMITER: &str = "\n---\n";
 
 static VALID_OPS: &[&str] = &[NOTE_OP_READ, NOTE_OP_SET, NOTE_OP_UPSERT, NOTE_OP_DELETE];
