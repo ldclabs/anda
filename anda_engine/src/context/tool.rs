@@ -6,7 +6,7 @@
 
 use anda_core::{
     Agent, AgentContext, AgentOutput, BoxError, CompletionFeatures, CompletionRequest,
-    FunctionDefinition, Json, Resource, ToolGroup,
+    FunctionDefinition, Json, Resource, ToolGroup, Usage,
 };
 use anda_db_tfs::{TokenizerChain, collect_tokens, jieba_tokenizer};
 use serde::{Deserialize, Serialize};
@@ -79,6 +79,7 @@ const MAX_DISCOVERED_REQUEST_TOOLS: usize = 16;
 #[derive(Debug, Clone, Default)]
 pub struct DiscoveredTools {
     definitions: BTreeMap<String, FunctionDefinition>,
+    known_names: BTreeSet<String>,
     selection_counts: BTreeMap<String, usize>,
     merge: Option<bool>,
 }
@@ -96,12 +97,13 @@ impl DiscoveredTools {
 
     /// Whether the lowercased name was legitimately discovered this round.
     pub fn contains(&self, lowercase_name: &str) -> bool {
-        self.definitions.contains_key(lowercase_name)
+        self.known_names.contains(lowercase_name)
     }
 
     /// Forgets accumulated definitions and probe counts, keeping the policy.
     pub fn reset_definitions(&mut self) {
         self.definitions.clear();
+        self.known_names.clear();
         self.selection_counts.clear();
     }
 
@@ -111,9 +113,8 @@ impl DiscoveredTools {
     /// are ignored. In probe mode (`None`), a repeated `tools_select` of the
     /// same name flips the policy to `Some(true)`.
     pub fn observe_output(&mut self, tool_name: &str, output: &Json) {
-        if self.merge == Some(false)
-            || (!tool_name.eq_ignore_ascii_case(TOOLS_SELECT_NAME)
-                && !tool_name.eq_ignore_ascii_case(TOOLS_SEARCH_NAME))
+        if !tool_name.eq_ignore_ascii_case(TOOLS_SELECT_NAME)
+            && !tool_name.eq_ignore_ascii_case(TOOLS_SEARCH_NAME)
         {
             return;
         }
@@ -125,12 +126,25 @@ impl DiscoveredTools {
         let count_selection =
             tool_name.eq_ignore_ascii_case(TOOLS_SELECT_NAME) && self.merge.is_none();
         let mut added = 0;
+        let mut seen = BTreeSet::new();
         for definition in tools_output.tools {
-            if definition.name.trim().is_empty() {
+            // Wildcard search returns directory entries without parameter schemas.
+            if definition.name.trim().is_empty()
+                || (tool_name.eq_ignore_ascii_case(TOOLS_SEARCH_NAME)
+                    && definition
+                        .parameters
+                        .as_object()
+                        .is_some_and(|p| p.is_empty())
+                    && definition.strict.is_none())
+            {
                 continue;
             }
 
             let key = definition.name.to_ascii_lowercase();
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            self.known_names.insert(key.clone());
             if count_selection {
                 let count = self
                     .selection_counts
@@ -141,10 +155,10 @@ impl DiscoveredTools {
                     self.merge = Some(true);
                 }
             }
-            self.definitions.entry(key).or_insert(definition);
-            added += 1;
-            if added >= MAX_DISCOVERED_REQUEST_TOOLS {
-                break;
+            if (self.definitions.contains_key(&key) || added < MAX_DISCOVERED_REQUEST_TOOLS)
+                && self.definitions.insert(key, definition).is_none()
+            {
+                added += 1;
             }
         }
     }
@@ -171,6 +185,15 @@ impl DiscoveredTools {
     /// are merged into the request tools, so full schemas are not duplicated
     /// in the conversation context. Non-discovery outputs are left untouched.
     pub fn compact_output_for_context(&self, tool_name: &str, output: &mut Json) {
+        self.compact_output_for_request(tool_name, output, &[]);
+    }
+
+    pub(crate) fn compact_output_for_request(
+        &self,
+        tool_name: &str,
+        output: &mut Json,
+        request_tools: &[FunctionDefinition],
+    ) {
         if self.merge != Some(true) {
             return;
         }
@@ -191,6 +214,15 @@ impl DiscoveredTools {
             .tools
             .into_iter()
             .map(|definition| {
+                let effective = request_tools
+                    .iter()
+                    .find(|tool| tool.name.eq_ignore_ascii_case(&definition.name))
+                    .or_else(|| self.definitions.get(&definition.name.to_ascii_lowercase()));
+                if !effective.is_some_and(|tool| {
+                    tool.parameters == definition.parameters && tool.strict == definition.strict
+                }) {
+                    return json!(definition);
+                }
                 if keep_description {
                     json!({
                         "name": definition.name,
@@ -208,6 +240,9 @@ impl DiscoveredTools {
             "tools": tools,
             "total_tools": tools_output.total_tools,
         });
+        if !tools_output.groups.is_empty() {
+            output["groups"] = json!(tools_output.groups);
+        }
     }
 }
 
@@ -236,19 +271,17 @@ impl ToolsSearch {
     /// Searches candidate definitions by name, description, and token overlap.
     pub fn search(&self, candidates: &[FunctionDefinition], args: &ToolsSearchArgs) -> ToolsOutput {
         let normalized_query = args.query.trim().to_lowercase();
-        let tools: Vec<FunctionDefinition> = candidates.to_vec();
-
-        let total_tools = tools.len();
+        let total_tools = candidates.len();
         if normalized_query == "*" {
             // Wildcard enumerates names only (name + description, no schema) so
             // listing everything stays cheap; the model calls a specific tool or
             // a keyword search to obtain the full schema. Capped like any search.
-            let tools: Vec<FunctionDefinition> = tools
-                .into_iter()
+            let tools: Vec<FunctionDefinition> = candidates
+                .iter()
                 .take(MAX_SEARCH_RESULTS)
                 .map(|definition| FunctionDefinition {
-                    name: definition.name,
-                    description: definition.description,
+                    name: definition.name.clone(),
+                    description: definition.description.clone(),
                     parameters: json!({}),
                     strict: None,
                 })
@@ -266,14 +299,23 @@ impl ToolsSearch {
                 .collect();
 
         let mut tools_name =
-            rank_search_items(&tools, &normalized_query, &normalized_tokens, false);
+            rank_search_items(candidates, &normalized_query, &normalized_tokens, false);
         let limit = if args.limit == 0 {
             10
         } else {
             args.limit.min(MAX_SEARCH_RESULTS)
         };
         tools_name.truncate(limit);
-        let tools = select_requested_definitions(tools, &tools_name);
+        let mut index = BTreeMap::new();
+        for definition in candidates {
+            index
+                .entry(definition.name.to_ascii_lowercase())
+                .or_insert(definition);
+        }
+        let tools = tools_name
+            .iter()
+            .filter_map(|name| index.remove(name).cloned())
+            .collect();
         ToolsOutput {
             tools,
             total_tools,
@@ -410,37 +452,44 @@ impl ToolsSelect {
         ctx: &AgentCtx,
         definitions: Vec<FunctionDefinition>,
         args: &ToolsSelectArgs,
-    ) -> Vec<FunctionDefinition> {
+    ) -> (Vec<FunctionDefinition>, Usage) {
         let normalized_query = args.query.trim().to_lowercase();
         let limit = if args.limit > 0 {
             args.limit.min(MAX_SELECTOR_LIMIT)
         } else {
             5
         };
-
-        let mut candidates = self.collect_query_candidates(
+        let names = self.collect_query_candidates(
             &definitions,
             &normalized_query,
             MAX_SELECTOR_CANDIDATE_LIMIT,
         );
-
-        if candidates.is_empty() {
-            return Vec::new();
+        let candidates = select_requested_definitions(definitions, &names);
+        if candidates.is_empty() || normalized_query.len() <= 3 {
+            return (
+                candidates.into_iter().take(limit).collect(),
+                Usage::default(),
+            );
         }
-
-        if normalized_query.len() <= 3 {
-            candidates.truncate(limit);
-            return select_requested_definitions(definitions, &candidates);
-        }
-
-        let mut requested =
-            select_requested_names_with_model(ctx, &definitions, &normalized_query, limit).await;
-        if requested.is_empty() {
-            candidates.truncate(limit);
-            requested = candidates;
-        }
-
-        select_requested_definitions(definitions, &requested)
+        let (requested, usage) =
+            select_requested_names_with_model(ctx, &candidates, &normalized_query, limit).await;
+        let allowed: BTreeSet<_> = candidates
+            .iter()
+            .map(|def| def.name.to_ascii_lowercase())
+            .collect();
+        let requested: Vec<_> = requested
+            .into_iter()
+            .filter(|name| allowed.contains(&name.trim().to_ascii_lowercase()))
+            .collect();
+        let tools = if requested.is_empty() {
+            candidates.into_iter().take(limit).collect()
+        } else {
+            select_requested_definitions(candidates, &requested)
+                .into_iter()
+                .take(limit)
+                .collect()
+        };
+        (tools, usage)
     }
 
     fn collect_query_candidates(
@@ -551,8 +600,11 @@ impl Agent<AgentCtx> for ToolsSelect {
             requested.extend(group.members.iter().cloned());
         }
 
-        let tool_definitions = if !requested.is_empty() {
-            select_requested_definitions(definitions, &requested)
+        let (tool_definitions, usage) = if !requested.is_empty() {
+            (
+                select_requested_definitions(definitions, &requested),
+                Usage::default(),
+            )
         } else {
             self.select_requested_definitions_by_query(&ctx, definitions, &args)
                 .await
@@ -565,6 +617,7 @@ impl Agent<AgentCtx> for ToolsSelect {
                 groups,
                 total_tools,
             })?,
+            usage,
             ..Default::default()
         })
     }
@@ -719,7 +772,7 @@ async fn select_requested_names_with_model(
     candidates: &[FunctionDefinition],
     query: &str,
     limit: usize,
-) -> Vec<String> {
+) -> (Vec<String>, Usage) {
     let tools = candidates.iter().map(ToolItemRef::from).collect::<Vec<_>>();
     let req = CompletionRequest {
         instructions: "You are selecting callable tools or agents for the next model turn. Choose only from the provided candidates. Prefer the smallest set that can plausibly help with the user intent. Return exact candidate names only. Never invent names. If no candidate is relevant, return an empty list.".to_string(),
@@ -746,12 +799,23 @@ async fn select_requested_names_with_model(
         ..Default::default()
     };
 
-    let output = match ctx.completion(req, Vec::new()).await {
-        Ok(output) if output.failed_reason.is_none() => output,
-        _ => return Vec::new(),
-    };
-
-    parse_selector_tool_names(output.content.trim())
+    match ctx.completion(req, Vec::new()).await {
+        Ok(output) => {
+            let names = if output.failed_reason.is_none() {
+                parse_selector_tool_names(output.content.trim())
+            } else {
+                Vec::new()
+            };
+            (names, output.usage)
+        }
+        Err(_) => (
+            Vec::new(),
+            Usage {
+                requests: 1,
+                ..Default::default()
+            },
+        ),
+    }
 }
 
 fn parse_selector_tool_names(content: &str) -> Vec<String> {
@@ -2012,7 +2076,7 @@ mod tests {
             .unwrap();
         let selector = ToolsSelect::new();
 
-        let selected = selector
+        let (selected, _) = selector
             .select_requested_definitions_by_query(
                 &ctx,
                 Vec::new(),
@@ -2026,7 +2090,7 @@ mod tests {
         assert!(selected.is_empty());
 
         let definitions = vec![EchoTool.definition(), HelpTool.definition()];
-        let selected = selector
+        let (selected, _) = selector
             .select_requested_definitions_by_query(
                 &ctx,
                 definitions.clone(),
@@ -2039,7 +2103,7 @@ mod tests {
             .await;
         assert_eq!(selected[0].name, "help_tool");
 
-        let selected = selector
+        let (selected, _) = selector
             .select_requested_definitions_by_query(
                 &ctx,
                 definitions,

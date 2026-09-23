@@ -422,6 +422,11 @@ impl CompletionResponse {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type")]
 pub enum StreamEvent {
+    #[serde(rename = "error")]
+    Error {
+        code: Option<String>,
+        message: String,
+    },
     #[serde(rename = "response.created")]
     ResponseCreated { response: CompletionResponse },
     #[serde(rename = "response.in_progress")]
@@ -484,6 +489,12 @@ impl<'de> Deserialize<'de> for StreamEvent {
         #[derive(Deserialize)]
         #[serde(tag = "type")]
         enum Helper {
+            #[serde(rename = "error")]
+            Error {
+                code: Option<String>,
+                #[serde(default)]
+                message: String,
+            },
             #[serde(rename = "response.created")]
             ResponseCreated { response: CompletionResponse },
             #[serde(rename = "response.in_progress")]
@@ -535,6 +546,7 @@ impl<'de> Deserialize<'de> for StreamEvent {
         }
 
         match Helper::deserialize(&value) {
+            Ok(Helper::Error { code, message }) => Ok(StreamEvent::Error { code, message }),
             Ok(Helper::ResponseCreated { response }) => {
                 Ok(StreamEvent::ResponseCreated { response })
             }

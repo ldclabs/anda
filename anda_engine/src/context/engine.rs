@@ -131,9 +131,18 @@ impl RemoteEngines {
         function: &Function,
         names: Option<&[String]>,
         prefix: &str,
+        routing_prefix: &str,
     ) -> Option<FunctionDefinition> {
+        let local_name = format!("{prefix}{}", function.definition.name);
+        let routed_name = format!("{routing_prefix}{local_name}");
         names
-            .is_none_or(|names| names.contains(&function.definition.name))
+            .is_none_or(|names| {
+                names.iter().any(|name| {
+                    name.eq_ignore_ascii_case(&function.definition.name)
+                        || name.eq_ignore_ascii_case(&local_name)
+                        || name.eq_ignore_ascii_case(&routed_name)
+                })
+            })
             .then(|| function.definition.clone().name_with_prefix(prefix))
     }
 
@@ -220,12 +229,9 @@ impl RemoteEngines {
                 continue;
             }
             let prefix = format!("{handle}_");
-            definitions.extend(
-                engine
-                    .tools
-                    .iter()
-                    .filter_map(|d| Self::filter_definition(d, names, &prefix)),
-            );
+            definitions.extend(engine.tools.iter().filter_map(|d| {
+                Self::filter_definition(d, names, &prefix, super::REMOTE_TOOL_PREFIX)
+            }));
         }
 
         definitions
@@ -281,12 +287,9 @@ impl RemoteEngines {
                 continue;
             }
             let prefix = format!("{handle}_");
-            definitions.extend(
-                engine
-                    .agents
-                    .iter()
-                    .filter_map(|d| Self::filter_definition(d, names, &prefix)),
-            );
+            definitions.extend(engine.agents.iter().filter_map(|d| {
+                Self::filter_definition(d, names, &prefix, super::REMOTE_AGENT_PREFIX)
+            }));
         }
 
         definitions

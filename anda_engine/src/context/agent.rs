@@ -222,6 +222,17 @@ impl AgentCtx {
         }
     }
 
+    async fn call_remote_agent(
+        &self,
+        target: Principal,
+        endpoint: &str,
+        mut args: AgentInput,
+    ) -> Result<AgentOutput, BoxError> {
+        args.meta = Some(self.base.self_meta(target));
+        self.https_signed_rpc(endpoint, "agent_run", &(&args,))
+            .await
+    }
+
     pub(crate) fn has_tool_lowercase(&self, lowercase_name: &str) -> bool {
         self.tools.contains_lowercase(lowercase_name)
             || self.tool_providers.contains_lowercase(lowercase_name)
@@ -240,14 +251,8 @@ impl AgentCtx {
 
         let static_names: BTreeMap<String, String> = self
             .tools
-            .definitions(None)
-            .into_iter()
-            .map(|definition| {
-                (
-                    definition.name.to_ascii_lowercase(),
-                    definition.name.clone(),
-                )
-            })
+            .iter()
+            .map(|(name, tool)| (name.to_string(), tool.name()))
             .collect();
         visible_names.extend(static_names.keys().cloned());
         for group in self.tools.groups() {
@@ -256,14 +261,9 @@ impl AgentCtx {
 
         let agent_names: BTreeMap<String, String> = self
             .agents
-            .definitions(None)
-            .into_iter()
-            .filter_map(|definition| {
-                let lowercase = definition.name.to_ascii_lowercase();
-                visible_names
-                    .insert(lowercase.clone())
-                    .then_some((lowercase, definition.name))
-            })
+            .iter()
+            .filter(|(name, _)| visible_names.insert(name.to_string()))
+            .map(|(name, agent)| (name.to_string(), agent.name()))
             .collect();
         for group in self.agents.groups() {
             merge_visible_group(&mut groups, group, &agent_names);
@@ -423,9 +423,19 @@ impl AgentContext for AgentCtx {
         }
 
         let mut defs = self.agents.definitions(names);
+        let sub_names = names.map(|names| {
+            names
+                .iter()
+                .map(|name| {
+                    strip_prefix_ignore_ascii_case(name, SUB_AGENT_PREFIX)
+                        .unwrap_or(name)
+                        .to_ascii_lowercase()
+                })
+                .collect::<Vec<_>>()
+        });
         defs.extend(
             self.subagents
-                .definitions(names)
+                .definitions(sub_names.as_deref())
                 .into_iter()
                 .map(|d| d.name_with_prefix(SUB_AGENT_PREFIX)),
         );
@@ -553,10 +563,9 @@ impl AgentContext for AgentCtx {
             // find registered remote tool and call it
             if let Some((id, endpoint, tool_name)) = self.base.remote.get_tool_endpoint(name) {
                 input.name = tool_name;
-                input.meta = Some(self.base.self_meta(id));
                 return self
                     .base
-                    .remote_tool_call(&endpoint, input)
+                    .call_remote_tool(id, &endpoint, input)
                     .await
                     .map(|output| (output, Some(id)));
             }
@@ -569,10 +578,9 @@ impl AgentContext for AgentCtx {
                 && let Some((id, endpoint, tool_name)) = engines.get_tool_endpoint(name)
             {
                 input.name = tool_name;
-                input.meta = Some(self.base.self_meta(id));
                 return self
                     .base
-                    .remote_tool_call(&endpoint, input)
+                    .call_remote_tool(id, &endpoint, input)
                     .await
                     .map(|output| (output, Some(id)));
             }
@@ -612,9 +620,8 @@ impl AgentContext for AgentCtx {
             if let Some(name) = strip_prefix_ignore_ascii_case(&input.name, REMOTE_AGENT_PREFIX) {
                 if let Some((id, endpoint, agent_name)) = ctx.base.remote.get_agent_endpoint(name) {
                     input.name = agent_name;
-                    input.meta = Some(ctx.base.self_meta(id));
                     return ctx
-                        .remote_agent_run(&endpoint, input)
+                        .call_remote_agent(id, &endpoint, input)
                         .await
                         .map(|output| (output, Some(id)));
                 }
@@ -626,9 +633,8 @@ impl AgentContext for AgentCtx {
                     && let Some((id, endpoint, agent_name)) = engines.get_agent_endpoint(name)
                 {
                     input.name = agent_name;
-                    input.meta = Some(ctx.base.self_meta(id));
                     return ctx
-                        .remote_agent_run(&endpoint, input)
+                        .call_remote_agent(id, &endpoint, input)
                         .await
                         .map(|output| (output, Some(id)));
                 }
@@ -669,20 +675,10 @@ impl AgentContext for AgentCtx {
     async fn remote_agent_run(
         &self,
         endpoint: &str,
-        mut args: AgentInput,
+        args: AgentInput,
     ) -> Result<AgentOutput, BoxError> {
-        let target = self
-            .base
-            .remote
-            .get_id_by_endpoint(endpoint)
-            .ok_or_else(|| format!("remote engine endpoint {} not found", endpoint))?;
-        let meta = self.base.self_meta(target);
-        args.meta = Some(meta);
-        let output: AgentOutput = self
-            .https_signed_rpc(endpoint, "agent_run", &(&args,))
-            .await?;
-
-        Ok(output)
+        let target = self.base.remote_target(endpoint).await?;
+        self.call_remote_agent(target, endpoint, args).await
     }
 }
 
@@ -1253,11 +1249,7 @@ mod tests {
             })
             .await
             .unwrap_err();
-        assert!(
-            tool_err
-                .to_string()
-                .contains("remote engine endpoint https://dynamic.example not found")
-        );
+        assert!(tool_err.to_string().contains("not implemented"));
 
         let agent_err = ctx
             .clone()
@@ -1268,11 +1260,7 @@ mod tests {
             })
             .await
             .unwrap_err();
-        assert!(
-            agent_err
-                .to_string()
-                .contains("remote engine endpoint https://dynamic.example not found")
-        );
+        assert!(agent_err.to_string().contains("not implemented"));
 
         let agent_err = ctx
             .clone()

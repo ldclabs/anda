@@ -95,14 +95,6 @@ impl SubAgent {
             parts.push(format!("Session idle timeout: {}s.", self.idle_timeout));
         }
 
-        let sessions = self.subsessions.active_session_ids();
-        if !sessions.is_empty() {
-            parts.push(format!(
-                "Active sessions: {}.",
-                summarize_items(&sessions, SUBAGENT_METADATA_LIST_LIMIT)
-            ));
-        }
-
         parts.join(" ")
     }
 }
@@ -231,7 +223,7 @@ impl Agent<AgentCtx> for SubAgent {
         if let PromptCommand::Command { command, .. } = &input.command
             && command == "status"
         {
-            let rt = match subsessions.get_session(&session_id) {
+            let rt = match subsessions.get_session_for(ctx.caller(), &session_id) {
                 Some(session) => AgentOutput {
                     content: session.detail().to_string(),
                     conversation: session.conversation_id(),
@@ -266,7 +258,7 @@ impl Agent<AgentCtx> for SubAgent {
                 .unwrap_or_default()
                 .trim()
                 .to_string();
-            let rt = match subsessions.get_session(&session_id) {
+            let rt = match subsessions.get_session_for(ctx.caller(), &session_id) {
                 Some(session) if task_id.is_empty() => AgentOutput {
                     content: format!(
                         "subagent {agent} session {session_id}: /stop_task requires a task_id argument (see the session's background_tasks in /status)."
@@ -310,9 +302,16 @@ impl Agent<AgentCtx> for SubAgent {
         let mut claimed: Option<(Arc<SubSession>, tokio::sync::mpsc::Receiver<SubAgentInput>)> =
             None;
         for _ in 0..8 {
-            if let Some(session) = subsessions.get_session(&session_id) {
+            if let Some(session) = subsessions.get_session_for(ctx.caller(), &session_id) {
                 // Join existing conversation session if it's active
-                match session.sender.send(input).await {
+                let send_result = if matches!(&input.command, PromptCommand::Command { command, .. } if matches!(command.as_str(), "stop" | "cancel"))
+                {
+                    session.request_control(input);
+                    Ok(())
+                } else {
+                    session.sender.send(input).await
+                };
+                match send_result {
                     Ok(_) => {
                         let rt = AgentOutput {
                             content: format!(
@@ -358,12 +357,15 @@ impl Agent<AgentCtx> for SubAgent {
             }
 
             let (sender, rx) = tokio::sync::mpsc::channel::<SubAgentInput>(42);
-            let candidate = Arc::new(SubSession::new(
-                session_id.clone(),
-                agent.clone(),
-                sender,
-                resolve_idle_timeout_ms(self.idle_timeout),
-            ));
+            let candidate = Arc::new(
+                SubSession::new(
+                    session_id.clone(),
+                    agent.clone(),
+                    sender,
+                    resolve_idle_timeout_ms(self.idle_timeout),
+                )
+                .with_caller(*ctx.caller()),
+            );
             match subsessions.try_insert_session(candidate.clone()) {
                 None => {
                     claimed = Some((candidate, rx));
@@ -481,19 +483,17 @@ impl Agent<AgentCtx> for SubAgent {
             // Deliver a graceful `/stop` to this session when its stop handle fires. The task is
             // released when `session_token` is cancelled (either by the parent stopping the task or
             // by the runner cancelling it on exit), so it never outlives the session.
-            let stop_sender = session.sender.clone();
+            let stop_session = session.clone();
             let stop_token = session_token.clone();
             tokio::spawn(async move {
                 stop_token.cancelled().await;
-                let _ = stop_sender
-                    .send(SubAgentInput {
-                        command: PromptCommand::Command {
-                            command: "stop".to_string(),
-                            prompt: String::new(),
-                        },
-                        ..Default::default()
-                    })
-                    .await;
+                stop_session.request_control(SubAgentInput {
+                    command: PromptCommand::Command {
+                        command: "stop".to_string(),
+                        prompt: String::new(),
+                    },
+                    ..Default::default()
+                });
             });
         }
 
@@ -526,12 +526,21 @@ impl Agent<AgentCtx> for SubAgent {
                     inputs.push(input);
                 }
 
-                if inputs.is_empty() && !runner.closing && runner.runner.is_idle() {
+                if inputs.is_empty()
+                    && !runner.closing
+                    && runner.runner.is_idle()
+                    && !session.has_control()
+                {
                     // Wait for input so new prompts are processed without polling latency; the
                     // timeout keeps the idle-timeout bookkeeping in `run` ticking.
                     match tokio::time::timeout(
                         std::time::Duration::from_millis(SESSION_INPUT_POLL_MS),
-                        rx.recv(),
+                        async {
+                            tokio::select! {
+                                input = rx.recv() => input,
+                                _ = session.control_ready.notified() => None,
+                            }
+                        },
                     )
                     .await
                     {

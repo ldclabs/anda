@@ -116,6 +116,17 @@ does not have to hold its response open. The tool call still blocks, bounded by
 undeclared extension, or an in-task input request it cannot answer — is
 cancelled best-effort so the server can release it.
 
+The task deadline includes each `tasks/get` response wait. Cancellation also runs
+when the parent drops the polling future; a `tasks/cancel` acknowledgement is
+bounded to two seconds. Context cancellation interrupts session setup and tool
+calls. Session setup (including OAuth) is bounded to 45 seconds per attempt,
+legacy handshakes use that bound, and discovery retains its shorter 10-second
+probe. Tool listing is bounded to 30 seconds and each `tools/call` round to 180
+seconds. Automatic fallback to a fresh legacy connection remains supported.
+Custom headers are validated before connection and their values are omitted
+from configuration Debug output.
+
+
 ## Tool Naming
 
 MCP tool names are not required to match Anda function naming rules. The

@@ -23,16 +23,10 @@ use crate::{
 };
 
 const DEFAULT_LIMIT: usize = 1000;
-/// Hard cap on collected matches across all workspaces. Scanning stops here so
-/// pathological patterns (e.g. `**/*` over a huge tree) stay bounded.
+/// Hard cap on collected matches across all workspaces.
 const MAX_GLOB_MATCHES: usize = 10_000;
-/// Hard cap on entries *examined* across all workspaces.
-///
-/// [`MAX_GLOB_MATCHES`] only counts matches that survive the workspace-containment filter,
-/// so a pattern whose every match is rejected (e.g. one reaching through a symlink that
-/// leaves the workspace) would never reach it and would walk without bound. This bounds the
-/// walk itself. It is deliberately well above the match cap so a legitimate search over a
-/// large tree is not truncated by entries it merely skipped.
+/// Caps entries yielded by glob before containment filtering. Non-matching directory
+/// visits inside the iterator are not counted, so traversal runs on a blocking worker.
 const MAX_GLOB_SCANNED: usize = 200_000;
 
 /// Arguments for filesystem glob operations.
@@ -134,131 +128,130 @@ impl Tool<BaseCtx> for SearchFileTool {
         let ctx = &ctx;
         hooked_call(ctx, args, |args| async move {
             let scope = WorkspaceScope::for_call(ctx.meta(), &self.workspaces).await;
-            let mut paths = Vec::new();
+            let mut searches = Vec::new();
             let mut errors = Vec::new();
-            let mut searched_any_workspace = false;
-            let mut scan_truncated = false;
-            let mut scanned = 0usize;
-            let cancellation_token = ctx.cancellation_token();
-
-            'workspaces: for workspace in scope.roots() {
-                let workspace_display = workspace.display().to_string();
-                let (resolved_workspace, pattern, restrict_to_workspace_targets) =
-                    match resolve_glob_pattern(workspace, &args.pattern).await {
-                        Ok(resolved) => resolved,
-                        Err(err) => {
-                            errors.push(format!("{}: {err}", workspace.display()));
-                            continue;
-                        }
-                    };
-                searched_any_workspace = true;
-
-                for entry in glob_with(&pattern, glob_match_options())
-                    .map_err(|err| {
-                        format!(
-                            "Invalid glob pattern (workspace: {}, requested_pattern: {}, expanded_pattern: {}): {err}",
-                            workspace_display,
-                            args.pattern,
-                            pattern
-                        )
-                    })?
-                {
-                    // Bound the walk itself, not just the surviving matches, and stay
-                    // interruptible: the glob iterator is synchronous and a pathological
-                    // pattern can enumerate an unbounded number of entries that all get
-                    // filtered out below.
-                    scanned += 1;
-                    if scanned > MAX_GLOB_SCANNED {
-                        scan_truncated = true;
-                        break 'workspaces;
+            for workspace in scope.roots() {
+                match resolve_glob_pattern(workspace, &args.pattern).await {
+                    Ok((resolved, pattern, restrict)) => {
+                        searches.push((workspace.clone(), resolved, pattern, restrict));
                     }
-                    if cancellation_token.is_cancelled() {
-                        return Err("search_file cancelled".into());
-                    }
-
-                    // Unreadable directories or entries removed mid-scan must not fail the
-                    // whole search; skip them and keep matching.
-                    let Ok(path) = entry else {
-                        continue;
-                    };
-
-                    // Every match is canonicalized and re-checked against the
-                    // workspace root. A workspace-internal directory symlink pointing
-                    // outside the workspace would otherwise let a plain pattern (no
-                    // `..`) enumerate external filenames, violating the workspace
-                    // scope invariant.
-                    let resolved_path = match tokio::fs::canonicalize(&path).await {
-                        // A match that resolves outside the workspace (via a symlinked
-                        // directory component) is skipped, not fatal.
-                        Ok(resolved) => {
-                            if ensure_path_in_workspace(&resolved_workspace, &resolved).is_err() {
-                                continue;
-                            }
-                            Some(resolved)
-                        }
-                        // Dangling symlink or entry removed mid-scan. Parent-traversal
-                        // patterns skip it; plain patterns list it as-is, since a
-                        // dangling link cannot leak an external path.
-                        Err(_) => {
-                            if restrict_to_workspace_targets {
-                                continue;
-                            }
-                            None
-                        }
-                    };
-
-                    let relative = match relative_match_path(&path, workspace, &resolved_workspace) {
-                        Some(relative) => relative,
-                        None => {
-                            let resolved = match resolved_path {
-                                Some(resolved) => resolved,
-                                None => match tokio::fs::canonicalize(&path).await {
-                                    Ok(resolved) => resolved,
-                                    Err(_) => continue,
-                                },
-                            };
-                            match resolved.strip_prefix(&resolved_workspace) {
-                                Ok(relative) => normalize_relative_path(relative),
-                                Err(_) => continue,
-                            }
-                        }
-                    };
-
-                    if paths.len() >= MAX_GLOB_MATCHES {
-                        scan_truncated = true;
-                        break 'workspaces;
-                    }
-                    paths.push(relative);
+                    Err(err) => errors.push(format!("{}: {err}", workspace.display())),
                 }
             }
-
-            if !searched_any_workspace {
+            if searches.is_empty() {
                 return Err(workspace_access_error(
-                    "Glob pattern",
-                    "requested_pattern",
-                    &args.pattern,
-                    scope.roots(),
-                    errors,
+                    "Glob pattern", "requested_pattern", &args.pattern, scope.roots(), errors,
                 ));
             }
+            let cancellation = ctx.cancellation_token().child_token();
+            let _cancel_on_drop = cancellation.clone().drop_guard();
+            let cancellation_token = cancellation.clone();
+            let worker = tokio::task::spawn_blocking(move || {
+                let mut paths = Vec::new();
+                let mut scan_truncated = false;
+                let mut scanned = 0usize;
+                'workspaces: for (workspace, resolved_workspace, pattern, restrict_to_workspace_targets)
+                    in searches
+                {
+                    let workspace_display = workspace.display().to_string();
+                    for entry in glob_with(&pattern, glob_match_options())
+                        .map_err(|err| {
+                            format!(
+                                "Invalid glob pattern (workspace: {}, requested_pattern: {}, expanded_pattern: {}): {err}",
+                                workspace_display,
+                                args.pattern,
+                                pattern
+                            )
+                        })?
+                    {
+                        // Bound yielded entries; glob may scan non-matches inside next().
+                        scanned += 1;
+                        if scanned > MAX_GLOB_SCANNED {
+                            scan_truncated = true;
+                            break 'workspaces;
+                        }
+                        if cancellation_token.is_cancelled() {
+                            return Err("search_file cancelled".into());
+                        }
 
-            paths.sort();
-            paths.dedup();
+                        // Unreadable directories or entries removed mid-scan must not fail the
+                        // whole search; skip them and keep matching.
+                        let Ok(path) = entry else {
+                            continue;
+                        };
 
-            let total_matches = paths.len();
-            paths.truncate(if args.limit == 0 {
-                DEFAULT_LIMIT
-            } else {
-                args.limit
+                        // Every match is canonicalized and re-checked against the
+                        // workspace root. A workspace-internal directory symlink pointing
+                        // outside the workspace would otherwise let a plain pattern (no
+                        // `..`) enumerate external filenames, violating the workspace
+                        // scope invariant.
+                        let resolved_path = match std::fs::canonicalize(&path) {
+                            // A match that resolves outside the workspace (via a symlinked
+                            // directory component) is skipped, not fatal.
+                            Ok(resolved) => {
+                                if ensure_path_in_workspace(&resolved_workspace, &resolved).is_err() {
+                                    continue;
+                                }
+                                Some(resolved)
+                            }
+                            // Dangling symlink or entry removed mid-scan. Parent-traversal
+                            // patterns skip it; plain patterns list it as-is, since a
+                            // dangling link cannot leak an external path.
+                            Err(_) => {
+                                if restrict_to_workspace_targets {
+                                    continue;
+                                }
+                                None
+                            }
+                        };
+
+                        let relative = match relative_match_path(&path, &workspace, &resolved_workspace) {
+                            Some(relative) => relative,
+                            None => {
+                                let resolved = match resolved_path {
+                                    Some(resolved) => resolved,
+                                    None => match std::fs::canonicalize(&path) {
+                                        Ok(resolved) => resolved,
+                                        Err(_) => continue,
+                                    },
+                                };
+                                match resolved.strip_prefix(&resolved_workspace) {
+                                    Ok(relative) => normalize_relative_path(relative),
+                                    Err(_) => continue,
+                                }
+                            }
+                        };
+
+                        if paths.len() >= MAX_GLOB_MATCHES {
+                            scan_truncated = true;
+                            break 'workspaces;
+                        }
+                        paths.push(relative);
+                    }
+                }
+                paths.sort();
+                paths.dedup();
+
+                let total_matches = paths.len();
+                paths.truncate(if args.limit == 0 {
+                    DEFAULT_LIMIT
+                } else {
+                    args.limit
+                });
+
+                let output = SearchFileOutput {
+                    paths,
+                    total_matches,
+                    scan_truncated,
+                };
+
+                Ok(ToolOutput::new(output))
             });
-
-            let output = SearchFileOutput {
-                paths,
-                total_matches,
-                scan_truncated,
-            };
-
-            Ok(ToolOutput::new(output))
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => Err("search_file cancelled".into()),
+                result = worker => result.map_err(|err| -> BoxError { err.into() })?,
+            }
         })
         .await
     }

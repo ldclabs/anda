@@ -19,11 +19,12 @@
 //!    [`Engine::tool_call`].
 //!
 //! # Example
-//! ```rust,ignore
+//! ```rust,no_run
 //! use anda_core::AgentInput;
 //! use anda_engine::{
 //!     ANONYMOUS,
 //!     engine::{AgentInfo, EchoEngineInfo, Engine},
+//!     management::{BaseManagement, Visibility},
 //! };
 //! use std::sync::Arc;
 //!
@@ -36,6 +37,11 @@
 //! };
 //!
 //! let engine = Engine::builder()
+//!     .with_management(Arc::new(BaseManagement {
+//!         controller: ANONYMOUS,
+//!         managers: Default::default(),
+//!         visibility: Visibility::Public,
+//!     }))
 //!     .register_agent(Arc::new(EchoEngineInfo::new(echo_info)), None)?
 //!     .build("echo".to_string())
 //!     .await?;
@@ -52,8 +58,8 @@
 
 use anda_cloud_cdk::{ChallengeEnvelope, ChallengeRequest};
 use anda_core::{
-    Agent, AgentInput, AgentOutput, AgentSet, BoxError, Function, Json, Path, RequestMeta,
-    Resource, Tool, ToolInput, ToolOutput, ToolProvider, ToolProviderSet, ToolSet,
+    Agent, AgentContext, AgentInput, AgentOutput, AgentSet, BoxError, Function, Json, Path,
+    RequestMeta, Resource, Tool, ToolInput, ToolOutput, ToolProvider, ToolProviderSet, ToolSet,
     validate_function_name,
 };
 use candid::Principal;
@@ -626,8 +632,8 @@ impl EngineBuilder {
     }
 
     /// Registers a single agent with optional label to the engine.
-    /// Verifies that all required tools are registered before adding the agent.
-    /// Returns an error if any dependency is missing or if the agent cannot be added.
+    /// Missing dependencies are rejected immediately when no dynamic providers exist;
+    /// otherwise they are verified after provider initialization during build.
     /// Recommended labels: "pro", "flash", "lite"
     pub fn register_agent<T>(
         mut self,
@@ -638,7 +644,10 @@ impl EngineBuilder {
         T: Agent<AgentCtx> + Send + Sync + 'static,
     {
         for tool in agent.tool_dependencies() {
-            if !self.tools.contains(&tool) && !self.agents.contains(&tool) {
+            if !self.tools.contains(&tool)
+                && !self.agents.contains(&tool)
+                && self.tool_providers.iter().next().is_none()
+            {
                 return Err(format!("dependent tool {} not found", tool).into());
             }
         }
@@ -649,11 +658,15 @@ impl EngineBuilder {
 
     /// Registers multiple agents to the engine.
     /// Verifies that all required tools are registered for each agent.
-    /// Returns an error if any agent already exists or if any dependency is missing.
+    /// Dynamic provider dependencies are checked after provider initialization;
+    /// other registration errors are returned immediately.
     pub fn register_agents(mut self, agents: AgentSet<AgentCtx>) -> Result<Self, BoxError> {
         for agent in agents {
             for tool in agent.tool_dependencies() {
-                if !self.tools.contains(&tool) && !self.agents.contains(&tool) {
+                if !self.tools.contains(&tool)
+                    && !self.agents.contains(&tool)
+                    && self.tool_providers.iter().next().is_none()
+                {
                     return Err(format!("dependent tool {} not found", tool).into());
                 }
             }
@@ -816,6 +829,18 @@ impl EngineBuilder {
         }
 
         tool_providers.init_all(ctx.base.clone()).await?;
+
+        for (_, agent) in agents.iter() {
+            for dependency in agent.tool_dependencies() {
+                if ctx
+                    .definitions(Some(std::slice::from_ref(&dependency)))
+                    .await
+                    .is_empty()
+                {
+                    return Err(format!("dependent tool {dependency} not found").into());
+                }
+            }
+        }
 
         for (name, agent) in agents.iter() {
             let ct = ctx.child_with(id, name, agent.label(), meta.clone())?;

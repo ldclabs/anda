@@ -123,7 +123,6 @@ fn is_tool_call_item(value: &Json) -> bool {
                 | "mcp_approval_request"
                 | "tool_call"
                 | "tool_use"
-                | "server_tool_use"
                 | "ToolCall"
                 | "toolCall"
         )

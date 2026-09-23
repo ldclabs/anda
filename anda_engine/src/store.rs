@@ -181,13 +181,13 @@ impl Store {
         prefix: Option<&Path>,
         offset: &Path,
     ) -> Result<Vec<ObjectMeta>, BoxError> {
-        let prefix = prefix.map(|p| path_join(namespace, p));
+        let prefix = prefix.map_or_else(|| namespace.clone(), |p| path_join(namespace, p));
         let offset = path_join(namespace, offset);
 
         let mut res = if offset.is_root() {
-            self.store.list(prefix.as_ref())
+            self.store.list(Some(&prefix))
         } else {
-            self.store.list_with_offset(prefix.as_ref(), &offset)
+            self.store.list_with_offset(Some(&prefix), &offset)
         };
         let mut metas = Vec::new();
         while let Some(meta) = res.try_next().await? {

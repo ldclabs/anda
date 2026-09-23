@@ -525,7 +525,7 @@ impl CompletionRunner {
 
     fn compact_discovery_tool_output_for_context(&self, tool_name: &str, output: &mut Json) {
         self.discovered
-            .compact_output_for_context(tool_name, output);
+            .compact_output_for_request(tool_name, output, &self.req.tools);
     }
 
     // Drains all queued steering messages into a single user turn. When steering exists, queued
@@ -691,6 +691,9 @@ impl CompletionRunner {
         &mut self,
         compaction_prompt: Option<String>,
     ) -> Result<(Self, AgentOutput), BoxError> {
+        if self.done {
+            return Err("completion already finalized".into());
+        }
         let unbound = self.unbound;
         let prompt = compaction_prompt.unwrap_or_else(|| COMPACTION_PROMPT.to_string());
 
@@ -713,50 +716,51 @@ impl CompletionRunner {
             }
         }
 
-        let discovered = self.discovered.clone();
-        // Captured before clearing tools so the replacement runner restores the base toolset.
+        self.sync_model_for_next_turn();
         let handoff_req = self.req.clone();
-        let queued_follow_up = std::mem::take(&mut self.follow_up_message);
-        let queued_steering = std::mem::take(&mut self.steering_message);
+        let mut summary_req = handoff_req.clone();
+        let mut pending_content = std::mem::take(&mut summary_req.content);
+        if !summary_req.prompt.is_empty() {
+            pending_content.insert(0, std::mem::take(&mut summary_req.prompt).into());
+        }
+        let pending_message = (!pending_content.is_empty()).then(|| Message {
+            role: summary_req.role.take().unwrap_or_else(|| "user".into()),
+            content: pending_content,
+            ..Default::default()
+        });
+        if let Some(message) = &pending_message {
+            summary_req.chat_history.push(message.clone());
+        }
+        summary_req.role = Some("user".into());
+        summary_req.content = vec![prompt.into()];
+        summary_req.tools.clear();
+        summary_req.tool_choice_required = false;
+        summary_req.output_schema = None;
 
-        self.steer(prompt);
-        // Drop tools so the summarization turn cannot spawn more tool calls.
-        self.set_tools(Vec::new());
-
-        // Summarize. On EVERY failure path restore a usable runner: put back the
-        // base toolset, discovered tools, queued user input, and the unbound
-        // flag, and drop the residual compaction prompt from the request.
-        // Without this, a failed handoff would silently drop queued
-        // follow-up/steering messages and leave a permanently tool-less runner
-        // that a retry cannot recover.
-        let outcome = match self.finalize(None).await {
-            Err(err) => Err(err),
-            Ok(output) => {
-                if let Some(reason) = output.failed_reason.clone() {
-                    Err(reason.into())
-                } else if output.content.trim().is_empty() {
-                    Err(BoxError::from(
-                        "context compaction produced an empty summary",
-                    ))
-                } else {
-                    Ok(output)
-                }
-            }
+        // Summarization is speculative: a failed response must not finalize or drain this runner.
+        self.turns += 1;
+        let token = self.ctx.cancellation_token();
+        let mut output = tokio::select! {
+            _ = token.cancelled() => return Err("operation cancelled".into()),
+            result = self.model.completion(summary_req) => result?,
         };
-        let output = match outcome {
-            Ok(output) => output,
-            Err(err) => {
-                self.req.tools = handoff_req.tools;
-                self.discovered = discovered;
-                self.follow_up_message = queued_follow_up;
-                self.steering_message = queued_steering;
-                self.unbound = unbound;
-                self.req.content.clear();
-                return Err(err);
-            }
-        };
-
+        self.accumulate(&output.usage);
+        if let Some(reason) = &output.failed_reason {
+            return Err(reason.clone().into());
+        }
+        if output.content.trim().is_empty() {
+            return Err("context compaction produced an empty summary".into());
+        }
+        if !output.tool_calls.is_empty() {
+            return Err("context compaction attempted a tool call".into());
+        }
         let summary = output.content.trim().to_string();
+        output.model = Some(self.model.model_name());
+        output.raw_history.clear();
+        if let Some(message) = pending_message {
+            self.chat_history.push(message);
+        }
+        let output = self.final_output(output);
 
         // The summary seeds the next conversation as its first message. It lives in `chat_history`
         // for the first request and migrates into the runner's raw history on later turns.
@@ -767,29 +771,24 @@ impl CompletionRunner {
             ..Default::default()
         };
 
-        let req = CompletionRequest {
-            instructions: handoff_req.instructions,
-            role: handoff_req.role,
-            chat_history: vec![compaction_msg.clone()],
-            tools: handoff_req.tools,
-            model: handoff_req.model,
-            effort: handoff_req.effort,
-            ..Default::default()
-        };
+        let mut req = handoff_req;
+        req.role = None;
+        req.prompt.clear();
+        req.content.clear();
+        req.documents.clear();
+        req.raw_history.clear();
+        req.chat_history = vec![compaction_msg.clone()];
+        req.tool_choice_required = false;
+        req.output_schema = None;
         let mut runner = self
             .ctx
             .clone()
-            .completion_iter(req, Vec::new())
-            // Seed the reported chat history too, so the summary survives into the final output.
+            .completion_iter(req, std::mem::take(&mut self.resources))
             .reserve_chat_history(vec![compaction_msg]);
         runner.set_unbound(unbound);
-        runner.discovered = discovered;
-        runner.follow_up_message = queued_follow_up;
-        runner.steering_message = queued_steering;
-        // Carry the execution-time tool allowlist across the handoff. Without this
-        // a subagent's whitelist (set on the session runner) would be silently
-        // dropped after the first context compaction, letting the subagent call
-        // any callable in the engine. Already lowercased, so assign directly.
+        runner.discovered = self.discovered.clone();
+        runner.follow_up_message = std::mem::take(&mut self.follow_up_message);
+        runner.steering_message = std::mem::take(&mut self.steering_message);
         runner.allowed_callables = self.allowed_callables.clone();
         Ok((runner, output))
     }
@@ -1273,7 +1272,11 @@ impl Stream for CompletionStream {
             let placeholder = this.runner.stream_placeholder();
             let mut runner = std::mem::replace(&mut this.runner, placeholder);
             this.pending = Some(Box::pin(async move {
+                // Defer normal finalization until buffered stream input has been delivered.
+                let unbound = runner.unbound;
+                runner.unbound = true;
                 let res = runner.next().await;
+                runner.unbound = unbound;
                 (runner, res)
             }));
         }
@@ -1286,8 +1289,19 @@ impl Stream for CompletionStream {
             Poll::Ready((runner, res)) => {
                 this.restore_runner(runner);
                 match res {
-                    Ok(Some(output)) => Poll::Ready(Some(Ok(output))),
-                    Ok(None) => Poll::Ready(None),
+                    Ok(Some(output)) => {
+                        let output =
+                            if !this.runner.done && !this.runner.unbound && this.runner.is_idle() {
+                                this.runner.final_idle_output()
+                            } else {
+                                output
+                            };
+                        Poll::Ready(Some(Ok(output)))
+                    }
+                    Ok(None) => {
+                        this.runner.done = true;
+                        Poll::Ready(None)
+                    }
                     Err(e) => Poll::Ready(Some(Err(e))),
                 }
             }
@@ -1753,6 +1767,7 @@ mod tests {
             "total_tools": 9
         });
 
+        runner.add_discovered_tools_from_output("tools_search", &full_output);
         let mut search_output = full_output.clone();
         runner.compact_discovery_tool_output_for_context("tools_search", &mut search_output);
         assert_eq!(search_output["tools"][0]["name"], "echo_tool");

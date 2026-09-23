@@ -15,7 +15,10 @@ use cbor2::{from_slice, to_canonical_vec};
 use object_store::Error as ObjectStoreError;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, Weak},
+};
 
 use crate::{
     context::{AgentCtx, BaseCtx},
@@ -192,9 +195,12 @@ impl NoteStore {
 /// Typed hook for note tool calls.
 pub type NoteToolHook = DynToolHook<NoteArgs, NoteOutput>;
 
+type NoteUpdateLocks = parking_lot::Mutex<HashMap<(Path, String), Weak<tokio::sync::Mutex<()>>>>;
+
 /// Tool implementation that exposes a persistent agent-scoped note store.
 #[derive(Clone)]
 pub struct NoteTool {
+    updates: Arc<NoteUpdateLocks>,
     char_limit: usize,
     description: String,
 }
@@ -212,6 +218,7 @@ impl NoteTool {
     /// Creates a note tool with the default behavioral guidance.
     pub fn new() -> Self {
         Self {
+            updates: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             char_limit: NOTE_CHAR_LIMIT,
             description: concat!(
                 "Persistent notes for the current agent only. Use op=upsert ",
@@ -233,6 +240,18 @@ impl NoteTool {
     pub fn with_description(mut self, description: String) -> Self {
         self.description = description;
         self
+    }
+
+    fn update_lock(&self, ctx: &BaseCtx) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.updates.lock();
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        let key = (ctx.path().clone(), ctx.agent.clone());
+        if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(key, Arc::downgrade(&lock));
+        lock
     }
 
     fn store_path(agent: &str) -> Path {
@@ -314,6 +333,9 @@ impl Tool<BaseCtx> for NoteTool {
     ) -> Result<ToolOutput<Self::Output>, BoxError> {
         let ctx = &ctx;
         hooked_call(ctx, args, |args| async move {
+            // Serialize one note document while unrelated agents can update independently.
+            let lock = self.update_lock(ctx);
+            let _guard = lock.lock().await;
             let mut store = Self::load_store(ctx).await?;
             let op = normalize_op(args.op.as_deref());
             let items = args.items;

@@ -11,13 +11,14 @@ use anda_core::{
     StoreFeatures, ToolOutput, Usage, select_resources, validate_function_name,
 };
 use async_trait::async_trait;
+use candid::Principal;
 use cbor2::{from_slice, to_canonical_vec};
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
     any::{Any, TypeId},
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     str::FromStr,
     sync::{
         Arc,

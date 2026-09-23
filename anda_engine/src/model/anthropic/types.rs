@@ -1253,10 +1253,7 @@ impl From<ContentBlock> for ContentPart {
                 },
             },
             block @ ContentBlock::SearchResult { .. } => ContentPart::Any(json!(block)),
-            ContentBlock::ServerToolUse {
-                id, name, input, ..
-            }
-            | ContentBlock::ToolUse {
+            ContentBlock::ToolUse {
                 id, name, input, ..
             } => ContentPart::ToolCall {
                 name,
@@ -1297,7 +1294,8 @@ impl From<ContentBlock> for ContentPart {
                 "type": "redacted_thinking",
                 "data": data,
             })),
-            block @ (ContentBlock::WebSearchToolResult { .. }
+            block @ (ContentBlock::ServerToolUse { .. }
+            | ContentBlock::WebSearchToolResult { .. }
             | ContentBlock::WebFetchToolResult { .. }
             | ContentBlock::CodeExecutionToolResult { .. }
             | ContentBlock::BashCodeExecutionToolResult { .. }

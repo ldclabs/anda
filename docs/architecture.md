@@ -9,7 +9,8 @@ Preview note: use [markdown-viewer/markdown-viewer-extension](https://github.com
 Source map:
 
 - [`engine.rs`](../anda_engine/src/engine.rs): top-level `Engine`, `EngineBuilder`, exported APIs, management checks, hooks, challenge signing.
-- [`context/agent.rs`](../anda_engine/src/context/agent.rs): `AgentCtx`, local/remote/subagent routing, `CompletionRunner`, `CompletionStream`.
+- [`context/agent.rs`](../anda_engine/src/context/agent.rs): `AgentCtx`, local/remote/subagent routing.
+- [`context/runner.rs`](../anda_engine/src/context/runner.rs): `CompletionRunner`, `CompletionStream`, queued input and compaction.
 - [`context/base.rs`](../anda_engine/src/context/base.rs): `BaseCtx`, scoped state, cache, store, keys, HTTP, signed RPC, cancellation.
 - [`context/tool.rs`](../anda_engine/src/context/tool.rs): built-in discovery agents: `tools_groups`, `tools_search`, and `tools_select`.
 - [`model.rs`](../anda_engine/src/model.rs): `Models` label router, provider adapters, retry and streaming helpers.
@@ -221,11 +222,11 @@ Host --> Caller : response
 - `Engine` is the public runtime boundary. It enforces exported agent/tool lists for non-manager callers and always exports the default agent.
 - `EngineBuilder` starts with in-memory storage, no implemented Web3 client, no external model, and built-in discovery/subagent control agents.
 - `AgentCtx` is the main scheduling surface. It exposes local tools, dynamic tool providers, local agents, subagents, registered remote engines, and dynamic remote engines from cache.
-- `CompletionRunner` is iterative. A model turn can return tool calls; the runner executes them and feeds tool outputs into the next model turn. Long-running runners can compact oversized history into a continuation handoff and resume from that summary.
+- `CompletionRunner` is iterative. A model turn can return tool calls; the runner executes them and feeds tool outputs into the next model turn. Long-running runners can compact oversized history into a continuation handoff and resume from that summary. A summary is committed only after validation, so failure leaves the original runner available for retry. Streams deliver queued input before committing normal completion.
 - `tools_groups`, `tools_search`, and `tools_select` are agents, not side channels. `tools_groups` returns a compact directory of visible capability bundles; `tools_select` can expand one group into schemas, and discovered schemas stay in tool-output context while repeated payloads are compacted from conversation context.
 - `BaseCtx` creates namespace-scoped child contexts. Agent paths use `a_<agent>`, tool paths use `t_<tool>`, and all store/cache operations are resolved under that path.
 - `Models` routes by label first and then falls back to the primary/default model. Provider-specific names stay inside adapter configuration.
 - Conversation history has two views, and the distinction is load-bearing. `chat_history` (`Vec<Message>` of `ContentPart`) is the provider-neutral view that gets persisted and crosses the RPC boundary. `raw_history` (`Vec<Json>`) holds the provider's own message JSON verbatim and exists so per-turn opaque state — Anthropic `thinking.signature`, Gemini `thoughtSignature` — survives a reasoning round without being modelled in `ContentPart`. Each turn the runner appends the response's `raw_history` onto the request's and clears `chat_history`; every adapter sends `raw_history` before the converted `chat_history`. The engine clears it at the RPC boundary, so it is scoped to one in-process round. A resumed conversation replays from `chat_history` alone and legitimately has no provider intermediate state — adapters must tolerate that rather than emit a block the provider rejects.
-- `SubAgentManager` turns persisted or temporary `SubAgent` definitions into callable `SA_<name>` agents. Long-running subagent sessions use hooks to push progress and final output.
+- `SubAgentManager` turns persisted or temporary `SubAgent` definitions into callable `SA_<name>` agents. Long-running subagent sessions are keyed by caller principal and session ID. They use hooks with consistent task IDs to push progress and final output; priority stop/cancel controls interrupt pending work.
 - Memory is an extension layer. Conversation/resource storage uses AndaDB collections, and persistent knowledge operations are exposed as KIP tools backed by Cognitive Nexus.
 - Web3, TEE, ICP, and IC-COSE integrations are implementation choices behind `Web3SDK`, `HttpFeatures`, `KeysFeatures`, `CanisterCaller`, or `ObjectStore`. They are not mandatory architecture layers for the engine itself.

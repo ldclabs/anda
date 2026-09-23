@@ -541,12 +541,6 @@ impl WireFormat for CompletionModel {
         res.maybe_failed()
     }
 
-    fn redacted_for_log(r: &Self::Request) -> Self::Request {
-        let mut logged = r.clone();
-        logged.system = None;
-        logged
-    }
-
     fn sent_messages(mut r: Self::Request, skip_raw: usize) -> Vec<Json> {
         if skip_raw > 0 {
             r.messages.drain(0..skip_raw);

@@ -109,6 +109,30 @@ impl StreamBuffer {
     }
 }
 
+// Owns cleanup even when an enclosing runner or timeout drops the execution future.
+struct ProcessGuard {
+    pid: Option<u32>,
+    readers: [tokio::task::AbortHandle; 2],
+    armed: bool,
+}
+
+impl ProcessGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ProcessGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            kill_process_group(self.pid);
+            for reader in &self.readers {
+                reader.abort();
+            }
+        }
+    }
+}
+
 struct RunningProcess {
     child: Child,
     stdout: OutputBuffer,
@@ -258,6 +282,12 @@ impl NativeRuntime {
         let stderr = std::sync::Arc::new(TokioMutex::new(StreamBuffer::default()));
         let stdout_reader = spawn_output_reader(child.stdout.take(), stdout.clone());
         let stderr_reader = spawn_output_reader(child.stderr.take(), stderr.clone());
+        let mut guard = ProcessGuard {
+            pid,
+            readers: [stdout_reader.abort_handle(), stderr_reader.abort_handle()],
+            armed: true,
+        };
+        let cancellation = ctx.cancellation_token();
         let mut running = RunningProcess {
             child,
             stdout,
@@ -274,13 +304,15 @@ impl NativeRuntime {
                 tokio::pin!(auto_background);
 
                 tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => return Err("shell command cancelled".into()),
                     status = &mut wait => Some(status),
                     _ = &mut auto_background => None,
                 }
             };
 
             if let Some(status) = status {
-                return Ok(finalize_process_output(
+                let output = finalize_process_output(
                     pid,
                     &workspace_str,
                     status,
@@ -290,7 +322,9 @@ impl NativeRuntime {
                     running.stderr_reader,
                     &self.temp_dir,
                 )
-                .await);
+                .await;
+                guard.disarm();
+                return Ok(output);
             }
         }
 
@@ -388,6 +422,7 @@ impl NativeRuntime {
                 )
                 .await;
 
+                guard.disarm();
                 if let Some(exec_output) = final_progress {
                     emit_background_progress(
                         &ctx,
@@ -470,7 +505,20 @@ fn kill_process_group(pid: Option<u32>) {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn kill_process_group(pid: Option<u32>) {
+    if let Some(pid) = pid {
+        let _ = std::process::Command::new("taskkill")
+            .env_clear()
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn kill_process_group(_pid: Option<u32>) {}
 
 #[derive(Default)]

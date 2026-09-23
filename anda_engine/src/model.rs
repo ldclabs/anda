@@ -885,7 +885,7 @@ where
                     format_error_chain(&err)
                 );
                 if retryable && attempt < MODEL_REQUEST_MAX_RETRIES {
-                    log_completion_retry(model, attempt + 1, &message);
+                    log_completion_retry(model, attempt + 1);
                     backoff_before_retry(None).await;
                     continue;
                 }
@@ -903,7 +903,7 @@ where
             match handle_response(response).await {
                 Ok(output) => return Ok(output),
                 Err(err) if is_retryable_box_error(&err) && attempt < MODEL_REQUEST_MAX_RETRIES => {
-                    log_completion_retry(model, attempt + 1, &err.to_string());
+                    log_completion_retry(model, attempt + 1);
                     backoff_before_retry(None).await;
                     continue;
                 }
@@ -924,7 +924,7 @@ where
                     format_error_chain(&err)
                 );
                 if retryable && attempt < MODEL_REQUEST_MAX_RETRIES {
-                    log_completion_retry(model, attempt + 1, &message);
+                    log_completion_retry(model, attempt + 1);
                     backoff_before_retry(retry_after).await;
                     continue;
                 }
@@ -944,7 +944,7 @@ where
         );
 
         if retryable && attempt < MODEL_REQUEST_MAX_RETRIES {
-            log_completion_retry(model, attempt + 1, &message);
+            log_completion_retry(model, attempt + 1);
             backoff_before_retry(retry_after).await;
             continue;
         }
@@ -989,13 +989,13 @@ fn retry_after_duration(headers: &http::HeaderMap) -> Option<Duration> {
         .ok()
 }
 
-fn log_completion_retry(model: &str, retry: usize, reason: &str) {
+fn log_completion_retry(model: &str, retry: usize) {
+    // The returned error retains diagnostics; routine retry logs omit upstream bodies.
     log::warn!(
-        "Retrying completion request, model: {}, retry: {}/{}, error: {}",
+        "Retrying completion request, model: {}, retry: {}/{}",
         model,
         retry,
-        MODEL_REQUEST_MAX_RETRIES,
-        reason
+        MODEL_REQUEST_MAX_RETRIES
     );
 }
 

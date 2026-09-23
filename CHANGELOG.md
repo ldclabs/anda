@@ -4,6 +4,39 @@ All notable changes to the Anda project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed — anda_engine
+
+- Isolate subagent sessions and model-visible status by caller; keep background
+  progress IDs consistent with start/end IDs. Stop/cancel interrupts pending
+  session work, and native shell cancellation also cleans up descendants and readers.
+- Scope unfiltered object listings to their namespace and serialize note updates
+  per document to prevent lost concurrent writes.
+- Preserve complete discovery schemas when request merging is capped, upgrade
+  directory entries on selection, honor selector limits, and retain selector usage.
+  Resolve exact routed names, call dynamically registered remote engines, and
+  validate lazy provider dependencies after initialization.
+- Keep queued stream input at normal completion, retain runner state when
+  compaction fails, and run remaining end hooks after a hook reports an error.
+- Keep Anthropic server tools out of local dispatch, reject Responses stream
+  errors and missing terminal responses, and use Gemini JSON Schema fields for
+  provider-neutral schemas.
+- Bound MCP setup, listing, tool requests, task polling, and cancellation
+  acknowledgements; preserve discovery and legacy lifecycle fallback.
+- Omit conversation bodies and credential-bearing headers from routine model
+  and MCP configuration logs; fix and run the public-engine quick-start example.
+
+### Changed — anda_engine
+
+- Gemini `FunctionDeclaration` adds `parameters_json_schema`; callers constructing
+  struct literals must initialize it. The existing `parameters` field remains
+  available for OpenAPI schemas. Responses `StreamEvent` adds an `Error` variant.
+- Caller-free `SubSessions::get_session` returns `None` for ambiguous IDs; use
+  caller-scoped lookup/status methods for user-facing access. Progress callback
+  IDs now match the existing `agent:session` start/end ID format.
+- Search candidates borrow schemas until selected; capability groups obtain
+  static names without regenerating schemas. Synchronous glob traversal runs
+  outside Tokio workers. Reuse context construction and conversation expiry logic.
+
 ### Fixed — anda_core
 
 - Cache/store helpers use the same canonical lowercase path for both layers,

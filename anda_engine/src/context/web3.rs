@@ -619,10 +619,23 @@ mod tests {
 
         fn https_signed_rpc_raw(
             &self,
-            _endpoint: String,
+            endpoint: String,
             method: String,
-            _args: Vec<u8>,
+            args: Vec<u8>,
         ) -> BoxPinFut<Result<Vec<u8>, BoxError>> {
+            if method == "agent_run" {
+                let (input,): (anda_core::AgentInput,) = from_slice(&args).unwrap();
+                return Box::pin(std::future::ready(Ok(to_canonical_vec(&anda_core::AgentOutput {
+                    content: serde_json::json!({"endpoint":endpoint,"name":input.name,"meta":input.meta}).to_string(),
+                    ..Default::default()
+                }).unwrap())));
+            }
+            if method == "tool_call" {
+                let (input,): (anda_core::ToolInput<anda_core::Json>,) = from_slice(&args).unwrap();
+                return Box::pin(std::future::ready(Ok(to_canonical_vec(&anda_core::ToolOutput::new(
+                    serde_json::json!({"endpoint":endpoint,"name":input.name,"meta":input.meta})
+                )).unwrap())));
+            }
             Box::pin(futures::future::ready(
                 to_canonical_vec(&format!("rpc:{method}")).map_err(|err| err.into()),
             ))
@@ -817,5 +830,108 @@ mod tests {
             .https_signed_rpc("https://example.test/rpc", "ping", &())
             .await;
         assert!(rpc.is_err());
+    }
+    #[tokio::test]
+    async fn dynamic_routes_send_the_resolved_identity_and_original_remote_name() {
+        use crate::{
+            context::{AgentInfo, DYNAMIC_REMOTE_ENGINES, EngineCard, RemoteEngines},
+            engine::Engine,
+        };
+        use anda_core::{
+            AgentContext, AgentInput, BaseContext, CacheStoreFeatures, Function,
+            FunctionDefinition, RequestMeta, ToolInput,
+        };
+        let target = Principal::self_authenticating([3]);
+        let ctx = Engine::builder()
+            .with_web3_client(Arc::new(Web3SDK::from_web3(Arc::new(MockWeb3Client::new(
+                Principal::self_authenticating([1]),
+            )))))
+            .mock_ctx();
+        let function = |name: &str| Function {
+            definition: FunctionDefinition {
+                name: name.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let remotes = RemoteEngines {
+            engines: std::collections::BTreeMap::from([(
+                "dynamic".into(),
+                EngineCard {
+                    id: target,
+                    info: AgentInfo {
+                        endpoint: "https://dynamic.example".into(),
+                        ..Default::default()
+                    },
+                    tools: vec![function("lookup")],
+                    agents: vec![function("worker")],
+                },
+            )]),
+        };
+        ctx.cache_store_set(DYNAMIC_REMOTE_ENGINES, remotes, None)
+            .await
+            .unwrap();
+        let child = ctx.child("parent", "parent").unwrap();
+        for name in ["RT_dynamic_lookup", "RA_dynamic_worker"] {
+            let definitions = child.definitions(Some(&[name.into()])).await;
+            assert_eq!(definitions.len(), 1);
+            assert_eq!(definitions[0].name, name);
+        }
+        assert!(
+            child
+                .definitions(Some(&["SA_dynamic_worker".into()]))
+                .await
+                .is_empty()
+        );
+        let forged = Some(RequestMeta {
+            engine: Some(Principal::anonymous()),
+            user: Some("forged".into()),
+            ..Default::default()
+        });
+        let (tool, remote) = child
+            .tool_call(ToolInput {
+                name: "RT_dynamic_lookup".into(),
+                args: serde_json::json!({}),
+                meta: forged.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(remote, Some(target));
+        assert_eq!(tool.output["name"], "lookup");
+        assert_eq!(tool.output["meta"]["engine"], target.to_text());
+        assert_eq!(tool.output["meta"]["user"], "Mocker");
+        let (agent, remote) = child
+            .clone()
+            .agent_run(AgentInput {
+                name: "RA_dynamic_worker".into(),
+                meta: forged,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(remote, Some(target));
+        let output: serde_json::Value = serde_json::from_str(&agent.content).unwrap();
+        assert_eq!(output["name"], "worker");
+        assert_eq!(output["meta"]["engine"], target.to_text());
+        let direct = child
+            .base
+            .remote_tool_call(
+                "https://dynamic.example",
+                ToolInput::new("lookup".into(), serde_json::json!({})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(direct.output["meta"]["engine"], target.to_text());
+        assert!(
+            child
+                .base
+                .remote_tool_call(
+                    "https://unregistered.example",
+                    ToolInput::new("lookup".into(), serde_json::json!({}))
+                )
+                .await
+                .is_err()
+        );
     }
 }

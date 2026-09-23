@@ -1539,29 +1539,9 @@ impl MemoryManagement {
     /// remaining references. Reclaiming orphaned resources therefore requires a
     /// dedicated reference-counted GC pass and is left to callers.
     pub async fn delete_expired_conversations(&self, timestamp: u64) -> Result<u64, BoxError> {
-        let period = timestamp / 3600 / 1000;
-        let mut count = 0u64;
-        loop {
-            let ids = next_expired_batch(&self.conversations, period).await?;
-            if ids.is_empty() {
-                break;
-            }
-
-            let mut removed = 0u64;
-            for id in ids {
-                if matches!(self.conversations.remove(id).await, Ok(Some(_))) {
-                    removed += 1;
-                }
-            }
-            count += removed;
-            if removed == 0 {
-                // Nothing was removable; stop instead of spinning on undeletable documents.
-                break;
-            }
-        }
-
-        self.conversations.flush(unix_ms()).await?;
-        Ok(count)
+        self.as_conversations()
+            .delete_expired_conversations(timestamp)
+            .await
     }
 }
 

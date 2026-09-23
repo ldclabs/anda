@@ -615,7 +615,8 @@ impl From<Vec<FunctionDefinition>> for Tool {
                 .map(|v| FunctionDeclaration {
                     name: v.name,
                     description: v.description,
-                    parameters: Some(v.parameters),
+                    parameters: None,
+                    parameters_json_schema: Some(v.parameters),
                     response: None,
                 })
                 .collect(),
@@ -864,6 +865,10 @@ pub struct FunctionDeclaration {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parameters: Option<Value>,
+
+    /// JSON Schema parameters, mutually exclusive with the OpenAPI `parameters` field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parameters_json_schema: Option<Value>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response: Option<Value>,
@@ -2740,6 +2745,7 @@ mod tests {
                     },
                     "required": ["location"]
                 })),
+                parameters_json_schema: None,
                 response: None,
             }],
         };
@@ -2857,7 +2863,7 @@ mod tests {
                     {
                         "name": "sum",
                         "description": "Sum two integers",
-                        "parameters": {
+                        "parametersJsonSchema": {
                             "type": "object",
                             "properties": {
                                 "a": {"type": "integer"},

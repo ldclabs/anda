@@ -5,7 +5,7 @@
 //! `input_required` rounds, task handles) until a final result, and adapts
 //! [`CallToolResult`] into the audited [`ToolOutput`] envelope.
 
-use anda_core::{BoxError, FunctionDefinition, Json, ToolOutput, Usage};
+use anda_core::{BoxError, CancellationToken, FunctionDefinition, Json, ToolOutput, Usage};
 use rmcp::{
     Peer, RoleClient,
     model::{
@@ -17,10 +17,14 @@ use serde_json::json;
 use std::{
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use super::McpTasksConfig;
+use tokio::time::Instant;
+
+pub(crate) const TOOL_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
+const TASK_CANCEL_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How many times to re-derive a local tool name before giving up on a collision.
 pub(crate) const MAX_LOCAL_NAME_ATTEMPTS: usize = 8;
@@ -56,9 +60,17 @@ pub(crate) async fn call_tool_rounds(
     peer: &Peer<RoleClient>,
     mut params: CallToolRequestParams,
     tasks: Option<&McpTasksConfig>,
+    cancellation: &CancellationToken,
 ) -> Result<CallToolResult, BoxError> {
     for _ in 0..DEFAULT_MRTR_MAX_ROUNDS {
-        match peer.call_tool_once(params.clone()).await? {
+        let response = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err("MCP tool call cancelled".into()),
+            response = tokio::time::timeout(TOOL_REQUEST_TIMEOUT, peer.call_tool_once(params.clone())) => {
+                response.map_err(|_| format!("MCP tool {} request timed out", route.name))??
+            }
+        };
+        match response {
             CallToolResponse::Complete(result) => return Ok(result),
             CallToolResponse::InputRequired(result) => {
                 // A round carrying actual `inputRequests` wants Sampling,
@@ -86,7 +98,7 @@ pub(crate) async fn call_tool_rounds(
                 tokio::time::sleep(MRTR_STATE_ROUND_DELAY).await;
             }
             CallToolResponse::Task(task) => {
-                return await_task(route, peer, task, tasks).await;
+                return await_task(route, peer, task, tasks, cancellation).await;
             }
             other => {
                 return Err(format!(
@@ -114,9 +126,16 @@ async fn await_task(
     peer: &Peer<RoleClient>,
     created: CreateTaskResult,
     tasks: Option<&McpTasksConfig>,
+    cancellation: &CancellationToken,
 ) -> Result<CallToolResult, BoxError> {
     let task_id = created.task.task_id.clone();
+    let mut cleanup = TaskCleanup {
+        peer: peer.clone(),
+        task_id: task_id.clone(),
+        armed: true,
+    };
     let Some(tasks) = tasks else {
+        cleanup.armed = false;
         cancel_task(peer, &task_id).await;
         return Err(format!(
             "MCP tool {} returned a task handle, but the tasks extension is not enabled \
@@ -130,25 +149,36 @@ async fn await_task(
     let deadline = Instant::now() + max_wait;
     let mut interval = task_poll_interval(created.task.poll_interval_ms);
     loop {
-        if Instant::now() + interval > deadline {
-            cancel_task(peer, &task_id).await;
-            return Err(format!(
-                "MCP tool {} task {task_id} did not finish within {}s",
-                route.name,
-                max_wait.as_secs()
-            )
-            .into());
-        }
-        tokio::time::sleep(interval).await;
-
-        let task = peer
-            .get_task(GetTaskParams::new(task_id.clone()))
-            .await?
-            .task;
+        let poll = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                cleanup.armed = false;
+                cancel_task(peer, &task_id).await;
+                return Err("MCP task cancelled".into());
+            }
+            poll = tokio::time::timeout_at(deadline, async {
+                tokio::time::sleep(interval).await;
+                peer.get_task(GetTaskParams::new(task_id.clone())).await
+            }) => poll,
+        };
+        let task = match poll {
+            Ok(result) => result?.task,
+            Err(_) => {
+                cleanup.armed = false;
+                cancel_task(peer, &task_id).await;
+                return Err(format!(
+                    "MCP tool {} task {task_id} did not finish within {}s",
+                    route.name,
+                    max_wait.as_secs()
+                )
+                .into());
+            }
+        };
         interval = task_poll_interval(task.task.poll_interval_ms);
         match task.payload {
             TaskPayload::Working => continue,
             TaskPayload::Completed { result } => {
+                cleanup.armed = false;
                 // The payload mirrors the result of the original request, so it
                 // deserializes as the `tools/call` result it stands in for.
                 return serde_json::from_value(Json::Object(result)).map_err(|err| {
@@ -160,6 +190,7 @@ async fn await_task(
                 });
             }
             TaskPayload::Failed { error } => {
+                cleanup.armed = false;
                 return Err(format!(
                     "MCP tool {} task {task_id} failed: {}",
                     route.name,
@@ -168,9 +199,11 @@ async fn await_task(
                 .into());
             }
             TaskPayload::Cancelled => {
+                cleanup.armed = false;
                 return Err(format!("MCP tool {} task {task_id} was cancelled", route.name).into());
             }
             TaskPayload::InputRequired { input_requests } => {
+                cleanup.armed = false;
                 // Same reasoning as the MRTR round above: nothing here can answer a
                 // sampling, elicitation, or roots request.
                 cancel_task(peer, &task_id).await;
@@ -186,6 +219,27 @@ async fn await_task(
                 )
                 .into());
             }
+        }
+    }
+}
+
+// Also cancel a remote task when a parent runner drops the polling future.
+struct TaskCleanup {
+    peer: Peer<RoleClient>,
+    task_id: String,
+    armed: bool,
+}
+
+impl Drop for TaskCleanup {
+    fn drop(&mut self) {
+        if self.armed
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            let peer = self.peer.clone();
+            let task_id = self.task_id.clone();
+            runtime.spawn(async move {
+                cancel_task(&peer, &task_id).await;
+            });
         }
     }
 }
@@ -213,8 +267,15 @@ pub(crate) fn task_poll_interval(poll_interval_ms: Option<u64>) -> Duration {
 
 /// Abandons a task this host will not wait for, so the server can release it.
 async fn cancel_task(peer: &Peer<RoleClient>, task_id: &str) {
-    if let Err(err) = peer.cancel_task(CancelTaskParams::new(task_id)).await {
-        log::debug!("MCP task {task_id} could not be cancelled: {err}");
+    match tokio::time::timeout(
+        TASK_CANCEL_TIMEOUT,
+        peer.cancel_task(CancelTaskParams::new(task_id)),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(err)) => log::debug!("MCP task {task_id} could not be cancelled: {err}"),
+        Err(_) => log::debug!("MCP task {task_id} cancellation acknowledgement timed out"),
     }
 }
 

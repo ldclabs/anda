@@ -655,7 +655,7 @@ fn subagent_metadata_args_and_content_helpers_cover_edge_inputs() {
             .description
             .contains("Session idle timeout: 120s.")
     );
-    assert!(definition.description.contains("Active sessions: Job-A."));
+    assert!(!definition.description.contains("Job-A"));
     assert_eq!(Agent::<AgentCtx>::description(&agent), "  ");
     assert_eq!(
         Agent::<AgentCtx>::tool_dependencies(&agent),
@@ -1290,7 +1290,7 @@ async fn subsession_runner_compacts_context_and_continues_from_handoff() {
 
     let progress = hook.progress_events();
     assert_eq!(progress.len(), 1);
-    assert_eq!(progress[0].0, "session-1");
+    assert_eq!(progress[0].0, "compactor:session-1");
     assert_eq!(progress[0].1.content, "seed task");
 
     let recorded = requests.lock().clone();
@@ -1605,7 +1605,7 @@ async fn subsession_runner_emits_progress_for_signal_steps_without_waiting_for_i
 
     let progress = hook.progress_events();
     assert_eq!(progress.len(), 1);
-    assert_eq!(progress[0].0, "session-1");
+    assert_eq!(progress[0].0, "worker:session-1");
     assert_eq!(progress[0].1.session.as_deref(), Some("session-1"));
     assert_eq!(progress[0].1.content, "searching now");
     assert_eq!(progress[0].1.tool_calls.len(), 1);

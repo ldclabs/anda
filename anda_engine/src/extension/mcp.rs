@@ -102,8 +102,8 @@
 //! ```
 
 use anda_core::{
-    BoxError, BoxFut, FunctionDefinition, Json, ToolGroup, ToolInput, ToolOutput, ToolProvider,
-    validate_function_name,
+    BoxError, BoxFut, CancellationToken, FunctionDefinition, Json, StateFeatures, ToolGroup,
+    ToolInput, ToolOutput, ToolProvider, validate_function_name,
 };
 use parking_lot::{Mutex as SyncMutex, RwLock};
 use reqwest::Client as ReqwestClient;
@@ -288,13 +288,18 @@ impl McpToolProvider {
         // initialize handshake so the discovery layer can present each server as
         // a coherent capability bundle, not just a flat list of tools.
         let meta = McpServerMeta::from_peer_info(&config.id, peer.peer_info().as_deref());
-        let tools = match peer.list_all_tools().await {
-            Ok(tools) => tools,
-            Err(err) => {
+        let listed = tokio::time::timeout(session::LIST_TOOLS_TIMEOUT, peer.list_all_tools()).await;
+        let tools = match listed {
+            Ok(Ok(tools)) => tools,
+            Ok(Err(err)) => {
                 // The listing failed, so the snapshot was not applied; re-arm the flag so
                 // the next call retries instead of trusting a stale route table.
                 session.dirty.store(true, Ordering::SeqCst);
                 return Err(err.into());
+            }
+            Err(_) => {
+                session.dirty.store(true, Ordering::SeqCst);
+                return Err(format!("MCP server {server_id} tools/list timed out").into());
             }
         };
 
@@ -444,6 +449,19 @@ impl McpToolProvider {
     /// opener has already exited, and a streamable-HTTP worker binds its lifecycle
     /// mode when it sends the first message.
     async fn connect(
+        &self,
+        config: &McpServerConfig,
+        lifecycle: ClientLifecycleMode,
+    ) -> Result<Arc<McpSession>, BoxError> {
+        tokio::time::timeout(
+            session::SESSION_SETUP_TIMEOUT,
+            self.connect_inner(config, lifecycle),
+        )
+        .await
+        .map_err(|_| format!("MCP server {} session setup timed out", config.id))?
+    }
+
+    async fn connect_inner(
         &self,
         config: &McpServerConfig,
         lifecycle: ClientLifecycleMode,
@@ -842,16 +860,32 @@ impl McpToolProvider {
         Ok(name)
     }
 
+    #[cfg(test)]
     async fn call_route(
         &self,
         route: McpToolRoute,
         input: ToolInput<Json>,
     ) -> Result<ToolOutput<Json>, BoxError> {
-        self.refresh_if_dirty(&route.server_id).await?;
-        // Reconnect on demand: a server may have crashed without sending a
-        // `tools/list_changed` notification, leaving a closed session.
-        let config = self.server_config(&route.server_id)?;
-        let session = self.ensure_session(&config).await?;
+        self.call_route_with_cancellation(route, input, CancellationToken::new())
+            .await
+    }
+
+    async fn call_route_with_cancellation(
+        &self,
+        route: McpToolRoute,
+        input: ToolInput<Json>,
+        cancellation: CancellationToken,
+    ) -> Result<ToolOutput<Json>, BoxError> {
+        let (config, session) = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err("MCP tool call cancelled".into()),
+            setup = async {
+                self.refresh_if_dirty(&route.server_id).await?;
+                let config = self.server_config(&route.server_id)?;
+                let session = self.ensure_session(&config).await?;
+                Ok::<_, BoxError>((config, session))
+            } => setup?,
+        };
 
         let arguments = match input.args {
             Json::Object(map) => map,
@@ -874,7 +908,8 @@ impl McpToolProvider {
             let service = session.service.lock().await;
             service.peer().clone()
         };
-        let result = call_tool_rounds(&route, &peer, params, config.tasks.as_ref()).await?;
+        let result =
+            call_tool_rounds(&route, &peer, params, config.tasks.as_ref(), &cancellation).await?;
         Ok(mcp_result_to_tool_output(&route, result))
     }
 
@@ -949,11 +984,18 @@ impl ToolProvider<BaseCtx> for McpToolProvider {
         self.tool_groups()
     }
 
-    fn init(&self, _ctx: BaseCtx) -> BoxFut<'_, Result<(), BoxError>> {
+    fn init(&self, ctx: BaseCtx) -> BoxFut<'_, Result<(), BoxError>> {
         // Startup must not fail because a single MCP server is unreachable;
         // failed servers are logged and can be refreshed later, on demand or
         // via an explicit `refresh()`.
-        Box::pin(async move { self.refresh_servers(true).await })
+        Box::pin(async move {
+            let cancellation = ctx.cancellation_token();
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => Err("MCP initialization cancelled".into()),
+                result = self.refresh_servers(true) => result,
+            }
+        })
     }
 
     fn refresh(&self) -> BoxFut<'_, Result<(), BoxError>> {
@@ -963,7 +1005,7 @@ impl ToolProvider<BaseCtx> for McpToolProvider {
 
     fn call(
         &self,
-        _ctx: BaseCtx,
+        ctx: BaseCtx,
         mut input: ToolInput<Json>,
     ) -> BoxFut<'_, Result<ToolOutput<Json>, BoxError>> {
         Box::pin(async move {
@@ -976,7 +1018,8 @@ impl ToolProvider<BaseCtx> for McpToolProvider {
                 .get(&input.name)
                 .cloned()
                 .ok_or_else(|| format!("MCP tool {} not found", input.name))?;
-            self.call_route(route, input).await
+            self.call_route_with_cancellation(route, input, ctx.cancellation_token())
+                .await
         })
     }
 }

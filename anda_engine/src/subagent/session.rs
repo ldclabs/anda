@@ -62,6 +62,9 @@ pub(super) const STATUS_PROGRESS_MAX_BYTES: usize = 2000;
 
 /// Long-lived conversation session for a subagent.
 pub struct SubSession {
+    pub(super) caller: Principal,
+    control_queue: Mutex<VecDeque<SubAgentInput>>,
+    pub(super) control_ready: tokio::sync::Notify,
     pub(super) id: String,
     pub(super) agent: String,
     pub(super) sender: tokio::sync::mpsc::Sender<SubAgentInput>,
@@ -282,10 +285,46 @@ impl SubSessionRunner {
         self.emit_progress(output).await;
     }
 
+    async fn cancel_current_task(&mut self, reason: String) -> Result<bool, BoxError> {
+        self.session.stop_background_tasks();
+        let failed_reason = self.record_failed_output(reason);
+        let output = self.last_output.take().unwrap_or_default();
+        self.last_output = Some(self.runner.stop_current_task(output));
+        if let Some(conversation) = &mut self.conversation
+            && let Some(output) = &mut self.last_output
+        {
+            conversation
+                .record_output(output, ConversationStatus::Cancelled)
+                .await;
+        }
+        Err(failed_reason.into())
+    }
+
+    async fn process_pending_control(&mut self) -> Result<bool, BoxError> {
+        if let Some(input) = self.session.take_control() {
+            let reason = input
+                .command
+                .command_argument()
+                .unwrap_or_default()
+                .to_string();
+            if let PromptCommand::Command { command, .. } = input.command {
+                if command == "cancel" {
+                    return self.cancel_current_task(reason).await;
+                }
+                self.stop_current_task(reason).await;
+            }
+        }
+        Ok(true)
+    }
+
     pub(super) async fn emit_progress(&self, output: AgentOutput) {
         if let Some(hook) = &self.agent_hook {
-            hook.on_background_progress(self.runner.ctx(), self.session.id.clone(), output)
-                .await;
+            hook.on_background_progress(
+                self.runner.ctx(),
+                self.session.background_task_id(),
+                output,
+            )
+            .await;
         }
     }
 
@@ -320,7 +359,10 @@ impl SubSessionRunner {
     }
 
     // returns true if the conversation should continue to be active after processing the inputs, or false if it should be terminated
-    pub(super) async fn run(&mut self, inputs: Vec<SubAgentInput>) -> Result<bool, BoxError> {
+    pub(super) async fn run(&mut self, mut inputs: Vec<SubAgentInput>) -> Result<bool, BoxError> {
+        if let Some(control) = self.session.take_control() {
+            inputs.insert(0, control);
+        }
         let mut stop_requested: Option<String> = None;
         let mut cancellation_requested: Option<String> = None;
         if !inputs.is_empty() {
@@ -406,15 +448,7 @@ impl SubSessionRunner {
         }
 
         if let Some(failed_reason) = cancellation_requested {
-            let failed_reason = self.record_failed_output(failed_reason);
-            if let Some(conversation) = &mut self.conversation
-                && let Some(output) = &mut self.last_output
-            {
-                conversation
-                    .record_output(output, ConversationStatus::Cancelled)
-                    .await;
-            }
-            return Err(failed_reason.into());
+            return self.cancel_current_task(failed_reason).await;
         }
 
         if let Some(reason) = stop_requested {
@@ -441,7 +475,13 @@ impl SubSessionRunner {
                         .sum(),
                 )
         }) {
-            match self.compact().await {
+            let session = self.session.clone();
+            let compacted = tokio::select! {
+                biased;
+                _ = session.control_ready.notified() => return self.process_pending_control().await,
+                result = self.compact() => result,
+            };
+            match compacted {
                 Ok(()) => {}
                 Err(err) => {
                     if let Some(conversation) = &mut self.conversation {
@@ -465,7 +505,13 @@ impl SubSessionRunner {
             conversation.mark_status(ConversationStatus::Working).await;
         }
 
-        match self.runner.next().await {
+        let session = self.session.clone();
+        let next = tokio::select! {
+            biased;
+            _ = session.control_ready.notified() => return self.process_pending_control().await,
+            next = self.runner.next() => next,
+        };
+        match next {
             Ok(None) => {
                 if self.closing || self.runner.is_done() {
                     return Ok(false);
@@ -537,6 +583,9 @@ impl SubSession {
     ) -> Self {
         let now = unix_ms();
         Self {
+            caller: Principal::anonymous(),
+            control_queue: Mutex::new(VecDeque::new()),
+            control_ready: tokio::sync::Notify::new(),
             id,
             agent,
             sender,
@@ -547,6 +596,28 @@ impl SubSession {
             conversation: AtomicU64::new(0),
             controls: BackgroundTaskControls::new(),
         }
+    }
+
+    pub(super) fn request_control(&self, input: SubAgentInput) {
+        self.control_queue.lock().push_back(input);
+        self.control_ready.notify_one();
+    }
+
+    pub(super) fn has_control(&self) -> bool {
+        !self.control_queue.lock().is_empty()
+    }
+
+    fn take_control(&self) -> Option<SubAgentInput> {
+        self.control_queue.lock().pop_front()
+    }
+
+    pub(super) fn with_caller(mut self, caller: Principal) -> Self {
+        self.caller = caller;
+        self
+    }
+
+    fn key(&self) -> (Principal, String) {
+        (self.caller, self.id.clone())
     }
 
     /// Identifier this session registers under in the *parent's* background-task registry.
@@ -625,10 +696,18 @@ impl SubSession {
 
     /// Closes the session.
     ///
-    /// This is a no-op today: the input channel closes on its own once every `sender` clone is
-    /// dropped, and the runner exits at its next idle boundary. The method is kept as the single
-    /// place to hook explicit teardown (e.g. cancelling the runner) if that becomes necessary.
-    pub fn close(self: Arc<Self>) {}
+    /// Stops owned background tasks and wakes the runner with a priority cancellation request.
+    /// The runner closes its input receiver as it exits.
+    pub fn close(self: Arc<Self>) {
+        self.stop_background_tasks();
+        self.request_control(SubAgentInput {
+            command: PromptCommand::Command {
+                command: "cancel".into(),
+                prompt: DEFAULT_CANCEL_REASON.into(),
+            },
+            ..Default::default()
+        });
+    }
 
     pub(super) fn stop_background_tasks(&self) {
         // Mark each task stopped so any late progress/end output is no longer forwarded, and
@@ -841,7 +920,7 @@ impl ToolBackgroundHook for SubSession {
 
 /// Registry of active subagent sessions for one subagent definition.
 pub struct SubSessions {
-    sessions: RwLock<BTreeMap<String, Arc<SubSession>>>,
+    sessions: RwLock<BTreeMap<(Principal, String), Arc<SubSession>>>,
 }
 
 impl Default for SubSessions {
@@ -853,35 +932,37 @@ impl Default for SubSessions {
 }
 
 impl SubSessions {
-    /// Inserts or replaces a session by ID.
+    /// Inserts or replaces a session within its caller namespace.
     pub fn insert_session(&self, sess: Arc<SubSession>) {
-        self.sessions.write().insert(sess.id.clone(), sess);
+        self.sessions.write().insert(sess.key(), sess);
     }
 
-    /// Atomically claims the session ID for `sess`.
+    /// Atomically claims the caller/session key for `sess`.
     ///
     /// Returns `None` when `sess` was inserted, or `Some(existing)` when another active session
     /// already owns the ID, so concurrent callers join the same conversation instead of spawning
     /// duplicate runners.
     pub fn try_insert_session(&self, sess: Arc<SubSession>) -> Option<Arc<SubSession>> {
+        let key = sess.key();
         let mut sessions = self.sessions.write();
-        if let Some(existing) = sessions.get(&sess.id)
+        if let Some(existing) = sessions.get(&key)
             && !existing.sender.is_closed()
         {
             return Some(existing.clone());
         }
 
-        sessions.insert(sess.id.clone(), sess);
+        sessions.insert(key, sess);
         None
     }
 
     /// Removes the session only if the registry still holds this exact instance, so a finished
     /// runner cannot remove a newer session that reused the same ID.
     pub fn remove_session_if(&self, sess: &Arc<SubSession>) {
+        let key = sess.key();
         let removed = {
             let mut sessions = self.sessions.write();
-            match sessions.get(&sess.id) {
-                Some(existing) if Arc::ptr_eq(existing, sess) => sessions.remove(&sess.id),
+            match sessions.get(&key) {
+                Some(existing) if Arc::ptr_eq(existing, sess) => sessions.remove(&key),
                 _ => None,
             }
         };
@@ -891,14 +972,16 @@ impl SubSessions {
         }
     }
 
-    /// Returns IDs for sessions whose runners are still active.
+    /// Host-side IDs for all active callers. Model-facing code should use
+    /// [`Self::active_session_ids_for`].
     pub fn active_session_ids(&self) -> Vec<String> {
         let mut sessions = self.sessions.write();
         sessions.retain(|_, sess| !sess.sender.is_closed());
-        sessions.keys().cloned().collect()
+        sessions.values().map(|sess| sess.id.clone()).collect()
     }
 
-    /// Returns a live status report for each active session: elapsed run time, idle time, token
+    /// Host-side report across all callers. Use [`Self::session_details_for`] for model output.
+    /// Reports elapsed run time, idle time, token
     /// usage, turn count, latest progress, and active background tasks.
     pub fn session_details(&self) -> Vec<Json> {
         let mut sessions = self.sessions.write();
@@ -906,17 +989,52 @@ impl SubSessions {
         sessions.values().map(|sess| sess.detail()).collect()
     }
 
-    /// Returns an active session by ID.
-    pub fn get_session(&self, id: &str) -> Option<Arc<SubSession>> {
+    /// Returns a caller's active sessions. Use this for model-visible status reports.
+    pub fn session_details_for(&self, caller: &Principal) -> Vec<Json> {
         let mut sessions = self.sessions.write();
         sessions.retain(|_, sess| !sess.sender.is_closed());
-        sessions.get(id).cloned()
+        sessions
+            .values()
+            .filter(|sess| &sess.caller == caller)
+            .map(|sess| sess.detail())
+            .collect()
     }
 
-    /// Removes a session by ID and closes its input channel.
+    /// Returns a caller's active session IDs.
+    pub fn active_session_ids_for(&self, caller: &Principal) -> Vec<String> {
+        self.sessions
+            .read()
+            .values()
+            .filter(|session| &session.caller == caller && !session.sender.is_closed())
+            .map(|session| session.id.clone())
+            .collect()
+    }
+
+    /// Looks up a session within the caller's namespace.
+    pub fn get_session_for(&self, caller: &Principal, id: &str) -> Option<Arc<SubSession>> {
+        self.sessions
+            .read()
+            .get(&(*caller, id.to_string()))
+            .filter(|session| !session.sender.is_closed())
+            .cloned()
+    }
+
+    /// Host-side lookup by ID. Returns `None` if multiple callers use this ID.
+    /// Model-facing callers must use [`Self::get_session_for`].
+    pub fn get_session(&self, id: &str) -> Option<Arc<SubSession>> {
+        let sessions = self.sessions.read();
+        let mut matching = sessions
+            .values()
+            .filter(|sess| sess.id == id && !sess.sender.is_closed());
+        let first = matching.next()?.clone();
+        matching.next().is_none().then_some(first)
+    }
+
+    /// Removes an unambiguous session by ID. Prefer caller-scoped lookup followed
+    /// by [`Self::remove_session_if`] when IDs can be shared across callers.
     pub fn remove_session(&self, id: &str) {
-        if let Some(subsession) = self.sessions.write().remove(id) {
-            subsession.close();
+        if let Some(session) = self.get_session(id) {
+            self.remove_session_if(&session);
         }
     }
 }

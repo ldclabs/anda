@@ -122,34 +122,8 @@ impl BaseCtx {
     /// # Arguments
     /// * `agent` - Agent namespace that owns the child context.
     /// * `path` - New path for the child context.
-    pub(crate) fn child(&self, agent: String, mut path: String) -> Result<Self, BoxError> {
-        path.make_ascii_lowercase();
-        let path = Path::parse(path)?;
-        let mut state = Extensions::default();
-        // Inherit state from parent context. Each context has its own state, but
-        // it is initialized with the parent's state.
-        state.extend(self.state.read().clone());
-        let child = Self {
-            id: self.id,
-            name: self.name.clone(),
-            agent,
-            caller: self.caller,
-            path,
-            cancellation_token: self.cancellation_token.child_token(),
-            start_at: self.start_at,
-            cache: self.cache.clone(),
-            store: self.store.clone(),
-            web3: self.web3.clone(),
-            depth: self.depth + 1,
-            remote: self.remote.clone(),
-            state: Arc::new(RwLock::new(state)),
-            meta: self.meta.clone(),
-        };
-
-        if child.depth >= CONTEXT_MAX_DEPTH {
-            return Err("Context depth limit exceeded".into());
-        }
-        Ok(child)
+    pub(crate) fn child(&self, agent: String, path: String) -> Result<Self, BoxError> {
+        self.scoped_child(self.caller, agent, path, self.meta.clone(), self.start_at)
     }
 
     /// Creates a child context with additional user and caller information.
@@ -169,8 +143,19 @@ impl BaseCtx {
         &self,
         caller: Principal,
         agent: String,
+        path: String,
+        meta: RequestMeta,
+    ) -> Result<Self, BoxError> {
+        self.scoped_child(caller, agent, path, meta, Instant::now())
+    }
+
+    fn scoped_child(
+        &self,
+        caller: Principal,
+        agent: String,
         mut path: String,
         meta: RequestMeta,
+        start_at: Instant,
     ) -> Result<Self, BoxError> {
         path.make_ascii_lowercase();
         let path = Path::parse(path)?;
@@ -183,7 +168,7 @@ impl BaseCtx {
             caller,
             path,
             cancellation_token: self.cancellation_token.child_token(),
-            start_at: Instant::now(),
+            start_at,
             cache: self.cache.clone(),
             store: self.store.clone(),
             web3: self.web3.clone(),
@@ -206,6 +191,33 @@ impl BaseCtx {
             user: Some(self.name.clone()),
             ..Default::default()
         }
+    }
+
+    pub(crate) async fn remote_target(&self, endpoint: &str) -> Result<Principal, BoxError> {
+        if let Some(id) = self.remote.get_id_by_endpoint(endpoint) {
+            return Ok(id);
+        }
+        if let Ok((data, _)) = self
+            .store
+            .store_get(&Path::default(), &Path::from(super::DYNAMIC_REMOTE_ENGINES))
+            .await
+            && let Ok(engines) = cbor2::from_slice::<RemoteEngines>(&data)
+            && let Some(id) = engines.get_id_by_endpoint(endpoint)
+        {
+            return Ok(id);
+        }
+        Err(format!("remote engine endpoint {endpoint} not found").into())
+    }
+
+    pub(crate) async fn call_remote_tool(
+        &self,
+        target: Principal,
+        endpoint: &str,
+        mut args: ToolInput<Json>,
+    ) -> Result<ToolOutput<Json>, BoxError> {
+        args.meta = Some(self.self_meta(target));
+        self.https_signed_rpc(endpoint, "tool_call", &(&args,))
+            .await
     }
 
     /// Clones the context with a new caller principal.
@@ -269,15 +281,10 @@ impl BaseContext for BaseCtx {
     async fn remote_tool_call(
         &self,
         endpoint: &str,
-        mut args: ToolInput<Json>,
+        args: ToolInput<Json>,
     ) -> Result<ToolOutput<Json>, BoxError> {
-        let target = self
-            .remote
-            .get_id_by_endpoint(endpoint)
-            .ok_or_else(|| format!("remote engine endpoint {} not found", endpoint))?;
-        args.meta = Some(self.self_meta(target));
-        self.https_signed_rpc(endpoint, "tool_call", &(&args,))
-            .await
+        let target = self.remote_target(endpoint).await?;
+        self.call_remote_tool(target, endpoint, args).await
     }
 }
 

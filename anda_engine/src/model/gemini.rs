@@ -312,7 +312,9 @@ impl WireFormat for CompletionModel {
         }
         if let Some(output_schema) = options.output_schema {
             r.generation_config.response_mime_type = Some("application/json".to_string());
-            r.generation_config.response_schema = Some(output_schema);
+            r.generation_config.response_schema = None;
+            r.generation_config.response_json_schema_compat = None;
+            r.generation_config.response_json_schema = Some(output_schema);
         }
         if let Some(stop) = options.stop {
             r.generation_config.stop_sequences = Some(stop);
@@ -371,12 +373,6 @@ impl WireFormat for CompletionModel {
 
     fn maybe_failed(res: &Self::Response) -> bool {
         res.maybe_failed()
-    }
-
-    fn redacted_for_log(r: &Self::Request) -> Self::Request {
-        let mut logged = r.clone();
-        logged.system_instruction = None;
-        logged
     }
 
     fn sent_messages(mut r: Self::Request, skip_raw: usize) -> Vec<Json> {
@@ -674,7 +670,7 @@ mod tests {
             "application/json"
         );
         assert_eq!(
-            sent["generationConfig"]["responseSchema"],
+            sent["generationConfig"]["responseJsonSchema"],
             json!({"type": "object"})
         );
         assert_eq!(sent["generationConfig"]["stopSequences"], json!(["END"]));

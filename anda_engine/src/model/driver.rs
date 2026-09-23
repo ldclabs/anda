@@ -48,9 +48,9 @@ pub(crate) struct SamplingOptions {
 pub(crate) trait WireFormat {
     /// Provider request template, pre-seeded by the adapter (model name,
     /// defaults) before the driver runs.
-    type Request: Clone + Serialize + Send + Sync;
+    type Request: Serialize + Send + Sync;
     /// Typed provider response produced by parsing or stream aggregation.
-    type Response: Serialize + Send;
+    type Response: Send;
     /// One deserialized item of the provider's SSE stream.
     type StreamItem: DeserializeOwned + Send;
 
@@ -100,12 +100,6 @@ pub(crate) trait WireFormat {
 
     /// Whether the response should be logged as a possible failure.
     fn maybe_failed(res: &Self::Response) -> bool;
-
-    /// Request clone with sensitive fields (for example system instructions)
-    /// removed before it is written to warn/debug logs.
-    fn redacted_for_log(r: &Self::Request) -> Self::Request {
-        r.clone()
-    }
 
     /// Drains the replayed raw-history prefix and returns the request messages
     /// this call actually added, as provider-native JSON.
@@ -187,12 +181,6 @@ pub(crate) async fn drive_completion<W: WireFormat>(
 
     W::finalize_request(&mut r);
 
-    if log_enabled!(Debug)
-        && let Ok(val) = serde_json::to_string(&r)
-    {
-        log::debug!(request = val; "Completion request");
-    }
-
     let stream = W::is_stream(&r);
     let path = W::endpoint(&r, &model);
     let (res, assistant_raw_message) = execute_completion_request_with_retry(
@@ -216,23 +204,14 @@ pub(crate) async fn drive_completion<W: WireFormat>(
     )
     .await?;
 
-    if log_enabled!(Debug) || W::maybe_failed(&res) {
-        let logged_request = W::redacted_for_log(&r);
-        if log_enabled!(Debug) {
-            log::debug!(
-                model = model,
-                request:serde = logged_request,
-                response:serde = res;
-                "Completion response");
-        } else {
-            log::warn!(
-                model = model,
-                request:serde = logged_request,
-                response:serde = res;
-                "Completion maybe failed");
-        }
-    }
-
+    let failed = W::maybe_failed(&res);
     let sent_messages = W::sent_messages(r, skip_raw);
-    W::into_output(res, sent_messages, chat_history, assistant_raw_message)
+    let output = W::into_output(res, sent_messages, chat_history, assistant_raw_message)?;
+    // Conversation content and provider tool credentials never belong in routine logs.
+    if failed {
+        log::warn!(model = model, usage:serde = output.usage; "Completion maybe failed");
+    } else if log_enabled!(Debug) {
+        log::debug!(model = model, usage:serde = output.usage; "Completion response");
+    }
+    Ok(output)
 }

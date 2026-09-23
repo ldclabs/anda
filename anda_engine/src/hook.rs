@@ -391,10 +391,24 @@ impl Hook for Hooks {
         agent: &str,
         mut output: AgentOutput,
     ) -> Result<AgentOutput, BoxError> {
+        let mut first_error = None;
         for hook in &self.hooks {
-            output = hook.on_agent_end(ctx, agent, output).await?;
+            output = match hook.on_agent_end(ctx, agent, output).await {
+                Ok(output) => output,
+                Err(err) => {
+                    let failed = AgentOutput {
+                        failed_reason: Some(err.to_string()),
+                        ..Default::default()
+                    };
+                    first_error.get_or_insert(err);
+                    failed
+                }
+            };
         }
-        Ok(output)
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(output),
+        }
     }
 
     /// Runs every hook's `on_tool_start`, unwinding on failure.
@@ -430,10 +444,24 @@ impl Hook for Hooks {
         tool: &str,
         mut output: ToolOutput<Json>,
     ) -> Result<ToolOutput<Json>, BoxError> {
+        let mut first_error = None;
         for hook in &self.hooks {
-            output = hook.on_tool_end(ctx, tool, output).await?;
+            output = match hook.on_tool_end(ctx, tool, output).await {
+                Ok(output) => output,
+                Err(err) => {
+                    let failed = ToolOutput {
+                        is_error: Some(true),
+                        ..ToolOutput::new(Json::String(err.to_string()))
+                    };
+                    first_error.get_or_insert(err);
+                    failed
+                }
+            };
         }
-        Ok(output)
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(output),
+        }
     }
 }
 
@@ -966,5 +994,42 @@ mod tests {
             .unwrap();
         assert_eq!(output.content, "done");
         hook.on_agent_start(&ctx, "agent").await.unwrap();
+    }
+    #[tokio::test]
+    async fn normal_end_cleanup_continues_after_multiple_errors() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut hooks = Hooks::new();
+        for (name, fail_end) in [("first", true), ("second", true), ("last", false)] {
+            hooks.add(Box::new(UnwindHook {
+                name,
+                events: events.clone(),
+                reject_start: false,
+                fail_end,
+            }));
+        }
+        let agent = agent_ctx();
+        hooks.on_agent_start(&agent, "worker").await.unwrap();
+        events.lock().clear();
+        let error = hooks
+            .on_agent_end(&agent, "worker", AgentOutput::default())
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "first agent end failed");
+        assert_eq!(
+            *events.lock(),
+            ["agent-end:first", "agent-end:second", "agent-end:last"]
+        );
+        let tool = base_ctx();
+        hooks.on_tool_start(&tool, "lookup").await.unwrap();
+        events.lock().clear();
+        let error = hooks
+            .on_tool_end(&tool, "lookup", ToolOutput::new(Json::Null))
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "first tool end failed");
+        assert_eq!(
+            *events.lock(),
+            ["tool-end:first", "tool-end:second", "tool-end:last"]
+        );
     }
 }

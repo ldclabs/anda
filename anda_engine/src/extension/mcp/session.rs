@@ -42,6 +42,11 @@ use super::auth::McpOAuthConfig;
 /// ([`McpLifecycle::Discover`]). Pin `initialize` to skip the wait entirely.
 pub(crate) const DISCOVERY_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Maximum duration of a connection attempt, including OAuth and handshake.
+pub(crate) const SESSION_SETUP_TIMEOUT: Duration = Duration::from_secs(45);
+/// Maximum duration of one complete paginated tool listing.
+pub(crate) const LIST_TOOLS_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// How long to wait for a `subscriptions/listen` acknowledgment before giving up
 /// on live `tools/list_changed` delivery for that session.
 pub(crate) const SUBSCRIPTION_ACK_TIMEOUT: Duration = Duration::from_secs(10);
@@ -272,7 +277,7 @@ impl std::fmt::Debug for McpStreamableHttpTransport {
                 "bearer_token",
                 &self.bearer_token.as_ref().map(|_| "[REDACTED]"),
             )
-            .field("headers", &self.headers)
+            .field("headers", &self.headers.keys().collect::<Vec<_>>())
             .field("auth", &self.auth)
             .finish()
     }
@@ -282,6 +287,10 @@ impl McpStreamableHttpTransport {
     pub(crate) fn validate(&self) -> Result<(), BoxError> {
         if self.url.trim().is_empty() {
             return Err("MCP HTTP URL must not be empty".into());
+        }
+        self.custom_headers()?;
+        if let Some(token) = &self.bearer_token {
+            HeaderValue::from_str(&format!("Bearer {token}"))?;
         }
         if let Some(auth) = &self.auth {
             if self.bearer_token.is_some() {
@@ -437,7 +446,7 @@ pub(crate) async fn pump_tool_subscription(
     }
 }
 
-/// Awaits a client handshake, optionally bounding how long it may stay pending.
+/// Bounds a client handshake, using the setup limit when no probe limit is supplied.
 pub(crate) async fn serve_bounded<F, S>(
     handshake: F,
     timeout: Option<Duration>,
@@ -445,15 +454,32 @@ pub(crate) async fn serve_bounded<F, S>(
 where
     F: Future<Output = Result<S, ClientInitializeError>>,
 {
-    match timeout {
-        None => Ok(handshake.await?),
-        Some(limit) => match tokio::time::timeout(limit, handshake).await {
-            Ok(result) => Ok(result?),
-            Err(_) => Err(format!(
-                "the MCP server did not answer the server/discover probe within {}s",
-                limit.as_secs()
+    let limit = timeout.unwrap_or(SESSION_SETUP_TIMEOUT);
+    match tokio::time::timeout(limit, handshake).await {
+        Ok(result) => Ok(result?),
+        Err(_) => Err(format!(
+            "the MCP server did not complete lifecycle setup within {}s",
+            limit.as_secs()
+        )
+        .into()),
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn legacy_and_discovery_handshakes_are_bounded() {
+        for limit in [None, Some(DISCOVERY_PROBE_TIMEOUT)] {
+            let started = tokio::time::Instant::now();
+            let result = serve_bounded(
+                std::future::pending::<Result<(), ClientInitializeError>>(),
+                limit,
             )
-            .into()),
-        },
+            .await;
+            assert!(result.unwrap_err().to_string().contains("lifecycle setup"));
+            assert_eq!(started.elapsed(), limit.unwrap_or(SESSION_SETUP_TIMEOUT));
+        }
     }
 }

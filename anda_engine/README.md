@@ -38,18 +38,19 @@ The crate has no default optional features.
 
 ```toml
 [dependencies]
-anda_engine = "0.14"
+anda_engine = "0.16"
 ```
 
 ## Quick Start
 
-The example below builds an engine with the built-in `EchoEngineInfo` agent. Real applications usually register their own `anda_core::Agent` and `anda_core::Tool` implementations.
+The example below builds an explicitly public demo engine with the built-in `EchoEngineInfo` agent. Engines remain private by default. The same example is runnable with `cargo run -p anda_engine --example quick_start`. Real applications usually register their own `anda_core::Agent` and `anda_core::Tool` implementations.
 
-```rust,no_run
+```rust
 use anda_core::AgentInput;
 use anda_engine::{
     ANONYMOUS,
     engine::{AgentInfo, EchoEngineInfo, Engine},
+    management::{BaseManagement, Visibility},
 };
 use std::sync::Arc;
 
@@ -62,7 +63,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         ..Default::default()
     };
 
+    // This demo explicitly permits anonymous callers; engines default to private.
     let engine = Engine::builder()
+        .with_management(Arc::new(BaseManagement {
+            controller: ANONYMOUS,
+            managers: Default::default(),
+            visibility: Visibility::Public,
+        }))
         .register_agent(Arc::new(EchoEngineInfo::new(echo_info)), None)?
         .build("echo".to_string())
         .await?;
@@ -92,6 +99,23 @@ Use `EngineBuilder` to configure an engine, then call `build(default_agent)` to 
 Agents receive `AgentCtx`; tools receive `BaseCtx`. Contexts carry caller identity, request metadata, cancellation tokens, scoped cache and storage, shared state, HTTP and canister features, Web3 signing, and remote engine access.
 
 Context namespaces are derived from agent and tool names so cache and object storage remain isolated between components.
+
+Subagent sessions are scoped by caller principal and session ID. Use
+`SubSessions::get_session_for`, `active_session_ids_for`, and `session_details_for`
+for caller-facing controls and status. The caller-free lookup is intended for
+host administration and returns `None` for an ambiguous ID. Shared callable
+schemas do not include other callers' active session IDs. Background progress
+uses the same `agent:session` task ID as start and end callbacks.
+
+`CompletionStream` preserves follow-up and steering input submitted while a
+model step is pending. Failed context compaction leaves the original runner
+usable. Stop/cancel controls interrupt pending subagent work; native shell
+cancellation cleans up the process tree and output readers.
+
+Agent dependencies supplied by dynamic providers are verified after provider
+initialization during engine build. Exact `SA_`, `RA_`, and `RT_` callable names
+can be used when requesting definitions.
+
 
 ### Models
 

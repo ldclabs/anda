@@ -1213,16 +1213,33 @@ fn responses_response_from_stream_events(
     events: Vec<types::StreamEvent>,
 ) -> Result<types::CompletionResponse, BoxError> {
     let mut last_response = None;
+    let mut terminal = false;
     let mut output_items = BTreeMap::<usize, types::MessageItem>::new();
 
     for event in events {
         match event {
             types::StreamEvent::ResponseCreated { response }
-            | types::StreamEvent::ResponseInProgress { response }
-            | types::StreamEvent::ResponseCompleted { response }
+            | types::StreamEvent::ResponseInProgress { response } => {
+                last_response = Some(response);
+            }
+            types::StreamEvent::ResponseCompleted { response }
             | types::StreamEvent::ResponseFailed { response }
             | types::StreamEvent::ResponseIncomplete { response } => {
+                terminal = true;
                 last_response = Some(response);
+            }
+            types::StreamEvent::Error { code, message } => {
+                let retryable = matches!(
+                    code.as_deref(),
+                    Some("server_error" | "rate_limit_exceeded" | "rate_limit_error")
+                );
+                return Err(Box::new(
+                    super::ModelError::new(format!(
+                        "Completion stream failed, code: {}, message: {message}",
+                        code.as_deref().unwrap_or("unknown")
+                    ))
+                    .with_retryable(retryable),
+                ));
             }
             types::StreamEvent::ResponseOutputItemDone { output_index, item } => {
                 output_items.insert(output_index, item);
@@ -1232,6 +1249,12 @@ fn responses_response_from_stream_events(
     }
 
     let mut response = last_response.ok_or("No streamed completion response")?;
+    if !terminal {
+        return Err(Box::new(
+            super::ModelError::new("Completion stream ended before a terminal response")
+                .with_retryable(true),
+        ));
+    }
     if response.output.is_empty() && !output_items.is_empty() {
         // Fill both representations in one pass instead of serializing the
         // typed items and re-parsing them right back in `parse_output`.
@@ -3201,13 +3224,16 @@ mod tests {
                 }
             }))
             .unwrap(),
+            serde_json::from_value::<types::StreamEvent>(json!({
+                "type": "response.completed",
+                "response": { "id": "resp_stream_2", "created_at": 1741569957,
+                    "model": "gpt-5.5", "output": [], "status": "completed" }
+            }))
+            .unwrap(),
         ];
 
         let response = responses_response_from_stream_events(events).unwrap();
-        assert!(matches!(
-            response.status,
-            types::ResponseStatus::Other(ref status) if status == "streaming"
-        ));
+        assert!(matches!(response.status, types::ResponseStatus::Completed));
         assert_eq!(response.output.len(), 1);
 
         let output = response.try_into(vec![], vec![]).unwrap();
@@ -3500,5 +3526,31 @@ mod tests {
         assert_eq!(output.failed_reason.as_deref(), Some("length"));
         assert!(output.content.is_empty());
         assert_eq!(output.chat_history[0].text().as_deref(), Some("truncated"));
+    }
+    #[test]
+    fn responses_stream_requires_a_terminal_event_and_classifies_errors() {
+        let created = || {
+            serde_json::from_value::<types::StreamEvent>(json!({
+            "type": "response.created",
+            "response": {"id":"r", "created_at":1,"model":"test","output":[],"status":"in_progress"}
+        })).unwrap()
+        };
+        let error = responses_response_from_stream_events(vec![created()]).unwrap_err();
+        assert!(crate::model::is_retryable_box_error(&error));
+        assert!(error.to_string().contains("terminal response"));
+        for (code, retryable) in [
+            ("rate_limit_exceeded", true),
+            ("invalid_request_error", false),
+        ] {
+            let error = responses_response_from_stream_events(vec![
+                created(),
+                types::StreamEvent::Error {
+                    code: Some(code.into()),
+                    message: "failed".into(),
+                },
+            ])
+            .unwrap_err();
+            assert_eq!(crate::model::is_retryable_box_error(&error), retryable);
+        }
     }
 }
