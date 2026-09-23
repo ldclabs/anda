@@ -10,14 +10,14 @@ pub(crate) fn rpc_body(method: &str, params: Vec<u8>) -> Result<Vec<u8>, BoxErro
     })?)
 }
 
-#[cfg(feature = "client")]
 /// Validates that `url` is a well-formed HTTP(S) endpoint this client may call.
 ///
-/// Only the `https` scheme is accepted by default. The `http` scheme is
-/// additionally allowed when [`crate::client::ClientBuilder::with_allow_http`] was enabled
-/// (intended for local development against a replica or test server). Every
-/// other scheme (`file`, `ftp`, `data`, ...) is rejected, and the URL must
-/// carry a host.
+/// Only the `https` scheme is accepted unless `allow_http` is set. The generic
+/// client sets it from `ClientBuilder::with_allow_http` (intended for local
+/// development against a replica or test server); the TEE client sets it and
+/// leaves HTTPS enforcement to the gateway and its HTTP client. Every other
+/// scheme (`file`, `ftp`, `data`, ...) is rejected, and the URL must carry a
+/// host.
 ///
 /// Embedded userinfo is rejected: in `https://api.trusted.example@evil.tld/`
 /// the authority is `evil.tld`, but the text reads as the trusted host. That

@@ -108,6 +108,13 @@ All notable changes to the Anda project will be documented in this file.
   document metadata, and share one definition snapshot between provider
   `definitions` and `functions`.
 
+### Fixed — anda_web3_client
+
+- `TeeClient` signed HTTP and RPC calls reject malformed URLs, non-HTTP(S)
+  schemes, and embedded userinfo before signing, matching the generic client.
+  `tee_attestation` checks for TEE information before requesting attestation.
+- Share envelope signing and derivation-path construction in the generic client.
+
 ## [0.16.0] — 2026-09-16
 
 This release moves persistent memory to KIP 2.0, adds caller-isolated memory

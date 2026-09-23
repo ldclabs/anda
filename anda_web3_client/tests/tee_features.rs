@@ -38,6 +38,34 @@ async fn tee_rejects_invalid_digests_before_contacting_gateway() {
 }
 
 #[tokio::test]
+async fn tee_signed_calls_reject_smuggled_hosts_before_signing() {
+    // Without a local identity every signature is a gateway round trip, which
+    // would fail with a connection error rather than the URL guard.
+    let client = TeeClient::new(Arc::new(
+        TeeGatewayClientBuilder::default()
+            .with_tee_host("http://127.0.0.1:1")
+            .build(),
+    ));
+    for url in [
+        "https://trusted.example@evil.test/rpc",
+        "https://trusted.example:token@evil.test/rpc",
+        "file:///etc/passwd",
+        "not-a-url",
+    ] {
+        let err = client
+            .https_signed_call(url.into(), http::Method::POST, [7; 32], None, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Invalid url"), "{url}: {err}");
+        let err = client
+            .https_signed_rpc_raw(url.into(), "ping".into(), Vec::new())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Invalid url"), "{url}: {err}");
+    }
+}
+
+#[tokio::test]
 async fn tee_rpc_can_delegate_envelope_signing_to_the_gateway() {
     use anda_core::{RPCRequest, RPCResponse};
     use axum::{Router, body::Bytes, routing::post};

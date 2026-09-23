@@ -6,6 +6,8 @@
 //! through [`anda_engine::context::Web3SDK::from_web3`]. Key derivation, envelope
 //! signing, and attestation use the gateway SDK. Signed RPC uses the engine's
 //! bounded response reader while leaving envelope signing to the gateway.
+//! Signed calls reject malformed URLs and embedded userinfo before any signing;
+//! the gateway and its HTTP client keep enforcing HTTPS.
 //!
 //! Canister access is not part of
 //! [`Web3ClientFeatures`](anda_engine::context::Web3ClientFeatures). When needed,
@@ -23,7 +25,10 @@
 //! }
 //! ```
 
-use crate::{ecdsa_digest, request::rpc_body};
+use crate::{
+    ecdsa_digest,
+    request::{check_url, rpc_body},
+};
 use anda_cloud_cdk::{TEEInfo, TEEKind};
 use anda_core::{BoxError, BoxPinFut, cbor_rpc};
 use anda_engine::context::Web3ClientFeatures;
@@ -75,6 +80,7 @@ impl Web3ClientFeatures for TeeClient {
     ) -> BoxPinFut<Result<Option<TEEInfo>, BoxError>> {
         let gw = self.gateway.clone();
         Box::pin(async move {
+            let info = gw.tee_info().ok_or("TEE not available")?;
             let tee = gw
                 .sign_attestation(AttestationRequest {
                     public_key: Some(public_key),
@@ -82,9 +88,6 @@ impl Web3ClientFeatures for TeeClient {
                     nonce: Some(nonce.into()),
                 })
                 .await?;
-            let info = gw
-                .tee_info()
-                .ok_or_else(|| "TEE not available".to_string())?;
             Ok(Some(TEEInfo {
                 id: info.id,
                 kind: TEEKind::try_from(tee.kind.as_str())?,
@@ -234,6 +237,9 @@ impl Web3ClientFeatures for TeeClient {
         headers: Option<http::HeaderMap>,
         body: Option<Vec<u8>>,
     ) -> BoxPinFut<Result<reqwest::Response, BoxError>> {
+        if let Err(err) = check_url(&url, true) {
+            return Box::pin(ready(Err(err)));
+        }
         let gw = self.gateway.clone();
         Box::pin(async move {
             gw.https_signed_call(&url, method, message_digest, headers, body)
@@ -247,6 +253,9 @@ impl Web3ClientFeatures for TeeClient {
         method: String,
         args: Vec<u8>,
     ) -> BoxPinFut<Result<Vec<u8>, BoxError>> {
+        if let Err(err) = check_url(&endpoint, true) {
+            return Box::pin(ready(Err(err)));
+        }
         let gw = self.gateway.clone();
         Box::pin(async move {
             let body = rpc_body(&method, args)?;

@@ -87,7 +87,9 @@ pub fn identity_from_pem(path: &str) -> Result<Box<dyn Identity>, BoxError> {
     }
 }
 
-/// Loads an identity from a 32-byte hex-encoded secret or PEM file
+/// Loads an identity from a PEM file path or a 32-byte hex-encoded secret.
+///
+/// The literal `"Anonymous"` returns the anonymous identity.
 pub fn load_identity(id_secret_or_path: &str) -> Result<Box<dyn Identity>, BoxError> {
     if id_secret_or_path == "Anonymous" {
         return Ok(Box::new(AnonymousIdentity));
@@ -280,8 +282,14 @@ impl Client {
         &self,
         message_digest: [u8; 32],
     ) -> Result<SignedEnvelope, BoxError> {
-        let se = SignedEnvelope::sign_digest(&self.identity, message_digest.into())?;
-        Ok(se)
+        self.envelope(message_digest)
+    }
+
+    fn envelope(&self, message_digest: [u8; 32]) -> Result<SignedEnvelope, BoxError> {
+        Ok(SignedEnvelope::sign_digest(
+            &self.identity,
+            message_digest.into(),
+        )?)
     }
 
     fn root_secret(&self) -> Result<&[u8; 48], BoxError> {
@@ -297,7 +305,7 @@ impl Client {
         message_digest: [u8; 32],
         headers: Option<http::HeaderMap>,
     ) -> Result<http::HeaderMap, BoxError> {
-        let se = SignedEnvelope::sign_digest(&self.identity, message_digest.into())?;
+        let se = self.envelope(message_digest)?;
         let mut headers = headers.unwrap_or_default();
         se.to_authorization(&mut headers)?;
         Ok(headers)
@@ -329,20 +337,9 @@ impl Web3ClientFeatures for Client {
         &self,
         message_digest: [u8; 32],
     ) -> BoxPinFut<Result<SignedEnvelope, BoxError>> {
-        let identity = self.identity.clone();
-        Box::pin(async move {
-            let se = SignedEnvelope::sign_digest(&identity, message_digest.into())?;
-            Ok(se)
-        })
+        Box::pin(ready(self.envelope(message_digest)))
     }
 
-    /// Derives a 256-bit AES-GCM key from the given derivation path
-    ///
-    /// # Arguments
-    /// * `derivation_path` - Additional path components for key derivation
-    ///
-    /// # Returns
-    /// Result containing the derived 256-bit key or an error
     fn a256gcm_key(&self, derivation_path: Vec<Vec<u8>>) -> BoxPinFut<Result<[u8; 32], BoxError>> {
         let res = self
             .root_secret()
@@ -350,14 +347,6 @@ impl Web3ClientFeatures for Client {
         Box::pin(ready(res))
     }
 
-    /// Signs a message using Ed25519 signature scheme
-    ///
-    /// # Arguments
-    /// * `derivation_path` - Additional path components for key derivation
-    /// * `message` - Message to be signed
-    ///
-    /// # Returns
-    /// Result containing the 64-byte signature or an error
     fn ed25519_sign_message(
         &self,
         derivation_path: Vec<Vec<u8>>,
@@ -369,15 +358,6 @@ impl Web3ClientFeatures for Client {
         Box::pin(ready(res))
     }
 
-    /// Verifies an Ed25519 signature
-    ///
-    /// # Arguments
-    /// * `derivation_path` - Additional path components for key derivation
-    /// * `message` - Original message that was signed
-    /// * `signature` - Signature to verify
-    ///
-    /// # Returns
-    /// Result indicating success or failure of verification
     fn ed25519_verify(
         &self,
         derivation_path: Vec<Vec<u8>>,
@@ -391,13 +371,6 @@ impl Web3ClientFeatures for Client {
         Box::pin(ready(res))
     }
 
-    /// Gets the public key for Ed25519
-    ///
-    /// # Arguments
-    /// * `derivation_path` - Additional path components for key derivation
-    ///
-    /// # Returns
-    /// Result containing the 32-byte public key or an error
     fn ed25519_public_key(
         &self,
         derivation_path: Vec<Vec<u8>>,
@@ -408,14 +381,6 @@ impl Web3ClientFeatures for Client {
         Box::pin(ready(res))
     }
 
-    /// Signs a message using Secp256k1 BIP340 Schnorr signature
-    ///
-    /// # Arguments
-    /// * `derivation_path` - Additional path components for key derivation
-    /// * `message` - Message to be signed
-    ///
-    /// # Returns
-    /// Result containing the 64-byte signature or an error
     fn secp256k1_sign_message_bip340(
         &self,
         derivation_path: Vec<Vec<u8>>,
@@ -427,15 +392,6 @@ impl Web3ClientFeatures for Client {
         Box::pin(ready(res))
     }
 
-    /// Verifies a Secp256k1 BIP340 Schnorr signature
-    ///
-    /// # Arguments
-    /// * `derivation_path` - Additional path components for key derivation
-    /// * `message` - Original message that was signed
-    /// * `signature` - Signature to verify
-    ///
-    /// # Returns
-    /// Result indicating success or failure of verification
     fn secp256k1_verify_bip340(
         &self,
         derivation_path: Vec<Vec<u8>>,
@@ -449,14 +405,6 @@ impl Web3ClientFeatures for Client {
         Box::pin(ready(res))
     }
 
-    /// Signs a message using Secp256k1 ECDSA signature
-    ///
-    /// # Arguments
-    /// * `derivation_path` - Additional path components for key derivation
-    /// * `message` - Message to be signed
-    ///
-    /// # Returns
-    /// Result containing the 64-byte signature or an error
     fn secp256k1_sign_message_ecdsa(
         &self,
         derivation_path: Vec<Vec<u8>>,
@@ -480,15 +428,6 @@ impl Web3ClientFeatures for Client {
         Box::pin(ready(res))
     }
 
-    /// Verifies a Secp256k1 ECDSA signature
-    ///
-    /// # Arguments
-    /// * `derivation_path` - Additional path components for key derivation
-    /// * `message_hash` - 32-byte digest (SHA-256 for a message signature)
-    /// * `signature` - Signature to verify
-    ///
-    /// # Returns
-    /// Result indicating success or failure of verification
     fn secp256k1_verify_ecdsa(
         &self,
         derivation_path: Vec<Vec<u8>>,
@@ -502,13 +441,6 @@ impl Web3ClientFeatures for Client {
         Box::pin(ready(res))
     }
 
-    /// Gets the compressed SEC1-encoded public key for Secp256k1
-    ///
-    /// # Arguments
-    /// * `derivation_path` - Additional path components for key derivation
-    ///
-    /// # Returns
-    /// Result containing the 33-byte public key or an error
     fn secp256k1_public_key(
         &self,
         derivation_path: Vec<Vec<u8>>,
@@ -589,13 +521,6 @@ impl Web3ClientFeatures for Client {
 }
 
 impl HttpFeatures for Client {
-    /// Makes an HTTPs request
-    ///
-    /// # Arguments
-    /// * `url` - Target URL, should start with `https://`
-    /// * `method` - HTTP method (GET, POST, etc.)
-    /// * `headers` - Optional HTTP headers
-    /// * `body` - Optional request body (default empty)
     async fn https_call(
         &self,
         url: &str,
@@ -607,14 +532,6 @@ impl HttpFeatures for Client {
         send_request(self.outer_http.clone(), url, method, headers, body).await
     }
 
-    /// Makes a signed HTTPs request with message authentication
-    ///
-    /// # Arguments
-    /// * `url` - Target URL
-    /// * `method` - HTTP method (GET, POST, etc.)
-    /// * `message_digest` - 32-byte message digest for signing
-    /// * `headers` - Optional HTTP headers
-    /// * `body` - Optional request body (default empty)
     async fn https_signed_call(
         &self,
         url: &str,
@@ -628,12 +545,6 @@ impl HttpFeatures for Client {
         send_request(self.outer_http.clone(), url, method, Some(headers), body).await
     }
 
-    /// Makes a signed CBOR-encoded RPC call
-    ///
-    /// # Arguments
-    /// * `endpoint` - URL endpoint to send the request to
-    /// * `method` - RPC method name to call
-    /// * `args` - Arguments to serialize as CBOR and send with the request
     async fn https_signed_rpc<T>(
         &self,
         endpoint: &str,

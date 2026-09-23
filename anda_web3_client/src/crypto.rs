@@ -24,13 +24,7 @@ pub fn ed25519_sign_message(
     msg: &[u8],
 ) -> [u8; 64] {
     let sk = ic_ed25519::PrivateKey::generate_from_seed(root_secret);
-    let path = ic_ed25519::DerivationPath::new(
-        derivation_path
-            .into_iter()
-            .map(ic_ed25519::DerivationIndex)
-            .collect(),
-    );
-    let (sk, _) = sk.derive_subkey(&path);
+    let (sk, _) = sk.derive_subkey(&ed25519_path(derivation_path));
     sk.sign_message(msg)
 }
 
@@ -39,15 +33,8 @@ pub fn ed25519_public_key(
     root_secret: &[u8],
     derivation_path: Vec<Vec<u8>>,
 ) -> ([u8; 32], [u8; 32]) {
-    let sk = ic_ed25519::PrivateKey::generate_from_seed(root_secret);
-    let path = ic_ed25519::DerivationPath::new(
-        derivation_path
-            .into_iter()
-            .map(ic_ed25519::DerivationIndex)
-            .collect(),
-    );
-    let pk = sk.public_key();
-    let (pk, chain_code) = pk.derive_subkey(&path);
+    let pk = ic_ed25519::PrivateKey::generate_from_seed(root_secret).public_key();
+    let (pk, chain_code) = pk.derive_subkey(&ed25519_path(derivation_path));
     (pk.serialize_raw(), chain_code)
 }
 
@@ -86,13 +73,7 @@ fn secp256k1_private_key(
     derivation_path: Vec<Vec<u8>>,
 ) -> ic_secp256k1::PrivateKey {
     let sk = ic_secp256k1::PrivateKey::generate_from_seed(root_secret);
-    let path = ic_secp256k1::DerivationPath::new(
-        derivation_path
-            .into_iter()
-            .map(ic_secp256k1::DerivationIndex)
-            .collect(),
-    );
-    let (sk, _) = sk.derive_subkey(&path);
+    let (sk, _) = sk.derive_subkey(&secp256k1_path(derivation_path));
     sk
 }
 
@@ -101,20 +82,31 @@ pub fn secp256k1_public_key(
     root_secret: &[u8],
     derivation_path: Vec<Vec<u8>>,
 ) -> ([u8; 33], [u8; 32]) {
-    let sk = ic_secp256k1::PrivateKey::generate_from_seed(root_secret);
-    let path = ic_secp256k1::DerivationPath::new(
-        derivation_path
-            .into_iter()
-            .map(ic_secp256k1::DerivationIndex)
-            .collect(),
-    );
-    let pk = sk.public_key();
-    let (pk, chain_code) = pk.derive_subkey(&path);
+    let pk = ic_secp256k1::PrivateKey::generate_from_seed(root_secret).public_key();
+    let (pk, chain_code) = pk.derive_subkey(&secp256k1_path(derivation_path));
     let pk = pk.serialize_sec1(true);
     let pk: [u8; 33] = pk
         .try_into()
         .expect("secp256k1_public_key: invalid SEC1 public key");
     (pk, chain_code)
+}
+
+fn ed25519_path(derivation_path: Vec<Vec<u8>>) -> ic_ed25519::DerivationPath {
+    ic_ed25519::DerivationPath::new(
+        derivation_path
+            .into_iter()
+            .map(ic_ed25519::DerivationIndex)
+            .collect(),
+    )
+}
+
+fn secp256k1_path(derivation_path: Vec<Vec<u8>>) -> ic_secp256k1::DerivationPath {
+    ic_secp256k1::DerivationPath::new(
+        derivation_path
+            .into_iter()
+            .map(ic_secp256k1::DerivationIndex)
+            .collect(),
+    )
 }
 
 /// Hashes the concatenation of the derivation path segments with SHA3-256.

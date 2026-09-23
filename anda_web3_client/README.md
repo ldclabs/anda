@@ -20,7 +20,7 @@ Feature flags: `client` (the generic non-TEE client), `tee` (a TEE gateway-backe
 
 Use `anda_web3_client` (the `client` feature) when your agent needs ICP canister access, signed HTTP/RPC calls, and key derivation but does not require the security guarantees of a TEE. For TEE-protected interactions, enable `tee`, connect a gateway client, and wrap it with `tee::TeeClient` for `Web3SDK::from_web3`.
 
-Endpoints passed to the signed HTTP/RPC calls must be trusted: requests are signed with the client identity before being sent, so a hostile endpoint receives a valid signed request.
+Endpoints passed to the signed HTTP/RPC calls must be trusted: requests are signed with the client identity before being sent, so a hostile endpoint receives a valid signed request. Both clients reject malformed URLs, non-HTTP(S) schemes, and embedded userinfo (`https://trusted@evil/`) before signing; this is a syntactic guard, not an SSRF filter.
 
 ## Configuration
 
