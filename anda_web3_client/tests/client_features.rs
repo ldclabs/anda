@@ -1,4 +1,6 @@
-use anda_core::{HttpFeatures, RPCResponse};
+mod support;
+
+use anda_core::{HttpFeatures, RPCRequest, RPCResponse};
 use anda_engine::context::Web3ClientFeatures;
 use anda_web3_client::{
     Agent, Client, Identity, identity_from_pem, identity_from_secret, load_identity,
@@ -7,9 +9,13 @@ use axum::{Router, body::Bytes, http::StatusCode, response::IntoResponse, routin
 use candid::Principal;
 use cbor2::to_canonical_vec;
 use ic_auth_types::ByteBufB64;
+use ic_auth_verifier::{envelope::SignedEnvelope, sha3_256};
 use ic_cose::client::CoseSDK;
 use ic_cose_types::CanisterCaller;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 const SECP256K1_IDENTITY_PEM: &str = "-----BEGIN EC PARAMETERS-----
 BgUrgQQACg==
@@ -44,10 +50,19 @@ fn rpc_response(result: RPCResponse) -> Vec<u8> {
     to_canonical_vec(&result).unwrap()
 }
 
-async fn rpc_handler(body: Bytes) -> impl IntoResponse {
+async fn rpc_handler(headers: http::HeaderMap, body: Bytes) -> impl IntoResponse {
     if body.is_empty() {
         return (StatusCode::BAD_REQUEST, "missing body".as_bytes().to_vec());
     }
+    let envelope = SignedEnvelope::from_authorization(&headers).unwrap();
+    envelope.verify(0, None, Some(&sha3_256(&body))).unwrap();
+    assert_eq!(envelope.sender(), boxed_identity([7; 32]).sender().unwrap());
+    let request: RPCRequest = cbor2::from_slice(&body).unwrap();
+    assert_eq!(request.method, "ping");
+    assert_eq!(
+        request.params.as_slice(),
+        to_canonical_vec(&("arg",)).unwrap()
+    );
     let payload = to_canonical_vec(&"pong".to_string()).unwrap();
     (StatusCode::OK, rpc_response(Ok(ByteBufB64::from(payload))))
 }
@@ -131,8 +146,7 @@ async fn pem_default_builder_and_canister_error_paths_are_exercised() {
 
     let endpoint = spawn_server().await;
     let default_client = Client::builder()
-        .with_ic_host(&endpoint)
-        .with_allow_http(true)
+        .with_root_secret([9; 48])
         .build()
         .await
         .unwrap();
@@ -428,9 +442,259 @@ async fn http_guards_local_calls_and_signed_rpc_paths_are_exercised() {
         &client,
         format!("{endpoint}/rpc"),
         "ping".into(),
-        vec![1, 2],
+        to_canonical_vec(&("arg",)).unwrap(),
     )
     .await
     .unwrap();
-    assert!(!raw.is_empty());
+    assert_eq!(cbor2::from_slice::<String>(&raw).unwrap(), "pong");
+}
+
+#[tokio::test]
+async fn missing_secrets_fail_without_breaking_identity_only_requests() {
+    assert!(
+        Client::builder()
+            .build()
+            .await
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("configure an identity")
+    );
+    assert!(
+        Client::builder()
+            .with_root_secret([0; 48])
+            .build()
+            .await
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("all zeros")
+    );
+    let client = Client::builder()
+        .with_identity(boxed_identity([7; 32]))
+        .with_http_client(no_proxy_http_client())
+        .with_allow_http(true)
+        .build()
+        .await
+        .unwrap();
+    let signature = [0; 64];
+    let results = [
+        client.a256gcm_key(vec![]).await.map(|_| ()),
+        client.ed25519_public_key(vec![]).await.map(|_| ()),
+        client
+            .ed25519_sign_message(vec![], b"message")
+            .await
+            .map(|_| ()),
+        client.ed25519_verify(vec![], b"message", &signature).await,
+        client.secp256k1_public_key(vec![]).await.map(|_| ()),
+        client
+            .secp256k1_sign_message_bip340(vec![], b"message")
+            .await
+            .map(|_| ()),
+        client
+            .secp256k1_verify_bip340(vec![], b"message", &signature)
+            .await,
+        client
+            .secp256k1_sign_message_ecdsa(vec![], b"message")
+            .await
+            .map(|_| ()),
+        client
+            .secp256k1_sign_digest_ecdsa(vec![], &[7; 32])
+            .await
+            .map(|_| ()),
+        client
+            .secp256k1_verify_ecdsa(vec![], &[7; 32], &signature)
+            .await,
+    ];
+    for result in results {
+        assert!(result.unwrap_err().to_string().contains("with_root_secret"));
+    }
+    support::assert_rpc_protocol(&client).await;
+}
+
+#[tokio::test]
+async fn mismatched_agent_identity_is_rejected() {
+    let agent = Agent::builder()
+        .with_url("https://icp-api.io")
+        .with_arc_identity(boxed_identity([2; 32]))
+        .build()
+        .unwrap();
+    let error = Client::builder()
+        .with_identity(boxed_identity([1; 32]))
+        .with_agent(agent)
+        .build()
+        .await
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("agent principal does not match"));
+}
+
+#[tokio::test]
+async fn ecdsa_digest_contract_matches_message_signing() {
+    let client = client_with_identity(false).await;
+    for length in [0, 16, 31, 33, 64] {
+        let digest = vec![7; length];
+        assert!(
+            client
+                .secp256k1_sign_digest_ecdsa(vec![], &digest)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("32-byte digest")
+        );
+        assert!(
+            client
+                .secp256k1_verify_ecdsa(vec![], &digest, &[0; 64])
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("32-byte digest")
+        );
+    }
+    let message = b"message";
+    let digest = ic_auth_verifier::sha256(message);
+    let from_message = client
+        .secp256k1_sign_message_ecdsa(vec![], message)
+        .await
+        .unwrap();
+    let from_digest = client
+        .secp256k1_sign_digest_ecdsa(vec![], &digest)
+        .await
+        .unwrap();
+    assert_eq!(from_message, from_digest);
+    client
+        .secp256k1_verify_ecdsa(vec![], &digest, &from_message)
+        .await
+        .unwrap();
+}
+
+fn replica_status() -> Vec<u8> {
+    use cbor2::Value;
+    to_canonical_vec(&Value::Map(vec![
+        (Value::Text("root_key".into()), Value::Bytes(vec![1; 96])),
+        (
+            Value::Text("replica_health_status".into()),
+            Value::Text("healthy".into()),
+        ),
+    ]))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn replica_root_key_failure_is_reported_and_rebuilding_recovers() {
+    let healthy = Arc::new(AtomicBool::new(false));
+    let state = healthy.clone();
+    let server = support::serve(Router::new().route(
+        "/api/v2/status",
+        axum::routing::get(move || {
+            let state = state.clone();
+            async move {
+                if state.load(Ordering::SeqCst) {
+                    (StatusCode::OK, replica_status())
+                } else {
+                    (StatusCode::BAD_REQUEST, vec![])
+                }
+            }
+        }),
+    ))
+    .await;
+    let make_client = || {
+        Client::builder()
+            .with_ic_host(&server.url)
+            .with_root_secret([9; 48])
+    };
+    let error = make_client().build().await.err().unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains("failed to fetch replica root key")
+    );
+    healthy.store(true, Ordering::SeqCst);
+    assert!(make_client().build().await.is_ok());
+}
+
+#[tokio::test(start_paused = true)]
+async fn replica_root_key_fetch_has_a_setup_deadline() {
+    // Keep the port open but never send an HTTP response.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let start = tokio::time::Instant::now();
+    let error = Client::builder()
+        .with_ic_host(&url)
+        .with_root_secret([9; 48])
+        .build()
+        .await
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("timed out after 10 seconds"));
+    assert_eq!(start.elapsed(), std::time::Duration::from_secs(10));
+}
+
+#[tokio::test]
+async fn default_agent_verifies_queries_and_custom_agent_can_opt_out() {
+    let read_state_called = Arc::new(AtomicBool::new(false));
+    let state = read_state_called.clone();
+    let server = support::serve(
+        Router::new()
+            .route(
+                "/api/v2/status",
+                axum::routing::get(|| async { replica_status() }),
+            )
+            .route(
+                "/api/v3/canister/{id}/query",
+                post(|| async {
+                    use cbor2::Value;
+                    to_canonical_vec(&Value::Map(vec![
+                        (Value::Text("status".into()), Value::Text("replied".into())),
+                        (
+                            Value::Text("reply".into()),
+                            Value::Map(vec![(
+                                Value::Text("arg".into()),
+                                Value::Bytes(candid::encode_one("unsigned").unwrap()),
+                            )]),
+                        ),
+                    ]))
+                    .unwrap()
+                }),
+            )
+            .fallback(move || {
+                let state = state.clone();
+                async move {
+                    state.store(true, Ordering::SeqCst);
+                    StatusCode::NOT_FOUND
+                }
+            }),
+    )
+    .await;
+    let identity = boxed_identity([7; 32]);
+    let client = Client::builder()
+        .with_ic_host(&server.url)
+        .with_identity(identity.clone())
+        .build()
+        .await
+        .unwrap();
+    let result: Result<String, _> =
+        CanisterCaller::canister_query(&client, &Principal::anonymous(), "greet", ()).await;
+    assert!(result.is_err());
+    assert!(read_state_called.load(Ordering::SeqCst));
+
+    read_state_called.store(false, Ordering::SeqCst);
+    let agent = Agent::builder()
+        .with_url(&server.url)
+        .with_arc_identity(identity.clone())
+        .with_verify_query_signatures(false)
+        .build()
+        .unwrap();
+    let client = Client::builder()
+        .with_identity(identity)
+        .with_agent(agent)
+        .build()
+        .await
+        .unwrap();
+    let result: String =
+        CanisterCaller::canister_query(&client, &Principal::anonymous(), "greet", ())
+            .await
+            .unwrap();
+    assert_eq!(result, "unsigned");
+    assert!(!read_state_called.load(Ordering::SeqCst));
 }

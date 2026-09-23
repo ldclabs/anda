@@ -31,3 +31,11 @@ jobs:
         run: cargo clippy --all-targets --all-features
       - name: Run tests
         run: cargo test --workspace -- --nocapture
+      - name: Test Web3 without features
+        run: cargo test -p anda_web3_client --no-default-features --locked
+      - name: Test Web3 client
+        run: cargo test -p anda_web3_client --no-default-features --features client --locked
+      - name: Test Web3 TEE
+        run: cargo test -p anda_web3_client --no-default-features --features tee --locked
+      - name: Test full Web3 integration
+        run: cargo test -p anda_web3_client --features full --locked

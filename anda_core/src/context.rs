@@ -253,7 +253,7 @@ pub trait KeysFeatures: Sized {
         signature: &[u8],
     ) -> impl Future<Output = Result<(), BoxError>> + Send;
 
-    /// Signs a SHA-256 digest using Secp256k1 ECDSA from the given derivation path.
+    /// Signs a message using Secp256k1 ECDSA from the given derivation path.
     /// The message will be hashed with SHA-256 before signing.
     fn secp256k1_sign_message_ecdsa(
         &self,
@@ -261,14 +261,15 @@ pub trait KeysFeatures: Sized {
         message: &[u8],
     ) -> impl Future<Output = Result<[u8; 64], BoxError>> + Send;
 
-    /// Signs a message using Secp256k1 ECDSA signature from the given derivation path.
+    /// Signs a 32-byte digest using Secp256k1 ECDSA from the given derivation path.
     fn secp256k1_sign_digest_ecdsa(
         &self,
         derivation_path: Vec<Vec<u8>>,
         message_hash: &[u8],
     ) -> impl Future<Output = Result<[u8; 64], BoxError>> + Send;
 
-    /// Verifies a Secp256k1 ECDSA signature from the given derivation path.
+    /// Verifies a Secp256k1 ECDSA signature against a 32-byte digest.
+    /// Use SHA-256 of the message for signatures from `secp256k1_sign_message_ecdsa`.
     fn secp256k1_verify_ecdsa(
         &self,
         derivation_path: Vec<Vec<u8>>,

@@ -10,8 +10,8 @@ categories.workspace = true
 license.workspace = true
 
 [dependencies]
-anda_core = { path = "../anda_core", version = "0.16" }
-anda_engine = { path = "../anda_engine", version = "0.16" }
+anda_core = { path = "../anda_core", version = "0.16", optional = true }
+anda_engine = { path = "../anda_engine", version = "0.16", optional = true }
 
 # Shared by both `client` and `tee` (none pulled in the default build).
 candid = { workspace = true, optional = true }
@@ -24,10 +24,9 @@ ic_auth_verifier = { workspace = true, optional = true, features = [
 ] }
 
 # `client` feature: the generic non-TEE Web3 client.
-futures = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
-log = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
 zeroize = { workspace = true, optional = true }
 ic-agent = { workspace = true, optional = true }
 ic_cose = { workspace = true, optional = true }
@@ -44,6 +43,8 @@ ic_tee_gateway_sdk = { workspace = true, optional = true }
 default = []
 # Internal: dependencies shared by `client` and `tee`.
 _common = [
+  "dep:anda_core",
+  "dep:anda_engine",
   "dep:candid",
   "dep:cbor2",
   "dep:http",
@@ -55,10 +56,9 @@ _common = [
 client = [
   "_common",
   "ic_auth_verifier/identity",
-  "dep:futures",
   "dep:hex",
-  "dep:log",
   "dep:serde",
+  "dep:tokio",
   "dep:zeroize",
   "dep:ic-agent",
   "dep:ic_cose",
@@ -77,11 +77,27 @@ full = ["client", "tee"]
 
 [dev-dependencies]
 axum = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 
-[lib]
-test = false
-doctest = false
+[[test]]
+name = "client_features"
+required-features = ["client"]
+
+[[test]]
+name = "crypto_vectors"
+required-features = ["client"]
+
+[[test]]
+name = "crypto_compatibility"
+required-features = ["client", "tee"]
+
+[[test]]
+name = "tee_features"
+required-features = ["tee"]
+
+[[example]]
+name = "client"
+required-features = ["client"]
 
 [package.metadata.docs.rs]
 all-features = true

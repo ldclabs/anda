@@ -135,14 +135,15 @@ pub trait Web3ClientFeatures: Send + Sync + 'static {
         message: &[u8],
     ) -> BoxPinFut<Result<[u8; 64], BoxError>>;
 
-    /// Signs a message hash using Secp256k1 ECDSA signature from the given derivation path
+    /// Signs a 32-byte digest using Secp256k1 ECDSA from the given derivation path.
     fn secp256k1_sign_digest_ecdsa(
         &self,
         derivation_path: Vec<Vec<u8>>,
         message_hash: &[u8],
     ) -> BoxPinFut<Result<[u8; 64], BoxError>>;
 
-    /// Verifies a Secp256k1 ECDSA signature from the given derivation path
+    /// Verifies a Secp256k1 ECDSA signature against a 32-byte digest.
+    /// Use SHA-256 of the message for signatures from `secp256k1_sign_message_ecdsa`.
     fn secp256k1_verify_ecdsa(
         &self,
         derivation_path: Vec<Vec<u8>>,

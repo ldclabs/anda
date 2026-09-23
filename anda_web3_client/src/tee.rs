@@ -1,32 +1,37 @@
 //! TEE gateway-backed Web3 client. Enabled by the `tee` feature.
 //!
-//! [`TeeClient`] adapts an [`ic_tee_gateway_sdk`] gateway client to the engine's
-//! object-safe [`Web3ClientFeatures`] trait so it can be handed to the engine
+//! [`TeeClient`](crate::tee::TeeClient) adapts an [`ic_tee_gateway_sdk`] client to
+//! the object-safe [`Web3ClientFeatures`](anda_engine::context::Web3ClientFeatures)
+//! trait so it can be handed to the engine
 //! through [`anda_engine::context::Web3SDK::from_web3`]. Key derivation, envelope
-//! signing, attestation, and HTTP/RPC calls are delegated to the TEE gateway, so
-//! the secret material stays inside the enclave.
+//! signing, and attestation use the gateway SDK. Signed RPC uses the engine's
+//! bounded response reader while leaving envelope signing to the gateway.
 //!
-//! Canister access is not part of [`Web3ClientFeatures`]. When a TEE deployment
-//! needs it, use the underlying gateway client via [`TeeClient::gateway`], which
+//! Canister access is not part of
+//! [`Web3ClientFeatures`](anda_engine::context::Web3ClientFeatures). When needed,
+//! use the gateway client via [`TeeClient::gateway`](crate::tee::TeeClient::gateway), which
 //! implements `CanisterCaller` itself.
 //!
-//! ```ignore
+//! ```
 //! use std::sync::Arc;
 //! use anda_engine::context::Web3SDK;
 //! use anda_web3_client::tee::{TeeClient, TeeGatewayClient};
 //!
-//! let gateway: Arc<TeeGatewayClient> = /* ic_tee_gateway_sdk client */;
-//! let web3 = Web3SDK::from_web3(Arc::new(TeeClient::new(gateway)));
+//! // Supply a gateway already connected to the TEE.
+//! fn web3_sdk(gateway: Arc<TeeGatewayClient>) -> Web3SDK {
+//!     Web3SDK::from_web3(Arc::new(TeeClient::new(gateway)))
+//! }
 //! ```
 
+use crate::{ecdsa_digest, request::rpc_body};
 use anda_cloud_cdk::{TEEInfo, TEEKind};
-use anda_core::{BoxError, BoxPinFut};
+use anda_core::{BoxError, BoxPinFut, cbor_rpc};
 use anda_engine::context::Web3ClientFeatures;
 use candid::Principal;
 use ic_auth_types::ByteBufB64;
-use ic_auth_verifier::envelope::SignedEnvelope;
+use ic_auth_verifier::{envelope::SignedEnvelope, sha3_256};
 use ic_tee_cdk::AttestationRequest;
-use std::sync::Arc;
+use std::{future::ready, sync::Arc};
 
 pub use ic_tee_gateway_sdk::client::{
     Client as TeeGatewayClient, ClientBuilder as TeeGatewayClientBuilder,
@@ -174,7 +179,10 @@ impl Web3ClientFeatures for TeeClient {
         message_hash: &[u8],
     ) -> BoxPinFut<Result<[u8; 64], BoxError>> {
         let gw = self.gateway.clone();
-        let message_hash = message_hash.to_vec();
+        let message_hash = match ecdsa_digest(message_hash) {
+            Ok(digest) => *digest,
+            Err(err) => return Box::pin(ready(Err(err))),
+        };
         Box::pin(async move {
             gw.secp256k1_sign_digest_ecdsa(derivation_path, &message_hash)
                 .await
@@ -188,7 +196,10 @@ impl Web3ClientFeatures for TeeClient {
         signature: &[u8],
     ) -> BoxPinFut<Result<(), BoxError>> {
         let gw = self.gateway.clone();
-        let message_hash = message_hash.to_vec();
+        let message_hash = match ecdsa_digest(message_hash) {
+            Ok(digest) => *digest,
+            Err(err) => return Box::pin(ready(Err(err))),
+        };
         let signature = signature.to_vec();
         Box::pin(async move {
             gw.secp256k1_verify_ecdsa(derivation_path, &message_hash, &signature)
@@ -238,12 +249,12 @@ impl Web3ClientFeatures for TeeClient {
     ) -> BoxPinFut<Result<Vec<u8>, BoxError>> {
         let gw = self.gateway.clone();
         Box::pin(async move {
-            // `args` is already the canonical CBOR encoding of the params; wrap
-            // it in a `RawValue` so the gateway re-emits it as-is, then hand the
-            // raw response bytes back to the engine for typed decoding.
-            let params = cbor2::RawValue::new(args)?;
-            let res: cbor2::RawValue = gw.https_signed_rpc(&endpoint, &method, params).await?;
-            Ok(res.into_bytes())
+            let body = rpc_body(&method, args)?;
+            let envelope = gw.sign_envelope(sha3_256(&body)).await?;
+            let mut headers = http::HeaderMap::new();
+            envelope.to_authorization(&mut headers)?;
+            let res = cbor_rpc(&gw.outer_http, &endpoint, &method, Some(headers), body).await?;
+            Ok(res.into_vec())
         })
     }
 }

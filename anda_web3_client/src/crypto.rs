@@ -57,14 +57,7 @@ pub fn secp256k1_sign_message_bip340(
     derivation_path: Vec<Vec<u8>>,
     msg: &[u8],
 ) -> [u8; 64] {
-    let sk = ic_secp256k1::PrivateKey::generate_from_seed(root_secret);
-    let path = ic_secp256k1::DerivationPath::new(
-        derivation_path
-            .into_iter()
-            .map(ic_secp256k1::DerivationIndex)
-            .collect(),
-    );
-    let (sk, _) = sk.derive_subkey(&path);
+    let sk = secp256k1_private_key(root_secret, derivation_path);
     sk.sign_message_with_bip340_no_rng(msg)
 }
 
@@ -74,23 +67,24 @@ pub fn secp256k1_sign_message_ecdsa(
     derivation_path: Vec<Vec<u8>>,
     msg: &[u8],
 ) -> [u8; 64] {
-    let sk = ic_secp256k1::PrivateKey::generate_from_seed(root_secret);
-    let path = ic_secp256k1::DerivationPath::new(
-        derivation_path
-            .into_iter()
-            .map(ic_secp256k1::DerivationIndex)
-            .collect(),
-    );
-    let (sk, _) = sk.derive_subkey(&path);
+    let sk = secp256k1_private_key(root_secret, derivation_path);
     sk.sign_message_with_ecdsa(msg)
 }
 
-/// Signs a pre-computed digest using ECDSA for secp256k1.
+/// Signs a pre-computed 32-byte digest using ECDSA for secp256k1.
 pub fn secp256k1_sign_digest_ecdsa(
     root_secret: &[u8],
     derivation_path: Vec<Vec<u8>>,
-    message_hash: &[u8],
+    message_hash: &[u8; 32],
 ) -> [u8; 64] {
+    let sk = secp256k1_private_key(root_secret, derivation_path);
+    sk.sign_digest_with_ecdsa(message_hash)
+}
+
+fn secp256k1_private_key(
+    root_secret: &[u8],
+    derivation_path: Vec<Vec<u8>>,
+) -> ic_secp256k1::PrivateKey {
     let sk = ic_secp256k1::PrivateKey::generate_from_seed(root_secret);
     let path = ic_secp256k1::DerivationPath::new(
         derivation_path
@@ -99,7 +93,7 @@ pub fn secp256k1_sign_digest_ecdsa(
             .collect(),
     );
     let (sk, _) = sk.derive_subkey(&path);
-    sk.sign_digest_with_ecdsa(message_hash)
+    sk
 }
 
 /// Derives a compressed SEC1 secp256k1 public key (33 bytes) and chain code (32 bytes).
@@ -135,10 +129,10 @@ pub fn secp256k1_public_key(
 /// that need distinct keys for distinct paths must not rely on a variable-length
 /// segment boundary alone to separate them. (Ed25519/secp256k1 derivation is
 /// unaffected: it preserves segment boundaries via `DerivationPath`.)
-fn derivation_path_to_context(derivation_path: &[Vec<u8>]) -> Vec<u8> {
-    let mut data = Vec::new();
+fn derivation_path_to_context(derivation_path: &[Vec<u8>]) -> [u8; 32] {
+    let mut data = Vec::with_capacity(derivation_path.iter().map(Vec::len).sum());
     for path in derivation_path {
         data.extend_from_slice(path);
     }
-    sha3_256(&data).to_vec()
+    sha3_256(&data)
 }

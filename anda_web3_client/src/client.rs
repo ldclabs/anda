@@ -4,8 +4,11 @@
 //! contexts, including canister calls, signed HTTP calls, and deterministic
 //! key derivation.
 
-use crate::crypto;
-use anda_core::{BoxError, BoxPinFut, HttpFeatures, RPCRequestRef, cbor_rpc};
+use crate::{
+    crypto, ecdsa_digest,
+    request::{check_url, rpc_body, send_request},
+};
+use anda_core::{BoxError, BoxPinFut, HttpFeatures, cbor_rpc};
 use anda_engine::context::Web3ClientFeatures;
 use candid::{
     CandidType, Decode, Principal,
@@ -13,7 +16,6 @@ use candid::{
 };
 use cbor2::{from_slice, to_canonical_vec};
 use ic_agent::identity::{AnonymousIdentity, BasicIdentity, Secp256k1Identity};
-use ic_auth_types::ByteBufB64;
 use ic_auth_verifier::envelope::SignedEnvelope;
 use ic_cose::client::CoseSDK;
 use ic_cose_types::{
@@ -25,7 +27,7 @@ use ic_cose_types::{
     },
 };
 use serde::{Serialize, de::DeserializeOwned};
-use std::{sync::Arc, time::Duration};
+use std::{future::ready, sync::Arc, time::Duration};
 use zeroize::Zeroizing;
 
 pub use ic_agent::{Agent, Identity};
@@ -42,7 +44,7 @@ pub struct Client {
     outer_http: reqwest::Client,
     // Kept in a `Zeroizing` wrapper so the long-lived copy of the root secret is
     // wiped from memory on drop, reducing the window in which it could leak.
-    root_secret: Zeroizing<[u8; 48]>,
+    root_secret: Option<Zeroizing<[u8; 48]>>,
     identity: Arc<dyn Identity>,
     principal: Principal,
     agent: Agent,
@@ -54,7 +56,7 @@ pub struct Client {
 #[non_exhaustive]
 pub struct ClientBuilder {
     ic_host: String,
-    root_secret: Zeroizing<[u8; 48]>,
+    root_secret: Option<Zeroizing<[u8; 48]>>,
     identity: Option<Arc<dyn Identity>>,
     agent: Option<Agent>,
     cose_canister: Principal,
@@ -115,7 +117,7 @@ impl Default for ClientBuilder {
     fn default() -> Self {
         Self {
             ic_host: "https://icp-api.io".to_string(),
-            root_secret: Zeroizing::new([0; 48]),
+            root_secret: None,
             identity: None,
             agent: None,
             cose_canister: Principal::anonymous(),
@@ -132,29 +134,37 @@ impl ClientBuilder {
         self
     }
 
-    /// Sets the 48-byte root secret for key derivation, default is all zeros
+    /// Sets the persistent 48-byte root secret for key derivation.
     ///
-    /// The default all-zero secret derives a public, predictable identity and
-    /// key set and is only suitable for tests; [`build`](Self::build) logs a
-    /// warning when it is used.
+    /// There is no default secret. Without one, key operations return an error.
+    /// All-zero secrets are rejected at build time. Store a securely generated
+    /// secret persistently to retain access to the same derived keys.
     pub fn with_root_secret(mut self, root_secret: [u8; 48]) -> Self {
-        self.root_secret = Zeroizing::new(root_secret);
+        self.root_secret = Some(Zeroizing::new(root_secret));
         self
     }
 
-    /// Sets the principal of the COSE canister, default is anonymous, which disables COSE operations
+    /// Sets the COSE canister principal. Configure it before using `CoseSDK`;
+    /// the default anonymous principal does not identify a COSE canister.
     pub fn with_cose_canister(mut self, cose_canister: Principal) -> Self {
         self.cose_canister = cose_canister;
         self
     }
 
-    /// Sets the identity for cryptographic operations, default is anonymous
+    /// Sets the identity for canister calls and HTTP/envelope signatures.
+    ///
+    /// If omitted, the identity is derived from the configured root secret.
+    /// This does not supply a root secret for key derivation; identity-only
+    /// clients can make authenticated requests but cannot derive keys.
     pub fn with_identity(mut self, identity: Arc<dyn Identity>) -> Self {
         self.identity = Some(identity);
         self
     }
 
-    /// Sets the agent for canister communication
+    /// Sets the agent for canister communication, preserving its configuration.
+    ///
+    /// Its principal must match the client identity. Supply an agent explicitly
+    /// to configure a local root key or opt out of query-signature verification.
     pub fn with_agent(mut self, agent: Agent) -> Self {
         self.agent = Some(agent);
         self
@@ -173,40 +183,55 @@ impl ClientBuilder {
     }
 
     /// Builds a [`Client`] with the configured identity, agent, and HTTP client.
+    ///
+    /// Requires an identity or a nonzero root secret. The default agent verifies
+    /// query signatures. For an `http://` IC host, fetching the replica root key
+    /// must succeed within ten seconds; rebuild after resolving any failure.
     pub async fn build(self) -> Result<Client, BoxError> {
-        if self.root_secret.iter().all(|&b| b == 0) {
-            log::warn!(
-                "anda_web3_client: building a Client with an all-zero root secret; the \
-                 derived identity and all sub-keys are public and predictable. Set a real \
-                 secret via ClientBuilder::with_root_secret for anything but tests."
-            );
+        if self
+            .root_secret
+            .as_ref()
+            .is_some_and(|secret| secret.iter().all(|&b| b == 0))
+        {
+            return Err("root secret must not be all zeros".into());
         }
 
         let identity = match self.identity {
             Some(identity) => identity,
-            None => Arc::from(identity_from_secret(sha3_256(&self.root_secret[..]))),
+            None => {
+                let secret = self
+                    .root_secret
+                    .as_ref()
+                    .ok_or("configure an identity or a root secret before building a Client")?;
+                Arc::from(identity_from_secret(sha3_256(&secret[..])))
+            }
         };
         let principal = identity
             .sender()
             .map_err(|err| format!("failed to get the principal from identity: {err}"))?;
 
         let agent = match self.agent {
-            Some(agent) => agent,
+            Some(agent) => {
+                if agent
+                    .get_principal()
+                    .map_err(|err| format!("invalid agent identity: {err}"))?
+                    != principal
+                {
+                    return Err("agent principal does not match the client identity".into());
+                }
+                agent
+            }
             None => {
-                // Query-signature verification is disabled on the default agent:
-                // a non-TEE client reads canister state through a trusted boundary
-                // node, and enabling it would require fetching node keys on every
-                // query. Supply your own agent via `with_agent` to change this.
                 let agent = Agent::builder()
-                    .with_url(self.ic_host.clone())
+                    .with_url(&self.ic_host)
                     .with_arc_identity(identity.clone())
-                    .with_verify_query_signatures(false)
                     .build()?;
 
-                if self.ic_host.starts_with("http://") {
-                    // local replica: ignore the error so the client can still be
-                    // constructed when the replica is not running yet
-                    let _ = agent.fetch_root_key().await;
+                if reqwest::Url::parse(&self.ic_host)?.scheme() == "http" {
+                    tokio::time::timeout(Duration::from_secs(10), agent.fetch_root_key())
+                        .await
+                        .map_err(|_| "fetching replica root key timed out after 10 seconds")?
+                        .map_err(|err| format!("failed to fetch replica root key: {err}"))?;
                 }
                 agent
             }
@@ -259,47 +284,10 @@ impl Client {
         Ok(se)
     }
 
-    /// Validates that `url` is a well-formed HTTP(S) endpoint this client may call.
-    ///
-    /// Only the `https` scheme is accepted by default. The `http` scheme is
-    /// additionally allowed when [`ClientBuilder::with_allow_http`] was enabled
-    /// (intended for local development against a replica or test server). Every
-    /// other scheme (`file`, `ftp`, `data`, ...) is rejected, and the URL must
-    /// carry a host.
-    ///
-    /// Embedded userinfo is rejected: in `https://api.trusted.example@evil.tld/`
-    /// the authority is `evil.tld`, but the text reads as the trusted host. That
-    /// mismatch is the classic URL-smuggling primitive, and here it would send a
-    /// request signed with the client identity to the attacker's host.
-    ///
-    /// This is a syntactic guard, not an SSRF firewall: it does not block
-    /// private, loopback, or link-local hosts (e.g. cloud metadata at
-    /// `169.254.169.254`), and it does not re-validate redirect hops. When this
-    /// client is used as a library, treat every endpoint passed to a signed call
-    /// as trusted — the request is signed with the client identity before it is
-    /// sent, so an attacker-controlled endpoint receives a valid signed request.
-    fn check_url(&self, url: &str) -> Result<(), BoxError> {
-        let parsed =
-            reqwest::Url::parse(url).map_err(|err| format!("Invalid url {url:?}: {err}"))?;
-        let scheme = parsed.scheme();
-        let scheme_ok = scheme == "https" || (self.allow_http && scheme == "http");
-        if !scheme_ok {
-            let expected = if self.allow_http {
-                "http or https"
-            } else {
-                "https"
-            };
-            return Err(
-                format!("Invalid url {url:?}: scheme must be {expected}, got {scheme:?}").into(),
-            );
-        }
-        if !parsed.has_host() {
-            return Err(format!("Invalid url {url:?}: missing host").into());
-        }
-        if !parsed.username().is_empty() || parsed.password().is_some() {
-            return Err(format!("Invalid url {url:?}: embedded userinfo is not allowed").into());
-        }
-        Ok(())
+    fn root_secret(&self) -> Result<&[u8; 48], BoxError> {
+        self.root_secret
+            .as_deref()
+            .ok_or_else(|| "key derivation requires ClientBuilder::with_root_secret".into())
     }
 
     /// Signs `message_digest` with the client identity and merges the
@@ -322,43 +310,16 @@ impl Client {
         method: &str,
         params: Vec<u8>,
     ) -> Result<(http::HeaderMap, Vec<u8>), BoxError> {
-        let params: ByteBufB64 = params.into();
-        let req = RPCRequestRef {
-            method,
-            params: &params,
-        };
-        let body = to_canonical_vec(&req)?;
+        let body = rpc_body(method, params)?;
         let digest: [u8; 32] = sha3_256(&body);
         let headers = self.sign_headers(digest, None)?;
         Ok((headers, body))
     }
 }
 
-/// Sends an HTTP request with optional headers and body using the given client.
-async fn send_request(
-    http: reqwest::Client,
-    url: String,
-    method: http::Method,
-    headers: Option<http::HeaderMap>,
-    body: Option<Vec<u8>>,
-) -> Result<reqwest::Response, BoxError> {
-    let mut req = http.request(method, url);
-    if let Some(headers) = headers {
-        req = req.headers(headers);
-    }
-    if let Some(body) = body {
-        req = req.body(body);
-    }
-
-    req.send().await.map_err(|e| e.into())
-}
-
-// The key-derivation and signing methods below run their (tens-of-microseconds)
-// CPU work synchronously and return an already-resolved future via
-// `futures::future::ready`, because the trait requires a future. This is a
-// deliberate trade-off: the work is short enough that dispatching it to a
-// blocking pool would cost more than it saves. If a deployment signs in a hot
-// loop on a latency-sensitive executor, wrap these in `spawn_blocking`.
+// Local cryptographic operations return ready futures without copying inputs or
+// dispatching each operation to a blocking pool. Hosts with sustained signing
+// workloads can benchmark and schedule those workloads separately.
 impl Web3ClientFeatures for Client {
     fn get_principal(&self) -> Principal {
         self.principal
@@ -383,8 +344,10 @@ impl Web3ClientFeatures for Client {
     /// # Returns
     /// Result containing the derived 256-bit key or an error
     fn a256gcm_key(&self, derivation_path: Vec<Vec<u8>>) -> BoxPinFut<Result<[u8; 32], BoxError>> {
-        let res = crypto::a256gcm_key(&self.root_secret[..], derivation_path);
-        Box::pin(futures::future::ready(Ok(res)))
+        let res = self
+            .root_secret()
+            .map(|root| crypto::a256gcm_key(root, derivation_path));
+        Box::pin(ready(res))
     }
 
     /// Signs a message using Ed25519 signature scheme
@@ -400,8 +363,10 @@ impl Web3ClientFeatures for Client {
         derivation_path: Vec<Vec<u8>>,
         message: &[u8],
     ) -> BoxPinFut<Result<[u8; 64], BoxError>> {
-        let res = crypto::ed25519_sign_message(&self.root_secret[..], derivation_path, message);
-        Box::pin(futures::future::ready(Ok(res)))
+        let res = self
+            .root_secret()
+            .map(|root| crypto::ed25519_sign_message(root, derivation_path, message));
+        Box::pin(ready(res))
     }
 
     /// Verifies an Ed25519 signature
@@ -419,10 +384,11 @@ impl Web3ClientFeatures for Client {
         message: &[u8],
         signature: &[u8],
     ) -> BoxPinFut<Result<(), BoxError>> {
-        let res = crypto::ed25519_public_key(&self.root_secret[..], derivation_path);
-        Box::pin(futures::future::ready(
-            ed25519_verify(&res.0, message, signature).map_err(|e| e.into()),
-        ))
+        let res = self.root_secret().and_then(|root| {
+            let (pk, _) = crypto::ed25519_public_key(root, derivation_path);
+            ed25519_verify(&pk, message, signature).map_err(|e| e.into())
+        });
+        Box::pin(ready(res))
     }
 
     /// Gets the public key for Ed25519
@@ -436,8 +402,10 @@ impl Web3ClientFeatures for Client {
         &self,
         derivation_path: Vec<Vec<u8>>,
     ) -> BoxPinFut<Result<[u8; 32], BoxError>> {
-        let res = crypto::ed25519_public_key(&self.root_secret[..], derivation_path);
-        Box::pin(futures::future::ready(Ok(res.0)))
+        let res = self
+            .root_secret()
+            .map(|root| crypto::ed25519_public_key(root, derivation_path).0);
+        Box::pin(ready(res))
     }
 
     /// Signs a message using Secp256k1 BIP340 Schnorr signature
@@ -453,9 +421,10 @@ impl Web3ClientFeatures for Client {
         derivation_path: Vec<Vec<u8>>,
         message: &[u8],
     ) -> BoxPinFut<Result<[u8; 64], BoxError>> {
-        let res =
-            crypto::secp256k1_sign_message_bip340(&self.root_secret[..], derivation_path, message);
-        Box::pin(futures::future::ready(Ok(res)))
+        let res = self
+            .root_secret()
+            .map(|root| crypto::secp256k1_sign_message_bip340(root, derivation_path, message));
+        Box::pin(ready(res))
     }
 
     /// Verifies a Secp256k1 BIP340 Schnorr signature
@@ -473,10 +442,11 @@ impl Web3ClientFeatures for Client {
         message: &[u8],
         signature: &[u8],
     ) -> BoxPinFut<Result<(), BoxError>> {
-        let res = crypto::secp256k1_public_key(&self.root_secret[..], derivation_path);
-        Box::pin(futures::future::ready(
-            secp256k1_verify_bip340(res.0.as_slice(), message, signature).map_err(|e| e.into()),
-        ))
+        let res = self.root_secret().and_then(|root| {
+            let (pk, _) = crypto::secp256k1_public_key(root, derivation_path);
+            secp256k1_verify_bip340(&pk, message, signature).map_err(|e| e.into())
+        });
+        Box::pin(ready(res))
     }
 
     /// Signs a message using Secp256k1 ECDSA signature
@@ -492,9 +462,10 @@ impl Web3ClientFeatures for Client {
         derivation_path: Vec<Vec<u8>>,
         message: &[u8],
     ) -> BoxPinFut<Result<[u8; 64], BoxError>> {
-        let res =
-            crypto::secp256k1_sign_message_ecdsa(&self.root_secret[..], derivation_path, message);
-        Box::pin(futures::future::ready(Ok(res)))
+        let res = self
+            .root_secret()
+            .map(|root| crypto::secp256k1_sign_message_ecdsa(root, derivation_path, message));
+        Box::pin(ready(res))
     }
 
     fn secp256k1_sign_digest_ecdsa(
@@ -502,19 +473,18 @@ impl Web3ClientFeatures for Client {
         derivation_path: Vec<Vec<u8>>,
         message_hash: &[u8],
     ) -> BoxPinFut<Result<[u8; 64], BoxError>> {
-        let res = crypto::secp256k1_sign_digest_ecdsa(
-            &self.root_secret[..],
-            derivation_path,
-            message_hash,
-        );
-        Box::pin(futures::future::ready(Ok(res)))
+        let res = ecdsa_digest(message_hash).and_then(|digest| {
+            self.root_secret()
+                .map(|root| crypto::secp256k1_sign_digest_ecdsa(root, derivation_path, digest))
+        });
+        Box::pin(ready(res))
     }
 
     /// Verifies a Secp256k1 ECDSA signature
     ///
     /// # Arguments
     /// * `derivation_path` - Additional path components for key derivation
-    /// * `message` - Original message that was signed
+    /// * `message_hash` - 32-byte digest (SHA-256 for a message signature)
     /// * `signature` - Signature to verify
     ///
     /// # Returns
@@ -522,19 +492,19 @@ impl Web3ClientFeatures for Client {
     fn secp256k1_verify_ecdsa(
         &self,
         derivation_path: Vec<Vec<u8>>,
-        message: &[u8],
+        message_hash: &[u8],
         signature: &[u8],
     ) -> BoxPinFut<Result<(), BoxError>> {
-        let res = crypto::secp256k1_public_key(&self.root_secret[..], derivation_path);
-        Box::pin(futures::future::ready(
-            secp256k1_verify_ecdsa(res.0.as_slice(), message, signature).map_err(|e| e.into()),
-        ))
+        let res = ecdsa_digest(message_hash).and_then(|digest| {
+            let (pk, _) = crypto::secp256k1_public_key(self.root_secret()?, derivation_path);
+            secp256k1_verify_ecdsa(&pk, digest, signature).map_err(|e| e.into())
+        });
+        Box::pin(ready(res))
     }
 
     /// Gets the compressed SEC1-encoded public key for Secp256k1
     ///
     /// # Arguments
-    /// * `path` - Base path for key derivation
     /// * `derivation_path` - Additional path components for key derivation
     ///
     /// # Returns
@@ -543,8 +513,10 @@ impl Web3ClientFeatures for Client {
         &self,
         derivation_path: Vec<Vec<u8>>,
     ) -> BoxPinFut<Result<[u8; 33], BoxError>> {
-        let res = crypto::secp256k1_public_key(&self.root_secret[..], derivation_path);
-        Box::pin(futures::future::ready(Ok(res.0)))
+        let res = self
+            .root_secret()
+            .map(|root| crypto::secp256k1_public_key(root, derivation_path).0);
+        Box::pin(ready(res))
     }
 
     fn https_call(
@@ -554,9 +526,10 @@ impl Web3ClientFeatures for Client {
         headers: Option<http::HeaderMap>,
         body: Option<Vec<u8>>, // default is empty
     ) -> BoxPinFut<Result<reqwest::Response, BoxError>> {
-        if let Err(err) = self.check_url(&url) {
-            return Box::pin(futures::future::ready(Err(err)));
-        }
+        let url = match check_url(&url, self.allow_http) {
+            Ok(url) => url,
+            Err(err) => return Box::pin(ready(Err(err))),
+        };
 
         Box::pin(send_request(
             self.outer_http.clone(),
@@ -575,12 +548,13 @@ impl Web3ClientFeatures for Client {
         headers: Option<http::HeaderMap>,
         body: Option<Vec<u8>>, // default is empty
     ) -> BoxPinFut<Result<reqwest::Response, BoxError>> {
-        if let Err(err) = self.check_url(&url) {
-            return Box::pin(futures::future::ready(Err(err)));
-        }
+        let url = match check_url(&url, self.allow_http) {
+            Ok(url) => url,
+            Err(err) => return Box::pin(ready(Err(err))),
+        };
         let headers = match self.sign_headers(message_digest, headers) {
             Ok(headers) => headers,
-            Err(err) => return Box::pin(futures::future::ready(Err(err))),
+            Err(err) => return Box::pin(ready(Err(err))),
         };
 
         Box::pin(send_request(
@@ -598,12 +572,12 @@ impl Web3ClientFeatures for Client {
         method: String,
         args: Vec<u8>,
     ) -> BoxPinFut<Result<Vec<u8>, BoxError>> {
-        if let Err(err) = self.check_url(&endpoint) {
-            return Box::pin(futures::future::ready(Err(err)));
+        if let Err(err) = check_url(&endpoint, self.allow_http) {
+            return Box::pin(ready(Err(err)));
         }
         let (headers, body) = match self.signed_rpc_request(&method, args) {
             Ok(req) => req,
-            Err(err) => return Box::pin(futures::future::ready(Err(err))),
+            Err(err) => return Box::pin(ready(Err(err))),
         };
 
         let outer_http = self.outer_http.clone();
@@ -629,15 +603,8 @@ impl HttpFeatures for Client {
         headers: Option<http::HeaderMap>,
         body: Option<Vec<u8>>, // default is empty
     ) -> Result<reqwest::Response, BoxError> {
-        self.check_url(url)?;
-        send_request(
-            self.outer_http.clone(),
-            url.to_string(),
-            method,
-            headers,
-            body,
-        )
-        .await
+        let url = check_url(url, self.allow_http)?;
+        send_request(self.outer_http.clone(), url, method, headers, body).await
     }
 
     /// Makes a signed HTTPs request with message authentication
@@ -656,16 +623,9 @@ impl HttpFeatures for Client {
         headers: Option<http::HeaderMap>,
         body: Option<Vec<u8>>, // default is empty
     ) -> Result<reqwest::Response, BoxError> {
-        self.check_url(url)?;
+        let url = check_url(url, self.allow_http)?;
         let headers = self.sign_headers(message_digest, headers)?;
-        send_request(
-            self.outer_http.clone(),
-            url.to_string(),
-            method,
-            Some(headers),
-            body,
-        )
-        .await
+        send_request(self.outer_http.clone(), url, method, Some(headers), body).await
     }
 
     /// Makes a signed CBOR-encoded RPC call
@@ -683,7 +643,7 @@ impl HttpFeatures for Client {
     where
         T: DeserializeOwned,
     {
-        self.check_url(endpoint)?;
+        check_url(endpoint, self.allow_http)?;
         let args = to_canonical_vec(&args)?;
         let (headers, body) = self.signed_rpc_request(method, args)?;
         let res = cbor_rpc(&self.outer_http, endpoint, method, Some(headers), body).await?;
