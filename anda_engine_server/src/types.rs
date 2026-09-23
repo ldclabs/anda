@@ -20,3 +20,13 @@ pub struct AppInformation {
     /// Extra server metadata configured on [`crate::ServerBuilder`].
     pub extra_info: BTreeMap<String, Json>,
 }
+
+/// Serialization view that keeps discovery metadata borrowed from server state.
+#[derive(Serialize)]
+pub(crate) struct AppInformationRef<'a> {
+    pub engines: Vec<&'a AgentInfo>,
+    pub default_engine: Principal,
+    pub caller: Principal,
+    pub start_time_ms: u64,
+    pub extra_info: &'a BTreeMap<String, Json>,
+}

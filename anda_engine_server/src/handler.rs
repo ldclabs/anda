@@ -8,11 +8,11 @@ use anda_engine::engine::Engine;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    response::IntoResponse,
+    response::{IntoResponse, Response},
 };
 use candid::Principal;
 use cbor2::{from_slice, to_canonical_vec};
-use http::header::AUTHORIZATION;
+use http::header::{ACCEPT, AUTHORIZATION, CACHE_CONTROL, VARY};
 use ic_auth_types::ByteBufB64;
 use ic_auth_verifier::{
     envelope::{
@@ -66,46 +66,12 @@ impl AppState {
     ///    `ic-auth-*` headers, verified against `expect_target` and
     ///    `expect_digest`.
     ///
-    /// On the signed-RPC path (`expect_digest` is `Some`) the envelope must
-    /// carry its own `digest`; a digest-less envelope is rejected instead of
-    /// letting [`SignedEnvelope::verify`] fall back to the server-computed body
-    /// hash. This is a fail-closed hygiene check: it forces the client to
-    /// explicitly commit to a body hash so the server always exercises the
-    /// `digest == body_hash` equality path.
-    ///
-    /// It is **not**, on its own, a cryptographic defense. The signature is
-    /// verified over the same 32-byte body hash whether or not `digest` is
-    /// present, and the anda RPC payload (`{method, params}`) binds neither the
-    /// target engine nor a domain tag. An attacker able to obtain a signature
-    /// over that hash (e.g. a signing oracle sharing the key) can still pass by
-    /// echoing the hash as `digest`. Genuine cross-protocol / oracle resistance
-    /// requires domain separation in the signature scheme (`ic_auth_verifier`),
-    /// which is out of scope for this crate.
-    ///
-    /// # Replay and target binding
-    ///
-    /// A verified envelope is **not** bound to one request occurrence or to one
-    /// engine, so an observer who captures a single signed request can replay it:
-    ///
-    /// - **Freshness.** `now_ms` reaches [`SignedEnvelope::verify`], but that
-    ///   function consults it only for delegation expiry and canister-signature
-    ///   certificates. For a direct-key envelope (`delegation: None`, what
-    ///   `anda_web3_client` and `anda_cli` produce) the sole check is the
-    ///   signature over the body hash. The signed payload carries no nonce,
-    ///   timestamp, or sequence number, so an identical re-POST verifies forever.
-    /// - **Target.** `expect_target` is likewise only compared inside the
-    ///   delegation loop, and only when the delegation carries `targets`. A
-    ///   direct-key envelope is therefore accepted by any engine on any server
-    ///   holding the same principal. The one available narrowing is
-    ///   [`RequestMeta::engine`](anda_core::RequestMeta), which
-    ///   `Engine::agent_run` / `Engine::tool_call` enforce when the client sets
-    ///   it — it is optional, so clients that omit it get no binding.
-    ///
-    /// Closing either gap requires committing a nonce (and an engine id) inside
-    /// the signed payload, which is a protocol change across every client, not a
-    /// server-side check. Until then: serve only over TLS, treat a captured
-    /// request as a bearer credential for the operation it encodes, and set
-    /// `RequestMeta::engine` on clients so cross-engine replay is rejected.
+    /// Authentication schemes are case-insensitive and allow one or more spaces
+    /// before the token. On signed RPCs the envelope must carry a `digest` that
+    /// matches the received body. Direct-key signatures provide neither freshness
+    /// nor automatic engine binding; clients should set [`anda_core::RequestMeta::engine`].
+    /// See the [authentication contract](https://github.com/ldclabs/anda/blob/main/anda_engine_server/README.md#authentication-contract)
+    /// for replay, delegation, and bearer-token boundaries.
     ///
     /// Returns the anonymous principal only when no credential is present. When a
     /// credential is present but fails to verify (bad signature, wrong target,
@@ -119,13 +85,9 @@ impl AppState {
         expect_target: Option<Principal>,
         expect_digest: Option<&[u8]>,
     ) -> Result<Principal, String> {
-        // Bearer CWT path, only when trusted keys are configured. A `Bearer ` token present
-        // here is a CWT attempt and must verify.
+        // A bearer attempt must verify when trusted keys are configured.
         if !self.ed25519_pubkeys.is_empty()
-            && let Some(token) = headers
-                .get(AUTHORIZATION)
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.strip_prefix("Bearer "))
+            && let Some(token) = authorization_token(headers, "Bearer")
         {
             let cwt = self
                 .verify_cwt_token(token, now_ms)
@@ -137,14 +99,11 @@ impl AppState {
         }
 
         // Signed-envelope path from the `Authorization` header or the `ic-auth-*` headers.
-        if let Some(se) = SignedEnvelope::from_authorization(headers)
+        if let Some(se) = authorization_token(headers, "ICP")
+            .and_then(|token| SignedEnvelope::from_base64(token).ok())
             .or_else(|| SignedEnvelope::from_headers(headers))
         {
-            // Fail-closed on a body-bound RPC: require the client to present its
-            // own committed digest rather than leaning on the server-computed
-            // body hash. This is hygiene, not a standalone crypto defense — see
-            // the `verify_user` docs for why the signing scheme must add domain
-            // separation to actually resist an oracle sharing the key.
+            // Require the client to commit to the body hash explicitly.
             if expect_digest.is_some() && se.digest.is_none() {
                 return Err("signed request is missing the content digest".to_string());
             }
@@ -154,11 +113,7 @@ impl AppState {
             };
         }
 
-        // Neither parser produced an envelope. Both return `None` for a malformed credential
-        // just as they do for an absent one, so distinguish the two here: a request that
-        // carries credential headers we could not parse must be rejected, not silently
-        // downgraded to anonymous (which would let an on-path attacker strip one header to
-        // launder an authenticated call into an unattributable anonymous one).
+        // Malformed credentials must not silently become anonymous requests.
         if has_credential_headers(headers) {
             return Err("unparseable request credential".to_string());
         }
@@ -187,11 +142,16 @@ impl AppState {
     }
 }
 
+fn authorization_token<'a>(headers: &'a http::HeaderMap, scheme: &str) -> Option<&'a str> {
+    let (actual, token) = headers.get(AUTHORIZATION)?.to_str().ok()?.split_once(' ')?;
+    actual
+        .eq_ignore_ascii_case(scheme)
+        .then(|| token.trim_start_matches(' '))
+}
+
 /// Returns true when the request carries any credential header, whether or not it parses.
 ///
-/// Used to tell "no credential" apart from "malformed credential": both
-/// [`SignedEnvelope::from_authorization`] and [`SignedEnvelope::from_headers`] return `None`
-/// in either case.
+/// Used to distinguish absent credentials from ones the parsers could not decode.
 fn has_credential_headers(headers: &http::HeaderMap) -> bool {
     headers.contains_key(AUTHORIZATION)
         || headers.contains_key(&HEADER_IC_AUTH_PUBKEY)
@@ -210,23 +170,26 @@ pub async fn get_information(
     State(app): State<AppState>,
     headers: http::HeaderMap,
 ) -> impl IntoResponse {
-    let caller = match app.verify_user(&headers, unix_timestamp().as_millis() as u64, None, None) {
-        Ok(caller) => caller,
-        Err(err) => return (StatusCode::UNAUTHORIZED, err).into_response(),
-    };
-
-    let info = AppInformation {
-        engines: app.engines.values().map(|e| e.info().clone()).collect(),
-        default_engine: app.default_engine,
-        start_time_ms: app.start_time_ms,
-        caller,
-        extra_info: app.extra_info.as_ref().clone(),
-    };
-
-    match Content::from(&headers) {
-        Content::CBOR(_, _) => Content::CBOR(info, None).into_response(),
-        _ => Content::JSON(info, None).into_response(),
-    }
+    let mut response =
+        match app.verify_user(&headers, unix_timestamp().as_millis() as u64, None, None) {
+            Ok(caller) => discovery_response(
+                &headers,
+                AppInformationRef {
+                    engines: app.engines.values().map(|e| e.info()).collect(),
+                    default_engine: app.default_engine,
+                    start_time_ms: app.start_time_ms,
+                    caller,
+                    extra_info: &app.extra_info,
+                },
+            ),
+            Err(err) => (StatusCode::UNAUTHORIZED, err).into_response(),
+        };
+    // The caller also varies with custom ic-auth-* headers, which HTTP caches
+    // do not automatically treat like Authorization.
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, http::HeaderValue::from_static("no-store"));
+    response
 }
 
 /// GET /.well-known/agents/{id}
@@ -248,13 +211,7 @@ pub async fn get_engine_information(
     };
 
     match app.engines.get(&id) {
-        Some(engine) => {
-            let info = engine.information();
-            match Content::from(&headers) {
-                Content::CBOR(_, _) => Content::CBOR(info, None).into_response(),
-                _ => Content::JSON(info, None).into_response(),
-            }
-        }
+        Some(engine) => discovery_response(&headers, engine.information()),
         None => (
             StatusCode::NOT_FOUND,
             format!("engine {} not found", id.to_text()),
@@ -275,7 +232,7 @@ pub async fn anda_engine(
         Err(err) => return (StatusCode::BAD_REQUEST, err).into_response(),
     };
 
-    let (codec, req, hash) = match &ct {
+    let (codec, req, hash) = match ct {
         ContentWithSHA3::CBOR(req, hash) => (Codec::Cbor, req, hash),
         ContentWithSHA3::JSON(req, hash) => (Codec::Json, req, hash),
     };
@@ -291,10 +248,7 @@ pub async fn anda_engine(
     };
 
     let res = engine_run(codec, req, &app, caller, id).await;
-    match codec {
-        Codec::Cbor => Content::CBOR(res, None).into_response(),
-        Codec::Json => Content::JSON(res, None).into_response(),
-    }
+    codec.respond(res)
 }
 
 /// Resolves an engine path segment: either the literal `default` or an engine
@@ -314,15 +268,99 @@ enum Codec {
     Json,
 }
 
+fn discovery_response(headers: &http::HeaderMap, value: impl Serialize) -> Response {
+    let mut response = match Codec::from_accept(headers) {
+        Some(codec) => codec.respond(value),
+        None => (
+            StatusCode::NOT_ACCEPTABLE,
+            "supported response types: application/json, application/cbor",
+        )
+            .into_response(),
+    };
+    // Append so outer compression middleware can retain both selection fields.
+    response
+        .headers_mut()
+        .append(VARY, http::HeaderValue::from_static("Accept"));
+    response
+}
+
+/// Parses HTTP quality values as thousandths, without floating-point rounding.
+fn parse_quality(value: &str) -> Option<u16> {
+    let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
+    if fraction.len() > 3 || !fraction.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    match whole {
+        "0" => Some(
+            fraction
+                .bytes()
+                .fold(0, |n, b| n * 10 + u16::from(b - b'0'))
+                * 10u16.pow(3 - fraction.len() as u32),
+        ),
+        "1" if fraction.bytes().all(|b| b == b'0') => Some(1000),
+        _ => None,
+    }
+}
+
 impl Codec {
-    fn decode_params<T: DeserializeOwned>(self, params: &[u8]) -> Result<T, String> {
+    fn from_accept(headers: &http::HeaderMap) -> Option<Self> {
+        if !headers.contains_key(ACCEPT) {
+            return Some(Self::Json);
+        }
+
+        // A specific range overrides a wildcard, including a specific q=0.
+        // The server emits unparameterized JSON/CBOR, so other media parameters
+        // do not match these representations.
+        let mut scores: [Option<(u8, u16)>; 2] = [None, None];
+        for value in headers.get_all(ACCEPT) {
+            for range in value.to_str().ok()?.split(',') {
+                let Ok(range) = range.trim().parse::<mime::Mime>() else {
+                    continue;
+                };
+                if range.params().any(|(name, _)| name != "q") {
+                    continue;
+                }
+                let quality = match range.get_param("q") {
+                    Some(q) => match parse_quality(q.as_str()) {
+                        Some(q) => q,
+                        None => continue,
+                    },
+                    None => 1000,
+                };
+                for (index, subtype) in ["json", "cbor"].iter().enumerate() {
+                    let specificity = match (range.type_().as_str(), range.subtype().as_str()) {
+                        ("*", "*") => 0,
+                        ("application", "*") => 1,
+                        ("application", actual) if actual == *subtype => 2,
+                        _ => continue,
+                    };
+                    scores[index] = scores[index].max(Some((specificity, quality)));
+                }
+            }
+        }
+        let [json, cbor] = scores.map(|score| score.map_or(0, |(_, q)| q));
+        match (json, cbor) {
+            (0, 0) => None,
+            _ if cbor > json => Some(Self::Cbor),
+            _ => Some(Self::Json),
+        }
+    }
+
+    fn respond(self, value: impl Serialize) -> Response {
+        match self {
+            Self::Cbor => Content::CBOR(value, None).into_response(),
+            Self::Json => Content::JSON(value, None).into_response(),
+        }
+    }
+
+    // Consuming the encoded buffer releases it before agent/tool execution awaits.
+    fn decode_params<T: DeserializeOwned>(self, params: ByteBufB64) -> Result<T, String> {
         // Use `Display` (not `Debug`) so decode errors report the parser's own
         // message without echoing raw request bytes back to the caller.
         match self {
-            Codec::Cbor => {
-                from_slice(params).map_err(|err| format!("failed to decode params: {err}"))
-            }
-            Codec::Json => serde_json::from_slice(params)
+            Codec::Cbor => from_slice(params.as_slice())
+                .map_err(|err| format!("failed to decode params: {err}")),
+            Codec::Json => serde_json::from_slice(params.as_slice())
                 .map_err(|err| format!("failed to decode params: {err}")),
         }
     }
@@ -360,7 +398,7 @@ fn log_rpc(
 
 async fn engine_run(
     codec: Codec,
-    req: &RPCRequest,
+    req: RPCRequest,
     app: &AppState,
     caller: Principal,
     id: Principal,
@@ -371,16 +409,17 @@ async fn engine_run(
         .ok_or_else(|| format!("engine {} not found", id.to_text()))?;
 
     let start = std::time::Instant::now();
-    match req.method.as_str() {
+    let RPCRequest { method, params } = req;
+    match method.as_str() {
         "agent_run" => {
-            let args: (AgentInput,) = codec.decode_params(req.params.as_slice())?;
+            let args: (AgentInput,) = codec.decode_params(params)?;
             let name = args.0.name.clone();
             let res = engine
                 .agent_run(caller, args.0)
                 .await
                 .map_err(|err| format!("failed to run agent: {err:?}"));
             log_rpc(
-                req.method.as_str(),
+                method.as_str(),
                 &id,
                 &caller,
                 start,
@@ -391,14 +430,14 @@ async fn engine_run(
             codec.encode_result(&res?)
         }
         "tool_call" => {
-            let args: (ToolInput<Json>,) = codec.decode_params(req.params.as_slice())?;
+            let args: (ToolInput<Json>,) = codec.decode_params(params)?;
             let name = args.0.name.clone();
             let res = engine
                 .tool_call(caller, args.0)
                 .await
                 .map_err(|err| format!("failed to call tool: {err:?}"));
             log_rpc(
-                req.method.as_str(),
+                method.as_str(),
                 &id,
                 &caller,
                 start,

@@ -34,7 +34,7 @@ pub struct ServerBuilder {
     addr: String,
     engines: BTreeMap<Principal, Arc<Engine>>,
     default_engine: Option<Principal>,
-    middlewares: Vec<Arc<dyn HttpMiddleware>>,
+    middlewares: Vec<Box<dyn HttpMiddleware>>,
     ed25519_pubkeys: Vec<VerifyingKey>,
     extra_info: BTreeMap<String, Json>,
 }
@@ -45,9 +45,7 @@ impl Default for ServerBuilder {
     }
 }
 
-/// Builder for creating a new Server.
-///
-/// Example: <https://github.com/ldclabs/anda/tree/main/examples/icp_ledger_agent>
+/// Builder for creating a new server.
 impl ServerBuilder {
     /// Creates a new ServerBuilder with default values.
     pub fn new() -> Self {
@@ -63,13 +61,13 @@ impl ServerBuilder {
         }
     }
 
-    /// Sets the application name advertised in logs and metadata.
+    /// Sets the application name used in [`Self::serve`] startup logs.
     pub fn with_app_name(mut self, app_name: String) -> Self {
         self.app_name = app_name;
         self
     }
 
-    /// Sets the application version advertised in logs and metadata.
+    /// Sets the application version used in [`Self::serve`] startup logs.
     pub fn with_app_version(mut self, app_version: String) -> Self {
         self.app_version = app_version;
         self
@@ -88,6 +86,9 @@ impl ServerBuilder {
     }
 
     /// Registers engines and optionally selects the default engine principal.
+    ///
+    /// Each map key must equal its engine's [`Engine::id`]; [`Self::build_router`]
+    /// rejects mismatches. Without an explicit default, the first map key is used.
     pub fn with_engines(
         mut self,
         engines: BTreeMap<Principal, Arc<Engine>>,
@@ -108,7 +109,9 @@ impl ServerBuilder {
     ///
     /// This is the low-level API. The middleware will be applied to the internal
     /// axum `Router` (typically via `router.layer(...)`). Middlewares are applied
-    /// in the order they are added.
+    /// in the order they are added. Each `router.layer(...)` wraps the previous
+    /// layers, so adding A then B runs requests as B → A → handler and responses
+    /// as handler → A → B.
     ///
     /// More details: <https://docs.rs/axum/latest/axum/middleware/index.html#ordering>
     ///
@@ -116,10 +119,13 @@ impl ServerBuilder {
     /// (i.e. can operate on `(req, next)`), prefer [`Self::with_request_middleware`].
     ///
     /// Example:
-    /// ```ignore
+    /// ```
+    /// use anda_engine_server::{ServerBuilder, middleware::AppRouter};
+    /// use axum::{extract::Request, middleware::Next};
+    ///
     /// let server = ServerBuilder::new()
-    ///   .with_middleware(|router| {
-    ///     router.layer(axum::middleware::from_fn(|req, next| async move {
+    ///   .with_middleware(|router: AppRouter| {
+    ///     router.layer(axum::middleware::from_fn(|req: Request, next: Next| async move {
     ///       // custom auth / param checks here
     ///       next.run(req).await
     ///     }))
@@ -129,7 +135,7 @@ impl ServerBuilder {
     where
         M: HttpMiddleware,
     {
-        self.middlewares.push(Arc::new(middleware));
+        self.middlewares.push(Box::new(middleware));
         self
     }
 
@@ -139,7 +145,8 @@ impl ServerBuilder {
     /// to short-circuit with a response or call `next.run(req)`.
     ///
     /// Example:
-    /// ```ignore
+    /// ```
+    /// use anda_engine_server::ServerBuilder;
     /// use axum::http::StatusCode;
     /// use axum::response::IntoResponse;
     ///
@@ -180,6 +187,15 @@ impl ServerBuilder {
             .unwrap_or_else(|| *self.engines.keys().next().unwrap());
         if !self.engines.contains_key(&default_engine) {
             return Err("default engine not found".into());
+        }
+        for (id, engine) in &self.engines {
+            if *id != engine.id() {
+                return Err(format!(
+                    "registered engine ID {id} does not match engine ID {}",
+                    engine.id()
+                )
+                .into());
+            }
         }
 
         let state = AppState {

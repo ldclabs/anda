@@ -1,5 +1,9 @@
-use anda_core::{AgentInput, AgentOutput, RPCRequest, RPCResponse, http_rpc};
+use anda_core::{
+    AgentInput, AgentOutput, BoxError, FunctionDefinition, Json, RPCRequest, RPCResponse, Resource,
+    Tool, ToolInput, ToolOutput, http_rpc,
+};
 use anda_core::{CONTENT_TYPE_CBOR, CONTENT_TYPE_JSON, HttpFeatures};
+use anda_engine::context::{BaseCtx, Web3SDK};
 use anda_engine::engine::{AgentInfo, EchoEngineInfo, Engine, EngineCard};
 use anda_engine::management::{BaseManagement, Visibility};
 use anda_engine_server::{ServerBuilder, middleware::ApiKeyMiddleware, types::AppInformation};
@@ -12,6 +16,14 @@ use std::{
 };
 
 async fn build_engine() -> Arc<Engine> {
+    build_configured_engine(Visibility::Public, Principal::anonymous(), None).await
+}
+
+async fn build_configured_engine(
+    visibility: Visibility,
+    controller: Principal,
+    web3: Option<Arc<Web3Client>>,
+) -> Arc<Engine> {
     let info = AgentInfo {
         handle: "anda".to_string(),
         name: "Anda".to_string(),
@@ -19,19 +31,127 @@ async fn build_engine() -> Arc<Engine> {
         endpoint: "https://localhost:8443/default".to_string(),
         ..Default::default()
     };
-    let engine = Engine::builder()
+    let mut builder = Engine::builder()
         .with_info(info.clone())
         .with_management(Arc::new(BaseManagement {
-            controller: Principal::anonymous(),
+            controller,
             managers: BTreeSet::new(),
-            visibility: Visibility::Public,
+            visibility,
         }))
-        .register_agent(Arc::new(EchoEngineInfo::new(info)), None)
+        .register_tool(Arc::new(EchoTool("echo_tool")))
         .unwrap()
-        .build("anda".to_string())
+        .register_tool(Arc::new(EchoTool("hidden_tool")))
+        .unwrap()
+        .export_tools(vec!["echo_tool".into()])
+        .register_agent(Arc::new(EchoEngineInfo::new(info)), None)
+        .unwrap();
+    if let Some(web3) = web3 {
+        builder = builder.with_web3_client(Arc::new(Web3SDK::from_web3(web3)));
+    }
+    let engine = builder.build("anda".to_string()).await.unwrap();
+    Arc::new(engine)
+}
+
+struct EchoTool(&'static str);
+
+impl Tool<BaseCtx> for EchoTool {
+    type Args = String;
+    type Output = String;
+
+    fn name(&self) -> String {
+        self.0.into()
+    }
+    fn description(&self) -> String {
+        "Echoes a string".into()
+    }
+    fn definition(&self) -> FunctionDefinition {
+        FunctionDefinition {
+            name: self.name(),
+            description: self.description(),
+            parameters: serde_json::json!({"type": "string"}),
+            strict: None,
+        }
+    }
+    async fn call(
+        &self,
+        _ctx: BaseCtx,
+        args: String,
+        _resources: Vec<Resource>,
+    ) -> Result<ToolOutput<String>, BoxError> {
+        if args == "fail" {
+            return Err("requested failure".into());
+        }
+        Ok(ToolOutput::new(args))
+    }
+}
+
+async fn web3_client(seed: u8) -> Arc<Web3Client> {
+    Arc::new(
+        Web3Client::builder()
+            .with_root_secret([seed; 48])
+            .with_allow_http(true)
+            .with_http_client(http_client())
+            .build()
+            .await
+            .unwrap(),
+    )
+}
+
+fn encode(json: bool, value: &impl serde::Serialize) -> Vec<u8> {
+    if json {
+        serde_json::to_vec(value).unwrap()
+    } else {
+        cbor2::to_canonical_vec(value).unwrap()
+    }
+}
+
+fn decode<T: serde::de::DeserializeOwned>(json: bool, bytes: &[u8]) -> T {
+    if json {
+        serde_json::from_slice(bytes).unwrap()
+    } else {
+        cbor2::from_slice(bytes).unwrap()
+    }
+}
+
+async fn call_rpc(
+    endpoint: &str,
+    json: bool,
+    method: &str,
+    args: &impl serde::Serialize,
+    signer: Option<&Web3Client>,
+) -> RPCResponse {
+    let body = encode(
+        json,
+        &RPCRequest {
+            method: method.into(),
+            params: encode(json, args).into(),
+        },
+    );
+    let mut headers = http::HeaderMap::new();
+    if let Some(signer) = signer {
+        signer
+            .sign_envelope(ic_cose_types::cose::sha3_256(&body))
+            .await
+            .unwrap()
+            .to_authorization(&mut headers)
+            .unwrap();
+    }
+    let content_type = if json {
+        CONTENT_TYPE_JSON
+    } else {
+        CONTENT_TYPE_CBOR
+    };
+    let response = http_client()
+        .post(endpoint)
+        .headers(headers)
+        .header("content-type", content_type)
+        .body(body)
+        .send()
         .await
         .unwrap();
-    Arc::new(engine)
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["content-type"], content_type);
+    decode(json, &response.bytes().await.unwrap())
 }
 
 async fn spawn_server(builder: ServerBuilder) -> String {
@@ -69,6 +189,546 @@ async fn build_router_validates_engines() {
         .build_router()
         .unwrap_err();
     assert!(err.to_string().contains("default engine not found"));
+
+    let engine = build_engine().await;
+    let err = ServerBuilder::new()
+        .with_engines(BTreeMap::from([(other, engine)]), None)
+        .build_router()
+        .unwrap_err();
+    assert!(err.to_string().contains(&other.to_text()));
+    assert!(err.to_string().contains(&id.to_text()));
+    assert!(err.to_string().contains("does not match"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn multiple_engines_resolve_the_selected_default_and_principal_paths() {
+    let first = build_configured_engine(
+        Visibility::Public,
+        Principal::anonymous(),
+        Some(web3_client(11).await),
+    )
+    .await;
+    let second = build_configured_engine(
+        Visibility::Public,
+        Principal::anonymous(),
+        Some(web3_client(12).await),
+    )
+    .await;
+    let default = second.id();
+    let ids = [first.id(), second.id()];
+    let endpoint = spawn_server(ServerBuilder::new().with_engines(
+        BTreeMap::from([(first.id(), first), (second.id(), second)]),
+        Some(default),
+    ))
+    .await;
+    let info: AppInformation = http_client()
+        .get(format!("{endpoint}/"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(info.default_engine, default);
+    assert_eq!(info.engines.len(), 2);
+    for (path, expected) in [
+        ("default".into(), default),
+        (ids[0].to_text(), ids[0]),
+        (ids[1].to_text(), ids[1]),
+    ] {
+        let card: EngineCard = http_rpc(
+            &http_client(),
+            &format!("{endpoint}/{path}"),
+            "information",
+            &(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(card.id, expected);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn discovery_honors_accept_weights_wildcards_and_exclusions() {
+    let (endpoint, _) = spawn_default_server().await;
+    let client = http_client();
+    let cases = [
+        (
+            "application/json, application/cbor;q=0",
+            Some(CONTENT_TYPE_JSON),
+        ),
+        (
+            "application/json;q=0.2, application/cbor;q=0.8",
+            Some(CONTENT_TYPE_CBOR),
+        ),
+        (
+            "application/json;q=0.8, application/cbor;q=0.2",
+            Some(CONTENT_TYPE_JSON),
+        ),
+        ("Application/CBOR;Q=1.000", Some(CONTENT_TYPE_CBOR)),
+        ("*/*", Some(CONTENT_TYPE_JSON)),
+        (
+            "application/*;q=0.8, application/json;q=0",
+            Some(CONTENT_TYPE_CBOR),
+        ),
+        ("application/cbor;q=0, */*;q=1", Some(CONTENT_TYPE_JSON)),
+        ("application/json;q=0, application/cbor;q=0", None),
+        ("text/plain", None),
+        ("application/cbor;q=1.001", None),
+    ];
+    for path in [
+        "/",
+        "/.well-known/information",
+        "/.well-known/agents",
+        "/.well-known/agents/default",
+    ] {
+        for (accept, expected) in cases {
+            let response = client
+                .get(format!("{endpoint}{path}"))
+                .header("accept", accept)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.headers()["vary"], "Accept");
+            if path != "/.well-known/agents/default" {
+                assert_eq!(response.headers()["cache-control"], "no-store");
+            }
+            match expected {
+                Some(content_type) => {
+                    assert_eq!(response.status(), 200, "{path}: {accept}");
+                    assert_eq!(response.headers()["content-type"], content_type, "{accept}");
+                }
+                None => assert_eq!(response.status(), 406, "{path}: {accept}"),
+            }
+        }
+    }
+    let response = client
+        .get(format!("{endpoint}/"))
+        .header("accept", "application/json;q=0.1")
+        .header("accept", "application/cbor;q=0.9")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.headers()["content-type"], CONTENT_TYPE_CBOR);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn discovery_preserves_metadata_and_vary_under_compression() {
+    use anda_engine_server::middleware::CompressionMiddleware;
+    let engine = build_engine().await;
+    let extra = BTreeMap::from([(
+        "nested".into(),
+        serde_json::json!({"items": [1, true, "value"]}),
+    )]);
+    let endpoint = spawn_server(
+        ServerBuilder::new()
+            .with_engines(BTreeMap::from([(engine.id(), engine)]), None)
+            .with_extra_info(extra.clone())
+            .with_middleware(CompressionMiddleware::default()),
+    )
+    .await;
+    let client = http_client();
+    for json in [false, true] {
+        let content_type = if json {
+            CONTENT_TYPE_JSON
+        } else {
+            CONTENT_TYPE_CBOR
+        };
+        let response = client
+            .get(format!("{endpoint}/"))
+            .header("accept", content_type)
+            .header("accept-encoding", "gzip")
+            .send()
+            .await
+            .unwrap();
+        let info: AppInformation = decode(json, &response.bytes().await.unwrap());
+        assert_eq!(info.extra_info, extra);
+    }
+    let response = client
+        .get(format!("{endpoint}/.well-known/agents/default"))
+        .header("accept-encoding", "gzip")
+        .send()
+        .await
+        .unwrap();
+    let vary: Vec<_> = response
+        .headers()
+        .get_all("vary")
+        .iter()
+        .flat_map(|value| value.to_str().unwrap().split(',').map(str::trim))
+        .collect();
+    assert!(
+        vary.iter()
+            .any(|value| value.eq_ignore_ascii_case("accept"))
+    );
+    assert!(
+        vary.iter()
+            .any(|value| value.eq_ignore_ascii_case("accept-encoding"))
+    );
+    let card: EngineCard = response.json().await.unwrap();
+    assert!(
+        card.tools
+            .iter()
+            .any(|tool| tool.definition.name == "echo_tool")
+    );
+    assert!(
+        !card
+            .tools
+            .iter()
+            .any(|tool| tool.definition.name == "hidden_tool")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn tool_rpc_preserves_success_errors_and_visibility_in_both_formats() {
+    let (endpoint, _) = spawn_default_server().await;
+    for json in [false, true] {
+        let input = ToolInput::new("echo_tool".into(), serde_json::json!("hello"));
+        let bytes = call_rpc(
+            &format!("{endpoint}/default"),
+            json,
+            "tool_call",
+            &(input,),
+            None,
+        )
+        .await
+        .unwrap();
+        let output: ToolOutput<Json> = decode(json, &bytes);
+        assert_eq!(output.output, "hello");
+        for (name, args, error) in [
+            ("echo_tool", serde_json::json!("fail"), "requested failure"),
+            ("echo_tool", serde_json::json!(123), "invalid args"),
+            ("missing_tool", Json::Null, "not found"),
+            ("hidden_tool", Json::Null, "not found"),
+        ] {
+            let result = call_rpc(
+                &format!("{endpoint}/default"),
+                json,
+                "tool_call",
+                &(ToolInput::new(name.into(), args),),
+                None,
+            )
+            .await;
+            assert!(result.unwrap_err().contains(error));
+        }
+        let result = call_rpc(
+            &format!("{endpoint}/default"),
+            json,
+            "agent_run",
+            &(AgentInput::new("missing_agent".into(), "hello".into()),),
+            None,
+        )
+        .await;
+        assert!(result.unwrap_err().contains("not found"));
+        // Invalid outer argument shape must remain an RPC error in each codec.
+        for method in ["tool_call", "agent_run"] {
+            let result = call_rpc(&format!("{endpoint}/default"), json, method, &(), None).await;
+            assert!(result.unwrap_err().contains("failed to decode params"));
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn private_engine_rejects_anonymous_and_other_users_but_accepts_controller() {
+    let controller = web3_client(21).await;
+    let user = web3_client(22).await;
+    let engine =
+        build_configured_engine(Visibility::Private, controller.get_principal(), None).await;
+    let endpoint = spawn_server(
+        ServerBuilder::new().with_engines(BTreeMap::from([(engine.id(), engine)]), None),
+    )
+    .await;
+    for json in [false, true] {
+        for (signer, allowed) in [
+            (None, false),
+            (Some(user.as_ref()), false),
+            (Some(controller.as_ref()), true),
+        ] {
+            let result = call_rpc(
+                &format!("{endpoint}/default"),
+                json,
+                "agent_run",
+                &(AgentInput::new("".into(), "hello".into()),),
+                signer,
+            )
+            .await;
+            assert_eq!(result.is_ok(), allowed);
+            let result = call_rpc(
+                &format!("{endpoint}/default"),
+                json,
+                "tool_call",
+                &(ToolInput::new(
+                    "echo_tool".into(),
+                    serde_json::json!("hello"),
+                ),),
+                signer,
+            )
+            .await;
+            assert_eq!(result.is_ok(), allowed);
+        }
+    }
+    let card: EngineCard = http_rpc(
+        &http_client(),
+        &format!("{endpoint}/default"),
+        "information",
+        &(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        card.tools
+            .iter()
+            .all(|tool| tool.definition.name != "hidden_tool")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn signed_rpc_accepts_scheme_variants_and_rejects_tampered_bodies() {
+    let (endpoint, _) = spawn_default_server().await;
+    let signer = web3_client(31).await;
+    for json in [false, true] {
+        let body = encode(
+            json,
+            &RPCRequest {
+                method: "information".into(),
+                params: encode(json, &()).into(),
+            },
+        );
+        let envelope = signer
+            .sign_envelope(ic_cose_types::cose::sha3_256(&body))
+            .await
+            .unwrap();
+        for scheme in ["ICP", "icp", "IcP "] {
+            let content_type = if json {
+                CONTENT_TYPE_JSON
+            } else {
+                CONTENT_TYPE_CBOR
+            };
+            let response = http_client()
+                .post(format!("{endpoint}/default"))
+                .header("content-type", content_type)
+                .header(
+                    "authorization",
+                    format!("{scheme} {}", envelope.to_base64()),
+                )
+                .body(body.clone())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200);
+            let result: RPCResponse = decode(json, &response.bytes().await.unwrap());
+            assert!(result.is_ok());
+        }
+        let tampered = encode(
+            json,
+            &RPCRequest {
+                method: "agent_run".into(),
+                params: encode(json, &(AgentInput::new("".into(), "tampered".into()),)).into(),
+            },
+        );
+        let response = http_client()
+            .post(format!("{endpoint}/default"))
+            .header(
+                "content-type",
+                if json {
+                    CONTENT_TYPE_JSON
+                } else {
+                    CONTENT_TYPE_CBOR
+                },
+            )
+            .header("authorization", format!("ICP {}", envelope.to_base64()))
+            .body(tampered)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 401);
+        assert!(response.text().await.unwrap().contains("digest"));
+    }
+    // Custom authentication headers must also identify the caller without caching it.
+    let mut headers = http::HeaderMap::new();
+    signer
+        .sign_envelope([0; 32])
+        .await
+        .unwrap()
+        .to_headers(&mut headers)
+        .unwrap();
+    let response = http_client()
+        .get(format!("{endpoint}/"))
+        .headers(headers)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    assert_eq!(
+        response.json::<AppInformation>().await.unwrap().caller,
+        signer.get_principal()
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cwt_authentication_checks_signatures_subjects_and_validity() {
+    use ic_cose_types::cose::{
+        cwt::ClaimsSet,
+        ed25519::{Signer, SigningKey},
+        sign1::{EdDSA, cose_sign1},
+    };
+    fn token(key: &SigningKey, claims: &ClaimsSet) -> String {
+        let mut message = cose_sign1(claims.to_vec().unwrap(), EdDSA, None).unwrap();
+        let signature = key.sign(&message.prepare_signature(None, None, None).unwrap());
+        message
+            .set_signature(signature.to_bytes().to_vec())
+            .unwrap();
+        ByteBufB64::from(message.to_vec().unwrap()).to_string()
+    }
+    let key = SigningKey::from_bytes(&[41; 32]);
+    let other = SigningKey::from_bytes(&[42; 32]);
+    let subject = Principal::self_authenticating([43; 32]);
+    let now = ic_auth_verifier::unix_timestamp().as_secs();
+    let valid = ClaimsSet {
+        subject: Some(subject.to_text()),
+        expiration: Some((now + 3600).into()),
+        ..Default::default()
+    };
+    let engine = build_configured_engine(Visibility::Private, subject, None).await;
+    let endpoint = spawn_server(
+        ServerBuilder::new()
+            .with_engines(BTreeMap::from([(engine.id(), engine)]), None)
+            .with_ed25519_pubkeys(vec![key.verifying_key()]),
+    )
+    .await;
+    for scheme in ["Bearer", "bearer", "BEARER", "Bearer "] {
+        let response = http_client()
+            .get(format!("{endpoint}/"))
+            .header("authorization", format!("{scheme} {}", token(&key, &valid)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response.json::<AppInformation>().await.unwrap().caller,
+            subject
+        );
+    }
+    for json in [false, true] {
+        let body = encode(
+            json,
+            &RPCRequest {
+                method: "agent_run".into(),
+                params: encode(json, &(AgentInput::new("".into(), "hello".into()),)).into(),
+            },
+        );
+        let response = http_client()
+            .post(format!("{endpoint}/default"))
+            .header(
+                "content-type",
+                if json {
+                    CONTENT_TYPE_JSON
+                } else {
+                    CONTENT_TYPE_CBOR
+                },
+            )
+            .header("authorization", format!("bearer {}", token(&key, &valid)))
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert!(decode::<RPCResponse>(json, &response.bytes().await.unwrap()).is_ok());
+    }
+    let invalid = [
+        token(&other, &valid),
+        token(
+            &key,
+            &ClaimsSet {
+                expiration: None,
+                ..valid.clone()
+            },
+        ),
+        token(
+            &key,
+            &ClaimsSet {
+                expiration: Some((now - 600).into()),
+                ..valid.clone()
+            },
+        ),
+        token(
+            &key,
+            &ClaimsSet {
+                not_before: Some((now + 600).into()),
+                ..valid.clone()
+            },
+        ),
+        token(
+            &key,
+            &ClaimsSet {
+                subject: None,
+                ..valid.clone()
+            },
+        ),
+        token(
+            &key,
+            &ClaimsSet {
+                subject: Some("not-a-principal".into()),
+                ..valid
+            },
+        ),
+    ];
+    for token in invalid {
+        let response = http_client()
+            .get(format!("{endpoint}/"))
+            .header("authorization", format!("bearer {token}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 401);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn request_body_limit_and_middleware_order_remain_intact() {
+    let engine = build_engine().await;
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut builder =
+        ServerBuilder::new().with_engines(BTreeMap::from([(engine.id(), engine)]), None);
+    for name in ["A", "B"] {
+        let events = events.clone();
+        builder = builder.with_request_middleware(move |req, next| {
+            let events = events.clone();
+            async move {
+                events.lock().unwrap().push((name, "before"));
+                let response = next.run(req).await;
+                events.lock().unwrap().push((name, "after"));
+                response
+            }
+        });
+    }
+    let endpoint = spawn_server(builder).await;
+    assert_eq!(
+        http_client()
+            .get(format!("{endpoint}/"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(
+        *events.lock().unwrap(),
+        [
+            ("B", "before"),
+            ("A", "before"),
+            ("A", "after"),
+            ("B", "after")
+        ]
+    );
+    let response = http_client()
+        .post(format!("{endpoint}/default"))
+        .header("content-type", CONTENT_TYPE_JSON)
+        .body(vec![b' '; 2 * 1024 * 1024 + 1])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 413);
 }
 
 #[tokio::test(flavor = "current_thread")]

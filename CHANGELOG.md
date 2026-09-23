@@ -4,6 +4,18 @@ All notable changes to the Anda project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed — anda_engine_server
+
+- Reject engine registry keys that differ from the engine's principal.
+- Honor discovery `Accept` weights, wildcards, and exclusions; return `406` when
+  no representation matches. Mark caller-bearing responses `no-store` and retain
+  `Vary: Accept` alongside compression's content-encoding variation.
+- Accept case-insensitive Bearer/ICP authentication schemes and multiple spaces
+  before tokens, while preserving signature and CWT validity checks.
+- Release encoded RPC parameters before agent/tool execution and borrow server
+  discovery metadata during serialization. Use owned middleware registration and
+  shared response encoding; clarify authentication and middleware-order contracts.
+
 ### Fixed — anda_engine
 
 - Isolate subagent sessions and model-visible status by caller; keep background

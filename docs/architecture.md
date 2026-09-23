@@ -220,6 +220,7 @@ Host --> Caller : response
 ## Component Notes
 
 - `Engine` is the public runtime boundary. It enforces exported agent/tool lists for non-manager callers and always exports the default agent.
+- `anda_engine_server` validates registry keys against engine identities, authenticates RPC bodies, and releases encoded parameters before awaiting execution. Discovery negotiates JSON/CBOR through `Accept`; caller-bearing responses are not cached. Public engine cards include current exported tool definitions. See the [HTTP and authentication contracts](../anda_engine_server/README.md#http-contract).
 - `EngineBuilder` starts with in-memory storage, no implemented Web3 client, no external model, and built-in discovery/subagent control agents.
 - `AgentCtx` is the main scheduling surface. It exposes local tools, dynamic tool providers, local agents, subagents, registered remote engines, and dynamic remote engines from cache.
 - `CompletionRunner` is iterative. A model turn can return tool calls; the runner executes them and feeds tool outputs into the next model turn. Long-running runners can compact oversized history into a continuation handoff and resume from that summary. A summary is committed only after validation, so failure leaves the original runner available for retry. Streams deliver queued input before committing normal completion.
