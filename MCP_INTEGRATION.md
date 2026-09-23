@@ -139,6 +139,9 @@ mcp_<server_id>_<remote_tool_name>
 Every segment is lowercased and normalized to `a-z`, `0-9`, and `_`. Names that
 exceed 64 characters or collide after normalization receive a short hash suffix.
 The route keeps both names so calls use the original MCP tool name.
+Bulk refresh fetches server listings concurrently and applies successful
+snapshots in server-id order, so response timing does not decide which server
+keeps an unsuffixed name when local tool names collide at startup.
 
 ## Capability Groups
 

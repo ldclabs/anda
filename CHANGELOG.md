@@ -58,6 +58,9 @@ All notable changes to the Anda project will be documented in this file.
 - Idle subagent sessions prune raw history once per turn instead of on every
   idle tick. Model error bodies are read and reported up to 8 KiB.
 - The memory tool description no longer advertises KIP command log listing.
+- Keep MCP tool names deterministic during concurrent startup discovery by
+  applying fetched server snapshots in server-id order. Unreachable servers
+  retain the existing tolerant-startup and explicit-refresh error behavior.
 
 ### Changed — anda_engine
 

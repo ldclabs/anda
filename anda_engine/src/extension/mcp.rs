@@ -264,6 +264,19 @@ impl McpToolProvider {
         server_id: &str,
         clear_dirty: bool,
     ) -> Result<(), BoxError> {
+        let (routes, meta) = self.fetch_server_snapshot(server_id, clear_dirty).await?;
+        let mut index = self.inner.index.write();
+        index.replace_server_routes(server_id, routes);
+        index.metas.insert(server_id.to_string(), meta);
+        Ok(())
+    }
+
+    /// Fetches a server's routes and metadata without publishing them to the shared index.
+    async fn fetch_server_snapshot(
+        &self,
+        server_id: &str,
+        clear_dirty: bool,
+    ) -> Result<(Vec<McpToolRoute>, McpServerMeta), BoxError> {
         let config = self.server_config(server_id)?;
         let session = self.ensure_session(&config).await?;
         let peer = {
@@ -304,12 +317,7 @@ impl McpToolProvider {
         };
 
         let routes = self.routes_for_tools(&config.id, tools)?;
-        {
-            let mut index = self.inner.index.write();
-            index.replace_server_routes(&config.id, routes);
-            index.metas.insert(config.id.clone(), meta);
-        }
-        Ok(())
+        Ok((routes, meta))
     }
 
     /// Returns one [`ToolGroup`] per configured server that currently exposes
@@ -353,27 +361,31 @@ impl McpToolProvider {
     /// startup). Otherwise the failing servers are reported as an aggregated
     /// error.
     async fn refresh_servers(&self, tolerant: bool) -> Result<(), BoxError> {
-        // Servers are independent (connection setup is serialized per server), so refresh
-        // them concurrently: startup then waits for the slowest server, not the sum of all.
+        // Fetch concurrently, but publish in server-id order: cross-server name collisions
+        // keep the first route, so response timing must not decide the name's owner.
         let server_ids = self.server_ids();
         let results = futures::future::join_all(
             server_ids
                 .iter()
-                .map(|server_id| self.refresh_server(server_id)),
+                .map(|server_id| self.fetch_server_snapshot(server_id, true)),
         )
         .await;
 
         let mut errors = Vec::new();
         for (server_id, result) in server_ids.into_iter().zip(results) {
-            if let Err(err) = result {
-                if tolerant {
+            match result {
+                Ok((routes, meta)) => {
+                    let mut index = self.inner.index.write();
+                    index.replace_server_routes(&server_id, routes);
+                    index.metas.insert(server_id, meta);
+                }
+                Err(err) if tolerant => {
                     log::warn!(
                         "MCP provider {}: failed to refresh server {server_id}: {err}",
                         self.inner.name
                     );
-                } else {
-                    errors.push(format!("{server_id}: {err}"));
                 }
+                Err(err) => errors.push(format!("{server_id}: {err}")),
             }
         }
         if errors.is_empty() {
@@ -1731,6 +1743,89 @@ done
         assert_ne!(github_prod.name, github.name);
         assert_eq!(github_prod.remote_name, "list_issues");
         assert_eq!(github_prod.definition.name, github_prod.name);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn concurrent_refresh_keeps_colliding_routes_stable() {
+        fn server(id: &str, tool: &str, delay: &str) -> McpServerConfig {
+            let script = r#"
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([^,}]*\).*/\1/p')
+  case "$line" in
+    *"server/discover"*)
+      printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"Method not found"}}\n' "$id"
+      ;;
+    *"initialize"*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"%s","version":"1.0.0"}}}\n' "$id" "$0"
+      ;;
+    *"tools/list"*)
+      sleep "$2"
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"%s","inputSchema":{"type":"object","properties":{}}}]}}\n' "$id" "$1"
+      ;;
+    *"tools/call"*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"%s"}],"isError":false}}\n' "$id" "$1"
+      ;;
+  esac
+done
+"#;
+            let mut config = McpServerConfig::stdio(id, "/bin/sh");
+            if let McpTransportConfig::Stdio(stdio) = &mut config.transport {
+                stdio.args = vec![
+                    "-c".into(),
+                    script.into(),
+                    id.into(),
+                    tool.into(),
+                    delay.into(),
+                ];
+            }
+            config
+        }
+
+        let mut expected = None;
+        for (github_delay, prod_delay) in [("0.2", "0"), ("0", "0.2")] {
+            let provider = McpToolProvider::new(vec![
+                server("github", "prod_list_issues", github_delay),
+                server("github_prod", "list_issues", prod_delay),
+                McpServerConfig::stdio("down", "anda_nonexistent_mcp_command_xyz"),
+            ])
+            .unwrap();
+
+            // Startup still publishes healthy servers when another is unavailable.
+            provider.refresh_servers(true).await.unwrap();
+            let routes = provider.routes();
+            assert_eq!(routes.len(), 2);
+            let github = routes.iter().find(|r| r.server_id == "github").unwrap();
+            assert_eq!(github.name, "mcp_github_prod_list_issues");
+            assert_eq!(github.remote_name, "prod_list_issues");
+
+            let names: Vec<_> = routes
+                .iter()
+                .map(|r| (r.name.clone(), r.server_id.clone(), r.remote_name.clone()))
+                .collect();
+            assert_eq!(expected.get_or_insert_with(|| names.clone()), &names);
+            assert_eq!(provider.tool_groups().len(), 2);
+
+            for route in routes {
+                let output = provider
+                    .call_route(route.clone(), ToolInput::new(route.name, json!({})))
+                    .await
+                    .unwrap();
+                assert_eq!(output.output["server_id"], route.server_id);
+                assert_eq!(output.output["tool"], route.remote_name);
+                assert_eq!(output.is_error, Some(false));
+            }
+
+            // Explicit refresh reports failures but keeps successful routes stable.
+            let err = provider.refresh_servers(false).await.unwrap_err();
+            assert!(err.to_string().contains("down"));
+            let refreshed: Vec<_> = provider
+                .routes()
+                .into_iter()
+                .map(|r| (r.name, r.server_id, r.remote_name))
+                .collect();
+            assert_eq!(refreshed, names);
+        }
     }
 
     fn http_auth_code_server(id: &str, client_id: Option<&str>) -> McpServerConfig {
