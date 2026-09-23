@@ -15,6 +15,17 @@ All notable changes to the Anda project will be documented in this file.
 - Release encoded RPC parameters before agent/tool execution and borrow server
   discovery metadata during serialization. Use owned middleware registration and
   shared response encoding; clarify authentication and middleware-order contracts.
+- Report RPC execution and encoding errors with their `Display` text instead of
+  `Debug` output. On Windows, the listener no longer sets `SO_REUSEADDR`, which
+  would let another socket bind the same port.
+
+### Changed — anda_engine_server
+
+- Drop the `ic_tee_agent` dependency and the `ic_auth_verifier` `full` feature
+  (verification needs only `envelope`), removing `ic-agent` and a second
+  `ic_cose` stack from the server build. `handler::anda_engine` now takes the
+  local `RPCRequestBody` extractor instead of `ContentWithSHA3<RPCRequest>`;
+  content-type selection and `415`/`400`/`413` rejections are unchanged.
 
 ### Fixed — anda_engine
 

@@ -45,7 +45,9 @@ additional media parameters do not match. Discovery adds `Vary: Accept`, which
 is retained alongside the compression layer's `Vary: Accept-Encoding`.
 
 RPC uses the request `Content-Type` for both the outer envelope and the encoded
-`params`/success payload. `Accept` does not change the RPC codec. Execution and
+`params`/success payload: `application/cbor`, `application/json`, or a type with
+a `+cbor`/`+json` suffix. Other types return `415`, and an undecodable envelope
+returns `400`. `Accept` does not change the RPC codec. Execution and
 parameter errors are returned inside the existing `RPCResponse::Err` envelope
 with HTTP `200`; invalid credentials return `401`. The default axum request
 body limit is 2 MiB and can be customized with a router middleware.

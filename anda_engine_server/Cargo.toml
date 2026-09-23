@@ -19,13 +19,12 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 http = { workspace = true }
 mime = { workspace = true }
-ic_tee_agent = { workspace = true }
 tokio-util = { workspace = true }
 structured-logger = { workspace = true }
 tokio = { workspace = true }
 log = { workspace = true }
 ic_auth_types = { workspace = true }
-ic_auth_verifier = { workspace = true, features = ["full"] }
+ic_auth_verifier = { workspace = true, features = ["envelope"] }
 ic_cose_types = { workspace = true }
 tower-http = { workspace = true }
 

@@ -582,7 +582,7 @@ async fn cwt_authentication_checks_signatures_subjects_and_validity() {
     let key = SigningKey::from_bytes(&[41; 32]);
     let other = SigningKey::from_bytes(&[42; 32]);
     let subject = Principal::self_authenticating([43; 32]);
-    let now = ic_auth_verifier::unix_timestamp().as_secs();
+    let now = structured_logger::unix_ms() / 1000;
     let valid = ClaimsSet {
         subject: Some(subject.to_text()),
         expiration: Some((now + 3600).into()),
@@ -902,6 +902,55 @@ async fn rpc_handles_json_requests() {
     let res: RPCResponse = serde_json::from_slice(&body).unwrap();
     let card: EngineCard = serde_json::from_slice(&res.unwrap()).unwrap();
     assert_eq!(card.id, id);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn rpc_body_codec_follows_content_type() {
+    let (endpoint, id) = spawn_default_server().await;
+    let client = http_client();
+    let url = format!("{endpoint}/default");
+    let information = RPCRequest {
+        method: "information".to_string(),
+        params: ByteBufB64::from(cbor2::to_canonical_vec(&()).unwrap()),
+    };
+
+    // A structured-syntax suffix selects the codec like the bare media type.
+    let res = client
+        .post(&url)
+        .header(http::header::CONTENT_TYPE, "application/vnd.anda+cbor")
+        .body(cbor2::to_canonical_vec(&information).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(
+        res.headers().get(http::header::CONTENT_TYPE).unwrap(),
+        CONTENT_TYPE_CBOR
+    );
+    let res: RPCResponse = cbor2::from_slice(&res.bytes().await.unwrap()).unwrap();
+    let card: EngineCard = cbor2::from_slice(&res.unwrap()).unwrap();
+    assert_eq!(card.id, id);
+
+    for content_type in [None, Some("text/plain"), Some("application/xml")] {
+        let mut req = client
+            .post(&url)
+            .body(cbor2::to_canonical_vec(&information).unwrap());
+        if let Some(content_type) = content_type {
+            req = req.header(http::header::CONTENT_TYPE, content_type);
+        }
+        assert_eq!(req.send().await.unwrap().status(), 415, "{content_type:?}");
+    }
+
+    for content_type in [CONTENT_TYPE_CBOR, CONTENT_TYPE_JSON] {
+        let res = client
+            .post(&url)
+            .header(http::header::CONTENT_TYPE, content_type)
+            .body(vec![0xff, b'{'])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 400, "{content_type}");
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]

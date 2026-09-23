@@ -178,13 +178,10 @@ impl ServerBuilder {
     /// Useful for embedding the engine server into a larger axum application
     /// or driving it with a custom listener; [`Self::serve`] uses it internally.
     pub fn build_router(self) -> Result<Router, BoxError> {
-        if self.engines.is_empty() {
-            return Err("no engines registered".into());
-        }
-
         let default_engine = self
             .default_engine
-            .unwrap_or_else(|| *self.engines.keys().next().unwrap());
+            .or_else(|| self.engines.keys().next().copied())
+            .ok_or("no engines registered")?;
         if !self.engines.contains_key(&default_engine) {
             return Err("default engine not found".into());
         }
@@ -231,7 +228,10 @@ impl ServerBuilder {
         self,
         signal: impl Future<Output = ()> + Send + 'static,
     ) -> Result<(), BoxError> {
-        let addr: SocketAddr = self.addr.parse()?;
+        let addr: SocketAddr = self
+            .addr
+            .parse()
+            .map_err(|err| format!("invalid server address {:?}: {err}", self.addr))?;
         let app_name = self.app_name.clone();
         let app_version = self.app_version.clone();
         let app = self.build_router()?;
@@ -276,6 +276,10 @@ pub async fn shutdown_signal(cancel_token: CancellationToken) {
 }
 
 /// Creates a TCP listener with `SO_REUSEPORT` on supported Unix targets.
+///
+/// Other Unix targets fall back to `SO_REUSEADDR`. Windows sets neither: there
+/// `SO_REUSEADDR` would let another socket bind the same port and take over
+/// its connections.
 pub async fn create_reuse_port_listener(
     addr: SocketAddr,
 ) -> Result<tokio::net::TcpListener, BoxError> {
@@ -292,12 +296,10 @@ pub async fn create_reuse_port_listener(
     ))]
     socket.set_reuseport(true)?;
 
-    #[cfg(not(all(
+    #[cfg(all(
         unix,
-        not(target_os = "solaris"),
-        not(target_os = "illumos"),
-        not(target_os = "cygwin"),
-    )))]
+        any(target_os = "solaris", target_os = "illumos", target_os = "cygwin",),
+    ))]
     socket.set_reuseaddr(true)?;
 
     socket.bind(addr)?;
