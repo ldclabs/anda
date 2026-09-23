@@ -176,7 +176,9 @@ impl Agent<AgentCtx> for SubAgent {
                 return Err("prompt cannot be empty".into());
             }
 
-            let input_resources = resources.clone();
+            // Keep a copy of the inputs only when a recorder will persist them.
+            let recorder = ctx.base.get_state::<SubAgentConversationRecorder>();
+            let input_resources = recorder.as_ref().map(|_| resources.clone());
             let req = CompletionRequest {
                 instructions: self.instructions.clone(),
                 prompt: args.prompt,
@@ -191,13 +193,13 @@ impl Agent<AgentCtx> for SubAgent {
             // Enforce the subagent's tool whitelist at execution time, not just
             // in the definitions sent to the model.
             let allowed = self.allowed_callables();
-            let mut conversation = match ctx.base.get_state::<SubAgentConversationRecorder>() {
-                Some(recorder) => Some(
+            let mut conversation = match (recorder, input_resources) {
+                (Some(recorder), Some(input_resources)) => Some(
                     recorder
                         .start(&ctx, self, "blocking", None, &req, input_resources)
                         .await?,
                 ),
-                None => None,
+                _ => None,
             };
             let mut runner = ctx.clone().completion_iter(req, Vec::new());
             runner.set_allowed_callables(Some(allowed));
@@ -400,7 +402,9 @@ impl Agent<AgentCtx> for SubAgent {
             PromptCommand::Command { prompt, .. } => prompt,
         };
 
-        let input_resources = resources.clone();
+        // Keep a copy of the inputs only when a recorder will persist them.
+        let recorder = ctx.base.get_state::<SubAgentConversationRecorder>();
+        let input_resources = recorder.as_ref().map(|_| resources.clone());
         let req = CompletionRequest {
             instructions: self.instructions.clone(),
             prompt,
@@ -413,7 +417,7 @@ impl Agent<AgentCtx> for SubAgent {
         };
 
         let mut conversation =
-            if let Some(recorder) = ctx.base.get_state::<SubAgentConversationRecorder>() {
+            if let (Some(recorder), Some(input_resources)) = (recorder, input_resources) {
                 match recorder
                     .start(
                         &ctx,
@@ -513,6 +517,7 @@ impl Agent<AgentCtx> for SubAgent {
                 last_output: None,
                 carried_artifacts: Vec::new(),
                 closing: false,
+                raw_history_pruned: false,
             };
 
             // Publish an initial snapshot so a `/status` poll right after launch reports the

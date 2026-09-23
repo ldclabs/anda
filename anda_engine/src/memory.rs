@@ -49,7 +49,10 @@ use std::{
 
 use crate::{
     context::BaseCtx,
-    extension::{fetch::FetchWebResourcesTool, hooked_call, tool_definition},
+    extension::{
+        fetch::{FetchWebResourcesTool, validate_public_url},
+        hooked_call, tool_definition,
+    },
     rfc3339_datetime, unix_ms,
 };
 
@@ -574,9 +577,9 @@ impl From<Conversation> for Document {
         }
         let message: Vec<PrunedMessage> = conversation
             .messages
-            .iter()
+            .into_iter()
             .filter_map(|v| {
-                serde_json::from_value::<Message>(v.clone())
+                serde_json::from_value::<Message>(v)
                     .ok()
                     .and_then(PrunedMessage::try_from)
             })
@@ -1418,12 +1421,20 @@ impl MemoryManagement {
                 }
             };
 
-            let r2 = Resource {
+            // Build the stored reference field by field so the blob is never cloned only to be
+            // dropped.
+            rs.push(Resource {
                 _id: id,
+                tags: r.tags.clone(),
+                name: r.name.clone(),
+                description: r.description.clone(),
+                uri: r.uri.clone(),
+                mime_type: r.mime_type.clone(),
                 blob: None,
-                ..r.clone()
-            };
-            rs.push(r2)
+                size: r.size,
+                hash: r.hash.clone(),
+                metadata: r.metadata.clone(),
+            })
         }
 
         if count > 0 {
@@ -1741,7 +1752,12 @@ impl Tool<BaseCtx> for GetResourceContentTool {
                     Err(e) => ByteBufB64(e.into_bytes()).to_string(),
                 },
                 None => match res.uri {
-                    Some(uri) => FetchWebResourcesTool::fetch_as_text(ctx, &uri).await?,
+                    // Resource URIs are caller-supplied, so apply the same public-address
+                    // guard as the fetch tool before the engine reaches out on their behalf.
+                    Some(uri) => {
+                        validate_public_url(&uri).await?;
+                        FetchWebResourcesTool::fetch_as_text(ctx, &uri).await?
+                    }
                     None => Err(format!("Invalid resource {}, no blob or uri", args._id))?,
                 },
             };
@@ -2089,7 +2105,7 @@ impl Tool<BaseCtx> for MemoryTool {
     }
 
     fn description(&self) -> String {
-        "A unified API for managing conversations and memory. Supports retrieving resources and conversation details, stopping or steering in-progress conversations, sending follow-up messages, deleting conversations, listing previous conversations with pagination, searching conversation history by keyword, and listing KIP command logs.".to_string()
+        "A unified API for managing conversations and memory. Supports retrieving resources and conversation details, stopping or steering in-progress conversations, sending follow-up messages, deleting conversations, listing previous conversations with pagination, and searching conversation history by keyword.".to_string()
     }
 
     fn group(&self) -> Option<ToolGroupInfo> {
@@ -2119,8 +2135,11 @@ impl Tool<BaseCtx> for MemoryTool {
                         .memory
                         .get_resource_for(ctx.caller(), conversation, _id)
                         .await?;
+                    // Caller-supplied URIs get the fetch tool's public-address guard; a
+                    // rejected URI is treated like any other failed fetch (no blob).
                     if res.blob.is_none()
                         && let Some(uri) = &res.uri
+                        && validate_public_url(uri).await.is_ok()
                     {
                         res.blob = FetchWebResourcesTool::fetch_as_bytes(ctx, uri).await.ok();
                     }
@@ -3077,6 +3096,17 @@ mod tests {
             .add_resource(ResourceRef::from(&empty_resource))
             .await
             .unwrap();
+        // A caller-supplied URI pointing at a cloud metadata endpoint.
+        let internal_resource = Resource {
+            name: "internal".to_string(),
+            tags: vec!["text".to_string()],
+            uri: Some("http://169.254.169.254/latest/meta-data/".to_string()),
+            ..Default::default()
+        };
+        let internal_id = memory
+            .add_resource(ResourceRef::from(&internal_resource))
+            .await
+            .unwrap();
         // A resource nobody's conversation references, used to check the ownership guard.
         let unowned_id = memory
             .add_resource(ResourceRef::from(&resource("unowned", Some(b"secret"))))
@@ -3096,6 +3126,10 @@ mod tests {
             Resource {
                 _id: missing_id,
                 ..empty_resource.clone()
+            },
+            Resource {
+                _id: internal_id,
+                ..internal_resource.clone()
             },
         ];
         stored.status = ConversationStatus::Working;
@@ -3157,6 +3191,20 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("no blob or uri"));
+
+        // A resource URI is fetched only when it targets a public address.
+        let err = get_content
+            .call(
+                ctx.clone(),
+                GetResourceContentArgs {
+                    _id: internal_id,
+                    conversation: conversation_id,
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("non-public address"));
 
         // Resource ids are dense and global, so naming one the conversation does not
         // reference must be refused rather than dumping another caller's blob.

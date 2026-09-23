@@ -52,22 +52,27 @@ impl Client {
     /// # Returns
     /// Configured Gemini client instance
     pub fn new(api_key: &str, endpoint: Option<String>) -> Self {
+        Self::new_with_client(
+            api_key,
+            endpoint,
+            request_client_builder()
+                .build()
+                .expect("Gemini reqwest client should build"),
+        )
+    }
+
+    /// Creates a client that uses the given HTTP client, without building a default one.
+    pub fn new_with_client(api_key: &str, endpoint: Option<String>, http: reqwest::Client) -> Self {
         Self {
             endpoint: super::resolve_endpoint(endpoint, API_BASE_URL),
             api_key: api_key.to_string(),
-            http: request_client_builder()
-                .build()
-                .expect("Gemini reqwest client should build"),
+            http,
         }
     }
 
     /// Sets a custom HTTP client for the client
     pub fn with_client(self, http: reqwest::Client) -> Self {
-        Self {
-            endpoint: self.endpoint,
-            api_key: self.api_key,
-            http,
-        }
+        Self { http, ..self }
     }
 
     /// Creates a POST request builder for the specified API path
@@ -130,6 +135,16 @@ impl CompletionModel {
                 .thinking_config
                 .get_or_insert_with(types::ThinkingConfig::default);
             thinking_config.thinking_level = Some(effort.into());
+        }
+        self
+    }
+
+    /// Uses the model's known output limit as the default `maxOutputTokens`, replacing the
+    /// built-in default. `0` (unknown) keeps the default.
+    pub fn with_max_output(mut self, max_output: usize) -> Self {
+        if max_output > 0 {
+            self.default_request.generation_config.max_output_tokens =
+                Some(i32::try_from(max_output).unwrap_or(i32::MAX));
         }
         self
     }
@@ -365,7 +380,7 @@ impl WireFormat for CompletionModel {
                 "Invalid completion response, model: {}, error: {}, body: {}",
                 model,
                 err,
-                String::from_utf8_lossy(data)
+                super::error_body_excerpt(data)
             )
             .into()),
         }
@@ -422,6 +437,30 @@ mod tests {
         assert_eq!(
             thinking_config.thinking_level,
             Some(types::ThinkingLevel::High)
+        );
+    }
+
+    #[test]
+    fn configured_max_output_replaces_the_default_output_budget() {
+        let model = Client::new("test-key", None).completion_model("gemini-2.0-flash");
+        let default_budget = model.default_request.generation_config.max_output_tokens;
+        assert_eq!(default_budget, Some(65535));
+        assert_eq!(
+            model
+                .clone()
+                .with_max_output(0)
+                .default_request
+                .generation_config
+                .max_output_tokens,
+            default_budget
+        );
+        assert_eq!(
+            model
+                .with_max_output(8192)
+                .default_request
+                .generation_config
+                .max_output_tokens,
+            Some(8192)
         );
     }
 

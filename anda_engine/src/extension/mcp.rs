@@ -353,9 +353,19 @@ impl McpToolProvider {
     /// startup). Otherwise the failing servers are reported as an aggregated
     /// error.
     async fn refresh_servers(&self, tolerant: bool) -> Result<(), BoxError> {
+        // Servers are independent (connection setup is serialized per server), so refresh
+        // them concurrently: startup then waits for the slowest server, not the sum of all.
+        let server_ids = self.server_ids();
+        let results = futures::future::join_all(
+            server_ids
+                .iter()
+                .map(|server_id| self.refresh_server(server_id)),
+        )
+        .await;
+
         let mut errors = Vec::new();
-        for server_id in self.server_ids() {
-            if let Err(err) = self.refresh_server(&server_id).await {
+        for (server_id, result) in server_ids.into_iter().zip(results) {
+            if let Err(err) = result {
                 if tolerant {
                     log::warn!(
                         "MCP provider {}: failed to refresh server {server_id}: {err}",

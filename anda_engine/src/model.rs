@@ -118,6 +118,38 @@ const COMPLETION_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 /// in practice.
 const MAX_COMPLETION_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 
+/// Upper bound on the response-body excerpt embedded in a completion error.
+///
+/// Error messages end up in logs and in `failed_reason`, so a gateway's HTML
+/// error page or a malformed multi-megabyte body is cut to a diagnostic prefix.
+const MAX_ERROR_BODY_BYTES: usize = 8 * 1024;
+
+/// Returns a lossy UTF-8 excerpt of `data` bounded by [`MAX_ERROR_BODY_BYTES`],
+/// for embedding a provider response body in an error message.
+pub(crate) fn error_body_excerpt(data: &[u8]) -> String {
+    if data.len() <= MAX_ERROR_BODY_BYTES {
+        return String::from_utf8_lossy(data).into_owned();
+    }
+
+    let mut text = String::from_utf8_lossy(&data[..MAX_ERROR_BODY_BYTES]).into_owned();
+    text.push_str("… [truncated]");
+    text
+}
+
+/// Reads a non-success response body for diagnostics, stopping once
+/// [`MAX_ERROR_BODY_BYTES`] is exceeded instead of buffering the whole body.
+async fn read_error_body(response: reqwest::Response) -> Result<String, reqwest::Error> {
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        body.extend_from_slice(&chunk?);
+        if body.len() > MAX_ERROR_BODY_BYTES {
+            break;
+        }
+    }
+    Ok(error_body_excerpt(&body))
+}
+
 /// Serializable configuration for constructing a model adapter.
 ///
 /// [`Debug`] is implemented manually so the `api_key` is redacted and never
@@ -149,6 +181,10 @@ pub struct ModelConfig {
 
     #[serde(default)]
     /// Provider maximum output tokens; `0` means unknown.
+    ///
+    /// When known, it caps each request's explicit output budget (see
+    /// [`Model::completion`]) and replaces the default budget of adapters that
+    /// always send one (Anthropic `max_tokens`, Gemini `maxOutputTokens`).
     pub max_output: usize,
 
     /// Optional reasoning/thinking effort for providers and models that support it.
@@ -218,27 +254,38 @@ impl ModelConfig {
 
         let mut model = match self.family.as_str() {
             "gemini" => Model::with_completer(Arc::new(
-                gemini::Client::new(&self.api_key, Some(self.api_base.clone()))
-                    .with_client(http_client)
-                    .completion_model(&self.model)
-                    .with_stream(self.stream)
-                    .with_effort(self.effort),
+                gemini::Client::new_with_client(
+                    &self.api_key,
+                    Some(self.api_base.clone()),
+                    http_client,
+                )
+                .completion_model(&self.model)
+                .with_stream(self.stream)
+                .with_effort(self.effort)
+                .with_max_output(self.max_output),
             )),
             "anthropic" => {
-                let mut cli = anthropic::Client::new(&self.api_key, Some(self.api_base.clone()))
-                    .with_client(http_client);
+                let mut cli = anthropic::Client::new_with_client(
+                    &self.api_key,
+                    Some(self.api_base.clone()),
+                    http_client,
+                );
                 if self.bearer_auth {
                     cli = cli.with_bearer_auth(true);
                 }
                 Model::with_completer(Arc::new(
                     cli.completion_model(&self.model)
                         .with_stream(self.stream)
-                        .with_effort(self.effort),
+                        .with_effort(self.effort)
+                        .with_max_output(self.max_output),
                 ))
             }
             "openai-response" => {
-                let cli = openai::Client::new(&self.api_key, Some(self.api_base.clone()))
-                    .with_client(http_client);
+                let cli = openai::Client::new_with_client(
+                    &self.api_key,
+                    Some(self.api_base.clone()),
+                    http_client,
+                );
                 Model::with_completer(Arc::new(
                     cli.completion_model_v2(&self.model)
                         .with_stream(self.stream)
@@ -246,8 +293,11 @@ impl ModelConfig {
                 ))
             }
             "openai" => {
-                let cli = openai::Client::new(&self.api_key, Some(self.api_base.clone()))
-                    .with_client(http_client);
+                let cli = openai::Client::new_with_client(
+                    &self.api_key,
+                    Some(self.api_base.clone()),
+                    http_client,
+                );
                 if self.model.starts_with("gpt") {
                     Model::with_completer(Arc::new(
                         cli.completion_model_v2(&self.model)
@@ -546,7 +596,8 @@ pub struct Model {
     /// Context window in input tokens; `0` means unknown.
     pub context_window: usize,
 
-    /// Maximum output tokens; `0` means unknown.
+    /// Maximum output tokens; `0` means unknown. A known value caps each
+    /// request's explicit `max_output_tokens`.
     pub max_output: usize,
 }
 
@@ -588,7 +639,17 @@ impl Model {
     }
 
     /// Executes a completion request with the underlying provider.
-    pub async fn completion(&self, req: CompletionRequest) -> Result<AgentOutput, BoxError> {
+    ///
+    /// A known [`Model::max_output`] caps an explicit `max_output_tokens`, so a request never
+    /// asks the provider for more than the configured model accepts. An unset budget stays
+    /// unset: defaulting it is the provider adapter's decision (see
+    /// [`ModelConfig::model`]), since some APIs reject an output limit they do not need.
+    pub async fn completion(&self, mut req: CompletionRequest) -> Result<AgentOutput, BoxError> {
+        if self.max_output > 0
+            && let Some(tokens) = req.max_output_tokens.as_mut()
+        {
+            *tokens = (*tokens).min(self.max_output);
+        }
         self.completer.completion(req).await
     }
 
@@ -913,7 +974,7 @@ where
 
         let retryable = is_retryable_status(status);
         let retry_after = retry_after_duration(response.headers());
-        let body = match response.text().await {
+        let body = match read_error_body(response).await {
             Ok(body) => body,
             Err(err) => {
                 let retryable = retryable || is_retryable_reqwest_error(&err);
@@ -1665,6 +1726,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn model_max_output_caps_explicit_request_output_budget() {
+        let completer = testing::ScriptedCompleter::new("capped").into_arc();
+        let mut model = Model::with_completer(completer.clone());
+
+        // Unknown model limit: the request budget passes through untouched.
+        model
+            .completion(CompletionRequest::default())
+            .await
+            .unwrap();
+
+        model.max_output = 32_000;
+        model
+            .completion(CompletionRequest::default())
+            .await
+            .unwrap();
+        for requested in [8_000, 64_000] {
+            model
+                .completion(CompletionRequest {
+                    max_output_tokens: Some(requested),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+
+        let sent = completer
+            .requests()
+            .into_iter()
+            .map(|req| req.max_output_tokens)
+            .collect::<Vec<_>>();
+        // An unset budget is left to the adapter; explicit budgets are capped.
+        assert_eq!(sent, vec![None, None, Some(8_000), Some(32_000)]);
+    }
+
+    #[tokio::test]
     async fn model_completion_placeholders_and_mock_tool_calls_are_stable() {
         let not_implemented = Model::not_implemented();
         assert_eq!(not_implemented.model_name(), "not_implemented");
@@ -1964,6 +2060,34 @@ mod tests {
             format_error_chain(&outer),
             "request failed: operation timed out"
         );
+    }
+
+    #[tokio::test]
+    async fn completion_error_bodies_are_truncated_for_diagnostics() {
+        assert_eq!(error_body_excerpt(b"short body"), "short body");
+        let excerpt = error_body_excerpt(&vec![b'x'; MAX_ERROR_BODY_BYTES * 4]);
+        assert!(excerpt.ends_with("… [truncated]"));
+        assert!(excerpt.len() < MAX_ERROR_BODY_BYTES + 32);
+
+        let (endpoint, _) =
+            test_support::spawn_retry_mock_server(vec![test_support::MockResponse {
+                status: StatusCode::BAD_REQUEST,
+                headers: HeaderMap::new(),
+                body: vec![b'e'; 1024 * 1024],
+            }])
+            .await;
+        let client = http_client();
+        let err = execute_completion_request_with_retry(
+            "error-body-test",
+            || client.post(&endpoint),
+            |response| async { read_completion_response_bytes(response, "error-body-test").await },
+        )
+        .await
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("status: 400"));
+        assert!(message.ends_with("… [truncated]"));
+        assert!(message.len() < MAX_ERROR_BODY_BYTES + 256);
     }
 
     #[test]

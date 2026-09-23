@@ -213,6 +213,10 @@ impl CompletionRunner {
     }
 
     /// Returns the most recent non-final output, when one is available.
+    ///
+    /// The stored copy omits the cumulative `chat_history` (read it from [`Self::chat_history`]
+    /// instead): the history grows every turn, and every path that surfaces this output rebuilds
+    /// it from runner state, so keeping a second full copy per step would only cost memory.
     pub fn last_output(&self) -> Option<&AgentOutput> {
         self.last_output.as_ref()
     }
@@ -415,13 +419,14 @@ impl CompletionRunner {
         self.follow_up_message.clear();
         self.implicit_context = None;
 
-        output.chat_history = self.chat_history.clone();
         output.tool_calls = self.tool_calls.clone();
         output.artifacts = self.artifacts.clone();
         output.usage = self.total_usage.clone();
         output.tools_usage = self.tools_usage.clone();
 
+        output.chat_history.clear();
         self.last_output = Some(output.clone());
+        output.chat_history = self.chat_history.clone();
         output
     }
 
@@ -717,8 +722,9 @@ impl CompletionRunner {
         }
 
         self.sync_model_for_next_turn();
-        let handoff_req = self.req.clone();
-        let mut summary_req = handoff_req.clone();
+        // Clone once for the speculative summary turn; on failure `self.req` stays intact so the
+        // runner can continue, and on success it is moved into the replacement runner.
+        let mut summary_req = self.req.clone();
         let mut pending_content = std::mem::take(&mut summary_req.content);
         if !summary_req.prompt.is_empty() {
             pending_content.insert(0, std::mem::take(&mut summary_req.prompt).into());
@@ -771,7 +777,7 @@ impl CompletionRunner {
             ..Default::default()
         };
 
-        let mut req = handoff_req;
+        let mut req = std::mem::take(&mut self.req);
         req.role = None;
         req.prompt.clear();
         req.content.clear();
@@ -786,10 +792,11 @@ impl CompletionRunner {
             .completion_iter(req, std::mem::take(&mut self.resources))
             .reserve_chat_history(vec![compaction_msg]);
         runner.set_unbound(unbound);
-        runner.discovered = self.discovered.clone();
+        // `self` is finalized above, so its remaining state moves into the replacement runner.
+        runner.discovered = std::mem::take(&mut self.discovered);
         runner.follow_up_message = std::mem::take(&mut self.follow_up_message);
         runner.steering_message = std::mem::take(&mut self.steering_message);
-        runner.allowed_callables = self.allowed_callables.clone();
+        runner.allowed_callables = self.allowed_callables.take();
         Ok((runner, output))
     }
 
@@ -1171,8 +1178,11 @@ impl CompletionRunner {
     fn intermediate_output(&mut self, mut output: AgentOutput) -> AgentOutput {
         output.usage = self.total_usage.clone();
         output.tools_usage = self.tools_usage.clone();
-        output.chat_history = self.chat_history.clone();
+        // The turn's own history was already moved into `self.chat_history`, so this clone is
+        // cheap; the cumulative history is attached only to the returned output.
+        output.chat_history.clear();
         self.last_output = Some(output.clone());
+        output.chat_history = self.chat_history.clone();
         output
     }
 

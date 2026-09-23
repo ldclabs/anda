@@ -125,89 +125,127 @@ impl RemoteEngines {
         name.strip_prefix(handle)?.strip_prefix('_')
     }
 
-    /// Clones `function`'s definition with the engine `prefix` applied, when it
-    /// passes the optional `names` filter.
-    fn filter_definition(
-        function: &Function,
-        names: Option<&[String]>,
-        prefix: &str,
-        routing_prefix: &str,
-    ) -> Option<FunctionDefinition> {
-        let local_name = format!("{prefix}{}", function.definition.name);
-        let routed_name = format!("{routing_prefix}{local_name}");
-        names
-            .is_none_or(|names| {
-                names.iter().any(|name| {
-                    name.eq_ignore_ascii_case(&function.definition.name)
-                        || name.eq_ignore_ascii_case(&local_name)
-                        || name.eq_ignore_ascii_case(&routed_name)
-                })
+    fn tools_of(engine: &EngineCard) -> &[Function] {
+        &engine.tools
+    }
+
+    fn agents_of(engine: &EngineCard) -> &[Function] {
+        &engine.agents
+    }
+
+    /// Resolves a handle-prefixed name to the engine and function it routes to.
+    ///
+    /// The longest matching handle wins and the remainder must equal an exported function name
+    /// exactly, so routing, resource selection, and endpoint lookup agree even when handle
+    /// prefixes overlap.
+    fn resolve<'a>(
+        &'a self,
+        name: &str,
+        functions: fn(&EngineCard) -> &[Function],
+    ) -> Option<(&'a EngineCard, &'a Function)> {
+        self.engines
+            .iter()
+            .filter_map(|(handle, engine)| {
+                let local_name = Self::strip_handle_prefix(name, handle)?;
+                let function = functions(engine)
+                    .iter()
+                    .find(|function| function.definition.name == local_name)?;
+                Some((handle.len(), engine, function))
             })
-            .then(|| function.definition.clone().name_with_prefix(prefix))
+            .max_by_key(|(handle_len, _, _)| *handle_len)
+            .map(|(_, engine, function)| (engine, function))
+    }
+
+    /// Returns the `(engine id, endpoint, remote name)` route for a handle-prefixed name.
+    fn route(
+        &self,
+        name: &str,
+        functions: fn(&EngineCard) -> &[Function],
+    ) -> Option<(Principal, String, String)> {
+        self.resolve(name, functions).map(|(engine, function)| {
+            (
+                engine.id,
+                engine.info.endpoint.clone(),
+                function.definition.name.clone(),
+            )
+        })
+    }
+
+    /// Removes and returns resources matching the resolved function's supported tags.
+    fn select_function_resources(
+        &self,
+        name: &str,
+        resources: &mut Vec<Resource>,
+        functions: fn(&EngineCard) -> &[Function],
+    ) -> Vec<Resource> {
+        match self.resolve(name, functions) {
+            Some((_, function)) => select_resources(resources, &function.supported_resource_tags),
+            None => Vec::new(),
+        }
+    }
+
+    /// Collects handle-prefixed definitions, optionally limited to one endpoint and to `names`.
+    ///
+    /// A requested name may be the remote name, the handle-prefixed local name, or the fully
+    /// routed name (with `routing_prefix`).
+    fn definitions(
+        &self,
+        endpoint: Option<&str>,
+        names: Option<&[String]>,
+        functions: fn(&EngineCard) -> &[Function],
+        routing_prefix: &str,
+    ) -> Vec<FunctionDefinition> {
+        let mut definitions = Vec::new();
+        for (handle, engine) in self.engines.iter() {
+            if endpoint.is_some_and(|endpoint| endpoint != engine.info.endpoint) {
+                continue;
+            }
+            let prefix = format!("{handle}_");
+            definitions.extend(
+                functions(engine)
+                    .iter()
+                    .filter(|function| {
+                        names.is_none_or(|names| {
+                            let remote_name = &function.definition.name;
+                            let local_name = format!("{prefix}{remote_name}");
+                            let routed_name = format!("{routing_prefix}{local_name}");
+                            names.iter().any(|name| {
+                                name.eq_ignore_ascii_case(remote_name)
+                                    || name.eq_ignore_ascii_case(&local_name)
+                                    || name.eq_ignore_ascii_case(&routed_name)
+                            })
+                        })
+                    })
+                    .map(|function| function.definition.clone().name_with_prefix(&prefix)),
+            );
+        }
+        definitions
     }
 
     /// Retrieves a remote tool endpoint and name from a prefixed name.
     pub fn get_tool_endpoint(&self, name: &str) -> Option<(Principal, String, String)> {
-        self.engines
-            .iter()
-            .filter_map(|(handle, engine)| {
-                let tool_name = Self::strip_handle_prefix(name, handle)?;
-                engine
-                    .tools
-                    .iter()
-                    .any(|tool| tool.definition.name == tool_name)
-                    .then_some((handle.len(), engine, tool_name))
-            })
-            .max_by_key(|(handle_len, _, _)| *handle_len)
-            .map(|(_, engine, tool_name)| {
-                (
-                    engine.id,
-                    engine.info.endpoint.clone(),
-                    tool_name.to_string(),
-                )
-            })
+        self.route(name, Self::tools_of)
     }
 
     /// Retrieves a remote agent endpoint and name from a prefixed name.
     pub fn get_agent_endpoint(&self, name: &str) -> Option<(Principal, String, String)> {
-        self.engines
-            .iter()
-            .filter_map(|(handle, engine)| {
-                let agent_name = Self::strip_handle_prefix(name, handle)?;
-                engine
-                    .agents
-                    .iter()
-                    .any(|agent| agent.definition.name == agent_name)
-                    .then_some((handle.len(), engine, agent_name))
-            })
-            .max_by_key(|(handle_len, _, _)| *handle_len)
-            .map(|(_, engine, agent_name)| {
-                (
-                    engine.id,
-                    engine.info.endpoint.clone(),
-                    agent_name.to_string(),
-                )
-            })
+        self.route(name, Self::agents_of)
     }
 
     /// Retrieves a remote engine ID by endpoint.
     pub fn get_id_by_endpoint(&self, endpoint: &str) -> Option<Principal> {
-        for engine in self.engines.values() {
-            if engine.info.endpoint == endpoint {
-                return Some(engine.id);
-            }
-        }
-        None
+        self.engines
+            .values()
+            .find(|engine| engine.info.endpoint == endpoint)
+            .map(|engine| engine.id)
     }
 
     /// Retrieves a remote engine endpoint by ID.
     pub fn get_endpoint_by_id(&self, id: &Principal) -> Option<String> {
-        for engine in self.engines.values() {
-            if &engine.id == id {
-                return Some(engine.info.endpoint.clone());
-            }
-        }
-        None
+        self.engines
+            .values()
+            .find(|engine| &engine.id == id)
+            .map(|engine| engine.info.endpoint.clone())
     }
 
     /// Retrieves definitions for available tools in the remote engines.
@@ -223,18 +261,7 @@ impl RemoteEngines {
         endpoint: Option<&str>,
         names: Option<&[String]>,
     ) -> Vec<FunctionDefinition> {
-        let mut definitions = Vec::new();
-        for (handle, engine) in self.engines.iter() {
-            if endpoint.is_some_and(|endpoint| endpoint != engine.info.endpoint) {
-                continue;
-            }
-            let prefix = format!("{handle}_");
-            definitions.extend(engine.tools.iter().filter_map(|d| {
-                Self::filter_definition(d, names, &prefix, super::REMOTE_TOOL_PREFIX)
-            }));
-        }
-
-        definitions
+        self.definitions(endpoint, names, Self::tools_of, super::REMOTE_TOOL_PREFIX)
     }
 
     /// Extracts resources from the provided list based on the tool's supported tags.
@@ -248,24 +275,7 @@ impl RemoteEngines {
         prefixed_name: &str,
         resources: &mut Vec<Resource>,
     ) -> Vec<Resource> {
-        let tags = self
-            .engines
-            .iter()
-            .filter_map(|(handle, engine)| {
-                let tool_name = Self::strip_handle_prefix(prefixed_name, handle)?;
-                let tool = engine
-                    .tools
-                    .iter()
-                    .find(|tool| tool.definition.name == tool_name)?;
-                Some((handle.len(), &tool.supported_resource_tags))
-            })
-            .max_by_key(|(handle_len, _)| *handle_len)
-            .map(|(_, tags)| tags);
-
-        match tags {
-            Some(tags) => select_resources(resources, tags),
-            None => Vec::new(),
-        }
+        self.select_function_resources(prefixed_name, resources, Self::tools_of)
     }
 
     /// Retrieves definitions for available agents in the remote engines.
@@ -281,18 +291,7 @@ impl RemoteEngines {
         endpoint: Option<&str>,
         names: Option<&[String]>,
     ) -> Vec<FunctionDefinition> {
-        let mut definitions = Vec::new();
-        for (handle, engine) in self.engines.iter() {
-            if endpoint.is_some_and(|endpoint| endpoint != engine.info.endpoint) {
-                continue;
-            }
-            let prefix = format!("{handle}_");
-            definitions.extend(engine.agents.iter().filter_map(|d| {
-                Self::filter_definition(d, names, &prefix, super::REMOTE_AGENT_PREFIX)
-            }));
-        }
-
-        definitions
+        self.definitions(endpoint, names, Self::agents_of, super::REMOTE_AGENT_PREFIX)
     }
 
     /// Extracts resources from the provided list based on the agent's supported tags.
@@ -306,24 +305,7 @@ impl RemoteEngines {
         name: &str,
         resources: &mut Vec<Resource>,
     ) -> Vec<Resource> {
-        let tags = self
-            .engines
-            .iter()
-            .filter_map(|(handle, engine)| {
-                let agent_name = Self::strip_handle_prefix(name, handle)?;
-                let agent = engine
-                    .agents
-                    .iter()
-                    .find(|agent| agent.definition.name == agent_name)?;
-                Some((handle.len(), &agent.supported_resource_tags))
-            })
-            .max_by_key(|(handle_len, _)| *handle_len)
-            .map(|(_, tags)| tags);
-
-        match tags {
-            Some(tags) => select_resources(resources, tags),
-            None => Vec::new(),
-        }
+        self.select_function_resources(name, resources, Self::agents_of)
     }
 }
 

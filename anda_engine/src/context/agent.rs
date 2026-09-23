@@ -286,6 +286,43 @@ impl AgentCtx {
         groups.into_values().collect()
     }
 
+    /// Loads the dynamically registered remote engines, if any are configured.
+    async fn dynamic_remote_engines(&self) -> Option<RemoteEngines> {
+        self.root
+            .cache_store_get::<RemoteEngines>(DYNAMIC_REMOTE_ENGINES)
+            .await
+            .ok()
+            .map(|(engines, _)| engines)
+    }
+
+    /// Remote tool definitions from static and dynamic engines, routed with `RT_`.
+    fn remote_tool_definitions_with(
+        &self,
+        dynamic: Option<&RemoteEngines>,
+        endpoint: Option<&str>,
+        names: Option<&[String]>,
+    ) -> Vec<FunctionDefinition> {
+        merge_remote_definitions(
+            self.base.remote.tool_definitions(endpoint, names),
+            dynamic.map(|engines| engines.tool_definitions(endpoint, names)),
+            REMOTE_TOOL_PREFIX,
+        )
+    }
+
+    /// Remote agent definitions from static and dynamic engines, routed with `RA_`.
+    fn remote_agent_definitions_with(
+        &self,
+        dynamic: Option<&RemoteEngines>,
+        endpoint: Option<&str>,
+        names: Option<&[String]>,
+    ) -> Vec<FunctionDefinition> {
+        merge_remote_definitions(
+            self.base.remote.agent_definitions(endpoint, names),
+            dynamic.map(|engines| engines.agent_definitions(endpoint, names)),
+            REMOTE_AGENT_PREFIX,
+        )
+    }
+
     /// Creates a completion runner for iterative processing of completion requests.
     pub fn completion_iter(
         self,
@@ -358,25 +395,8 @@ impl AgentContext for AgentCtx {
             return Ok(Vec::new());
         }
 
-        let mut defs = self.base.remote.tool_definitions(endpoint, names);
-        let mut seen: BTreeSet<String> =
-            BTreeSet::from_iter(defs.iter().map(|d| d.name.to_ascii_lowercase()));
-        if let Ok((engines, _)) = self
-            .root
-            .cache_store_get::<RemoteEngines>(DYNAMIC_REMOTE_ENGINES)
-            .await
-        {
-            for def in engines.tool_definitions(endpoint, names) {
-                if seen.insert(def.name.to_ascii_lowercase()) {
-                    defs.push(def);
-                }
-            }
-        }
-
-        Ok(defs
-            .into_iter()
-            .map(|d| d.name_with_prefix(REMOTE_TOOL_PREFIX))
-            .collect())
+        let dynamic = self.dynamic_remote_engines().await;
+        Ok(self.remote_tool_definitions_with(dynamic.as_ref(), endpoint, names))
     }
 
     /// Extracts resources from the provided list based on the tool's supported tags.
@@ -391,11 +411,7 @@ impl AgentContext for AgentCtx {
                 return res;
             }
 
-            if let Ok((engines, _)) = self
-                .root
-                .cache_store_get::<RemoteEngines>(DYNAMIC_REMOTE_ENGINES)
-                .await
-            {
+            if let Some(engines) = self.dynamic_remote_engines().await {
                 return engines.select_tool_resources(name, resources);
             }
         }
@@ -461,23 +477,8 @@ impl AgentContext for AgentCtx {
             return Ok(Vec::new());
         }
 
-        let mut defs = self.base.remote.agent_definitions(endpoint, names);
-        if let Ok((engines, _)) = self
-            .root
-            .cache_store_get::<RemoteEngines>(DYNAMIC_REMOTE_ENGINES)
-            .await
-        {
-            for def in engines.agent_definitions(endpoint, names) {
-                if !defs.iter().any(|d| d.name == def.name) {
-                    defs.push(def);
-                }
-            }
-        }
-
-        Ok(defs
-            .into_iter()
-            .map(|d| d.name_with_prefix(REMOTE_AGENT_PREFIX))
-            .collect())
+        let dynamic = self.dynamic_remote_engines().await;
+        Ok(self.remote_agent_definitions_with(dynamic.as_ref(), endpoint, names))
     }
 
     /// Extracts resources from the provided list based on the agent's supported tags.
@@ -492,11 +493,7 @@ impl AgentContext for AgentCtx {
                 return res;
             }
 
-            if let Ok((engines, _)) = self
-                .root
-                .cache_store_get::<RemoteEngines>(DYNAMIC_REMOTE_ENGINES)
-                .await
-            {
+            if let Some(engines) = self.dynamic_remote_engines().await {
                 return engines.select_agent_resources(name, resources);
             }
         }
@@ -537,12 +534,16 @@ impl AgentContext for AgentCtx {
 
         extend_unique(self.tool_definitions(names), &mut definitions);
         extend_unique(self.agent_definitions(names), &mut definitions);
-        if let Ok(remote) = self.remote_tool_definitions(None, names).await {
-            extend_unique(remote, &mut definitions);
-        }
-        if let Ok(remote) = self.remote_agent_definitions(None, names).await {
-            extend_unique(remote, &mut definitions);
-        }
+        // Load the dynamic engine registry once for both remote tools and remote agents.
+        let dynamic = self.dynamic_remote_engines().await;
+        extend_unique(
+            self.remote_tool_definitions_with(dynamic.as_ref(), None, names),
+            &mut definitions,
+        );
+        extend_unique(
+            self.remote_agent_definitions_with(dynamic.as_ref(), None, names),
+            &mut definitions,
+        );
 
         definitions
     }
@@ -571,10 +572,7 @@ impl AgentContext for AgentCtx {
             }
 
             // find dynamic remote tool and call it
-            if let Ok((engines, _)) = self
-                .root
-                .cache_store_get::<RemoteEngines>(DYNAMIC_REMOTE_ENGINES)
-                .await
+            if let Some(engines) = self.dynamic_remote_engines().await
                 && let Some((id, endpoint, tool_name)) = engines.get_tool_endpoint(name)
             {
                 input.name = tool_name;
@@ -626,10 +624,7 @@ impl AgentContext for AgentCtx {
                         .map(|output| (output, Some(id)));
                 }
 
-                if let Ok((engines, _)) = ctx
-                    .root
-                    .cache_store_get::<RemoteEngines>(DYNAMIC_REMOTE_ENGINES)
-                    .await
+                if let Some(engines) = ctx.dynamic_remote_engines().await
                     && let Some((id, endpoint, agent_name)) = engines.get_agent_endpoint(name)
                 {
                     input.name = agent_name;
@@ -1037,7 +1032,33 @@ impl HttpFeatures for AgentCtx {
     }
 }
 
-/// A iteration style executor for completion.
+/// Merges static and dynamic remote definitions, keeping the first of any
+/// case-insensitively repeated name, and applies the model-facing routing prefix.
+fn merge_remote_definitions(
+    mut definitions: Vec<FunctionDefinition>,
+    dynamic: Option<Vec<FunctionDefinition>>,
+    routing_prefix: &str,
+) -> Vec<FunctionDefinition> {
+    if let Some(dynamic) = dynamic {
+        let mut seen: BTreeSet<String> = definitions
+            .iter()
+            .map(|definition| definition.name.to_ascii_lowercase())
+            .collect();
+        definitions.extend(
+            dynamic
+                .into_iter()
+                .filter(|definition| seen.insert(definition.name.to_ascii_lowercase())),
+        );
+    }
+
+    definitions
+        .into_iter()
+        .map(|definition| definition.name_with_prefix(routing_prefix))
+        .collect()
+}
+
+/// Merges one source's capability group into `groups`, keeping only members
+/// visible to the model and deduplicating them case-insensitively.
 fn merge_visible_group(
     groups: &mut BTreeMap<String, ToolGroup>,
     mut group: ToolGroup,

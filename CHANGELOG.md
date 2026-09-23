@@ -36,6 +36,17 @@ All notable changes to the Anda project will be documented in this file.
   acknowledgements; preserve discovery and legacy lifecycle fallback.
 - Omit conversation bodies and credential-bearing headers from routine model
   and MCP configuration logs; fix and run the public-engine quick-start example.
+- Apply `ModelConfig::max_output`: explicit request output budgets are capped at
+  it, and the Anthropic and Gemini adapters send it instead of their fixed
+  defaults (64000 / 65535), so models with lower limits are not rejected. Other
+  providers still omit the budget when a request does not set one.
+- Memory resource tools reject URIs that resolve to non-public addresses before
+  fetching, matching the fetch tool's SSRF guard.
+- `Engine::tool_call` checks caller visibility before reporting whether a tool
+  exists, matching `agent_run`.
+- Idle subagent sessions prune raw history once per turn instead of on every
+  idle tick. Model error bodies are read and reported up to 8 KiB.
+- The memory tool description no longer advertises KIP command log listing.
 
 ### Changed — anda_engine
 
@@ -48,6 +59,19 @@ All notable changes to the Anda project will be documented in this file.
 - Search candidates borrow schemas until selected; capability groups obtain
   static names without regenerating schemas. Synchronous glob traversal runs
   outside Tokio workers. Reuse context construction and conversation expiry logic.
+- `CompletionRunner::last_output()` no longer carries `chat_history`; use
+  `chat_history()`. Handoff clones the request once and moves discovery and
+  allowed-callable state into the new runner.
+- Add `Client::new_with_client` for the Anthropic, OpenAI, and Gemini adapters
+  and `CompletionModel::with_max_output` for Anthropic and Gemini; `ModelConfig`
+  no longer builds a throwaway HTTP client.
+- Refresh MCP servers concurrently. Load dynamic remote engines once per
+  definition listing and deduplicate remote tool and agent names
+  case-insensitively; consolidate `RemoteEngines` resolution helpers.
+- Cache parsed `SKILL.md` files by size and modification time so name scans skip
+  unchanged files while keeping directory priority and ambiguity checks.
+- Drop `async_trait` from `Management` and avoid redundant clones of subagent
+  resources, resource metadata, conversation documents, and context state.
 
 ### Fixed — anda_core
 

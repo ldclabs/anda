@@ -1166,6 +1166,83 @@ async fn subagent_session_persists_conversation_and_reports_status_id() {
     );
 }
 
+/// Echo completer that returns provider raw history and counts idle-boundary prunes.
+struct PruneCountingCompleter {
+    prunes: Arc<AtomicU64>,
+}
+
+impl CompletionFeaturesDyn for PruneCountingCompleter {
+    fn model_name(&self) -> String {
+        "prune-counter".to_string()
+    }
+
+    fn completion(&self, req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
+        Box::pin(futures::future::ready(Ok(AgentOutput {
+            content: request_text(&req),
+            raw_history: vec![json!({"role": "assistant", "content": "raw"})],
+            ..Default::default()
+        })))
+    }
+
+    fn prune_tool_interactions(&self, _raw_history: &mut Vec<Json>) {
+        self.prunes.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn subsession_runner_prunes_idle_raw_history_once_per_turn() {
+    let prunes = Arc::new(AtomicU64::new(0));
+    let model = Model::with_completer(Arc::new(PruneCountingCompleter {
+        prunes: prunes.clone(),
+    }));
+    let ctx = EngineBuilder::new().with_model(model).mock_ctx();
+    let (sender, _rx) = tokio::sync::mpsc::channel(4);
+    let session = Arc::new(SubSession::new(
+        "session-1".to_string(),
+        "worker".to_string(),
+        sender,
+        60_000,
+    ));
+    let mut runner = SubSessionRunner {
+        session,
+        agent_hook: None,
+        runner: ctx
+            .clone()
+            .completion_iter(
+                CompletionRequest {
+                    prompt: "first".to_string(),
+                    ..Default::default()
+                },
+                Vec::new(),
+            )
+            .unbound(),
+        conversation: None,
+        last_output: None,
+        carried_artifacts: Vec::new(),
+        closing: false,
+        raw_history_pruned: false,
+    };
+
+    // One model turn, then repeated idle polls: the unchanged history is pruned only once.
+    assert!(runner.run(Vec::new()).await.unwrap());
+    for _ in 0..3 {
+        assert!(runner.run(Vec::new()).await.unwrap());
+    }
+    assert_eq!(prunes.load(Ordering::SeqCst), 1);
+
+    // A new turn makes the next idle boundary prune again.
+    let input = SubAgentInput {
+        command: PromptCommand::Plain {
+            prompt: "second".to_string(),
+        },
+        ..Default::default()
+    };
+    assert!(runner.run(vec![input]).await.unwrap());
+    assert!(runner.run(Vec::new()).await.unwrap());
+    assert!(runner.run(Vec::new()).await.unwrap());
+    assert_eq!(prunes.load(Ordering::SeqCst), 2);
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn subsession_runner_honors_configured_idle_timeout() {
     let model = Model::with_completer(Arc::new(EchoCompleter));
@@ -1201,6 +1278,7 @@ async fn subsession_runner_honors_configured_idle_timeout() {
             last_output: None,
             carried_artifacts: Vec::new(),
             closing: false,
+            raw_history_pruned: false,
         };
         // First step consumes the seed and keeps the session active.
         assert!(runner.run(Vec::new()).await.unwrap());
@@ -1269,6 +1347,7 @@ async fn subsession_runner_compacts_context_and_continues_from_handoff() {
         last_output: None,
         carried_artifacts: Vec::new(),
         closing: false,
+        raw_history_pruned: false,
     };
 
     assert!(runner.run(Vec::new()).await.unwrap());
@@ -1387,6 +1466,7 @@ async fn subsession_runner_compacts_oversized_input_batch_before_queueing() {
         last_output: None,
         carried_artifacts: Vec::new(),
         closing: false,
+        raw_history_pruned: false,
     };
 
     // Each input carries no usage, so only the batch content estimate can trigger compaction.
@@ -1468,6 +1548,7 @@ async fn subsession_runner_compaction_executes_pending_tool_calls_first() {
         last_output: None,
         carried_artifacts: Vec::new(),
         closing: false,
+        raw_history_pruned: false,
     };
 
     assert!(runner.run(Vec::new()).await.unwrap());
@@ -1538,6 +1619,7 @@ async fn subsession_runner_fails_when_compaction_summary_is_empty() {
         last_output: None, // A previously rescued artifact must survive even when compaction fails.
         carried_artifacts: vec![resource(5, &["artifact"])],
         closing: false,
+        raw_history_pruned: false,
     };
 
     // First step seeds the conversation and pushes usage over the compaction threshold.
@@ -1598,6 +1680,7 @@ async fn subsession_runner_emits_progress_for_signal_steps_without_waiting_for_i
         last_output: None,
         carried_artifacts: Vec::new(),
         closing: false,
+        raw_history_pruned: false,
     };
 
     assert!(runner.run(Vec::new()).await.unwrap());
@@ -1651,6 +1734,7 @@ async fn subsession_runner_filters_signalless_tool_call_steps_from_progress() {
         last_output: None,
         carried_artifacts: Vec::new(),
         closing: false,
+        raw_history_pruned: false,
     };
 
     assert!(runner.run(Vec::new()).await.unwrap());
@@ -1696,6 +1780,7 @@ async fn subsession_runner_accepts_resource_only_follow_up() {
         last_output: None,
         carried_artifacts: Vec::new(),
         closing: false,
+        raw_history_pruned: false,
     };
 
     assert!(runner.run(Vec::new()).await.unwrap());
@@ -1760,6 +1845,7 @@ async fn subsession_runner_handles_control_inputs_model_effort_and_finalize_erro
         last_output: None,
         carried_artifacts: Vec::new(),
         closing: false,
+        raw_history_pruned: false,
     };
 
     assert!(runner.run(Vec::new()).await.unwrap());
@@ -1838,6 +1924,7 @@ async fn subsession_runner_handles_control_inputs_model_effort_and_finalize_erro
         last_output: None,
         carried_artifacts: Vec::new(),
         closing: false,
+        raw_history_pruned: false,
     };
     let output = runner.finalize_output().await;
     assert_eq!(output.failed_reason.as_deref(), Some("model failed"));
@@ -1874,6 +1961,7 @@ async fn subsession_runner_finalizes_with_latest_visible_output_after_compaction
         last_output: None,
         carried_artifacts: Vec::new(),
         closing: false,
+        raw_history_pruned: false,
     };
 
     assert!(runner.run(Vec::new()).await.unwrap());
@@ -1924,6 +2012,7 @@ async fn subsession_runner_keeps_latest_output_for_final_end_after_progress() {
         last_output: None,
         carried_artifacts: Vec::new(),
         closing: false,
+        raw_history_pruned: false,
     };
 
     assert!(runner.run(Vec::new()).await.unwrap());
@@ -2038,6 +2127,7 @@ async fn subsession_runner_output_classification_and_failure_defaults_are_covere
         last_output: None,
         carried_artifacts: Vec::new(),
         closing: false,
+        raw_history_pruned: false,
     };
 
     assert_eq!(
@@ -2079,6 +2169,7 @@ async fn subsession_runner_reports_cancel_failure_as_latest_output() {
         last_output: None,
         carried_artifacts: Vec::new(),
         closing: false,
+        raw_history_pruned: false,
     };
 
     assert!(runner.run(Vec::new()).await.unwrap());
@@ -2137,6 +2228,7 @@ async fn subsession_runner_stop_idles_current_task_without_ending_session() {
         last_output: None,
         carried_artifacts: Vec::new(),
         closing: false,
+        raw_history_pruned: false,
     };
 
     assert!(runner.run(Vec::new()).await.unwrap());
@@ -3180,6 +3272,7 @@ async fn subsession_runner_sync_status_snapshots_progress_and_usage() {
         last_output: None,
         carried_artifacts: Vec::new(),
         closing: false,
+        raw_history_pruned: false,
     };
 
     // Before any step the snapshot is empty.

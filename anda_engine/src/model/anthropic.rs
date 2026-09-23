@@ -57,26 +57,29 @@ impl Client {
     /// # Returns
     /// Configured Anthropic client instance
     pub fn new(api_key: &str, endpoint: Option<String>) -> Self {
+        Self::new_with_client(
+            api_key,
+            endpoint,
+            request_client_builder()
+                .build()
+                .expect("Anthropic reqwest client should build"),
+        )
+    }
+
+    /// Creates a client that uses the given HTTP client, without building a default one.
+    pub fn new_with_client(api_key: &str, endpoint: Option<String>, http: reqwest::Client) -> Self {
         Self {
             endpoint: super::resolve_endpoint(endpoint, API_BASE_URL),
             bearer_auth: false,
             api_key: api_key.to_string(),
             api_version: API_VERSION.to_string(),
-            http: request_client_builder()
-                .build()
-                .expect("Anthropic reqwest client should build"),
+            http,
         }
     }
 
     /// Sets a custom HTTP client for the client
     pub fn with_client(self, http: reqwest::Client) -> Self {
-        Self {
-            endpoint: self.endpoint,
-            bearer_auth: self.bearer_auth,
-            api_key: self.api_key,
-            api_version: self.api_version,
-            http,
-        }
+        Self { http, ..self }
     }
 
     /// Overrides the Anthropic API version header value.
@@ -159,6 +162,18 @@ impl CompletionModel {
                 .output_config
                 .get_or_insert_default()
                 .effort = Some(effort.into());
+        }
+        self
+    }
+
+    /// Uses the model's known output limit as the default `max_tokens`.
+    ///
+    /// Anthropic requires `max_tokens` on every request and rejects a value above the model's
+    /// limit, so a model with a lower limit than the built-in default must say so here. `0`
+    /// (unknown) keeps the default.
+    pub fn with_max_output(mut self, max_output: usize) -> Self {
+        if max_output > 0 {
+            self.default_request.max_tokens = u32::try_from(max_output).unwrap_or(u32::MAX);
         }
         self
     }
@@ -518,7 +533,7 @@ impl WireFormat for CompletionModel {
                     "Completion error, model: {}, error: {}, body: {}",
                     model,
                     err,
-                    String::from_utf8_lossy(data)
+                    super::error_body_excerpt(data)
                 )
                 .into());
             }
@@ -531,7 +546,7 @@ impl WireFormat for CompletionModel {
                 "Completion error, model: {}, error: {}, body: {}",
                 model,
                 err,
-                String::from_utf8_lossy(data)
+                super::error_body_excerpt(data)
             )
             .into()),
         }
@@ -583,6 +598,20 @@ mod tests {
         assert_eq!(
             model.default_request.output_config.unwrap().effort,
             Some(types::OutputEffort::Max)
+        );
+    }
+
+    #[test]
+    fn configured_max_output_replaces_the_default_max_tokens() {
+        let model = Client::new("test-key", None).completion_model("claude-opus-4-1");
+        assert_eq!(model.default_request.max_tokens, 64000);
+        assert_eq!(
+            model.clone().with_max_output(0).default_request.max_tokens,
+            64000
+        );
+        assert_eq!(
+            model.with_max_output(32_000).default_request.max_tokens,
+            32_000
         );
     }
 

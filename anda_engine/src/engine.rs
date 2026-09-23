@@ -332,18 +332,18 @@ impl Engine {
         let meta = input.meta.take().unwrap_or_default();
         self.validate_request_meta(&meta)?;
 
-        // manager can call any tool
-        if !self.export_tools.contains(&input.name) && !self.management.is_manager(&caller) {
-            return Err(format!("tool {} not found", input.name).into());
-        }
-
-        if !self.ctx.has_tool_lowercase(&input.name) {
-            return Err(format!("tool {} not found", input.name).into());
-        }
-
+        // As in `agent_run`, check the caller before looking up the tool so an
+        // unauthorized caller cannot probe which tools are registered.
         let visibility = self.management.check_visibility(&caller)?;
         if visibility == Visibility::Protected && !self.management.is_manager(&caller) {
             return Err("caller does not have permission".into());
+        }
+
+        // manager can call any tool
+        if (!self.export_tools.contains(&input.name) && !self.management.is_manager(&caller))
+            || !self.ctx.has_tool_lowercase(&input.name)
+        {
+            return Err(format!("tool {} not found", input.name).into());
         }
 
         let tool_name = input.name.clone();

@@ -138,6 +138,10 @@ pub(super) struct SubSessionRunner {
     /// Set when the session decided to terminate; the runner then finishes the remaining queued
     /// inputs and exits at the next idle boundary instead of waiting for more input.
     pub(super) closing: bool,
+    /// Whether the runner's raw history has been pruned since the last model turn. An idle
+    /// session polls every second, and re-walking an unchanged history on each tick is wasted
+    /// work, so pruning runs once per idle transition.
+    pub(super) raw_history_pruned: bool,
 }
 
 impl SubSessionRunner {
@@ -346,6 +350,7 @@ impl SubSessionRunner {
         // The old runner handed over the whole session's accumulated usage/tools_usage/artifacts on
         // finalize; rescue them first so nothing is lost even if the summary turns out unusable.
         self.runner = runner;
+        self.raw_history_pruned = false;
         self.runner.accumulate(&output.usage);
         self.runner.accumulate_tools_usage(&output.tools_usage);
         self.carried_artifacts.append(&mut output.artifacts);
@@ -531,11 +536,15 @@ impl SubSessionRunner {
                 if let Some(conversation) = &mut self.conversation {
                     conversation.mark_status(ConversationStatus::Idle).await;
                 }
-                self.runner.prune_req_raw_history();
+                if !self.raw_history_pruned {
+                    self.runner.prune_req_raw_history();
+                    self.raw_history_pruned = true;
+                }
                 Ok(true)
             }
 
             Ok(Some(mut res)) => {
+                self.raw_history_pruned = false;
                 let now_ms = unix_ms();
                 self.session.active_at.store(now_ms, Ordering::SeqCst);
                 res.session = Some(self.session.id.clone());

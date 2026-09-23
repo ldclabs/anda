@@ -77,22 +77,27 @@ impl Client {
     /// # Arguments
     /// * `api_key` - OpenAI API key for authentication
     pub fn new(api_key: &str, endpoint: Option<String>) -> Self {
+        Self::new_with_client(
+            api_key,
+            endpoint,
+            request_client_builder()
+                .build()
+                .expect("OpenAI reqwest client should build"),
+        )
+    }
+
+    /// Creates a client that uses the given HTTP client, without building a default one.
+    pub fn new_with_client(api_key: &str, endpoint: Option<String>, http: reqwest::Client) -> Self {
         Self {
             endpoint: super::resolve_endpoint(endpoint, API_BASE_URL),
             api_key: api_key.to_string(),
-            http: request_client_builder()
-                .build()
-                .expect("OpenAI reqwest client should build"),
+            http,
         }
     }
 
     /// Sets a custom HTTP client for the client
     pub fn with_client(self, http: reqwest::Client) -> Self {
-        Self {
-            endpoint: self.endpoint,
-            api_key: self.api_key,
-            http,
-        }
+        Self { http, ..self }
     }
 
     /// Creates a POST request builder for the given API path
@@ -1720,7 +1725,7 @@ impl WireFormat for CompletionModel {
                 "Invalid completion response, model: {}, error: {}, body: {}",
                 model,
                 err,
-                String::from_utf8_lossy(data)
+                super::error_body_excerpt(data)
             )
             .into()),
         }
@@ -1931,7 +1936,7 @@ impl WireFormat for CompletionModelV2 {
                 "Invalid completion response, model: {}, error: {}, body: {}",
                 model,
                 err,
-                String::from_utf8_lossy(data)
+                super::error_body_excerpt(data)
             )
             .into()),
         }

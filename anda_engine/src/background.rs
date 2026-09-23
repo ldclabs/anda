@@ -32,14 +32,13 @@ impl FromStr for PrefixedId {
     type Err = BoxError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let parts: Vec<&str> = s.splitn(2, ':').collect();
-        if parts.len() != 2 {
+        let Some((prefix, id)) = s.split_once(':') else {
             return Err(format!("Invalid PrefixedId format: {}", s).into());
-        }
-        if parts[0].trim().is_empty() || parts[1].trim().is_empty() {
+        };
+        if prefix.trim().is_empty() || id.trim().is_empty() {
             return Err(format!("Prefix and ID cannot be empty: {}", s).into());
         }
-        if parts[0].trim() != parts[0] || parts[1].trim() != parts[1] {
+        if prefix.trim() != prefix || id.trim() != id {
             return Err(format!(
                 "Prefix and ID cannot have leading or trailing whitespace: {}",
                 s
@@ -47,8 +46,8 @@ impl FromStr for PrefixedId {
             .into());
         }
         Ok(Self {
-            prefix: parts[0].to_string(),
-            id: parts[1].to_string(),
+            prefix: prefix.to_string(),
+            id: id.to_string(),
         })
     }
 }
@@ -218,8 +217,7 @@ impl BackgroundTaskControls {
     /// Returns `true` if a task was found and signalled, `false` if no such task was registered
     /// (it already ended or never started).
     pub fn stop_background_task(&self, task_id: &str) -> bool {
-        let handle = self.tasks.read().get(task_id).cloned();
-        match handle {
+        match self.tasks.read().get(task_id) {
             Some(handle) => {
                 handle.stop();
                 true

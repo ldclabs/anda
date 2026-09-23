@@ -5,7 +5,6 @@
 //! makes engines private to the controller and explicit managers.
 
 use anda_core::BoxError;
-use async_trait::async_trait;
 use candid::Principal;
 use ic_auth_verifier::ANONYMOUS_PRINCIPAL;
 use std::collections::BTreeSet;
@@ -14,7 +13,6 @@ use std::collections::BTreeSet;
 pub static SYSTEM_PATH: &str = "_";
 
 /// Authorization policy used by [`Engine`](crate::engine::Engine).
-#[async_trait]
 pub trait Management: Send + Sync {
     /// Returns whether `caller` is the engine controller.
     fn is_controller(&self, caller: &Principal) -> bool;
@@ -52,7 +50,6 @@ pub enum Visibility {
     Public = 2,
 }
 
-#[async_trait]
 impl Management for BaseManagement {
     /// Returns true if the caller is the controller of the engine.
     ///

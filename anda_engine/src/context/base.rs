@@ -159,8 +159,8 @@ impl BaseCtx {
     ) -> Result<Self, BoxError> {
         path.make_ascii_lowercase();
         let path = Path::parse(path)?;
-        let mut state = Extensions::default();
-        state.extend(self.state.read().clone());
+        // Snapshot the parent's state; later writes on either side stay isolated.
+        let state = self.state.read().clone();
         let child = Self {
             id: self.id,
             name: self.name.clone(),
@@ -222,8 +222,7 @@ impl BaseCtx {
 
     /// Clones the context with a new caller principal.
     pub fn with_caller(&self, caller: Principal) -> Self {
-        let mut state = Extensions::default();
-        state.extend(self.state.read().clone());
+        let state = self.state.read().clone();
         Self {
             caller,
             state: Arc::new(RwLock::new(state)),

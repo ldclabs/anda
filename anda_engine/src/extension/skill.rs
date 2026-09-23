@@ -37,7 +37,7 @@
 use anda_core::{
     Agent, BoxError, FunctionDefinition, Resource, Tool, ToolOutput, select_resources,
 };
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -46,6 +46,7 @@ use std::{
     ffi::OsStr,
     path::{Path, PathBuf},
     sync::Arc,
+    time::SystemTime,
 };
 
 use crate::{
@@ -111,6 +112,14 @@ pub struct SkillContentOutput {
 /// locks, so it must not call back into the manager.
 pub type SkillFilter = Arc<dyn Fn(&Skill) -> bool + Send + Sync>;
 
+/// A parsed `SKILL.md` remembered with the size and modification time it was read at.
+struct ParsedSkillFile {
+    len: u64,
+    modified: Option<SystemTime>,
+    /// `None` when the file could not be read or parsed.
+    skill: Option<Skill>,
+}
+
 /// Manages skills loaded from `SKILL.md` files on disk.
 ///
 /// [`SkillManager`] implements [`Tool<BaseCtx>`] so that LLMs can read skill files at runtime and
@@ -130,6 +139,10 @@ pub struct SkillManager {
     subagents: RwLock<BTreeMap<String, SubAgent>>,
     /// Host policy over which skills are admissible; `None` admits every skill.
     filter: RwLock<Option<SkillFilter>>,
+    /// Parse cache for the name scan in [`Self::find_skill_dir`], keyed by file path. A read by
+    /// name must still see every `SKILL.md` (to resolve priority and detect ambiguity), but an
+    /// unchanged file does not need to be read and parsed again on every call.
+    parsed_files: Mutex<BTreeMap<PathBuf, ParsedSkillFile>>,
     description: String,
     default_skill_tools: Vec<String>,
 }
@@ -207,6 +220,7 @@ impl SkillManager {
             skills: RwLock::new(BTreeMap::new()),
             subagents: RwLock::new(BTreeMap::new()),
             filter: RwLock::new(None),
+            parsed_files: Mutex::new(BTreeMap::new()),
             description: build_description(&default_skills_dir, &skills_dirs),
             default_skills_dir,
             skills_dirs,
@@ -314,6 +328,36 @@ impl SkillManager {
         })
     }
 
+    /// Reads and parses `path`, reusing the cached result while the file's size and
+    /// modification time are unchanged. Unreadable or malformed files yield `None`.
+    ///
+    /// Only the name scan uses this; the skill that is finally returned is always re-read
+    /// through [`Self::read_text_file`] with its safety checks.
+    async fn parse_skill_file(&self, path: &Path, base_dir: &Path) -> Option<Skill> {
+        let meta = tokio::fs::symlink_metadata(path).await.ok()?;
+        let (len, modified) = (meta.len(), meta.modified().ok());
+        if let Some(cached) = self.parsed_files.lock().get(path)
+            && cached.len == len
+            && cached.modified == modified
+        {
+            return cached.skill.clone();
+        }
+
+        let skill = match self.read_text_file(path, MAX_SKILL_FILE_BYTES).await {
+            Ok(content) => parse_skill_md(base_dir.to_path_buf(), &content).ok(),
+            Err(_) => None,
+        };
+        self.parsed_files.lock().insert(
+            path.to_path_buf(),
+            ParsedSkillFile {
+                len,
+                modified,
+                skill: skill.clone(),
+            },
+        );
+        skill
+    }
+
     /// Index of the configured root `base_dir` sits under, or `skills_dirs.len()` when it sits
     /// under none — an unplaceable directory sorts last and never wins a priority contest.
     fn skills_dir_rank(&self, base_dir: &Path) -> usize {
@@ -357,10 +401,7 @@ impl SkillManager {
                     let dir_name_matches = base_dir.file_name() == Some(OsStr::new(name));
                     // Always parse: the filter votes on the parsed skill, so a directory whose
                     // name alone matches cannot be admitted on the strength of that name.
-                    let parsed = match self.read_text_file(&path, MAX_SKILL_FILE_BYTES).await {
-                        Ok(content) => parse_skill_md(base_dir.clone(), &content).ok(),
-                        Err(_) => None,
-                    };
+                    let parsed = self.parse_skill_file(&path, &base_dir).await;
                     match parsed {
                         Some(skill) => {
                             if (skill.frontmatter.name == name || dir_name_matches)
@@ -1422,6 +1463,50 @@ Body.
         let tool = SkillManager::new(tmp.clone());
         let engine = EngineBuilder::new().empty().await.unwrap();
         assert!(engine.sub_agents_manager().insert(Arc::new(tool)).is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn name_scan_reuses_parsed_files_until_they_change() {
+        let root = std::env::temp_dir().join(format!(
+            "anda-skills-parse-cache-{:016x}",
+            rand::random::<u64>()
+        ));
+        write_subagent_skill(&root, "worker", "worker", "First instructions.").await;
+        let mgr = SkillManager::new(root.clone());
+        mgr.load().await.unwrap();
+
+        let read = mgr
+            .call_raw(mock_ctx(), json!({ "name": "worker" }), Vec::new())
+            .await
+            .unwrap();
+        assert!(
+            read.output["content"]
+                .as_str()
+                .unwrap()
+                .contains("First instructions.")
+        );
+        assert_eq!(mgr.parsed_files.lock().len(), 1);
+
+        // Changing the file (here its declared name and size) invalidates the cached parse, so
+        // the scan finds the new name and the old name no longer resolves to a matching skill.
+        write_subagent_skill(&root, "worker", "renamed-worker", "Second, longer text.").await;
+        let read = mgr
+            .call_raw(mock_ctx(), json!({ "name": "renamed-worker" }), Vec::new())
+            .await
+            .unwrap();
+        assert!(
+            read.output["content"]
+                .as_str()
+                .unwrap()
+                .contains("Second, longer text.")
+        );
+        let err = mgr
+            .call_raw(mock_ctx(), json!({ "name": "worker" }), Vec::new())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("renamed-worker"), "{err}");
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
     }
 
     /// Writes `<root>/<dir>/SKILL.md` for a subagent skill named `name`.
