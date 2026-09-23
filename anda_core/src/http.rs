@@ -15,7 +15,7 @@
 //! The main functions are:
 //! - [`http_rpc`]: Makes a generic CBOR-encoded RPC call;
 //! - [`canister_rpc`]: Makes a canister-specific RPC call with Candid encoding;
-//! - [`cbor_rpc`]: Internal function for making CBOR-encoded HTTP requests.
+//! - [`cbor_rpc`]: Sends a raw CBOR-encoded request and returns the remote payload.
 
 use candid::{CandidType, Principal, decode_args, encode_args, utils::ArgumentEncoder};
 use cbor2::{from_slice, to_canonical_vec};
@@ -23,7 +23,7 @@ use http::header;
 use ic_auth_types::ByteBufB64;
 use reqwest::Client;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::fmt::Display;
+use std::fmt::{Debug, Display};
 
 /// MIME type used for CBOR-encoded RPC request and response bodies.
 pub const CONTENT_TYPE_CBOR: &str = "application/cbor";
@@ -171,6 +171,24 @@ pub enum HttpRPCError {
     },
 }
 
+impl HttpRPCError {
+    fn request(endpoint: &str, path: &dyn Display, error: impl Debug) -> Self {
+        Self::RequestError {
+            endpoint: endpoint.to_string(),
+            path: path.to_string(),
+            error: format!("{error:?}"),
+        }
+    }
+
+    fn result(endpoint: &str, path: &dyn Display, error: impl Debug) -> Self {
+        Self::ResultError {
+            endpoint: endpoint.to_string(),
+            path: path.to_string(),
+            error: format!("{error:?}"),
+        }
+    }
+}
+
 /// Calls a remote CBOR RPC method and decodes its CBOR response payload.
 ///
 /// # Arguments
@@ -190,30 +208,20 @@ pub async fn http_rpc<T>(
 where
     T: DeserializeOwned,
 {
-    let args = to_canonical_vec(args).map_err(|e| HttpRPCError::RequestError {
-        endpoint: endpoint.to_string(),
-        path: method.to_string(),
-        error: format!("{e:?}"),
-    })?;
-    let req = RPCRequestRef {
+    let args = to_canonical_vec(args).map_err(|e| HttpRPCError::request(endpoint, &method, e))?;
+    let req = to_canonical_vec(&RPCRequestRef {
         method,
         params: &args.into(),
-    };
-    let req = to_canonical_vec(&req).map_err(|e| HttpRPCError::RequestError {
-        endpoint: endpoint.to_string(),
-        path: method.to_string(),
-        error: format!("{e:?}"),
-    })?;
+    })
+    .map_err(|e| HttpRPCError::request(endpoint, &method, e))?;
 
     let res = cbor_rpc(client, endpoint, method, None, req).await?;
-    from_slice(&res[..]).map_err(|e| HttpRPCError::ResultError {
-        endpoint: endpoint.to_string(),
-        path: method.to_string(),
-        error: format!("{e:?}"),
-    })
+    from_slice(&res[..]).map_err(|e| HttpRPCError::result(endpoint, &method, e))
 }
 
 /// Calls a canister method through a remote endpoint using Candid-encoded arguments.
+///
+/// Errors report `endpoint` as given and `path` as `{canister}/{method}`.
 ///
 /// # Arguments
 /// * `client` - HTTP client to use for the request.
@@ -235,28 +243,18 @@ where
     In: ArgumentEncoder,
     Out: CandidType + for<'a> candid::Deserialize<'a>,
 {
-    let args = encode_args(args).map_err(|e| HttpRPCError::RequestError {
-        endpoint: format!("{endpoint}/{canister}"),
-        path: method.to_string(),
-        error: format!("{e:?}"),
-    })?;
+    let path = format!("{canister}/{method}");
+    let args = encode_args(args).map_err(|e| HttpRPCError::request(endpoint, &path, e))?;
     let req = to_canonical_vec(&CanisterRequestRef {
         canister,
         method,
         params: &ByteBufB64::from(args),
     })
-    .map_err(|e| HttpRPCError::RequestError {
-        endpoint: format!("{endpoint}/{canister}"),
-        path: method.to_string(),
-        error: format!("{e:?}"),
-    })?;
-    let res = cbor_rpc(client, endpoint, canister, None, req).await?;
-    let res: (Out,) = decode_args(&res).map_err(|e| HttpRPCError::ResultError {
-        endpoint: format!("{endpoint}/{canister}"),
-        path: method.to_string(),
-        error: format!("{e:?}"),
-    })?;
-    Ok(res.0)
+    .map_err(|e| HttpRPCError::request(endpoint, &path, e))?;
+
+    let res = cbor_rpc(client, endpoint, &path, None, req).await?;
+    let (out,): (Out,) = decode_args(&res).map_err(|e| HttpRPCError::result(endpoint, &path, e))?;
+    Ok(out)
 }
 
 /// Sends a raw CBOR RPC request and returns the remote payload.
@@ -269,7 +267,7 @@ where
 /// # Arguments
 /// * `client` - HTTP client to use for the request.
 /// * `endpoint` - URL endpoint to send the request to.
-/// * `path` - Path or identifier for the request.
+/// * `path` - Path or identifier for the request, used only in error context.
 /// * `headers` - Optional headers to include in the request.
 /// * `body` - CBOR-encoded request body.
 ///
@@ -283,7 +281,7 @@ pub async fn cbor_rpc(
     body: Vec<u8>,
 ) -> Result<ByteBufB64, HttpRPCError> {
     let mut headers = headers.unwrap_or_default();
-    let ct: http::HeaderValue = http::HeaderValue::from_static(CONTENT_TYPE_CBOR);
+    let ct = http::HeaderValue::from_static(CONTENT_TYPE_CBOR);
     headers.insert(header::CONTENT_TYPE, ct.clone());
     headers.insert(header::ACCEPT, ct);
     let res = client
@@ -292,11 +290,7 @@ pub async fn cbor_rpc(
         .body(body)
         .send()
         .await
-        .map_err(|e| HttpRPCError::RequestError {
-            endpoint: endpoint.to_string(),
-            path: path.to_string(),
-            error: format!("{e:?}"),
-        })?;
+        .map_err(|e| HttpRPCError::request(endpoint, &path, e))?;
     let status = res.status().as_u16();
     if status != 200 {
         return Err(HttpRPCError::ResponseError {
@@ -314,11 +308,8 @@ pub async fn cbor_rpc(
             path: path.to_string(),
             error,
         })?;
-    let res: RPCResponse = from_slice(&data[..]).map_err(|e| HttpRPCError::ResultError {
-        endpoint: endpoint.to_string(),
-        path: path.to_string(),
-        error: format!("{e:?}"),
-    })?;
+    let res: RPCResponse =
+        from_slice(&data[..]).map_err(|e| HttpRPCError::result(endpoint, &path, e))?;
     res.map_err(|error| HttpRPCError::RemoteError {
         endpoint: endpoint.to_string(),
         path: path.to_string(),
@@ -623,10 +614,38 @@ mod tests {
         assert!(matches!(
             err,
             HttpRPCError::RequestError {
+                endpoint,
                 path,
                 error,
-                ..
-            } if path == "encode" && error.contains("encode failed")
+            } if endpoint == "http://127.0.0.1:1"
+                && path == format!("{}/encode", Principal::anonymous())
+                && error.contains("encode failed")
+        ));
+    }
+
+    #[tokio::test]
+    async fn canister_rpc_reports_canister_and_method_in_every_error() {
+        let canister = Principal::anonymous();
+        let expected_path = format!("{canister}/greet");
+
+        // Transport failures carry the same context as encode/decode failures.
+        let err =
+            canister_rpc::<_, String>(&client(), "http://127.0.0.1:1", &canister, "greet", ())
+                .await
+                .unwrap_err();
+        assert!(matches!(
+            err,
+            HttpRPCError::RequestError { ref endpoint, ref path, .. }
+                if endpoint == "http://127.0.0.1:1" && *path == expected_path
+        ));
+
+        let (endpoint, _) = spawn_server(StatusCode::BAD_REQUEST, b"nope".to_vec()).await;
+        let err = canister_rpc::<_, String>(&client(), &endpoint, &canister, "greet", ())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            HttpRPCError::ResponseError { ref path, status: 400, .. } if *path == expected_path
         ));
     }
 

@@ -492,21 +492,10 @@ where
     /// returns a mixed-case name, and so duplicate names across providers are
     /// deduplicated by their canonical lowercase form.
     pub fn definitions(&self, names: Option<&[String]>) -> Vec<FunctionDefinition> {
-        match names {
-            Some([]) => Vec::new(),
-            _ => {
-                let mut definitions = BTreeMap::new();
-                for provider in self.set.values() {
-                    for mut definition in provider.definitions(names) {
-                        definition.name.make_ascii_lowercase();
-                        definitions
-                            .entry(definition.name.clone())
-                            .or_insert(definition);
-                    }
-                }
-                definitions.into_values().collect()
-            }
-        }
+        self.collect_definitions(names)
+            .into_values()
+            .map(|(definition, _)| definition)
+            .collect()
     }
 
     /// Returns the capability groups exposed by every registered provider.
@@ -519,23 +508,37 @@ where
 
     /// Returns function metadata for all provider-backed tools or selected names.
     pub fn functions(&self, names: Option<&[String]>) -> Vec<Function> {
+        self.collect_definitions(names)
+            .into_values()
+            .map(|(definition, provider)| Function {
+                supported_resource_tags: provider.supported_resource_tags(&definition.name),
+                definition,
+            })
+            .collect()
+    }
+
+    /// Takes one definition snapshot per provider, keyed by lowercase name.
+    ///
+    /// When several providers expose the same name, the first provider in
+    /// provider-name order wins and is returned alongside its definition.
+    fn collect_definitions(
+        &self,
+        names: Option<&[String]>,
+    ) -> BTreeMap<String, (FunctionDefinition, &Arc<dyn ToolProvider<C>>)> {
+        let mut definitions = BTreeMap::new();
         if matches!(names, Some([])) {
-            return Vec::new();
+            return definitions;
         }
 
-        let mut functions = BTreeMap::new();
         for provider in self.set.values() {
             for mut definition in provider.definitions(names) {
                 definition.name.make_ascii_lowercase();
-                functions
+                definitions
                     .entry(definition.name.clone())
-                    .or_insert_with(|| Function {
-                        supported_resource_tags: provider.supported_resource_tags(&definition.name),
-                        definition,
-                    });
+                    .or_insert((definition, provider));
             }
         }
-        functions.into_values().collect()
+        definitions
     }
 
     /// Removes and returns resources supported by the named provider tool.
@@ -1216,6 +1219,17 @@ mod tests {
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].definition.name, "tool00");
         assert_eq!(selected[0].supported_resource_tags, vec!["first"]);
+        // `definitions` resolves names and duplicates exactly like `functions`.
+        let definitions = set.definitions(None);
+        assert_eq!(
+            definitions.iter().map(|d| &d.name).collect::<Vec<_>>(),
+            functions
+                .iter()
+                .map(|f| &f.definition.name)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(definitions[0].description, "first");
+        assert!(set.definitions(Some(&[])).is_empty());
         futures::executor::block_on(async {
             assert_eq!(
                 set.call(

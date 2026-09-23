@@ -17,9 +17,11 @@ pub fn root_schema_for<T: JsonSchema>() -> Schema {
         s.inline_subschemas = true;
         s.meta_schema = None; // Remove the $schema field
 
-        let mut formater = RestrictFormats::default();
-        formater.infer_from_meta_schema = false; // Do not infer formats from meta schema
-        s.transforms.push(Box::new(formater)); // Remove the $format field
+        // Drop `format` values outside the standard vocabulary without inferring
+        // extra formats from the meta schema.
+        let mut formatter = RestrictFormats::default();
+        formatter.infer_from_meta_schema = false;
+        s.transforms.push(Box::new(formatter));
     });
     let generator = settings.into_generator();
     generator.into_root_schema_for::<T>()
@@ -139,8 +141,6 @@ mod tests {
     #[test]
     fn test_root_schema_for() {
         let schema = gen_schema_for::<TestStruct>();
-        let s = serde_json::to_string(&schema).unwrap();
-        println!("{}", s);
         assert_eq!(
             schema,
             serde_json::json!({"type":"object","properties":{"name":{"type":"string"},"age":{"type":["integer","null"],"maximum":255,"minimum":0}},"required":["name","age"],"additionalProperties":false})

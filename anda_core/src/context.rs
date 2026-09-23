@@ -20,7 +20,6 @@
 //! implementation. Other runtimes can implement these traits for specialized
 //! environments such as tests, embedded workers, or alternative TEE backends.
 
-use async_trait::async_trait;
 use cbor2::{from_slice, to_canonical_vec};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{future::Future, time::Duration};
@@ -484,68 +483,77 @@ fn is_store_not_found(mut error: &(dyn std::error::Error + 'static)) -> bool {
 /// persist until eviction or an explicit refresh. Callers needing consistency
 /// under concurrency must serialize the entire read/fill, write, and delete
 /// operations for a key, or use [`StoreFeatures`] directly with versioned writes.
-#[async_trait]
 pub trait CacheStoreFeatures: StoreFeatures + CacheFeatures + Send + Sync + 'static {
     /// Initializes a cached value from storage, or creates it with `init` if missing.
     /// Read errors other than [`object_store::Error::NotFound`] are propagated
     /// without running `init`.
-    async fn cache_store_init<T, F>(&self, key: &str, init: F) -> Result<(), BoxError>
+    fn cache_store_init<T, F>(
+        &self,
+        key: &str,
+        init: F,
+    ) -> impl Future<Output = Result<(), BoxError>> + Send
     where
         T: DeserializeOwned + Serialize + Send,
         F: Future<Output = Result<T, BoxError>> + Send + 'static,
     {
-        let p = path_lowercase(&Path::from(key));
-        let (val, version) = match self.store_get(&p).await {
-            Ok((v, meta)) => {
-                let val: T = from_slice(&v[..])?;
-                (
-                    val,
-                    UpdateVersion {
-                        e_tag: meta.e_tag,
-                        version: meta.version,
-                    },
-                )
-            }
-            Err(error) if is_store_not_found(error.as_ref()) => {
-                let val: T = init.await?;
-                let data = to_canonical_vec(&val)?;
-                let res = self.store_put(&p, PutMode::Create, data.into()).await?;
-                (
-                    val,
-                    UpdateVersion {
-                        e_tag: res.e_tag,
-                        version: res.version,
-                    },
-                )
-            }
-            Err(error) => return Err(error),
-        };
-        self.cache_set(p.as_ref(), (CacheStoreValue(val, version), None))
-            .await;
-        Ok(())
+        async move {
+            let p = path_lowercase(&Path::from(key));
+            let (val, version) = match self.store_get(&p).await {
+                Ok((v, meta)) => {
+                    let val: T = from_slice(&v[..])?;
+                    (
+                        val,
+                        UpdateVersion {
+                            e_tag: meta.e_tag,
+                            version: meta.version,
+                        },
+                    )
+                }
+                Err(error) if is_store_not_found(error.as_ref()) => {
+                    let val: T = init.await?;
+                    let data = to_canonical_vec(&val)?;
+                    let res = self.store_put(&p, PutMode::Create, data.into()).await?;
+                    (
+                        val,
+                        UpdateVersion {
+                            e_tag: res.e_tag,
+                            version: res.version,
+                        },
+                    )
+                }
+                Err(error) => return Err(error),
+            };
+            self.cache_set(p.as_ref(), (CacheStoreValue(val, version), None))
+                .await;
+            Ok(())
+        }
     }
 
     /// Returns a value and its storage version, loading it into cache if needed.
-    async fn cache_store_get<T>(&self, key: &str) -> Result<(T, UpdateVersion), BoxError>
+    fn cache_store_get<T>(
+        &self,
+        key: &str,
+    ) -> impl Future<Output = Result<(T, UpdateVersion), BoxError>> + Send
     where
         T: DeserializeOwned + Serialize + Send + Sync,
     {
-        let p = path_lowercase(&Path::from(key));
-        let key = p.as_ref();
-        match self.cache_get::<CacheStoreValue<T>>(key).await {
-            Ok(CacheStoreValue(val, ver)) => Ok((val, ver)),
-            Err(_) => {
-                // fetch from store and set in cache
-                let (v, meta) = self.store_get(&p).await?;
-                let val: T = from_slice(&v[..])?;
-                let version = UpdateVersion {
-                    e_tag: meta.e_tag,
-                    version: meta.version,
-                };
-                self.cache_set(key, (CacheStoreValue(&val, version.clone()), None))
-                    .await;
-                Ok((val, version))
+        async move {
+            let p = path_lowercase(&Path::from(key));
+            let key = p.as_ref();
+            if let Ok(CacheStoreValue(val, ver)) = self.cache_get::<CacheStoreValue<T>>(key).await {
+                return Ok((val, ver));
             }
+
+            // Cache miss (or undecodable entry): fetch from store and refill the cache.
+            let (v, meta) = self.store_get(&p).await?;
+            let val: T = from_slice(&v[..])?;
+            let version = UpdateVersion {
+                e_tag: meta.e_tag,
+                version: meta.version,
+            };
+            self.cache_set(key, (CacheStoreValue(&val, version.clone()), None))
+                .await;
+            Ok((val, version))
         }
     }
 
@@ -555,31 +563,33 @@ pub trait CacheStoreFeatures: StoreFeatures + CacheFeatures + Send + Sync + 'sta
     /// against that storage version. Without a version, the store write uses
     /// overwrite semantics. Neither mode makes the cache update atomic with
     /// storage; see the trait's consistency notes.
-    async fn cache_store_set<T>(
+    fn cache_store_set<T>(
         &self,
         key: &str,
         val: T,
         version: Option<UpdateVersion>,
-    ) -> Result<UpdateVersion, BoxError>
+    ) -> impl Future<Output = Result<UpdateVersion, BoxError>> + Send
     where
-        T: DeserializeOwned + Serialize + Send,
+        T: Serialize + Send,
     {
-        let data = to_canonical_vec(&val)?;
-        let p = path_lowercase(&Path::from(key));
-        let mode = version.map_or(PutMode::Overwrite, |ver| {
-            PutMode::Update(OsVersion {
-                e_tag: ver.e_tag,
-                version: ver.version,
-            })
-        });
-        let res = self.store_put(&p, mode, data.into()).await?;
-        let ver = UpdateVersion {
-            e_tag: res.e_tag,
-            version: res.version,
-        };
-        self.cache_set(p.as_ref(), (CacheStoreValue(val, ver.clone()), None))
-            .await;
-        Ok(ver)
+        async move {
+            let data = to_canonical_vec(&val)?;
+            let p = path_lowercase(&Path::from(key));
+            let mode = version.map_or(PutMode::Overwrite, |ver| {
+                PutMode::Update(OsVersion {
+                    e_tag: ver.e_tag,
+                    version: ver.version,
+                })
+            });
+            let res = self.store_put(&p, mode, data.into()).await?;
+            let ver = UpdateVersion {
+                e_tag: res.e_tag,
+                version: res.version,
+            };
+            self.cache_set(p.as_ref(), (CacheStoreValue(val, ver.clone()), None))
+                .await;
+            Ok(ver)
+        }
     }
 
     /// Deletes a value from both cache and storage.
@@ -587,11 +597,13 @@ pub trait CacheStoreFeatures: StoreFeatures + CacheFeatures + Send + Sync + 'sta
     /// The cache is evicted only after storage deletion succeeds. An already
     /// in-flight read can still repopulate it afterward; callers must coordinate
     /// concurrent operations when deletion needs to be immediately visible.
-    async fn cache_store_delete(&self, key: &str) -> Result<(), BoxError> {
-        let p = path_lowercase(&Path::from(key));
-        self.store_delete(&p).await?;
-        self.cache_delete(p.as_ref()).await;
-        Ok(())
+    fn cache_store_delete(&self, key: &str) -> impl Future<Output = Result<(), BoxError>> + Send {
+        async move {
+            let p = path_lowercase(&Path::from(key));
+            self.store_delete(&p).await?;
+            self.cache_delete(p.as_ref()).await;
+            Ok(())
+        }
     }
 }
 
@@ -976,6 +988,18 @@ mod tests {
         ))
         .unwrap_err();
         assert!(err.to_string().contains("version mismatch"));
+    }
+
+    /// The default methods must yield `Send` futures so runtimes can spawn them.
+    #[test]
+    fn cache_store_futures_are_send() {
+        fn assert_send<T: Send>(_: T) {}
+
+        let ctx = TestCacheStore::default();
+        assert_send(ctx.cache_store_init("key", async { Ok::<_, BoxError>(1_u32) }));
+        assert_send(ctx.cache_store_get::<u32>("key"));
+        assert_send(ctx.cache_store_set("key", 1_u32, None));
+        assert_send(ctx.cache_store_delete("key"));
     }
 
     #[test]

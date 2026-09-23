@@ -3,7 +3,6 @@ use chrono::prelude::*;
 use ic_auth_types::{ByteArrayB64, ByteBufB64};
 use ic_cose_types::cose::sha3_256;
 use serde::Serialize;
-use std::collections::BTreeSet;
 
 use anda_db_schema::{Json, Map};
 
@@ -107,24 +106,12 @@ pub fn select_resources(resources: &mut Vec<Resource>, tags: &[String]) -> Vec<R
         return std::mem::take(resources);
     }
 
-    let tag_set: BTreeSet<&str> = tags.iter().map(String::as_str).collect();
-    let mut selected = Vec::new();
-    let mut remaining = Vec::with_capacity(resources.len());
-
-    for resource in std::mem::take(resources) {
-        if resource
-            .tags
-            .iter()
-            .any(|tag| tag_set.contains(tag.as_str()))
-        {
-            selected.push(resource);
-        } else {
-            remaining.push(resource);
-        }
-    }
-
-    *resources = remaining;
-    selected
+    // Tag lists are tiny, so a linear scan beats building a set.
+    resources
+        .extract_if(.., |resource| {
+            resource.tags.iter().any(|tag| tags.contains(tag))
+        })
+        .collect()
 }
 
 #[cfg(test)]

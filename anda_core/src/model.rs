@@ -68,8 +68,8 @@ impl AgentInput {
 /// Empty prompts and `/ping` (with or without arguments) are treated as
 /// lightweight health checks. A leading slash with no command name (`/`,
 /// `/ arg`) and prompts without a leading slash are plain user prompts. Other
-/// slash-prefixed prompts keep the original prompt while exposing the lowercase
-/// command name.
+/// slash-prefixed prompts keep the original prompt while exposing the
+/// ASCII-lowercased command name.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum PromptCommand {
     /// Empty prompt or `/ping`.
@@ -82,7 +82,7 @@ pub enum PromptCommand {
     },
     /// Slash-prefixed command and the original prompt text.
     Command {
-        /// Lowercase command name without the leading slash.
+        /// ASCII-lowercased command name without the leading slash.
         command: String,
         /// Original prompt text.
         prompt: String,
@@ -100,7 +100,7 @@ impl From<String> for PromptCommand {
             return Self::Plain { prompt };
         };
         let command_end = stripped.find(char::is_whitespace).unwrap_or(stripped.len());
-        let command = stripped[..command_end].to_lowercase();
+        let command = stripped[..command_end].to_ascii_lowercase();
 
         // A leading slash with no command name (`/`, `/ arg`) is a plain prompt.
         if command.is_empty() {
@@ -565,6 +565,17 @@ mod tests {
         assert_eq!(manual.command_argument(), Some("取消当前任务"));
 
         assert_eq!(PromptCommand::Ping.command_argument(), None);
+
+        // Command names are ASCII-lowercased, consistent with `command_argument`.
+        let command = PromptCommand::from("/ÄRGER now".to_string());
+        assert_eq!(
+            command,
+            PromptCommand::Command {
+                command: "Ärger".into(),
+                prompt: "/ÄRGER now".into(),
+            }
+        );
+        assert_eq!(command.command_argument(), Some("now"));
     }
 
     #[test]

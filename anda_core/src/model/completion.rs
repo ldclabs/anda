@@ -141,7 +141,7 @@ pub struct CompletionRequest {
 impl CompletionRequest {
     /// Adds a document to the request.
     pub fn context(mut self, id: String, text: String) -> Self {
-        self.documents.append(Document::from_text(&id, &text));
+        self.documents.append(Document::from_text(id, text));
         self
     }
 

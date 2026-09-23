@@ -60,6 +60,11 @@ All notable changes to the Anda project will be documented in this file.
   UTF-8 bytes. URI-only and undecodable text attachments remain available after
   prompt document extraction.
 - Correct the generic tool example and compile the README example as a doctest.
+- `canister_rpc` errors report the endpoint as given and `path` as
+  `{canister}/{method}` for encoding, transport, response, and decoding failures;
+  transport errors previously omitted the method.
+- `PromptCommand` lowercases command names with ASCII rules, consistent with
+  `command_argument`.
 
 ### Changed — anda_core
 
@@ -70,6 +75,14 @@ All notable changes to the Anda project will be documented in this file.
   without cloning the source JSON value.
 - Consolidate cache write branches and replace mock-only tests with regression
   coverage for the public contracts and scoped engine cache/store integration.
+- `CacheStoreFeatures` default methods return `Send` futures without
+  `async_trait`, and the `async-trait` dependency is removed. `cache_store_set`
+  no longer requires `T: DeserializeOwned`.
+- `Document::from_text` accepts `impl Into<String>`.
+- Decode message `content` from CBOR or JSON without buffering an untagged copy,
+  move resource blobs into content parts, decode resource text before building
+  document metadata, and share one definition snapshot between provider
+  `definitions` and `functions`.
 
 ## [0.16.0] — 2026-09-16
 

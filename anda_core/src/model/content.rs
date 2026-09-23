@@ -18,21 +18,57 @@ fn deserialize_content<'de, D>(deserializer: D) -> Result<Vec<ContentPart>, D::E
 where
     D: serde::Deserializer<'de>,
 {
-    // Deserialize directly instead of routing through `serde_json::Value`, whose
-    // visitor cannot represent CBOR byte strings. Untagged buffering keeps byte
-    // payloads (e.g. `InlineData.data`) intact so CBOR RPC bodies round-trip.
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Content {
-        Text(String),
-        Parts(Vec<ContentPart>),
+    // Dispatch on the wire shape directly rather than through `serde_json::Value`
+    // (which cannot represent CBOR byte strings) or an untagged enum (which would
+    // deep-copy the whole content array before each part buffers itself again).
+    struct ContentVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for ContentVisitor {
+        type Value = Vec<ContentPart>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a string, an array of content parts, or null")
+        }
+
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            Ok(vec![ContentPart::Text {
+                text: v.to_string(),
+            }])
+        }
+
+        fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+            Ok(vec![ContentPart::Text { text: v }])
+        }
+
+        fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+
+        fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            deserializer.deserialize_any(self)
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            // `size_hint` is untrusted; cap the up-front reservation.
+            let mut parts = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(1024));
+            while let Some(part) = seq.next_element()? {
+                parts.push(part);
+            }
+            Ok(parts)
+        }
     }
 
-    match Option::<Content>::deserialize(deserializer)? {
-        None => Ok(Vec::new()),
-        Some(Content::Text(s)) => Ok(vec![ContentPart::Text { text: s }]),
-        Some(Content::Parts(parts)) => Ok(parts),
-    }
+    deserializer.deserialize_any(ContentVisitor)
 }
 
 /// Chat message sent to or returned by an LLM provider.
@@ -538,37 +574,33 @@ impl From<Json> for ContentPart {
 impl TryFrom<Resource> for ContentPart {
     type Error = Resource;
     fn try_from(res: Resource) -> Result<Self, Self::Error> {
-        if res.blob.as_ref().map(|v| !v.0.is_empty()).unwrap_or(false)
-            && let Some(data) = res.blob
-        {
-            match resource_text_from_bytes(&data.0, res.mime_type.as_deref()) {
-                Some(text) => Ok(ContentPart::Text {
-                    text: text.into_owned(),
-                }),
-                None => {
-                    let data: ByteBufB64 = data.0.into();
-                    let mime_type = res.mime_type.unwrap_or_else(|| {
-                        infer2::get(&data)
-                            .map(|t| t.mime_type())
-                            .unwrap_or("application/octet-stream")
-                            .to_string()
+        // Guarded matches move a field only once the guard passes, so `res` is
+        // still whole when neither branch applies.
+        match res.blob {
+            Some(data) if !data.is_empty() => {
+                if let Some(text) = resource_text_from_bytes(&data, res.mime_type.as_deref()) {
+                    return Ok(ContentPart::Text {
+                        text: text.into_owned(),
                     });
-                    Ok(ContentPart::InlineData { mime_type, data })
                 }
+
+                let mime_type = res.mime_type.unwrap_or_else(|| {
+                    infer2::get(&data)
+                        .map(|t| t.mime_type())
+                        .unwrap_or("application/octet-stream")
+                        .to_string()
+                });
+                return Ok(ContentPart::InlineData { mime_type, data });
             }
-        } else if res
-            .uri
-            .as_ref()
-            .map(|v| !v.trim().is_empty())
-            .unwrap_or(false)
-            && let Some(file_uri) = res.uri
-        {
-            Ok(ContentPart::FileData {
+            _ => {}
+        }
+
+        match res.uri {
+            Some(file_uri) if !file_uri.trim().is_empty() => Ok(ContentPart::FileData {
                 file_uri,
                 mime_type: res.mime_type,
-            })
-        } else {
-            Err(res)
+            }),
+            _ => Err(res),
         }
     }
 }
@@ -1319,6 +1351,50 @@ mod tests {
         }))
         .unwrap();
         assert!(msg4.content.is_empty());
+    }
+
+    /// Every accepted `content` shape decodes the same way from CBOR as from JSON.
+    #[test]
+    fn test_message_content_deserialize_cbor_shapes() {
+        #[derive(Serialize)]
+        struct RawMessage<T> {
+            role: &'static str,
+            content: T,
+        }
+
+        fn decode<T: Serialize>(content: T) -> Result<Message, String> {
+            let bytes = cbor2::to_canonical_vec(&RawMessage {
+                role: "user",
+                content,
+            })
+            .unwrap();
+            cbor2::from_slice(&bytes).map_err(|err| err.to_string())
+        }
+
+        assert_eq!(
+            decode("hello").unwrap().content,
+            vec![ContentPart::Text {
+                text: "hello".into()
+            }]
+        );
+        assert!(decode(None::<String>).unwrap().content.is_empty());
+        assert!(decode(()).unwrap().content.is_empty());
+        assert!(
+            decode(Vec::<ContentPart>::new())
+                .unwrap()
+                .content
+                .is_empty()
+        );
+        assert!(decode(123_u32).is_err());
+
+        let parts = vec![
+            ContentPart::Text { text: "a".into() },
+            ContentPart::InlineData {
+                mime_type: "image/png".into(),
+                data: vec![0u8, 255].into(),
+            },
+        ];
+        assert_eq!(decode(&parts).unwrap().content, parts);
     }
 
     #[test]

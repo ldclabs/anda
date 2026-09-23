@@ -10,7 +10,6 @@ categories.workspace = true
 license.workspace = true
 
 [dependencies]
-async-trait = { workspace = true }
 anda_db_schema = { workspace = true }
 candid = { workspace = true }
 bytes = { workspace = true }

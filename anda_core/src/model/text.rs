@@ -116,30 +116,25 @@ fn resource_text_from_bytes_with_encoding<'a>(
     mime_type: Option<&str>,
     fallback_encoding: Option<&'static Encoding>,
 ) -> Option<Cow<'a, str>> {
+    let essence = mime_type.map(mime_essence);
+
     // Some binary formats (notably uncompressed PDFs) contain valid UTF-8.
     // Preserve their modality instead of exposing the file's source as text.
-    if let Some(mime_type) = mime_type {
-        let essence = mime_type
-            .split(';')
-            .next()
-            .unwrap_or(mime_type)
-            .trim()
-            .to_ascii_lowercase();
-        if essence == "application/pdf"
+    if let Some(essence) = &essence
+        && (essence == "application/pdf"
             || essence.starts_with("audio/")
             || essence.starts_with("video/")
-            || (essence.starts_with("image/") && !essence.ends_with("+xml"))
-        {
-            return None;
-        }
+            || (essence.starts_with("image/") && !essence.ends_with("+xml")))
+    {
+        return None;
     }
 
     if let Some(text) = utf8_text_from_bytes(data) {
         return Some(Cow::Borrowed(text));
     }
 
-    if let Some(mime_type) = mime_type
-        && !mime_type_allows_text_fallback(mime_type)
+    if let Some(essence) = &essence
+        && !mime_essence_allows_text_fallback(essence)
     {
         return None;
     }
@@ -147,20 +142,23 @@ fn resource_text_from_bytes_with_encoding<'a>(
     text_from_bytes_with_encoding(data, fallback_encoding)
 }
 
-fn mime_type_allows_text_fallback(mime_type: &str) -> bool {
-    let essence = mime_type
+/// Returns the lowercase `type/subtype` of a MIME type, without parameters.
+fn mime_essence(mime_type: &str) -> String {
+    mime_type
         .split(';')
         .next()
         .unwrap_or(mime_type)
         .trim()
-        .to_ascii_lowercase();
+        .to_ascii_lowercase()
+}
 
+fn mime_essence_allows_text_fallback(essence: &str) -> bool {
     essence.is_empty()
         || essence.starts_with("text/")
         || essence.ends_with("+json")
         || essence.ends_with("+xml")
         || matches!(
-            essence.as_str(),
+            essence,
             "application/json"
                 | "application/xml"
                 | "application/javascript"

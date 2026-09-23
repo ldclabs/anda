@@ -20,19 +20,27 @@ pub struct Document {
 
 impl Document {
     /// Creates a new text document with the given ID and text content.
-    pub fn from_text(id: &str, text: &str) -> Self {
+    pub fn from_text(id: impl Into<String>, text: impl Into<String>) -> Self {
         Self {
             metadata: BTreeMap::from([
-                ("id".to_string(), id.into()),
+                ("id".to_string(), Json::String(id.into())),
                 ("type".to_string(), "Text".into()),
             ]),
-            content: text.into(),
+            content: Json::String(text.into()),
         }
     }
 }
 
 impl From<&Resource> for Document {
     fn from(res: &Resource) -> Self {
+        let content = resource_text(res).map_or(Json::Null, Json::String);
+        Self::from_resource(res, content)
+    }
+}
+
+impl Document {
+    /// Builds a resource document with the resource's metadata (blob excluded).
+    fn from_resource(res: &Resource, content: Json) -> Self {
         let mut metadata = BTreeMap::from([
             ("id".to_string(), res._id.into()),
             ("type".to_string(), "Resource".into()),
@@ -44,17 +52,14 @@ impl From<&Resource> for Document {
             metadata.extend(val);
         };
 
-        let content = match res
-            .blob
-            .as_ref()
-            .and_then(|b| resource_text_from_bytes(&b.0, res.mime_type.as_deref()))
-        {
-            Some(text) => text.into_owned().into(),
-            None => Json::Null,
-        };
-
         Self { metadata, content }
     }
+}
+
+/// Decodes a resource blob as text, honoring its MIME type.
+fn resource_text(res: &Resource) -> Option<String> {
+    let blob = res.blob.as_ref()?;
+    resource_text_from_bytes(blob, res.mime_type.as_deref()).map(Cow::into_owned)
 }
 
 /// Collection of documents that can be injected into a completion prompt.
@@ -125,20 +130,18 @@ impl IntoIterator for Documents {
 
 impl From<Vec<String>> for Documents {
     fn from(texts: Vec<String>) -> Self {
-        let mut docs = Vec::new();
-        for (i, text) in texts.into_iter().enumerate() {
-            docs.push(Document {
+        texts
+            .into_iter()
+            .enumerate()
+            .map(|(i, text)| Document {
                 content: text.into(),
                 metadata: BTreeMap::from([
                     ("_id".to_string(), i.into()),
                     ("type".to_string(), "Text".into()),
                 ]),
-            });
-        }
-        Self {
-            docs,
-            ..Default::default()
-        }
+            })
+            .collect::<Vec<_>>()
+            .into()
     }
 }
 
@@ -197,7 +200,8 @@ impl std::fmt::Display for Documents {
         }
         writeln!(f, "<{}>", self.tag)?;
         for doc in &self.docs {
-            writeln!(f, "{}", escape_closing_tag(&doc.to_string(), &self.tag))?;
+            let rendered = serde_json::to_string(doc).map_err(|_| std::fmt::Error)?;
+            writeln!(f, "{}", escape_closing_tag(&rendered, &self.tag))?;
         }
         write!(f, "</{}>", self.tag)
     }
@@ -262,11 +266,11 @@ pub fn text_resource_documents(resources: &mut Vec<Resource>) -> Vec<Document> {
         {
             return true;
         }
-        let doc = Document::from(resource);
-        if doc.content == Json::Null {
+        // Decode before building metadata so undecodable resources cost nothing.
+        let Some(text) = resource_text(resource) else {
             return true;
-        }
-        user_resources.push(doc);
+        };
+        user_resources.push(Document::from_resource(resource, Json::String(text)));
         false
     });
     user_resources
