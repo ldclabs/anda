@@ -31,8 +31,8 @@ pub use ic_oss_types::object_store::UpdateVersion;
 pub use object_store::{ObjectMeta, PutMode, PutResult, UpdateVersion as OsVersion, path::Path};
 pub use tokio_util::sync::CancellationToken;
 
-use crate::BoxError;
 use crate::model::*;
+use crate::{BoxError, path_lowercase};
 
 /// Execution environment available to agents.
 ///
@@ -289,6 +289,10 @@ pub trait KeysFeatures: Sized {
 /// All operations are asynchronous and return Result types with custom error handling.
 pub trait StoreFeatures: Sized {
     /// Retrieves data from storage at the specified path.
+    ///
+    /// Missing objects should return [`object_store::Error::NotFound`], directly
+    /// or in the error's source chain, so [`CacheStoreFeatures`] can distinguish
+    /// absence from a failed read.
     fn store_get(
         &self,
         path: &Path,
@@ -449,67 +453,75 @@ pub trait HttpFeatures: Sized {
 #[derive(Clone, Deserialize, Serialize)]
 struct CacheStoreValue<T>(T, UpdateVersion);
 
+fn is_store_not_found(mut error: &(dyn std::error::Error + 'static)) -> bool {
+    loop {
+        if matches!(
+            error.downcast_ref::<object_store::Error>(),
+            Some(object_store::Error::NotFound { .. })
+        ) {
+            return true;
+        }
+        match error.source() {
+            Some(source) => error = source,
+            None => return false,
+        }
+    }
+}
+
 /// Convenience methods for values backed by both cache and object storage.
+///
+/// Keys are namespace-relative and converted to object-store paths, then
+/// ASCII-lowercased with [`path_lowercase`]. The same path is used for storage and as the
+/// cache key. Direct cache access to these entries must use that canonical key.
 ///
 /// # Consistency
 ///
 /// These helpers coordinate a cache and a store as two separate operations and
-/// do **not** provide cross-task linearizability. Concurrent writers to the same
-/// key can interleave and leave the cache holding a stale or rolled-back value
-/// until the entry is refreshed or the process restarts. Cache entries written
-/// here never expire on their own. Callers that need last-writer-wins semantics
-/// under concurrency should use the versioned write path
-/// ([`CacheStoreFeatures::cache_store_set`] with a version), whose
-/// compare-and-swap against the store guards the cache update.
+/// do **not** provide cross-task linearizability, even with versioned writes.
+/// An in-flight cache fill can overwrite a newer cached value or repopulate an
+/// entry after deletion. These helpers set no expiry, so stale entries may
+/// persist until eviction or an explicit refresh. Callers needing consistency
+/// under concurrency must serialize the entire read/fill, write, and delete
+/// operations for a key, or use [`StoreFeatures`] directly with versioned writes.
 #[async_trait]
 pub trait CacheStoreFeatures: StoreFeatures + CacheFeatures + Send + Sync + 'static {
     /// Initializes a cached value from storage, or creates it with `init` if missing.
+    /// Read errors other than [`object_store::Error::NotFound`] are propagated
+    /// without running `init`.
     async fn cache_store_init<T, F>(&self, key: &str, init: F) -> Result<(), BoxError>
     where
         T: DeserializeOwned + Serialize + Send,
         F: Future<Output = Result<T, BoxError>> + Send + 'static,
     {
-        let p = Path::from(key);
-        match self.store_get(&p).await {
+        let p = path_lowercase(&Path::from(key));
+        let (val, version) = match self.store_get(&p).await {
             Ok((v, meta)) => {
                 let val: T = from_slice(&v[..])?;
-                self.cache_set(
-                    key,
-                    (
-                        CacheStoreValue(
-                            val,
-                            UpdateVersion {
-                                e_tag: meta.e_tag,
-                                version: meta.version,
-                            },
-                        ),
-                        None,
-                    ),
+                (
+                    val,
+                    UpdateVersion {
+                        e_tag: meta.e_tag,
+                        version: meta.version,
+                    },
                 )
-                .await;
-                Ok(())
             }
-            Err(_) => {
+            Err(error) if is_store_not_found(error.as_ref()) => {
                 let val: T = init.await?;
                 let data = to_canonical_vec(&val)?;
                 let res = self.store_put(&p, PutMode::Create, data.into()).await?;
-                self.cache_set(
-                    key,
-                    (
-                        CacheStoreValue(
-                            val,
-                            UpdateVersion {
-                                e_tag: res.e_tag,
-                                version: res.version,
-                            },
-                        ),
-                        None,
-                    ),
+                (
+                    val,
+                    UpdateVersion {
+                        e_tag: res.e_tag,
+                        version: res.version,
+                    },
                 )
-                .await;
-                Ok(())
             }
-        }
+            Err(error) => return Err(error),
+        };
+        self.cache_set(p.as_ref(), (CacheStoreValue(val, version), None))
+            .await;
+        Ok(())
     }
 
     /// Returns a value and its storage version, loading it into cache if needed.
@@ -517,11 +529,12 @@ pub trait CacheStoreFeatures: StoreFeatures + CacheFeatures + Send + Sync + 'sta
     where
         T: DeserializeOwned + Serialize + Send + Sync,
     {
+        let p = path_lowercase(&Path::from(key));
+        let key = p.as_ref();
         match self.cache_get::<CacheStoreValue<T>>(key).await {
             Ok(CacheStoreValue(val, ver)) => Ok((val, ver)),
             Err(_) => {
                 // fetch from store and set in cache
-                let p = Path::from(key);
                 let (v, meta) = self.store_get(&p).await?;
                 let val: T = from_slice(&v[..])?;
                 let version = UpdateVersion {
@@ -538,11 +551,9 @@ pub trait CacheStoreFeatures: StoreFeatures + CacheFeatures + Send + Sync + 'sta
     /// Persists a value to storage and updates the cache on success.
     ///
     /// When `version` is provided, the write uses an atomic compare-and-swap
-    /// against that storage version, so the subsequent cache update reflects a
-    /// linearized write. Without a version, the value is written with overwrite
-    /// semantics: the store write and cache update are not atomic, so concurrent
-    /// unversioned writers may leave the cache on an older value (see the trait's
-    /// consistency notes). Prefer the versioned path for contended keys.
+    /// against that storage version. Without a version, the store write uses
+    /// overwrite semantics. Neither mode makes the cache update atomic with
+    /// storage; see the trait's consistency notes.
     async fn cache_store_set<T>(
         &self,
         key: &str,
@@ -553,50 +564,32 @@ pub trait CacheStoreFeatures: StoreFeatures + CacheFeatures + Send + Sync + 'sta
         T: DeserializeOwned + Serialize + Send,
     {
         let data = to_canonical_vec(&val)?;
-        let p = Path::from(key);
-        if let Some(ver) = version {
-            // atomic update
-            let res = self
-                .store_put(
-                    &p,
-                    PutMode::Update(OsVersion {
-                        e_tag: ver.e_tag.clone(),
-                        version: ver.version.clone(),
-                    }),
-                    data.into(),
-                )
-                .await?;
-            // we can set the cache value after atomic update succeeded
-            let ver = UpdateVersion {
-                e_tag: res.e_tag,
-                version: res.version,
-            };
-            self.cache_set(key, (CacheStoreValue(val, ver.clone()), None))
-                .await;
-            Ok(ver)
-        } else {
-            let res = self.store_put(&p, PutMode::Overwrite, data.into()).await?;
-            let ver = UpdateVersion {
-                e_tag: res.e_tag,
-                version: res.version,
-            };
-            self.cache_set(key, (CacheStoreValue(val, ver.clone()), None))
-                .await;
-            Ok(ver)
-        }
+        let p = path_lowercase(&Path::from(key));
+        let mode = version.map_or(PutMode::Overwrite, |ver| {
+            PutMode::Update(OsVersion {
+                e_tag: ver.e_tag,
+                version: ver.version,
+            })
+        });
+        let res = self.store_put(&p, mode, data.into()).await?;
+        let ver = UpdateVersion {
+            e_tag: res.e_tag,
+            version: res.version,
+        };
+        self.cache_set(p.as_ref(), (CacheStoreValue(val, ver.clone()), None))
+            .await;
+        Ok(ver)
     }
 
     /// Deletes a value from both cache and storage.
     ///
-    /// The store is deleted first, then the cache. Evicting the cache first would
-    /// let a concurrent [`CacheStoreFeatures::cache_store_get`] miss, read the
-    /// still-present store value, and repopulate a ghost cache entry that
-    /// survives the store deletion. Deleting the store first bounds the race to a
-    /// brief stale read that self-heals once the cache entry is removed.
+    /// The cache is evicted only after storage deletion succeeds. An already
+    /// in-flight read can still repopulate it afterward; callers must coordinate
+    /// concurrent operations when deletion needs to be immediately visible.
     async fn cache_store_delete(&self, key: &str) -> Result<(), BoxError> {
-        let p = Path::from(key);
+        let p = path_lowercase(&Path::from(key));
         self.store_delete(&p).await?;
-        self.cache_delete(key).await;
+        self.cache_delete(p.as_ref()).await;
         Ok(())
     }
 }
@@ -630,6 +623,7 @@ mod tests {
     struct TestCacheStore {
         cache: Mutex<TestCacheMap>,
         store: Mutex<BTreeMap<String, (Bytes, UpdateVersion)>>,
+        read_error: Mutex<Option<BoxError>>,
         store_gets: AtomicUsize,
         versions: AtomicUsize,
     }
@@ -721,13 +715,19 @@ mod tests {
     impl StoreFeatures for TestCacheStore {
         async fn store_get(&self, path: &Path) -> Result<(bytes::Bytes, ObjectMeta), BoxError> {
             self.store_gets.fetch_add(1, Ordering::SeqCst);
+            if let Some(error) = self.read_error.lock().unwrap().take() {
+                return Err(error);
+            }
             let (value, version) = self
                 .store
                 .lock()
                 .unwrap()
                 .get(path.as_ref())
                 .cloned()
-                .ok_or_else(|| format!("path {path} not found"))?;
+                .ok_or_else(|| object_store::Error::NotFound {
+                    path: path.to_string(),
+                    source: std::io::Error::from(std::io::ErrorKind::NotFound).into(),
+                })?;
 
             Ok((
                 value.clone(),
@@ -801,6 +801,83 @@ mod tests {
     }
 
     impl CacheStoreFeatures for TestCacheStore {}
+
+    #[test]
+    fn cache_store_keys_use_the_same_canonical_path_in_both_layers() {
+        block_on(async {
+            let ctx = TestCacheStore::default();
+            ctx.cache_store_init("Folder/Foo*", async { Ok::<_, BoxError>(1_u32) })
+                .await
+                .unwrap();
+            assert_eq!(
+                ctx.cache_store_get::<u32>("folder/foo*").await.unwrap().0,
+                1
+            );
+            ctx.cache_store_set("folder/foo*", 2_u32, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                ctx.cache_store_get::<u32>("Folder/Foo*").await.unwrap().0,
+                2
+            );
+            let key = path_lowercase(&Path::from("Folder/Foo*"));
+            assert!(ctx.cache_contains(key.as_ref()));
+            assert_eq!(
+                ctx.store.lock().unwrap().keys().collect::<Vec<_>>(),
+                vec![&key.to_string()]
+            );
+            ctx.cache_delete(key.as_ref()).await;
+            assert_eq!(
+                ctx.cache_store_get::<u32>("Folder/Foo*").await.unwrap().0,
+                2
+            );
+            ctx.cache_store_delete("FOLDER/FOO*").await.unwrap();
+            assert!(!ctx.cache_contains(key.as_ref()));
+            assert!(ctx.cache_store_get::<u32>("folder/foo*").await.is_err());
+        });
+    }
+
+    #[test]
+    fn cache_store_init_propagates_read_failures_without_initializing() {
+        block_on(async {
+            for kind in [
+                std::io::ErrorKind::TimedOut,
+                std::io::ErrorKind::PermissionDenied,
+            ] {
+                let ctx = TestCacheStore::default();
+                *ctx.read_error.lock().unwrap() = Some(std::io::Error::from(kind).into());
+                let error = ctx
+                    .cache_store_init::<u32, _>("key", async {
+                        panic!("initializer must not run on read failure")
+                    })
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.downcast_ref::<std::io::Error>().unwrap().kind(), kind);
+                assert!(ctx.store.lock().unwrap().is_empty());
+                assert!(!ctx.cache_contains("key"));
+            }
+        });
+    }
+
+    #[test]
+    fn cache_store_init_recognizes_wrapped_not_found_errors() {
+        #[derive(Debug, thiserror::Error)]
+        #[error("store read failed: {0}")]
+        struct WrappedError(#[source] object_store::Error);
+
+        block_on(async {
+            let ctx = TestCacheStore::default();
+            *ctx.read_error.lock().unwrap() =
+                Some(Box::new(WrappedError(object_store::Error::NotFound {
+                    path: "key".into(),
+                    source: std::io::Error::from(std::io::ErrorKind::NotFound).into(),
+                })));
+            ctx.cache_store_init("key", async { Ok::<_, BoxError>(7_u32) })
+                .await
+                .unwrap();
+            assert_eq!(ctx.cache_store_get::<u32>("key").await.unwrap().0, 7);
+        });
+    }
 
     #[test]
     fn cache_store_get_populates_cache_without_second_store_read() {
@@ -898,96 +975,6 @@ mod tests {
         ))
         .unwrap_err();
         assert!(err.to_string().contains("version mismatch"));
-    }
-
-    #[test]
-    fn cache_and_store_mock_helpers_cover_absent_existing_and_error_paths() {
-        let ctx = TestCacheStore::default();
-
-        let ttl = CacheExpiry::TTL(Duration::from_secs(5));
-        block_on(ctx.cache_set("ttl", ("one".to_string(), Some(ttl.clone()))));
-        assert!(ctx.cache_contains("ttl"));
-
-        let existing = block_on(ctx.cache_set_if_not_exists(
-            "ttl",
-            (
-                "two".to_string(),
-                Some(CacheExpiry::TTI(Duration::from_secs(9))),
-            ),
-        ));
-        assert!(!existing);
-
-        let inserted = block_on(ctx.cache_set_if_not_exists(
-            "tti",
-            (
-                "three".to_string(),
-                Some(CacheExpiry::TTI(Duration::from_secs(9))),
-            ),
-        ));
-        assert!(inserted);
-
-        let seen = ctx
-            .cache
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(key, value)| (key.clone(), value.1.clone()))
-            .collect::<Vec<_>>();
-        assert_eq!(seen.len(), 2);
-        let ttl_expiry = seen
-            .iter()
-            .find(|(key, _)| key == "ttl")
-            .and_then(|(_, expiry)| expiry.as_ref())
-            .unwrap();
-        let tti_expiry = seen
-            .iter()
-            .find(|(key, _)| key == "tti")
-            .and_then(|(_, expiry)| expiry.as_ref())
-            .unwrap();
-        match ttl_expiry {
-            CacheExpiry::TTL(duration) => assert_eq!(*duration, Duration::from_secs(5)),
-            CacheExpiry::TTI(_) => panic!("expected ttl"),
-        }
-        match tti_expiry {
-            CacheExpiry::TTI(duration) => assert_eq!(*duration, Duration::from_secs(9)),
-            CacheExpiry::TTL(_) => panic!("expected tti"),
-        }
-
-        let value =
-            block_on(ctx.cache_get_with("lazy", async { Ok::<_, BoxError>((99_u32, None)) }))
-                .unwrap();
-        assert_eq!(value, 99);
-        let cached =
-            block_on(ctx.cache_get_with("lazy", async { Ok::<_, BoxError>((100_u32, None)) }))
-                .unwrap();
-        assert_eq!(cached, 99);
-
-        let first =
-            block_on(ctx.store_put(&Path::from("created"), PutMode::Create, Bytes::from("a")))
-                .unwrap();
-        assert!(first.version.is_some());
-        let err =
-            block_on(ctx.store_put(&Path::from("created"), PutMode::Create, Bytes::from("b")))
-                .unwrap_err();
-        assert!(err.to_string().contains("already exists"));
-
-        block_on(ctx.store_rename_if_not_exists(&Path::from("created"), &Path::from("renamed")))
-            .unwrap();
-        assert!(ctx.store.lock().unwrap().contains_key("renamed"));
-        let err = block_on(
-            ctx.store_rename_if_not_exists(&Path::from("missing"), &Path::from("renamed")),
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("already exists"));
-        let err = block_on(
-            ctx.store_rename_if_not_exists(&Path::from("missing"), &Path::from("new-destination")),
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("not found"));
-
-        let listed =
-            block_on(ctx.store_list(Some(&Path::from("r")), &Path::from("renamed"))).unwrap();
-        assert!(listed.is_empty());
     }
 
     #[test]

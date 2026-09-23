@@ -384,7 +384,7 @@ impl RequestMeta {
     {
         self.extra
             .get(key)
-            .and_then(|value| serde_json::from_value(value.clone()).ok())
+            .and_then(|value| T::deserialize(value).ok())
     }
 }
 

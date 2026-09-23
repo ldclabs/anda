@@ -116,6 +116,24 @@ fn resource_text_from_bytes_with_encoding<'a>(
     mime_type: Option<&str>,
     fallback_encoding: Option<&'static Encoding>,
 ) -> Option<Cow<'a, str>> {
+    // Some binary formats (notably uncompressed PDFs) contain valid UTF-8.
+    // Preserve their modality instead of exposing the file's source as text.
+    if let Some(mime_type) = mime_type {
+        let essence = mime_type
+            .split(';')
+            .next()
+            .unwrap_or(mime_type)
+            .trim()
+            .to_ascii_lowercase();
+        if essence == "application/pdf"
+            || essence.starts_with("audio/")
+            || essence.starts_with("video/")
+            || (essence.starts_with("image/") && !essence.ends_with("+xml"))
+        {
+            return None;
+        }
+    }
+
     if let Some(text) = utf8_text_from_bytes(data) {
         return Some(Cow::Borrowed(text));
     }
@@ -225,5 +243,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(decoded.as_ref(), "café");
+    }
+
+    #[test]
+    fn resource_text_preserves_utf8_detection_for_text_and_unspecified_types() {
+        for mime in [
+            None,
+            Some("application/octet-stream"),
+            Some("text/plain"),
+            Some("application/json"),
+            Some("application/xml"),
+            Some("image/svg+xml"),
+            Some("application/example+json"),
+        ] {
+            let text = resource_text_from_bytes_with_encoding(b"UTF-8 text", mime, None).unwrap();
+            assert!(matches!(text, Cow::Borrowed("UTF-8 text")));
+        }
     }
 }

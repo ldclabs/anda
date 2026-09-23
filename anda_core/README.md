@@ -16,7 +16,7 @@ Full API documentation is available on [docs.rs][docs].
 
 ```toml
 [dependencies]
-anda_core = "0.14"
+anda_core = "0.16"
 ```
 
 ## What It Provides
@@ -52,6 +52,8 @@ Agent names are registered case-insensitively and must follow the same function-
 A tool implements [`Tool<C>`][tool-trait] with typed `Args` and `Output` associated types. The runtime accepts raw JSON tool calls, deserializes them into `Args`, executes the tool, then serializes the output back to JSON.
 
 Tools can declare supported resource tags. During a call, the runtime removes matching resources from the request resource list and passes them to the tool.
+Both tool and agent registries honor custom `select_resources` implementations;
+the default implementation selects by the declared tags.
 
 ### Contexts
 
@@ -67,9 +69,27 @@ Tools can declare supported resource tags. During a call, the runtime removes ma
 
 [`AgentContext`][agent-context] extends `BaseContext` with LLM completion and orchestration methods for local or remote agents and tools.
 
+`CacheStoreFeatures` takes namespace-relative keys and uses one ASCII-lowercased
+object-store path for both the storage path and cache key. Direct cache access
+to its entries must use the same
+canonical key. Storage implementations should report missing objects as
+`object_store::Error::NotFound` (directly or in the error's source chain): only
+that error triggers `cache_store_init`'s initializer; other read errors propagate.
+These helpers provide weak cache consistency. Versioned writes protect storage,
+but concurrent cache fills can still overwrite newer entries or repopulate a
+deleted entry. Serialize all operations on a contended key, or use versioned
+storage operations directly when consistency is required.
+
 ### Messages and Content
 
 [`Message`][message] and [`ContentPart`][content-part] provide a normalized representation for text, reasoning, files, inline binary data, tool calls, tool outputs, signed actions, and provider-specific JSON payloads. Model adapters can preserve unknown provider content in `ContentPart::Any` while still exposing common behavior to the rest of the framework.
+
+Resource conversion preserves explicit PDF, audio, video, and binary image MIME
+types as inline file data even when their bytes are valid UTF-8. Text detection
+continues to support unspecified types and textual formats such as JSON, XML,
+and SVG. `text_resource_documents` and `prompt_with_resources` consume only
+successfully decoded `text`/`md` attachments; URI-only and undecodable resources
+remain available for subsequent processing.
 
 ## Minimal Tool Example
 
@@ -105,8 +125,8 @@ where
 
     fn definition(&self) -> FunctionDefinition {
         FunctionDefinition {
-            name: self.name(),
-            description: self.description(),
+            name: <Self as Tool<C>>::name(self),
+            description: <Self as Tool<C>>::description(self),
             parameters: gen_schema_for::<EchoArgs>(),
             strict: Some(true),
         }
@@ -124,6 +144,8 @@ where
 ```
 
 ## Validation
+
+The Rust example above is compiled by `cargo test` as a doctest.
 
 Useful checks while working on this crate:
 

@@ -162,6 +162,11 @@ where
     /// Returns resource tags this tool can consume.
     fn supported_resource_tags(&self) -> Vec<String>;
 
+    /// Removes and returns resources selected for this tool.
+    fn select_resources(&self, resources: &mut Vec<Resource>) -> Vec<Resource> {
+        select_resources(resources, &self.supported_resource_tags())
+    }
+
     /// Initializes the tool through object-safe dispatch.
     fn init(&self, ctx: C) -> BoxPinFut<Result<(), BoxError>>;
 
@@ -182,7 +187,7 @@ where
 /// reflects the tools actually registered (no stale or missing entries).
 ///
 /// Share one constructor across a bundle's tools to keep the metadata identical;
-/// when ids collide, the first-registered tool's metadata wins.
+/// when ids collide, the first tool in lowercase-name order supplies the metadata.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ToolGroupInfo {
     /// Stable group id, unique across the engine (for example `fs_workspace`).
@@ -371,6 +376,10 @@ where
         self.0.supported_resource_tags()
     }
 
+    fn select_resources(&self, resources: &mut Vec<Resource>) -> Vec<Resource> {
+        self.0.select_resources(resources)
+    }
+
     fn init(&self, ctx: C) -> BoxPinFut<Result<(), BoxError>> {
         let tool = self.0.clone();
         Box::pin(async move { tool.init(ctx).await })
@@ -391,7 +400,6 @@ where
 ///
 /// # Type Parameters
 /// - `C`: The context type that implements [`BaseContext`].
-#[derive(Default)]
 pub struct ToolSet<C: BaseContext> {
     /// Registered tools keyed by their lowercase function names.
     ///
@@ -402,7 +410,6 @@ pub struct ToolSet<C: BaseContext> {
 }
 
 /// Registry for runtime-discovered tool providers.
-#[derive(Default)]
 pub struct ToolProviderSet<C: BaseContext> {
     /// Registered providers keyed by their lowercase provider names.
     ///
@@ -411,15 +418,29 @@ pub struct ToolProviderSet<C: BaseContext> {
     set: BTreeMap<String, Arc<dyn ToolProvider<C>>>,
 }
 
+impl<C: BaseContext> Default for ToolSet<C> {
+    fn default() -> Self {
+        Self {
+            set: BTreeMap::new(),
+        }
+    }
+}
+
+impl<C: BaseContext> Default for ToolProviderSet<C> {
+    fn default() -> Self {
+        Self {
+            set: BTreeMap::new(),
+        }
+    }
+}
+
 impl<C> ToolProviderSet<C>
 where
     C: BaseContext + Clone + Send + Sync + 'static,
 {
     /// Creates an empty provider set.
     pub fn new() -> Self {
-        Self {
-            set: BTreeMap::new(),
-        }
+        Self::default()
     }
 
     /// Returns whether a provider with the given name exists.
@@ -498,21 +519,23 @@ where
 
     /// Returns function metadata for all provider-backed tools or selected names.
     pub fn functions(&self, names: Option<&[String]>) -> Vec<Function> {
-        self.definitions(names)
-            .into_iter()
-            .map(|definition| {
-                let supported_resource_tags = self
-                    .set
-                    .values()
-                    .find(|provider| provider.contains_lowercase(&definition.name))
-                    .map(|provider| provider.supported_resource_tags(&definition.name))
-                    .unwrap_or_default();
-                Function {
-                    definition,
-                    supported_resource_tags,
-                }
-            })
-            .collect()
+        if matches!(names, Some([])) {
+            return Vec::new();
+        }
+
+        let mut functions = BTreeMap::new();
+        for provider in self.set.values() {
+            for mut definition in provider.definitions(names) {
+                definition.name.make_ascii_lowercase();
+                functions
+                    .entry(definition.name.clone())
+                    .or_insert_with(|| Function {
+                        supported_resource_tags: provider.supported_resource_tags(&definition.name),
+                        definition,
+                    });
+            }
+        }
+        functions.into_values().collect()
     }
 
     /// Removes and returns resources supported by the named provider tool.
@@ -580,9 +603,7 @@ where
 {
     /// Creates an empty tool set.
     pub fn new() -> Self {
-        Self {
-            set: BTreeMap::new(),
-        }
+        Self::default()
     }
 
     /// Returns whether a tool with the given name exists.
@@ -654,10 +675,7 @@ where
 
         self.set
             .get(&name.to_ascii_lowercase())
-            .map(|tool| {
-                let supported_tags = tool.supported_resource_tags();
-                select_resources(resources, &supported_tags)
-            })
+            .map(|tool| tool.select_resources(resources))
             .unwrap_or_default()
     }
 
@@ -800,6 +818,12 @@ mod tests {
             }
         }
 
+        fn select_resources(&self, resources: &mut Vec<Resource>) -> Vec<Resource> {
+            resources
+                .extract_if(.., |resource| resource.name == "selected")
+                .collect()
+        }
+
         async fn call(
             &self,
             _ctx: MockContext,
@@ -937,37 +961,6 @@ mod tests {
 
         assert!(Arc::ptr_eq(&err, &original));
         assert_eq!(err.name(), "example_tool");
-    }
-
-    #[test]
-    fn fixture_tools_cover_direct_methods() {
-        futures::executor::block_on(async {
-            let other = OtherTool;
-            assert_eq!(other.name(), "other_tool");
-            assert_eq!(other.description(), "Other tool used for downcast tests");
-            let definition = other.definition();
-            assert_eq!(definition.name, "other_tool");
-            assert_eq!(definition.description, "Other tool used for downcast tests");
-            assert_eq!(definition.parameters["type"], "object");
-            let output = other
-                .call(MockContext::default(), (), Vec::new())
-                .await
-                .unwrap();
-            assert_eq!(output.output, "other");
-
-            let invalid = InvalidTool;
-            assert_eq!(invalid.name(), "bad.tool");
-            assert_eq!(invalid.description(), "Invalid function name");
-            let definition = invalid.definition();
-            assert_eq!(definition.name, "bad.tool");
-            assert_eq!(definition.description, "Invalid function name");
-            assert_eq!(definition.parameters["type"], "object");
-            let output = invalid
-                .call(MockContext::default(), (), Vec::new())
-                .await
-                .unwrap();
-            assert!(output.output.is_empty());
-        });
     }
 
     #[test]
@@ -1118,6 +1111,131 @@ mod tests {
     struct GroupedTool {
         name: &'static str,
         group: &'static str,
+    }
+
+    #[test]
+    fn tool_registry_preserves_custom_resource_selection() {
+        let tool = Arc::new(OtherTool);
+        let mut direct = vec![
+            resource(1, &["text"]),
+            Resource {
+                name: "selected".into(),
+                ..resource(2, &["image"])
+            },
+        ];
+        let mut registered = direct.clone();
+        let expected = tool.select_resources(&mut direct);
+        assert_eq!(expected.iter().map(|r| r._id).collect::<Vec<_>>(), vec![2]);
+        let mut set = ToolSet::new();
+        set.add(tool).unwrap();
+        let actual = set.select_resources("OTHER_TOOL", &mut registered);
+        assert_eq!(
+            serde_json::to_value(actual).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+        assert_eq!(
+            registered.iter().map(|r| r._id).collect::<Vec<_>>(),
+            vec![1]
+        );
+    }
+
+    struct SnapshotProvider {
+        name: &'static str,
+        names: Vec<String>,
+        snapshots: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ToolProvider<MockContext> for SnapshotProvider {
+        fn name(&self) -> String {
+            self.name.into()
+        }
+
+        fn definitions(&self, names: Option<&[String]>) -> Vec<FunctionDefinition> {
+            self.snapshots
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.names
+                .iter()
+                .filter(|name| {
+                    names.is_none_or(|names| names.iter().any(|n| n.eq_ignore_ascii_case(name)))
+                })
+                .map(|name| FunctionDefinition {
+                    name: name.clone(),
+                    description: self.name.into(),
+                    ..Default::default()
+                })
+                .collect()
+        }
+
+        fn supported_resource_tags(&self, name: &str) -> Vec<String> {
+            assert_eq!(name, name.to_ascii_lowercase());
+            vec![self.name.into()]
+        }
+
+        fn call(
+            &self,
+            _ctx: MockContext,
+            _input: ToolInput<Json>,
+        ) -> BoxFut<'_, Result<ToolOutput<Json>, BoxError>> {
+            Box::pin(async { Ok(ToolOutput::new(json!(self.name))) })
+        }
+    }
+
+    #[test]
+    fn provider_functions_use_one_snapshot_and_preserve_routes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let first = Arc::new(SnapshotProvider {
+            name: "first",
+            names: (0..32).map(|i| format!("Tool{i:02}")).collect(),
+            snapshots: AtomicUsize::new(0),
+        });
+        let second = Arc::new(SnapshotProvider {
+            name: "second",
+            names: vec!["tool00".into(), "unique".into()],
+            snapshots: AtomicUsize::new(0),
+        });
+        let mut set = ToolProviderSet::new();
+        set.add(second.clone()).unwrap();
+        set.add(first.clone()).unwrap();
+        let functions = set.functions(None);
+        assert_eq!(functions.len(), 33);
+        assert_eq!(first.snapshots.load(Ordering::Relaxed), 1);
+        assert_eq!(second.snapshots.load(Ordering::Relaxed), 1);
+        for pair in functions.windows(2) {
+            assert!(pair[0].definition.name < pair[1].definition.name);
+        }
+        assert_eq!(functions[0].definition.description, "first");
+        assert_eq!(functions[0].supported_resource_tags, vec!["first"]);
+        assert_eq!(
+            functions.last().unwrap().supported_resource_tags,
+            vec!["second"]
+        );
+        assert!(set.functions(Some(&[])).is_empty());
+        assert_eq!(first.snapshots.load(Ordering::Relaxed), 1);
+        assert_eq!(second.snapshots.load(Ordering::Relaxed), 1);
+        let selected = set.functions(Some(&["TOOL00".into(), "tool00".into(), "missing".into()]));
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].definition.name, "tool00");
+        assert_eq!(selected[0].supported_resource_tags, vec!["first"]);
+        futures::executor::block_on(async {
+            assert_eq!(
+                set.call(
+                    MockContext::default(),
+                    ToolInput::new("TOOL00".into(), Json::Null)
+                )
+                .await
+                .unwrap()
+                .output,
+                json!("first")
+            );
+            assert!(
+                set.call(
+                    MockContext::default(),
+                    ToolInput::new("missing".into(), Json::Null)
+                )
+                .await
+                .is_err()
+            );
+        });
     }
 
     impl Tool<MockContext> for GroupedTool {

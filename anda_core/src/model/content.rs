@@ -719,6 +719,32 @@ mod tests {
     }
 
     #[test]
+    fn binary_mime_types_preserve_inline_data_even_when_bytes_are_utf8() {
+        let data: ByteBufB64 = b"%PDF-1.4\nASCII file content".to_vec().into();
+        for mime_type in [
+            "application/pdf",
+            " Application/PDF ; version=1.4",
+            "audio/wav",
+            "video/mp4",
+            "image/png",
+        ] {
+            let part = ContentPart::try_from(Resource {
+                mime_type: Some(mime_type.into()),
+                blob: Some(data.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+            assert_eq!(
+                part,
+                ContentPart::InlineData {
+                    mime_type: mime_type.into(),
+                    data: data.clone()
+                }
+            );
+        }
+    }
+
+    #[test]
     fn test_message_content_deserialize_rejects_non_string_non_array() {
         assert!(
             serde_json::from_value::<Message>(json!({

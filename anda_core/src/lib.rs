@@ -33,6 +33,11 @@ pub use json::*;
 pub use model::*;
 pub use tool::*;
 
+// Compile the README's Rust examples as part of `cargo test`.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct Readme;
+
 /// A type alias for a boxed error that is thread-safe and sendable across threads.
 /// This is commonly used as a return type for functions that can return various error types.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -113,6 +118,21 @@ pub fn validate_function_name(name: &str) -> Result<(), BoxError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registry_defaults_do_not_require_a_default_context() {
+        fn defaults<C: AgentContext>() -> (AgentSet<C>, ToolSet<C>, ToolProviderSet<C>) {
+            (
+                AgentSet::default(),
+                ToolSet::default(),
+                ToolProviderSet::default(),
+            )
+        }
+        let (agents, tools, providers) = defaults::<crate::test_support::MockContext>();
+        assert!(agents.names().is_empty());
+        assert!(tools.names().is_empty());
+        assert!(providers.definitions(None).is_empty());
+    }
 
     #[test]
     fn test_path_lowercase() {

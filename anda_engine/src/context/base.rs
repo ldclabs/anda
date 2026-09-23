@@ -658,6 +658,34 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn cache_store_aliases_share_one_entry_in_a_scoped_context() {
+        let ctx = test_ctx().child("worker".into(), "worker".into()).unwrap();
+        ctx.cache_store_init("Folder/Foo*", async { Ok::<_, BoxError>(1_u32) })
+            .await
+            .unwrap();
+        let (_, version) = ctx.cache_store_get::<u32>("folder/foo*").await.unwrap();
+        ctx.cache_store_set("folder/foo*", 2_u32, Some(version))
+            .await
+            .unwrap();
+        assert_eq!(
+            ctx.cache_store_get::<u32>("Folder/Foo*").await.unwrap().0,
+            2
+        );
+        assert_eq!(
+            ctx.store_list(None, &Path::default()).await.unwrap().len(),
+            1
+        );
+        ctx.cache_store_delete("FOLDER/FOO*").await.unwrap();
+        assert!(ctx.cache_store_get::<u32>("Folder/Foo*").await.is_err());
+        assert!(
+            ctx.store_list(None, &Path::default())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     #[test]
     fn base_ctx_state_child_meta_and_depth_behaviour() {
         let ctx = test_ctx();

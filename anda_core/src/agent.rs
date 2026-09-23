@@ -175,6 +175,11 @@ where
     /// Returns resource tags this agent can consume.
     fn supported_resource_tags(&self) -> Vec<String>;
 
+    /// Removes and returns resources selected for this agent.
+    fn select_resources(&self, resources: &mut Vec<Resource>) -> Vec<Resource> {
+        select_resources(resources, &self.supported_resource_tags())
+    }
+
     /// Initializes the agent through object-safe dispatch.
     fn init(&self, ctx: C) -> BoxPinFut<Result<(), BoxError>>;
 
@@ -259,6 +264,10 @@ where
         self.inner.supported_resource_tags()
     }
 
+    fn select_resources(&self, resources: &mut Vec<Resource>) -> Vec<Resource> {
+        self.inner.select_resources(resources)
+    }
+
     fn init(&self, ctx: C) -> BoxPinFut<Result<(), BoxError>> {
         let agent = self.inner.clone();
         Box::pin(async move { agent.init(ctx).await })
@@ -279,7 +288,6 @@ where
 ///
 /// # Type Parameters
 /// - `C`: The context type that implements [`AgentContext`].
-#[derive(Default)]
 pub struct AgentSet<C: AgentContext> {
     /// Registered agents keyed by their lowercase function names.
     ///
@@ -289,15 +297,21 @@ pub struct AgentSet<C: AgentContext> {
     set: BTreeMap<String, Arc<dyn DynAgent<C>>>,
 }
 
+impl<C: AgentContext> Default for AgentSet<C> {
+    fn default() -> Self {
+        Self {
+            set: BTreeMap::new(),
+        }
+    }
+}
+
 impl<C> AgentSet<C>
 where
     C: AgentContext + Send + Sync + 'static,
 {
     /// Creates a new empty AgentSet.
     pub fn new() -> Self {
-        Self {
-            set: BTreeMap::new(),
-        }
+        Self::default()
     }
 
     /// Returns whether an agent with the given name exists.
@@ -369,10 +383,7 @@ where
 
         self.set
             .get(&name.to_ascii_lowercase())
-            .map(|agent| {
-                let supported_tags = agent.supported_resource_tags();
-                select_resources(resources, &supported_tags)
-            })
+            .map(|agent| agent.select_resources(resources))
             .unwrap_or_default()
     }
 
@@ -499,6 +510,12 @@ mod tests {
                 description: "Agents used together in tests".to_string(),
                 instructions: Some("Combine these agents.".to_string()),
             })
+        }
+
+        fn select_resources(&self, resources: &mut Vec<Resource>) -> Vec<Resource> {
+            resources
+                .extract_if(.., |resource| resource.name == "selected")
+                .collect()
         }
 
         async fn run(
@@ -683,41 +700,6 @@ mod tests {
     }
 
     #[test]
-    fn fixture_agents_cover_direct_trait_methods() {
-        futures::executor::block_on(async {
-            let other = OtherAgent;
-            assert_eq!(other.name(), "other_agent");
-            assert_eq!(other.description(), "Other agent used for downcast tests");
-            assert_eq!(
-                other
-                    .run(MockContext::default(), "prompt".to_string(), Vec::new())
-                    .await
-                    .unwrap()
-                    .content,
-                "other"
-            );
-
-            let tagged = TaggedAgent;
-            assert_eq!(
-                tagged.tool_dependencies(),
-                vec!["lookup".to_string(), "summarize".to_string()]
-            );
-
-            let invalid = InvalidAgent;
-            assert_eq!(invalid.name(), "bad.agent");
-            assert_eq!(invalid.description(), "Invalid function name");
-            assert!(
-                invalid
-                    .run(MockContext::default(), "prompt".to_string(), Vec::new())
-                    .await
-                    .unwrap()
-                    .content
-                    .is_empty()
-            );
-        });
-    }
-
-    #[test]
     fn agent_set_registry_filters_resources_and_reports_errors() {
         futures::executor::block_on(async {
             let mut agent_set = AgentSet::<MockContext>::new();
@@ -809,5 +791,31 @@ mod tests {
             let invalid = agent_set.add(Arc::new(InvalidAgent), None).unwrap_err();
             assert!(invalid.to_string().contains("invalid character"));
         });
+    }
+
+    #[test]
+    fn agent_registry_preserves_custom_resource_selection() {
+        let agent = Arc::new(OtherAgent);
+        let mut direct = vec![
+            resource(1, &["text"]),
+            Resource {
+                name: "selected".into(),
+                ..resource(2, &["image"])
+            },
+        ];
+        let mut registered = direct.clone();
+        let expected = agent.select_resources(&mut direct);
+        assert_eq!(expected.iter().map(|r| r._id).collect::<Vec<_>>(), vec![2]);
+        let mut set = AgentSet::new();
+        set.add(agent, None).unwrap();
+        let actual = set.select_resources("OTHER_AGENT", &mut registered);
+        assert_eq!(
+            serde_json::to_value(actual).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+        assert_eq!(
+            registered.iter().map(|r| r._id).collect::<Vec<_>>(),
+            vec![1]
+        );
     }
 }

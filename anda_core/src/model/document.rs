@@ -3,10 +3,10 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::BTreeMap;
+use std::{borrow::Cow, collections::BTreeMap};
 
 use super::text::resource_text_from_bytes;
-use crate::{Json, Message, Resource, ResourceRef, select_resources};
+use crate::{Json, Message, Resource, ResourceRef};
 
 /// A document with metadata and content.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -173,7 +173,13 @@ impl AsRef<Vec<Document>> for Documents {
 
 impl std::fmt::Display for Document {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        json!(self).fmt(f)
+        let rendered = if f.alternate() {
+            serde_json::to_string_pretty(self)
+        } else {
+            serde_json::to_string(self)
+        }
+        .map_err(|_| std::fmt::Error)?;
+        f.write_str(&rendered)
     }
 }
 
@@ -203,30 +209,33 @@ impl std::fmt::Display for Documents {
 /// Matching is case-insensitive; the original casing is preserved and only the
 /// leading `<` is separated (`</tag>` becomes `< /tag>`), which stays valid JSON
 /// and readable while no longer matching the delimiter.
-fn escape_closing_tag(rendered: &str, tag: &str) -> String {
-    let needle = format!("</{}>", tag.to_ascii_lowercase());
-    let lower = rendered.to_ascii_lowercase();
-    if !lower.contains(&needle) {
-        return rendered.to_string();
-    }
+fn escape_closing_tag<'a>(rendered: &'a str, tag: &str) -> Cow<'a, str> {
+    let needle = format!("</{tag}>");
+    let mut matches = rendered.match_indices("</").filter_map(|(pos, _)| {
+        rendered[pos..]
+            .get(..needle.len())
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(&needle))
+            .then_some(pos)
+    });
+    let Some(first) = matches.next() else {
+        return Cow::Borrowed(rendered);
+    };
 
     let mut out = String::with_capacity(rendered.len() + 8);
     let mut start = 0;
-    while let Some(rel) = lower[start..].find(&needle) {
-        let pos = start + rel;
-        out.push_str(&rendered[start..pos]);
-        out.push_str("< ");
-        out.push_str(&rendered[pos + 1..pos + needle.len()]);
-        start = pos + needle.len();
+    for pos in std::iter::once(first).chain(matches) {
+        out.push_str(&rendered[start..pos + 1]);
+        out.push(' ');
+        start = pos + 1;
     }
     out.push_str(&rendered[start..]);
-    out
+    Cow::Owned(out)
 }
 
 /// Appends text resources to the prompt as an `<attachments>` document block.
 ///
-/// Resources tagged `text` or `md` are removed from `resources` (see
-/// [`text_resource_documents`]); other resources are left untouched.
+/// Successfully decoded resources tagged `text` or `md` are removed from
+/// `resources` (see [`text_resource_documents`]); other resources remain available.
 pub fn prompt_with_resources(prompt: String, resources: &mut Vec<Resource>) -> String {
     let user_resources = text_resource_documents(resources);
     if user_resources.is_empty() {
@@ -239,20 +248,27 @@ pub fn prompt_with_resources(prompt: String, resources: &mut Vec<Resource>) -> S
     }
 }
 
-/// Removes resources tagged `text` or `md` and converts them into documents.
+/// Converts decodable resources tagged `text` or `md` into documents, removing them.
 ///
-/// Removed resources whose blob cannot be decoded as text are discarded
-/// without producing a document.
+/// URI-only resources and blobs that cannot be decoded as text remain in
+/// `resources` for subsequent processing. Both collections preserve input order.
 pub fn text_resource_documents(resources: &mut Vec<Resource>) -> Vec<Document> {
-    let res = select_resources(resources, &["text".to_string(), "md".to_string()]);
-    let mut user_resources: Vec<Document> = Vec::with_capacity(res.len());
-    for resource in &res {
-        let doc = Document::from(resource);
-        if doc.content != Json::Null {
-            user_resources.push(doc);
+    let mut user_resources = Vec::new();
+    resources.retain(|resource| {
+        if !resource
+            .tags
+            .iter()
+            .any(|tag| matches!(tag.as_str(), "text" | "md"))
+        {
+            return true;
         }
-    }
-
+        let doc = Document::from(resource);
+        if doc.content == Json::Null {
+            return true;
+        }
+        user_resources.push(doc);
+        false
+    });
     user_resources
 }
 
@@ -337,8 +353,10 @@ mod tests {
                 content: json!("alpha"),
             }]
         );
-        assert_eq!(resources.len(), 1);
-        assert_eq!(resources[0]._id, 3);
+        assert_eq!(
+            resources.iter().map(|r| r._id).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
 
         let mut prompt_resources = vec![Resource {
             blob: Some(b"beta".to_vec().into()),
@@ -385,6 +403,80 @@ mod tests {
         );
         // The neutralized form is present and still readable.
         assert!(rendered.contains("< /attachments>"));
+    }
+
+    #[test]
+    fn undecodable_and_uri_only_attachments_remain_available_in_order() {
+        let mut resources = vec![
+            Resource {
+                uri: Some("https://example.test/note.txt".into()),
+                ..resource(1, &["text"])
+            },
+            Resource {
+                blob: Some(b"first".to_vec().into()),
+                ..resource(2, &["text"])
+            },
+            Resource {
+                blob: Some(vec![0; 16].into()),
+                ..resource(3, &["md"])
+            },
+            Resource {
+                blob: Some(b"second".to_vec().into()),
+                ..resource(4, &["md"])
+            },
+            Resource {
+                blob: Some(b"%PDF-1.4\nASCII PDF data".to_vec().into()),
+                mime_type: Some("application/pdf".into()),
+                ..resource(5, &["text"])
+            },
+        ];
+        let docs = text_resource_documents(&mut resources);
+        assert_eq!(
+            docs.iter().map(|doc| &doc.content).collect::<Vec<_>>(),
+            vec![&json!("first"), &json!("second")]
+        );
+        assert_eq!(
+            resources.iter().map(|r| r._id).collect::<Vec<_>>(),
+            vec![1, 3, 5]
+        );
+        assert_eq!(
+            prompt_with_resources("unchanged".into(), &mut resources),
+            "unchanged"
+        );
+        assert_eq!(
+            resources.iter().map(|r| r._id).collect::<Vec<_>>(),
+            vec![1, 3, 5]
+        );
+    }
+
+    #[test]
+    fn document_rendering_preserves_json_and_borrows_unescaped_text() {
+        let doc = Document::from_text(
+            "文档",
+            "before </ATTACHMENTS> and </attachments> after\n\"quoted\"",
+        );
+        assert_eq!(doc.to_string(), json!(doc).to_string());
+        assert_eq!(format!("{doc:#}"), format!("{:#}", json!(doc)));
+        let rendered = doc.to_string();
+        let escaped = escape_closing_tag(&rendered, "attachments");
+        assert!(matches!(escaped, Cow::Owned(_)));
+        let parsed: Document = serde_json::from_str(&escaped).unwrap();
+        assert_eq!(
+            parsed.content,
+            json!("before < /ATTACHMENTS> and < /attachments> after\n\"quoted\"")
+        );
+        for text in [
+            "中文 </other> untouched",
+            "a </attach",
+            "plain text",
+            "</中文>",
+        ] {
+            assert!(matches!(
+                escape_closing_tag(text, "attachments"),
+                Cow::Borrowed(_)
+            ));
+        }
+        assert_eq!(escape_closing_tag("</文档>", "文档"), "< /文档>");
     }
 
     #[test]

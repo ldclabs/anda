@@ -2,6 +2,30 @@
 
 All notable changes to the Anda project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed — anda_core
+
+- Cache/store helpers use the same canonical lowercase path for both layers,
+  and initialization propagates read failures other than typed `NotFound` errors.
+  Document that storage CAS does not make cache fills or deletions linearizable.
+- Agent and tool registries forward custom resource selection through dynamic
+  dispatch. Empty registries no longer require a `Default` context.
+- Explicit binary media MIME types retain their file representation even for
+  UTF-8 bytes. URI-only and undecodable text attachments remain available after
+  prompt document extraction.
+- Correct the generic tool example and compile the README example as a doctest.
+
+### Changed — anda_core
+
+- Collect provider function metadata from one definition snapshot per provider;
+  preserve name ordering and duplicate-provider precedence.
+- Serialize prompt documents without a JSON value intermediate, avoid copying
+  documents that need no delimiter escaping, and deserialize request metadata
+  without cloning the source JSON value.
+- Consolidate cache write branches and replace mock-only tests with regression
+  coverage for the public contracts and scoped engine cache/store integration.
+
 ## [0.16.0] — 2026-09-16
 
 This release moves persistent memory to KIP 2.0, adds caller-isolated memory
