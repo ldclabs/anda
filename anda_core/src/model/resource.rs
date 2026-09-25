@@ -233,7 +233,7 @@ mod tests {
             mime_type: Some("text/plain".to_string()),
             blob: Some(ByteBufB64(b"hello".to_vec())),
             size: Some(5),
-            hash: Some(hash.clone()),
+            hash: Some(hash),
             metadata: Some(metadata("source", "unit")),
         };
 

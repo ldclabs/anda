@@ -1432,7 +1432,7 @@ impl MemoryManagement {
                 mime_type: r.mime_type.clone(),
                 blob: None,
                 size: r.size,
-                hash: r.hash.clone(),
+                hash: r.hash,
                 metadata: r.metadata.clone(),
             })
         }

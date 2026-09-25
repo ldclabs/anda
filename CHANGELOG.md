@@ -2,7 +2,29 @@
 
 All notable changes to the Anda project will be documented in this file.
 
-## [Unreleased]
+## [0.16.1] — 2026-09-25
+
+This release moves the AndaDB stack to 0.14, upgrades the cloud and TEE
+dependencies, and ships the review fixes staged since `0.16.0`.
+
+### Changed — workspace
+
+- **Workspace release alignment** — `anda_core`, `anda_engine`,
+  `anda_engine_server`, `anda_web3_client`, and `anda_cli` now share version
+  `0.16.1`.
+
+- **Published dependency upgrades** — `anda_db`, `anda_db_schema`,
+  `anda_db_tfs`, `anda_kip`, and `anda_cognitive_nexus` move from 0.13 to 0.14,
+  `anda_cloud_cdk` from 0.6 to 0.7, and `ic_tee_cdk` and `ic_tee_gateway_sdk`
+  from 0.7 to 0.8. `ic_auth_types` now requires 0.10.5, where `ByteArrayB64` is
+  `Copy`.
+
+- **Hosts upgrade these crates in step** — `anda_core::Resource`,
+  `anda_engine::context::AgentInfo`, and `anda_web3_client::tee`'s
+  `TeeGatewayClient` / `TeeGatewayClientBuilder` are re-exported from the
+  upgraded crates, and the memory APIs take AndaDB 0.14 handles. AndaDB 0.14
+  does not migrate Spaces activated under the `cognitive-memory` 2.1.0 draft;
+  follow its upgrading notes before opening existing memory stores.
 
 ### Fixed — anda_engine_server
 
