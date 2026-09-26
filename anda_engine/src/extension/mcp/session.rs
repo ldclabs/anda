@@ -44,8 +44,6 @@ pub(crate) const DISCOVERY_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Maximum duration of a connection attempt, including OAuth and handshake.
 pub(crate) const SESSION_SETUP_TIMEOUT: Duration = Duration::from_secs(45);
-/// Maximum duration of one complete paginated tool listing.
-pub(crate) const LIST_TOOLS_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long to wait for a `subscriptions/listen` acknowledgment before giving up
 /// on live `tools/list_changed` delivery for that session.
@@ -82,6 +80,10 @@ pub(crate) fn legacy_protocol_version() -> ProtocolVersion {
 }
 
 pub(crate) struct McpSession {
+    pub(crate) retired: AtomicBool,
+    pub(crate) session_cancelled: anda_core::CancellationToken,
+    pub(crate) elicitation: Option<super::interaction::ElicitationDispatcher>,
+    pub(crate) _process: Option<super::bounded::StdioProcess>,
     pub(crate) service: Mutex<RunningService<RoleClient, AndaMcpClient>>,
     pub(crate) dirty: Arc<AtomicBool>,
     /// Deadline after which the session's credentials are stale and it must be re-established.
@@ -95,6 +97,7 @@ pub(crate) struct McpSession {
 
 impl Drop for McpSession {
     fn drop(&mut self) {
+        self.session_cancelled.cancel();
         // The pump holds a peer clone and would otherwise outlive the session it
         // feeds; dropping its `Subscription` also cancels the server-side stream.
         if let Some(subscription) = &self.subscription {
@@ -114,6 +117,9 @@ impl McpSession {
     /// transport state is what actually flips, so check both — plus the credential deadline,
     /// since an expired token makes the session unusable while the transport is still open.
     pub(crate) async fn is_closed(&self) -> bool {
+        if self.retired.load(Ordering::SeqCst) {
+            return true;
+        }
         if self
             .expires_at
             .is_some_and(|deadline| Instant::now() >= deadline)
@@ -126,13 +132,24 @@ impl McpSession {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct AndaMcpClient {
     pub(crate) info: ClientConfig,
     dirty: Arc<AtomicBool>,
+    elicitation: Option<super::interaction::ElicitationDispatcher>,
 }
 
 impl AndaMcpClient {
+    pub(crate) fn with_elicitation(
+        mut self,
+        dispatcher: Option<super::interaction::ElicitationDispatcher>,
+    ) -> Self {
+        self.info.capabilities.elicitation = dispatcher
+            .as_ref()
+            .map(|dispatcher| dispatcher.handler.capabilities());
+        self.elicitation = dispatcher;
+        self
+    }
     pub(crate) fn new(dirty: Arc<AtomicBool>, tasks: bool) -> Self {
         let mut info = ClientConfig::default();
         info.client_info = Implementation::new("anda_engine", env!("CARGO_PKG_VERSION"))
@@ -148,11 +165,28 @@ impl AndaMcpClient {
                 .get_or_insert_with(ExtensionCapabilities::new)
                 .insert(TASKS_EXTENSION_ID.to_string(), Map::new());
         }
-        Self { info, dirty }
+        Self {
+            info,
+            dirty,
+            elicitation: None,
+        }
     }
 }
 
 impl ClientHandler for AndaMcpClient {
+    async fn create_elicitation(
+        &self,
+        request: rmcp::model::ElicitRequestParams,
+        context: rmcp::service::RequestContext<RoleClient>,
+    ) -> Result<rmcp::model::ElicitResult, rmcp::ErrorData> {
+        let dispatcher = self
+            .elicitation
+            .as_ref()
+            .ok_or_else(|| rmcp::ErrorData::invalid_request("elicitation is disabled", None))?;
+        dispatcher.elicit(request, &context.ct).await.map_err(|_| {
+            rmcp::ErrorData::internal_error("application elicitation failed or was cancelled", None)
+        })
+    }
     fn get_info(&self) -> ClientConfig {
         self.info.clone()
     }
@@ -199,6 +233,10 @@ pub struct McpStdioTransport {
     /// so the values are redacted from [`Debug`] output.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Explicit opt-in to inheriting the entire parent environment. By default
+    /// only platform essentials and `env` overrides reach the child.
+    #[serde(default)]
+    pub inherit_env: bool,
     /// Optional working directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<PathBuf>,
@@ -219,6 +257,7 @@ impl std::fmt::Debug for McpStdioTransport {
                     .map(|key| (key, "[REDACTED]"))
                     .collect::<BTreeMap<_, _>>(),
             )
+            .field("inherit_env", &self.inherit_env)
             .field("cwd", &self.cwd)
             .finish()
     }
@@ -235,6 +274,35 @@ impl McpStdioTransport {
     pub(crate) fn command(&self) -> Command {
         let mut command = Command::new(&self.command);
         command.args(&self.args);
+        if !self.inherit_env {
+            command.env_clear();
+            for name in [
+                "PATH",
+                "HOME",
+                "USER",
+                "LOGNAME",
+                "SHELL",
+                "LANG",
+                "LC_ALL",
+                "TERM",
+                "TMPDIR",
+                "TZ",
+                "SystemRoot",
+                "SYSTEMROOT",
+                "WINDIR",
+                "COMSPEC",
+                "PATHEXT",
+                "TEMP",
+                "TMP",
+                "USERPROFILE",
+                "APPDATA",
+                "LOCALAPPDATA",
+            ] {
+                if let Some(value) = std::env::var_os(name) {
+                    command.env(name, value);
+                }
+            }
+        }
         command.envs(&self.env);
         if let Some(cwd) = &self.cwd {
             command.current_dir(cwd);
@@ -289,6 +357,36 @@ impl McpStreamableHttpTransport {
             return Err("MCP HTTP URL must not be empty".into());
         }
         self.custom_headers()?;
+        let url = reqwest::Url::parse(&self.url)?;
+        if !matches!(url.scheme(), "http" | "https")
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.fragment().is_some()
+        {
+            return Err("MCP endpoint must be an HTTP(S) URL without user info or fragment".into());
+        }
+        if self.headers.keys().any(|name| {
+            [
+                "accept",
+                "mcp-session-id",
+                "last-event-id",
+                "mcp-protocol-version",
+                "content-length",
+                "host",
+            ]
+            .iter()
+            .any(|reserved| name.eq_ignore_ascii_case(reserved))
+        }) {
+            return Err("MCP custom headers cannot override protocol or routing headers".into());
+        }
+        if (self.auth.is_some() || self.bearer_token.is_some())
+            && self
+                .headers
+                .keys()
+                .any(|name| name.eq_ignore_ascii_case("authorization"))
+        {
+            return Err("MCP Authorization header conflicts with configured authentication".into());
+        }
         if let Some(token) = &self.bearer_token {
             HeaderValue::from_str(&format!("Bearer {token}"))?;
         }

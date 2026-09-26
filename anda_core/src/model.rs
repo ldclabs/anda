@@ -21,12 +21,14 @@ mod content;
 mod document;
 mod resource;
 mod text;
+mod tool_presentation;
 
 pub use completion::*;
 pub use content::*;
 pub use document::*;
 pub use resource::*;
 pub use text::*;
+pub use tool_presentation::*;
 
 /// Request sent to an agent for processing.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -283,6 +285,7 @@ impl AgentOutput {
 
         ToolOutput {
             output,
+            model_output: None,
             is_error,
             artifacts,
             usage,
@@ -327,6 +330,11 @@ pub struct ToolOutput<T> {
     /// The output from the tool.
     pub output: T,
 
+    /// Optional bounded, provider-neutral view sent to the model. The original
+    /// `output` remains available to callers and audit hooks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_output: Option<ToolPresentation>,
+
     /// Indicates if the tool execution resulted in an error.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_error: Option<bool>,
@@ -348,6 +356,7 @@ impl<T> ToolOutput<T> {
     pub fn new(output: T) -> Self {
         Self {
             output,
+            model_output: None,
             is_error: None,
             artifacts: Vec::new(),
             usage: Usage::default(),

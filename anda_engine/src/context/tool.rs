@@ -57,11 +57,35 @@ pub struct ToolsOutput {
 
 /// Upper bound on the definitions taken from a *single* discovery-tool output.
 ///
-/// It is not a cap on the accumulated set: definitions collected across
-/// successive discovery rounds all stay in [`DiscoveredTools`] until
-/// [`DiscoveredTools::reset_definitions`] clears them, and
-/// [`DiscoveredTools::merge_into_request`] injects the whole set.
+/// Successive rounds are additionally bounded to 128 definitions and 256 KiB
+/// of complete schemas. No schema is weakened to fit the budget.
 const MAX_DISCOVERED_REQUEST_TOOLS: usize = 16;
+const MAX_ACCUMULATED_TOOLS: usize = 128;
+const MAX_DISCOVERY_BYTES: usize = 256 * 1024;
+
+// Keep complete schemas or omit them; never silently weaken their constraints.
+fn bounded_discovery(mut output: ToolsOutput) -> ToolsOutput {
+    let mut used = 128usize;
+    output.tools.retain(|tool| {
+        let bytes = serde_json::to_vec(tool).map_or(usize::MAX, |v| v.len().saturating_add(1));
+        if bytes > MAX_DISCOVERY_BYTES.saturating_sub(used) {
+            false
+        } else {
+            used += bytes;
+            true
+        }
+    });
+    output.groups.retain(|group| {
+        let bytes = serde_json::to_vec(group).map_or(usize::MAX, |v| v.len().saturating_add(1));
+        if bytes > MAX_DISCOVERY_BYTES.saturating_sub(used) {
+            false
+        } else {
+            used += bytes;
+            true
+        }
+    });
+    output
+}
 
 /// Runner-side state and policy for tool discovery.
 ///
@@ -127,6 +151,9 @@ impl DiscoveredTools {
             tool_name.eq_ignore_ascii_case(TOOLS_SELECT_NAME) && self.merge.is_none();
         let mut added = 0;
         let mut seen = BTreeSet::new();
+        let mut current_size = self.definitions.values().fold(0usize, |size, definition| {
+            size.saturating_add(serde_json::to_vec(definition).map_or(usize::MAX, |v| v.len()))
+        });
         for definition in tools_output.tools {
             // Wildcard search returns directory entries without parameter schemas.
             if definition.name.trim().is_empty()
@@ -144,6 +171,19 @@ impl DiscoveredTools {
             if !seen.insert(key.clone()) {
                 continue;
             }
+            let old_size = self.definitions.get(&key).map_or(0, |definition| {
+                serde_json::to_vec(definition).map_or(usize::MAX, |v| v.len())
+            });
+            let new_size = serde_json::to_vec(&definition).map_or(usize::MAX, |v| v.len());
+            if (!self.definitions.contains_key(&key)
+                && self.definitions.len() >= MAX_ACCUMULATED_TOOLS)
+                || current_size
+                    .saturating_sub(old_size)
+                    .saturating_add(new_size)
+                    > MAX_DISCOVERY_BYTES
+            {
+                continue;
+            }
             self.known_names.insert(key.clone());
             if count_selection {
                 let count = self
@@ -155,10 +195,14 @@ impl DiscoveredTools {
                     self.merge = Some(true);
                 }
             }
-            if (self.definitions.contains_key(&key) || added < MAX_DISCOVERED_REQUEST_TOOLS)
-                && self.definitions.insert(key, definition).is_none()
-            {
-                added += 1;
+            if self.definitions.contains_key(&key) || added < MAX_DISCOVERED_REQUEST_TOOLS {
+                let is_new = self.definitions.insert(key, definition).is_none();
+                current_size = current_size
+                    .saturating_sub(old_size)
+                    .saturating_add(new_size);
+                if is_new {
+                    added += 1;
+                }
             }
         }
     }
@@ -386,6 +430,7 @@ impl Agent<AgentCtx> for ToolsSearch {
         }
         let mut rt = self.search(&definitions, &args);
         rt.groups = relevant_groups(ctx.tool_groups(), &rt.tools);
+        let rt = bounded_discovery(rt);
         Ok(AgentOutput {
             content: serde_json::to_string(&rt)?,
             ..Default::default()
@@ -525,7 +570,7 @@ impl Agent<AgentCtx> for ToolsSelect {
     }
 
     fn description(&self) -> String {
-        "Select callable tools or agents and return full schemas in this tool output for direct tool calls. Use exact names via `tools`; use `query` only when exact names are unknown; use `group` to pull in every tool of a capability group at once (discover group ids with `tools_groups`). Do not call tools_select again for the same returned tools. The output may also include `groups`: related tool bundles (for example one MCP server) with their purpose, usage instructions, and sibling member names.".to_string()
+        "Select callable tools or agents and return full schemas in this tool output for direct tool calls. Use exact names via `tools`; use `query` only when exact names are unknown; use `group` to expand a capability group within the discovery byte budget (discover group ids with `tools_groups`). Do not call tools_select again for the same returned tools. The output may also include `groups`: related tool bundles (for example one MCP server) with their purpose, usage instructions, and sibling member names.".to_string()
     }
 
     fn definition(&self) -> FunctionDefinition {
@@ -548,7 +593,7 @@ impl Agent<AgentCtx> for ToolsSelect {
                     },
                     "group": {
                         "type": "string",
-                        "description": "Capability group id to expand. Returns every member tool of that group. Use an empty string when not selecting by group."
+                        "description": "Capability group id to expand. Returns member tool schemas within the discovery byte budget; select omitted tools by exact name. Use an empty string when not selecting by group."
                     },
                     "limit": {
                         "type": "integer",
@@ -612,11 +657,11 @@ impl Agent<AgentCtx> for ToolsSelect {
 
         let groups = relevant_groups(all_groups, &tool_definitions);
         Ok(AgentOutput {
-            content: serde_json::to_string(&ToolsOutput {
+            content: serde_json::to_string(&bounded_discovery(ToolsOutput {
                 tools: tool_definitions,
                 groups,
                 total_tools,
-            })?,
+            }))?,
             usage,
             ..Default::default()
         })
@@ -2198,5 +2243,40 @@ mod tests {
         let ranked = rank_search_items(&definitions, "remote_lookup", &[], false);
         let selected = select_requested_definitions(definitions, &ranked);
         assert_eq!(selected[0].name, "RT_remote_lookup");
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    #[test]
+    fn discovery_and_accumulated_schemas_stay_bounded() {
+        let tool = |n: usize| FunctionDefinition {
+            name: format!("tool_{n}"),
+            description: "x".repeat(10_000),
+            parameters: json!({"type":"object"}),
+            strict: Some(false),
+        };
+        let output = bounded_discovery(ToolsOutput {
+            tools: (0..100).map(tool).collect(),
+            total_tools: 100,
+            ..Default::default()
+        });
+        assert!(serde_json::to_vec(&output).unwrap().len() <= MAX_DISCOVERY_BYTES);
+        let mut discovered = DiscoveredTools::default();
+        discovered.set_merge_policy(Some(true));
+        for n in 0..200 {
+            discovered.observe_output(
+                TOOLS_SELECT_NAME,
+                &json!(ToolsOutput {
+                    tools: vec![tool(n)],
+                    ..Default::default()
+                }),
+            );
+        }
+        let mut request = CompletionRequest::default();
+        discovered.merge_into_request(&mut request);
+        assert!(serde_json::to_vec(&request.tools).unwrap().len() <= MAX_DISCOVERY_BYTES);
+        assert!(request.tools.len() < 200);
     }
 }

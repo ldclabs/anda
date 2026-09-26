@@ -1570,9 +1570,7 @@ pub fn message_into(msg: Message) -> Vec<MessageItem> {
             } => {
                 push_message_item(&mut rt, &msg.role, &mut content);
                 rt.push(MessageItem::FunctionCallOutput {
-                    output: FunctionCallOutput::String(
-                        serde_json::to_string(&output).unwrap_or_default(),
-                    ),
+                    output: tool_presentation_output(&output),
                     call_id: call_id.unwrap_or_default(),
                     id: None,
                     status: None,
@@ -2769,6 +2767,30 @@ pub enum ReasoningSummaryLevel {
     Auto,
     Concise,
     Detailed,
+}
+
+fn tool_presentation_output(output: &Json) -> FunctionCallOutput {
+    let Some(view) = anda_core::ToolPresentation::from_output(output) else {
+        return FunctionCallOutput::String(serde_json::to_string(output).unwrap_or_default());
+    };
+    let mut items = vec![FunctionCallOutputItem::Text { text: view.text }];
+    for media in view.media {
+        if media.mime_type.starts_with("image/") {
+            items.push(FunctionCallOutputItem::Image {
+                image_url: part_to_data_url(&media.data, Some(&media.mime_type)),
+                detail: "auto".into(),
+                file_id: None,
+            });
+        } else {
+            items.push(FunctionCallOutputItem::Text {
+                text: format!(
+                    "[{} tool media omitted: unsupported by this model API]",
+                    media.mime_type
+                ),
+            });
+        }
+    }
+    FunctionCallOutput::Items(items)
 }
 
 #[cfg(test)]
@@ -4461,5 +4483,25 @@ mod tests {
         assert_eq!(value["format"]["name"], "answer");
         assert_eq!(value["format"]["strict"], true);
         assert_eq!(value["format"]["schema"]["type"], "object");
+    }
+}
+
+#[cfg(test)]
+mod tool_presentation_tests {
+    use super::*;
+    #[test]
+    fn tool_media_keeps_its_call_boundary() {
+        let output = anda_core::ToolPresentation {
+            text: "visible".into(),
+            media: vec![anda_core::ToolMedia {
+                mime_type: "image/png".into(),
+                data: anda_core::ByteBufB64::from(vec![1, 2, 3]),
+            }],
+        }
+        .into_output();
+        let result = serde_json::to_value(tool_presentation_output(&output)).unwrap();
+        assert_eq!(result[0]["type"], "input_text");
+        assert_eq!(result[1]["type"], "input_image");
+        assert_eq!(result[1]["image_url"], "data:image/png;base64,AQID");
     }
 }

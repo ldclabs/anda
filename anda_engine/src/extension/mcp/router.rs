@@ -23,7 +23,6 @@ use std::{
 use super::McpTasksConfig;
 use tokio::time::Instant;
 
-pub(crate) const TOOL_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
 const TASK_CANCEL_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How many times to re-derive a local tool name before giving up on a collision.
@@ -61,29 +60,48 @@ pub(crate) async fn call_tool_rounds(
     mut params: CallToolRequestParams,
     tasks: Option<&McpTasksConfig>,
     cancellation: &CancellationToken,
+    request_timeout: Duration,
+    elicitation: Option<&super::interaction::ElicitationDispatcher>,
 ) -> Result<CallToolResult, BoxError> {
     for _ in 0..DEFAULT_MRTR_MAX_ROUNDS {
         let response = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return Err("MCP tool call cancelled".into()),
-            response = tokio::time::timeout(TOOL_REQUEST_TIMEOUT, peer.call_tool_once(params.clone())) => {
+            response = tokio::time::timeout(request_timeout, peer.call_tool_once(params.clone())) => {
                 response.map_err(|_| format!("MCP tool {} request timed out", route.name))??
             }
         };
         match response {
             CallToolResponse::Complete(result) => return Ok(result),
             CallToolResponse::InputRequired(result) => {
-                // A round carrying actual `inputRequests` wants Sampling,
-                // Elicitation, or Roots, none of which this host advertises. Report
-                // it as a tool-level error the model can act on instead of failing
-                // the turn. A round with only `requestState` is the server asking to
-                // be polled: echo the state back and continue.
-                if result
+                // Only explicitly enabled standard elicitation reaches the app.
+                // State-only rounds are polled within the same logical deadline.
+                if let Some(requests) = result
                     .input_requests
                     .as_ref()
-                    .is_some_and(|requests| !requests.is_empty())
+                    .filter(|requests| !requests.is_empty())
                 {
-                    return Ok(input_required_error(route, &result));
+                    // Validate the entire round before opening any application prompt.
+                    let Some(dispatcher) = elicitation.filter(|_| {
+                        requests.values().all(|request| {
+                            matches!(request, rmcp::model::InputRequest::Elicitation(_))
+                        })
+                    }) else {
+                        return Ok(input_required_error(route, &result));
+                    };
+                    let mut responses = std::collections::BTreeMap::new();
+                    for (key, request) in requests {
+                        let rmcp::model::InputRequest::Elicitation(request) = request else {
+                            unreachable!()
+                        };
+                        let response = dispatcher
+                            .elicit(request.params.clone(), cancellation)
+                            .await?;
+                        responses.insert(key.clone(), serde_json::to_value(response)?);
+                    }
+                    params.input_responses = Some(responses);
+                    params.request_state = result.request_state;
+                    continue;
                 }
                 let Some(request_state) = result.request_state else {
                     return Err(format!(
@@ -255,6 +273,38 @@ pub struct McpToolRoute {
     pub remote_name: String,
     /// Model-facing function definition.
     pub definition: FunctionDefinition,
+    /// Original MCP definition, including untrusted annotations and output schema.
+    pub tool: rmcp::model::Tool,
+    /// Registration identity; changes when a server is removed and registered again.
+    pub server_generation: u64,
+    /// Catalog revision from which this route was published.
+    pub catalog_revision: u64,
+}
+
+pub(super) fn tool_is_model_visible(tool: &rmcp::model::Tool) -> bool {
+    let visibility = tool
+        .meta
+        .as_deref()
+        .and_then(|meta| meta.get("ui"))
+        .and_then(|ui| ui.get("visibility"));
+    match visibility {
+        None => true,
+        Some(Json::Array(targets)) => targets
+            .iter()
+            .any(|target| target.as_str() == Some("model")),
+        Some(_) => false,
+    }
+}
+
+/// Minimal compatibility lowering; retain all remote constraints and references.
+pub(super) fn model_schema(schema: &serde_json::Map<String, Json>) -> Json {
+    let mut schema = schema.clone();
+    if schema.get("type").and_then(Json::as_str) == Some("object")
+        && schema.get("properties").is_none_or(Json::is_null)
+    {
+        schema.insert("properties".into(), json!({}));
+    }
+    Json::Object(schema)
 }
 
 /// Clamps a server-suggested `tasks/get` poll interval into a sane range.
@@ -292,8 +342,7 @@ pub(crate) fn input_required_error(
 
 /// Tool-level error for a server round this host cannot answer.
 ///
-/// Anda advertises neither Sampling, Elicitation, nor Roots, so an MRTR round
-/// asking for them is a dead end. Returning it as a failed tool result — rather
+/// Sampling and Roots are never advertised; elicitation requires explicit opt-in. Returning it as a failed tool result — rather
 /// than an error that aborts the turn — lets the model choose another path.
 pub(crate) fn unsupported_input_error<'a>(
     route: &McpToolRoute,
@@ -307,7 +356,7 @@ pub(crate) fn unsupported_input_error<'a>(
     };
     CallToolResult::error(vec![ContentBlock::text(format!(
         "MCP tool {} on server {} requires client-side input{requested}, which this host \
-         does not provide: sampling, elicitation, and roots are not supported. Call the tool \
+         does not provide for this call: sampling and roots are not supported; elicitation requires opt-in. Call the tool \
          with complete arguments, or use a different tool.",
         route.remote_name, route.server_id
     ))])
@@ -324,6 +373,10 @@ pub(crate) fn mcp_result_to_tool_output(
         "content": result.content,
         "_meta": result.meta,
     }));
+    output.model_output = Some(super::presentation::present_result(
+        &output.output,
+        &super::McpLimits::default(),
+    ));
     output.is_error = result.is_error;
     output.usage = Usage {
         requests: 1,

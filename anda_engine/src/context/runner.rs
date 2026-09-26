@@ -1037,7 +1037,11 @@ impl CompletionRunner {
                     // GPT-5: An assistant message with 'tool_calls' must be followed by tool messages responding to each 'tool_call_id'.
                     tool_calls_continue.push(ContentPart::ToolOutput {
                         name: tool.name.clone(),
-                        output: res.output.clone(),
+                        output: res
+                            .model_output
+                            .clone()
+                            .map(anda_core::ToolPresentation::into_output)
+                            .unwrap_or_else(|| res.output.clone()),
                         is_error: res.is_error,
                         call_id: tool.call_id.clone(),
                         remote_id: tool.remote_id,

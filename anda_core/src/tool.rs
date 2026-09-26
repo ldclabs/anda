@@ -124,6 +124,7 @@ where
             }
 
             Ok(ToolOutput {
+                model_output: result.model_output,
                 output,
                 is_error: result.is_error,
                 artifacts: result.artifacts,

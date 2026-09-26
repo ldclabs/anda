@@ -302,3 +302,26 @@ these metadata fields expands the caller's execution permissions or installs pro
 
 See [the engine skill guide](../anda_engine/README.md#skill-catalogs-and-resources) for
 limits, refresh semantics and integration details.
+
+## MCP catalog and result lifecycle
+
+Each MCP registration owns connection/refresh locks, catalog authority, call
+concurrency, and cancellation. Fetches retain their registration identity until
+publication, which checks both registration and session identity. A cancelled
+fetch restores dirty state. Published raw tool metadata is retained alongside
+model definitions; local names remain stable for the registration lifetime.
+Calls refresh dirty catalogs, revalidate the captured route, and hold catalog
+authority through execution. Removal cancels old work; disconnect retires queued
+work while allowing requests already sent to finish.
+
+MCP transport/lifecycle and protocol decoding remain in rmcp. Byte readers and
+an HTTP backend bound input before decoding; pagination and model presentations
+have separate budgets. The runner writes `ToolOutput.model_output` into the
+existing neutral tool-output history envelope while retaining full raw results
+for callers. Adapters preserve tool IDs and project supported media within the
+tool response, with text fallback for unsupported API/model combinations.
+
+Application callbacks supply optional elicitation; resource methods use explicit
+server/URI selection. Approval UX, secret expansion, persistent credential stores
+and launch policy remain outside the MCP protocol layer. No full conversation
+history is sent to MCP servers. See [MCP integration](../MCP_INTEGRATION.md).

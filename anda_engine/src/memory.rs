@@ -1605,6 +1605,7 @@ impl Tool<BaseCtx> for MemoryManagement {
 /// detail the model needs to tell which is already in the payload.
 fn kip_output(res: Response) -> ToolOutput<Response> {
     ToolOutput {
+        model_output: None,
         is_error: if res.status == TopLevelStatus::Succeeded {
             None
         } else {

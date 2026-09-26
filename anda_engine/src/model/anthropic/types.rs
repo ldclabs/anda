@@ -1206,10 +1206,7 @@ impl From<ContentPart> for ContentBlock {
                 ..
             } => ContentBlock::ToolResult {
                 tool_use_id: call_id.unwrap_or_else(|| synthetic_tool_use_id(&name)),
-                content: Some(ToolResultContent::Text(match &output {
-                    Value::String(s) => s.clone(),
-                    _ => serde_json::to_string(&output).unwrap_or_default(),
-                })),
+                content: Some(tool_presentation_content(&output)),
                 cache_control: None,
                 is_error,
             },
@@ -1705,6 +1702,33 @@ pub struct MessageDeltaContent {
 pub struct StreamError {
     pub r#type: String,
     pub message: String,
+}
+
+fn tool_presentation_content(output: &Value) -> ToolResultContent {
+    let Some(view) = anda_core::ToolPresentation::from_output(output) else {
+        return ToolResultContent::Text(match output {
+            Value::String(s) => s.clone(),
+            _ => output.to_string(),
+        });
+    };
+    let mut blocks = vec![ContentBlock::text(view.text)];
+    for media in view.media {
+        if media.mime_type.starts_with("image/") {
+            blocks.push(ContentBlock::Image {
+                source: ImageSource::Base64 {
+                    media_type: media.mime_type,
+                    data: media.data.to_base64(),
+                },
+                cache_control: None,
+            });
+        } else {
+            blocks.push(ContentBlock::text(format!(
+                "[{} tool media omitted: unsupported by this model API]",
+                media.mime_type
+            )));
+        }
+    }
+    ToolResultContent::Blocks(blocks)
 }
 
 #[cfg(test)]
@@ -2898,5 +2922,33 @@ mod tests {
         assert_eq!(value["metadata"]["user_id"], "user_1");
         assert_eq!(value["tools"][0]["type"], "web_search_20250305");
         assert_eq!(value["thinking"]["budget_tokens"], 1024);
+    }
+}
+
+#[cfg(test)]
+mod tool_presentation_tests {
+    use super::*;
+    #[test]
+    fn tool_media_keeps_its_call_boundary() {
+        let output = anda_core::ToolPresentation {
+            text: "visible".into(),
+            media: vec![anda_core::ToolMedia {
+                mime_type: "image/png".into(),
+                data: anda_core::ByteBufB64::from(vec![1, 2, 3]),
+            }],
+        }
+        .into_output();
+        let block = ContentBlock::from(anda_core::ContentPart::ToolOutput {
+            name: "mcp_test_echo".into(),
+            output,
+            is_error: Some(false),
+            call_id: Some("call-1".into()),
+            remote_id: None,
+        });
+        let result = serde_json::to_value(block).unwrap();
+        assert_eq!(result["type"], "tool_result");
+        assert_eq!(result["tool_use_id"], "call-1");
+        assert_eq!(result["content"][0]["text"], "visible");
+        assert_eq!(result["content"][1]["type"], "image");
     }
 }

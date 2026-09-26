@@ -7,7 +7,7 @@ expansion, and launcher UX, then pass concrete server configs into
 
 ## Scope
 
-The first implementation supports MCP tools only:
+The implementation provides MCP tools plus opt-in resource and elicitation APIs:
 
 - Protocol: MCP `2026-07-28` plus the older `initialize`-based revisions. See
   [Protocol Revisions](#protocol-revisions).
@@ -20,8 +20,8 @@ The first implementation supports MCP tools only:
   including the `2026-07-28` shapes that replace a direct result (MRTR
   `input_required` rounds and task handles).
 - Refresh: `notifications/tools/list_changed` marks a session dirty; the next
-  async refresh or call refreshes the affected server. Concurrent callers race
-  through an atomic claim so only one refresh runs per notification. On
+  async refresh or call refreshes the affected server. Concurrent callers share
+  a serialized refresh; cancelling before publication restores the dirty flag. On
   `2026-07-28` peers the notification arrives on a `subscriptions/listen` stream
   the provider opens per session.
 - Reconnect: a closed session (for example a crashed stdio child) is
@@ -47,9 +47,10 @@ execution.
 `anda_engine::EngineBuilder` registers providers with
 `register_tool_provider`. During `build`, the engine initializes static tools
 first and then initializes dynamic providers. Provider initialization is
-fault-tolerant: an MCP server that is unreachable at startup is logged and
-skipped rather than failing the whole engine build, and its tools become
-available once a later refresh succeeds. An explicit `refresh()` instead reports
+fault-tolerant by default: an unreachable optional server is logged and skipped.
+Set `required = true` to fail initialization instead. Optional servers can use
+`startup = "background"`; their tools become visible only after live discovery
+succeeds. No cached annotations or credentials are used as authorization. An explicit `refresh()` instead reports
 per-server failures to the caller. Tool discovery and tool calls merge static
 tools and provider-backed tools, with static tools retaining precedence if names
 collide.
@@ -96,8 +97,9 @@ Three consequences of the revision shape the host behavior:
   across the gap rather than trusting a possibly stale route table.
 - **A tool call may not return a result.** An MRTR (SEP-2322) `input_required`
   round that carries only `requestState` is echoed back and the call continues;
-  a round that actually requests sampling, elicitation, or roots comes back as a
-  failed tool result, because this host advertises none of them. The model sees
+  a round requesting sampling or roots comes back as a failed tool result.
+  Standard elicitation is supported only when both the server config and an
+  application handler opt in; otherwise it also produces a tool-level error. The model sees
   a tool-level error and can choose another path instead of losing the turn.
 - **Results may be cacheable.** SEP-2549 `ttlMs` / `cacheScope` are honored by
   rmcp's client response cache. An explicit `refresh()` clears that cache first
@@ -116,15 +118,19 @@ does not have to hold its response open. The tool call still blocks, bounded by
 undeclared extension, or an in-task input request it cannot answer — is
 cancelled best-effort so the server can release it.
 
-The task deadline includes each `tasks/get` response wait. Cancellation also runs
-when the parent drops the polling future; a `tasks/cancel` acknowledgement is
-bounded to two seconds. Context cancellation interrupts session setup and tool
-calls. Session setup (including OAuth) is bounded to 45 seconds per attempt,
-legacy handshakes use that bound, and discovery retains its shorter 10-second
-probe. Tool listing is bounded to 30 seconds and each `tools/call` round to 180
-seconds. Automatic fallback to a fresh legacy connection remains supported.
-Custom headers are validated before connection and their values are omitted
-from configuration Debug output.
+The task deadline includes each `tasks/get` response wait; cancellation also
+runs when a parent drops the polling future. A `tasks/cancel` acknowledgement
+is bounded to two seconds. Per-server `McpTimeouts` defaults are 90 seconds for
+setup including fallback, 30 for complete listing, 180 for one tool request,
+600 for a logical call including queueing/setup/MRTR/tasks, and 300 for an
+elicitation callback. Each connection attempt additionally retains the
+45-second bound and the discovery probe its 10-second bound. The logical-call
+wall deadline includes human interaction; an application can configure it up
+to one day. A task's `max_wait_secs` remains an additional, independent bound.
+
+HTTP handshake and `tools/list` transient failures receive at most two retries
+(250 ms and 1 s), within their outer deadline. Tool calls are never retried by
+Anda after a transport failure; rmcp retains its protocol/auth challenge handling.
 
 
 ## Tool Naming
@@ -138,7 +144,12 @@ mcp_<server_id>_<remote_tool_name>
 
 Every segment is lowercased and normalized to `a-z`, `0-9`, and `_`. Names that
 exceed 64 characters or collide after normalization receive a short hash suffix.
-The route keeps both names so calls use the original MCP tool name.
+The route keeps both names so calls use the original MCP tool name. Initial
+same-server normalization collisions are all hashed, independently of list
+order. Published identities retain their assigned names across additions,
+removals, and reordering for the life of the registration. The catalog item
+budget also bounds these retained identities; explicitly re-register a server
+to reset that budget. Existing unambiguous names are unchanged.
 Bulk refresh fetches server listings concurrently and applies successful
 snapshots in server-id order, so response timing does not decide which server
 keeps an unsuffixed name when local tool names collide at startup.
@@ -165,7 +176,7 @@ built-in discovery helpers expose them top-down:
   `title`, `description`, `member_count`) — no tool schemas — so the model can
   scan which bundles exist without flooding its context.
 - `tools_select { group: "<id>" }` expands one group into the full schemas of
-  all its member tools in a single call.
+  its member tools in a single call, within the discovery byte budget.
 - `tools_search` / `tools_select` also attach the groups that the returned tools
   belong to, so discovering one tool reveals the bundle's purpose, the server's
   usage `instructions`, and the sibling member names.
@@ -263,7 +274,10 @@ Two related primitives:
   the next connection fails with `McpAuthorizationRequired` until the
   interactive flow runs again — the "sign out / force re-consent" primitive.
 
-`McpAuthorizationRequired` is the single signal to act on. It covers both "no
+Setup reports `McpAuthorizationRequired`. An authorization failure during a
+live tool call instead returns `is_error: true` and
+`{"error":{"code":"authorization_required","server_id":"..."}}`, allowing the
+model and application to recover without exposing transport credentials. The setup error covers both "no
 grant is stored" and "the stored grant is no longer usable" — a refresh token the
 authorization server has revoked surfaces as an auth failure during credential
 acquisition or the handshake, and is reported as `McpAuthorizationRequired` with
@@ -277,16 +291,22 @@ stored credentials in place) and run the flow again.
 ## Security Boundaries
 
 - MCP servers are never enabled implicitly by this crate.
-- Stdio uses `command` plus `args`; it does not invoke a shell string.
-- Streamable HTTP validates custom headers before connecting.
+- Stdio uses `command` plus `args`; it does not invoke a shell string. It inherits
+  only platform essentials by default; put extra values in `env`, or explicitly
+  opt into the old full-parent behavior with `inherit_env = true`. Unix child
+  processes get a dedicated process group that is terminated when the session
+  is released. Windows currently guarantees direct-child cleanup only.
+- Streamable HTTP validates URLs and custom headers before connecting. Protocol,
+  routing, and conflicting Authorization headers are rejected. Both static and
+  OAuth data clients disable redirects, including same-origin redirects.
 - Bearer tokens, OAuth client secrets, and stdio `env` values are redacted from
   `Debug` output, so a config can be logged without leaking expanded secrets.
 - Remote tool descriptions and annotations are treated as untrusted metadata.
 - Server title and `instructions` are likewise untrusted: they are surfaced as
   group data the model reads, never as system instructions or runtime
   directives.
-- Calls send only tool arguments and explicitly selected resources, not full
-  conversation history.
+- Tool calls send arguments only. Resource reads are explicit separate operations;
+  neither operation forwards conversation history or arbitrary context metadata.
 - Tool results include `server_id` and the original MCP tool name for audit.
 
 ## Bot Integration
@@ -299,3 +319,119 @@ remain outside this repository layer:
 - Default per-server working directories.
 - User-facing approval UX.
 - Commands such as `anda mcp list` or `anda mcp ping`.
+
+## Catalog Consistency And Budgets
+
+Every server registration has an identity and cancellation token. Catalog
+fetches are serialized through publication, and published routes carry a
+revision plus the original MCP `Tool` (annotations, output schema and metadata).
+Calls refresh dirty catalogs and validate their captured identity/definition
+before execution. Publication waits for calls already using that catalog;
+removal cancels the registration and prevents in-flight fetches from publishing.
+Disconnect retires the session: calls already sent may finish, but queued calls
+cannot begin on retired credentials. A reconnect refreshes the live catalog.
+
+`McpConcurrency` defaults to `Serial`. `ReadOnlyParallel` permits concurrent
+annotated reads while excluding writes; `Parallel` requires explicit host
+configuration. Remote annotations are hints, never approval or permission grants.
+Tools with MCP Apps visibility metadata must explicitly include `model` to enter
+the model-facing catalog. `server_statuses()` observes state without connecting.
+
+`McpLimits` defaults:
+
+| Budget | Default |
+| --- | --- |
+| Catalog pages / items / cursor | 100 / 2,048 / 64 KiB |
+| Input or output schema per tool | 64 KiB |
+| Tool description / title | 8 KiB each |
+| Combined server metadata | 32 KiB |
+| Incoming stdio line, HTTP JSON body, SSE event | 8 MiB |
+| Model result text / decoded media / media blocks | 32 KiB / 5 MiB / 8 |
+
+Repeated cursors and duplicate raw tool names are rejected. Invalid or oversized
+catalogs leave the last published snapshot intact and retryable. SSE budgets
+include raw comments within each event. rmcp still owns lifecycle negotiation,
+JSON-RPC decoding/routing, subscriptions and authentication; the byte/HTTP
+adapters enforce bounds before SDK decoding. Header/body errors omit raw bodies.
+
+Discovery outputs are limited to 256 KiB; complete schemas that do not fit are
+omitted, and callers can select omitted tools by exact name. Accumulated
+discovered schemas are additionally limited to 128 definitions and 256 KiB.
+MCP schema adaptation only fills missing/null `properties` on object schemas;
+it preserves constraints, compositions and references rather than using lossy
+schema compaction.
+
+## Results And Model Presentation
+
+`ToolOutput.output` retains the complete audited MCP envelope, including
+`server_id`, original tool name, structured content, content blocks and `_meta`.
+`ToolOutput.model_output` contains a bounded `ToolPresentation`: visible text
+and inline media. Top-level and content-block `_meta` do not enter that view.
+Unknown content and unsupported media produce explicit text notices; oversized
+text carries a truncation marker. Structured data and content images can coexist.
+
+The runner persists the explicitly tagged presentation inside the existing
+`ContentPart::ToolOutput.output`, preserving call IDs and tool/user boundaries.
+OpenAI Responses and Anthropic project images into native tool-result blocks;
+Chat Completions falls back to text. Gemini 3 projects supported image/document
+MIME types into `functionResponse.parts`; older or unknown Gemini model names
+fall back to text. Audio remains available to callers and in the neutral view,
+but these model APIs currently receive a text notice instead of audio bytes.
+See [Gemini's function response restrictions](https://ai.google.dev/gemini-api/docs/generate-content/function-calling#multimodal-function-responses).
+
+Hooks that rewrite a result must update `model_output` too, or clear it to use
+their replacement raw output. The original MCP envelope is not itself truncated.
+
+## Optional Interaction And Resources
+
+Install `McpToolProviderBuilder::elicitation_handler(Arc<dyn McpElicitationHandler>)`
+and set `server.elicitation = true`. The handler declares supported standard
+form/URL modes and receives the server id, typed request and cancellation token.
+The application owns UI, consent, URL presentation, input validation and approval.
+Legacy server requests and modern tool-call MRTR both use that handler. An MRTR
+round is checked for unsupported methods before any prompt is opened. Sampling,
+Roots, Logging control and proprietary verification extensions remain disabled.
+Task-level input requests still cancel the task and return a tool error.
+
+Set `server.resources = true` to call `list_resources`,
+`list_resource_templates`, and `read_resource` with an explicit server id and
+cancellation token. These methods share the authenticated session and byte/time
+budgets. They do not register new model tools or fetch returned resource URIs
+from the local filesystem or an unrelated HTTP origin.
+
+## Credential Transactions
+
+`McpCredentialStore::acquire_refresh_guard` is an optional extension with a
+backward-compatible default. The adapter forwards it to rmcp, which holds it
+across authoritative credential reread, token exchange and completed persistence.
+The in-memory store coordinates managers sharing the same store/server id.
+Persistent stores should implement equivalent process/database coordination;
+`load`, `save`, and `clear` must not reacquire the same lock. Credential keys must
+identify the intended server/account, and changing an endpoint must not reuse an
+unrelated grant. OS keychains and browser/callback UX remain application-owned.
+
+## Configuration Example
+
+```rust,no_run
+use std::sync::Arc;
+use anda_engine::extension::mcp::{McpConcurrency, McpServerConfig, McpToolProvider};
+
+# async fn example() -> Result<(), anda_core::BoxError> {
+let mut server = McpServerConfig::streamable_http("catalog", "https://example.com/mcp");
+server.required = true;
+server.timeouts.call_secs = 120;
+server.limits.catalog_items = 512;
+server.concurrency = McpConcurrency::ReadOnlyParallel;
+server.resources = true;
+let provider = Arc::new(McpToolProvider::new(vec![server])?);
+let builder = anda_engine::engine::Engine::builder().register_tool_provider(provider)?;
+# let _ = builder;
+# Ok(())
+# }
+```
+
+For Rust struct literals, use the server constructors and transport `..Default::default()`
+so new policy fields receive their defaults. `ToolOutput` literals must include
+`model_output` or use `..Default::default()`; persisted older outputs deserialize
+with no presentation override. Servers requiring inherited process secrets must
+configure `env` or explicitly select full inheritance.

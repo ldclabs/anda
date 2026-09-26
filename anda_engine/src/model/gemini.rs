@@ -318,12 +318,37 @@ fn response_from_stream_chunks(
     })
 }
 
+// Gemini 3 function responses support images/documents; older models require
+// a textual result. Leave raw provider history and tool-call boundaries intact.
+fn prepare_tool_presentations(request: &mut CompletionRequest, model: &str) {
+    if model
+        .rsplit('/')
+        .next()
+        .is_some_and(|model| model.starts_with("gemini-3"))
+    {
+        return;
+    }
+    for part in request.content.iter_mut().chain(
+        request
+            .chat_history
+            .iter_mut()
+            .flat_map(|message| message.content.iter_mut()),
+    ) {
+        if let anda_core::ContentPart::ToolOutput { output, .. } = part
+            && let Some(view) = anda_core::ToolPresentation::from_output(output)
+        {
+            *output = Json::String(view.text_fallback());
+        }
+    }
+}
+
 impl CompletionFeaturesDyn for CompletionModel {
     fn model_name(&self) -> String {
         self.model.clone()
     }
 
-    fn completion(&self, req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
+    fn completion(&self, mut req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
+        prepare_tool_presentations(&mut req, &self.model);
         let model = self.model.clone();
         let client = self.client.clone();
         let r = self.default_request.clone();
@@ -1069,5 +1094,35 @@ mod tests {
         assert_eq!(output.usage.input_tokens, 2);
         assert_eq!(output.usage.output_tokens, 1);
         assert_eq!(output.chat_history.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod tool_presentation_compat_tests {
+    use super::*;
+    #[test]
+    fn older_models_receive_text_without_losing_the_tool_call_id() {
+        let content = anda_core::ContentPart::ToolOutput {
+            name: "echo".into(),
+            call_id: Some("call-1".into()),
+            is_error: None,
+            remote_id: None,
+            output: anda_core::ToolPresentation {
+                text: "result".into(),
+                media: vec![anda_core::ToolMedia {
+                    mime_type: "image/png".into(),
+                    data: anda_core::ByteBufB64::from(vec![1, 2, 3]),
+                }],
+            }
+            .into_output(),
+        };
+        let mut request = CompletionRequest {
+            content: vec![content],
+            ..Default::default()
+        };
+        prepare_tool_presentations(&mut request, "gemini-2.5-pro");
+        assert!(
+            matches!(&request.content[0], anda_core::ContentPart::ToolOutput { output, call_id, .. } if call_id.as_deref() == Some("call-1") && output.as_str().unwrap().contains("omitted"))
+        );
     }
 }

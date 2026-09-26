@@ -34,6 +34,8 @@ Anda は、モデル、ツール、メモリ、ほかのエージェントを 1 
 6. **発見フローに対応したツールバンドル**
    静的 tools、動的 providers、MCP servers は capability groups を公開できるため、agents は `tools_groups` で関連ツールのまとまりを確認し、schema が必要になった時だけ `tools_select` で group を展開できます。
 
+   MCP 統合は、カタログと受信データの上限、安定したルーティング、モデル向け画像結果、呼び出しポリシー、オプトインの elicitation・リソース API を提供します。[MCP 統合ガイド](MCP_INTEGRATION.md)を参照してください。
+
 ## プロジェクト
 
 ドキュメント:

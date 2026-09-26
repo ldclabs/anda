@@ -34,6 +34,8 @@ The core engine lets developers register agents and tools, route model requests 
 6. **Discovery-aware tool bundles**
    Static tools, dynamic providers, and MCP servers can expose capability groups so agents can survey related tool bundles with `tools_groups`, then expand a group with `tools_select` only when its schemas are needed.
 
+   MCP integrations include bounded catalogs and transport input, stable routes, model-facing image results, configurable call policies, and opt-in elicitation/resource APIs. See [MCP integration](MCP_INTEGRATION.md).
+
 ## Project
 
 Documents:

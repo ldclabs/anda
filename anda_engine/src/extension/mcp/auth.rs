@@ -174,6 +174,15 @@ pub trait McpCredentialStore: Send + Sync {
     async fn save(&self, server_id: &str, credentials: StoredCredentials) -> Result<(), BoxError>;
     /// Removes any stored credentials for `server_id`.
     async fn clear(&self, server_id: &str) -> Result<(), BoxError>;
+    /// Optionally lock a complete refresh transaction (load, exchange, save).
+    /// Store methods must not reacquire this lock. Shared persistent backends
+    /// should coordinate every writer, including sign-out, using the same authority.
+    async fn acquire_refresh_guard(
+        &self,
+        _server_id: &str,
+    ) -> Result<Option<rmcp::transport::auth::CredentialRefreshGuard>, BoxError> {
+        Ok(None)
+    }
 }
 
 /// Default in-memory [`McpCredentialStore`]. Credentials do not survive a
@@ -181,6 +190,7 @@ pub trait McpCredentialStore: Send + Sync {
 #[derive(Debug, Default)]
 pub struct InMemoryMcpCredentialStore {
     credentials: RwLock<HashMap<String, StoredCredentials>>,
+    refresh_locks: RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl InMemoryMcpCredentialStore {
@@ -192,6 +202,20 @@ impl InMemoryMcpCredentialStore {
 
 #[async_trait]
 impl McpCredentialStore for InMemoryMcpCredentialStore {
+    async fn acquire_refresh_guard(
+        &self,
+        server_id: &str,
+    ) -> Result<Option<rmcp::transport::auth::CredentialRefreshGuard>, BoxError> {
+        let lock = self
+            .refresh_locks
+            .write()
+            .entry(server_id.to_string())
+            .or_default()
+            .clone();
+        Ok(Some(rmcp::transport::auth::CredentialRefreshGuard::new(
+            lock.lock_owned().await,
+        )))
+    }
     async fn load(&self, server_id: &str) -> Result<Option<StoredCredentials>, BoxError> {
         Ok(self.credentials.read().get(server_id).cloned())
     }
@@ -218,6 +242,14 @@ pub(crate) struct ScopedCredentialStore {
 
 #[async_trait]
 impl CredentialStore for ScopedCredentialStore {
+    async fn acquire_refresh_guard(
+        &self,
+    ) -> Result<Option<rmcp::transport::auth::CredentialRefreshGuard>, AuthError> {
+        self.inner
+            .acquire_refresh_guard(&self.server_id)
+            .await
+            .map_err(|err| AuthError::CredentialStoreError(err.to_string()))
+    }
     async fn load(&self) -> Result<Option<StoredCredentials>, AuthError> {
         self.inner
             .load(&self.server_id)
@@ -268,6 +300,34 @@ impl std::error::Error for McpAuthorizationRequired {}
 /// Whether a failed connection attempt was about credentials rather than the
 /// lifecycle, in which case retrying with a different opener cannot help.
 pub(crate) fn is_authorization_error(err: &(dyn std::error::Error + 'static)) -> bool {
+    use rmcp::transport::streamable_http_client::StreamableHttpError;
+    if let Some(rmcp::service::ServiceError::TransportSend(transport)) =
+        err.downcast_ref::<rmcp::service::ServiceError>()
+    {
+        return is_authorization_error(transport.error.as_ref());
+    }
+    if let Some(error) = err.downcast_ref::<ClientInitializeError>() {
+        match error {
+            ClientInitializeError::TransportError { error, .. } => {
+                return is_authorization_error(error.error.as_ref());
+            }
+            ClientInitializeError::LegacyFallbackFailed { fallback, .. } => {
+                return is_authorization_error(fallback.as_ref());
+            }
+            _ => {}
+        }
+    }
+    if let Some(error) = err.downcast_ref::<StreamableHttpError<super::http_client::HttpError>>() {
+        return matches!(
+            error,
+            StreamableHttpError::AuthRequired(_)
+                | StreamableHttpError::InsufficientScope(_)
+                | StreamableHttpError::Client(super::http_client::HttpError::Status(401 | 403))
+                | StreamableHttpError::Auth(
+                    AuthError::AuthorizationRequired | AuthError::TokenRefreshRejected(_)
+                )
+        );
+    }
     if err.is::<McpAuthorizationRequired>() {
         return true;
     }

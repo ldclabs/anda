@@ -25,7 +25,7 @@ Full API documentation is available on [docs.rs][docs].
 - Remote engine discovery and cross-engine tool or agent calls.
 - Hook APIs for observing and transforming agent and tool execution.
 - Workspace tools for filesystem access, shell execution, web fetch, notes, skills, todos, and search.
-- MCP client support exposing remote MCP servers as runtime-discovered tools.
+- MCP client support with versioned catalogs, stable routes, input/output budgets, configurable concurrency/deadlines, OAuth refresh coordination, and opt-in elicitation/resources.
 - Web3 and TEE challenge signing through the Anda Web3 stack.
 
 ## Installation
@@ -348,3 +348,15 @@ additional terms or conditions.
 
 [docs]: https://docs.rs/anda_engine
 [license]: ./../LICENSE-MIT
+
+### MCP runtime policies
+
+Use `McpServerConfig` constructors, then configure `limits`, `timeouts`,
+`concurrency`, `required`, and `startup`. Stdio forwards only platform essentials
+plus explicit `env` by default (`inherit_env = true` restores full inheritance).
+`routes()` preserves original tool metadata; `server_statuses()` is observational.
+Raw MCP outputs remain auditable while the runner uses bounded
+`ToolOutput::model_output` presentations, including supported images in tool
+responses. Elicitation needs both a handler and per-server opt-in; resource APIs
+are separately opt-in. See [MCP_INTEGRATION.md](../MCP_INTEGRATION.md) for defaults,
+migration notes, lifecycle guarantees, model compatibility, and an example.

@@ -20,6 +20,28 @@ All notable changes to the Anda project will be documented in this file.
 - Hosts continuing one root task across entry contexts must reinstall its
   `SubAgentScope`; session aliases no longer implicitly join another root task.
 
+### Added — MCP runtime policies
+
+- Add registration-bound catalog publication, stable collision mappings, bounded
+  pagination/transport input, per-server deadlines/concurrency/startup policy,
+  server status inspection, and retained MCP tool metadata.
+- Add opt-in standard elicitation callbacks and explicit resource APIs; forward
+  credential refresh transaction guards to rmcp.
+- Add `ToolOutput.model_output` with provider-neutral presentations, bounded MCP
+  text/media, private metadata separation and native image tool results where
+  supported. Bound discovery outputs and accumulated schemas without weakening
+  schema constraints.
+
+### Changed — MCP compatibility
+
+- Stdio now forwards platform essentials and explicit environment overrides by
+  default. Set `inherit_env = true` only when full inheritance is intended.
+- Calls default to serial execution; hosts can opt into parallel/read-only
+  parallel operation. Static and OAuth HTTP clients reject redirects and limit
+  response bodies. Logical-call deadlines include all continuation rounds.
+- Use `McpServerConfig` constructors and defaults for new policy fields;
+  `ToolOutput` literals now include optional `model_output`. See MCP_INTEGRATION.md.
+
 ### Fixed — anda_engine
 
 - Align Completion budget, reasoning effort, strict schemas, media inputs, and

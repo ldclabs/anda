@@ -34,6 +34,8 @@ Anda 是一个用于构建 AI 智能体的 Rust 框架，可以把模型、工�
 6. **支持发现流程的工具组**
    静态 tools、动态 providers 和 MCP servers 可以暴露 capability groups，让 agents 先用 `tools_groups` 浏览相关工具包，再在需要 schema 时通过 `tools_select` 展开某个 group。
 
+   MCP 集成支持有界目录与传输入站数据、稳定路由、面向模型的图片结果、可配置调用策略，以及按需启用的 elicitation 和资源接口。参见 [MCP 集成说明](MCP_INTEGRATION.md)。
+
 ## 项目说明
 
 文档：

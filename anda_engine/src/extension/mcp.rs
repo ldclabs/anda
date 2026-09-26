@@ -20,10 +20,9 @@
 //!
 //! Two `2026-07-28` response shapes replace what used to be a plain result:
 //!
-//! - MRTR (SEP-2322) `input_required` rounds. This host advertises neither
-//!   Sampling, Elicitation, nor Roots, so a round that genuinely asks for input
-//!   comes back as a tool-level error; a round that only carries `requestState`
-//!   is echoed back and the call continues.
+//! - MRTR (SEP-2322) `input_required` rounds. Standard elicitation is opt-in via
+//!   an application handler. Sampling, Roots, and other disabled inputs produce
+//!   tool-level errors; state-only rounds are echoed back and bounded.
 //! - Tasks (SEP-2663). Opt in per server with [`McpTasksConfig`]; the provider
 //!   then polls `tasks/get` until the task finishes, so a long-running tool no
 //!   longer has to hold its response open. Without the opt-in the extension is
@@ -106,15 +105,12 @@ use anda_core::{
     ToolInput, ToolOutput, ToolProvider, validate_function_name,
 };
 use parking_lot::{Mutex as SyncMutex, RwLock};
-use reqwest::Client as ReqwestClient;
 use rmcp::{
     Peer, RoleClient,
     model::{CallToolRequestParams, ServerPeerInfo, Tool as McpTool},
     serve_client_with_lifecycle,
     service::ClientLifecycleMode,
-    transport::{
-        AuthClient, AuthorizationManager, StreamableHttpClientTransport, TokioChildProcess,
-    },
+    transport::{AuthClient, AuthorizationManager, StreamableHttpClientTransport},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Map;
@@ -127,7 +123,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -136,6 +132,17 @@ use tokio::sync::Mutex;
 use crate::context::BaseCtx;
 
 mod auth;
+mod bounded;
+mod catalog;
+mod http_client;
+mod interaction;
+mod policy;
+mod presentation;
+mod resources;
+pub use interaction::McpElicitationHandler;
+
+use catalog::{DirtyGuard, Registration, Snapshot, collect_pages};
+pub use policy::{McpConcurrency, McpLimits, McpServerStatus, McpStartup, McpTimeouts};
 mod router;
 mod session;
 
@@ -199,11 +206,20 @@ impl McpToolProvider {
     ///
     /// [`Engine`]: crate::engine::Engine
     pub async fn add_server(&self, server: McpServerConfig) -> Result<(), BoxError> {
-        let server_id = server.id.clone();
-        self.insert_server(server)?;
-
-        if let Err(err) = self.refresh_server(&server_id).await {
-            self.remove_server_state(&server_id);
+        let registration = self.insert_server(server)?;
+        let refresh = async {
+            let snapshot = self
+                .fetch_registration_snapshot(registration.clone(), true)
+                .await?;
+            self.publish_snapshot(snapshot).await
+        };
+        let result = tokio::select! {
+            biased;
+            _ = registration.cancelled.cancelled() => Err("MCP server removed during registration".into()),
+            result = refresh => result,
+        };
+        if let Err(err) = result {
+            self.remove_registration(&registration);
             return Err(err);
         }
 
@@ -225,7 +241,7 @@ impl McpToolProvider {
     /// [`complete_authorization`]: Self::complete_authorization
     /// [`refresh_server`]: Self::refresh_server
     pub fn register_server(&self, server: McpServerConfig) -> Result<(), BoxError> {
-        self.insert_server(server)
+        self.insert_server(server).map(|_| ())
     }
 
     /// Removes a server along with its session, routes, and any pending
@@ -255,69 +271,158 @@ impl McpToolProvider {
         self.refresh_server_inner(server_id, true).await
     }
 
-    /// Refreshes one server after optionally clearing a pre-existing dirty notification.
-    ///
-    /// A caller that already claimed `dirty` with `swap(false)` must pass `false`: clearing it
-    /// again would erase a second notification delivered between the claim and `tools/list`.
     async fn refresh_server_inner(
         &self,
         server_id: &str,
         clear_dirty: bool,
     ) -> Result<(), BoxError> {
-        let (routes, meta) = self.fetch_server_snapshot(server_id, clear_dirty).await?;
+        let snapshot = self.fetch_server_snapshot(server_id, clear_dirty).await?;
+        self.publish_snapshot(snapshot).await
+    }
+
+    async fn publish_snapshot(&self, snapshot: Option<Snapshot>) -> Result<(), BoxError> {
+        let Some(mut snapshot) = snapshot else {
+            return Ok(());
+        };
+        let registration = &snapshot.registration;
+        let _catalog = registration.catalog.write().await;
+        let servers = self.inner.servers.read();
+        if !servers
+            .get(&registration.id)
+            .is_some_and(|current| Arc::ptr_eq(current, registration))
+        {
+            return Err("MCP server registration changed during discovery".into());
+        }
         let mut index = self.inner.index.write();
-        index.replace_server_routes(server_id, routes);
-        index.metas.insert(server_id.to_string(), meta);
+        if !index
+            .sessions
+            .get(&registration.id)
+            .is_some_and(|session| Arc::ptr_eq(session, &snapshot.session))
+        {
+            return Err("MCP session changed during discovery".into());
+        }
+        let known = index
+            .names
+            .keys()
+            .filter(|(id, _)| id == &registration.id)
+            .count();
+        let added = snapshot
+            .routes
+            .iter()
+            .filter(|route| {
+                !index
+                    .names
+                    .contains_key(&(route.server_id.clone(), route.remote_name.clone()))
+            })
+            .count();
+        if known.saturating_add(added) > registration.limits.catalog_items {
+            return Err(
+                "MCP catalog identity budget exhausted; re-register the server to reset it".into(),
+            );
+        }
+        let revision = registration.revision.fetch_add(1, Ordering::SeqCst) + 1;
+        for route in &mut snapshot.routes {
+            route.catalog_revision = revision;
+        }
+        index.replace_server_routes(&registration.id, snapshot.routes);
+        index.metas.insert(registration.id.clone(), snapshot.meta);
+        *registration.status.lock() = McpServerStatus::Ready;
+        snapshot.dirty.commit();
         Ok(())
     }
 
-    /// Fetches a server's routes and metadata without publishing them to the shared index.
     async fn fetch_server_snapshot(
         &self,
         server_id: &str,
         clear_dirty: bool,
-    ) -> Result<(Vec<McpToolRoute>, McpServerMeta), BoxError> {
-        let config = self.server_config(server_id)?;
-        let session = self.ensure_session(&config).await?;
-        let peer = {
-            let service = session.service.lock().await;
-            service.peer().clone()
+    ) -> Result<Option<Snapshot>, BoxError> {
+        self.fetch_registered_snapshot(self.server_config(server_id)?, clear_dirty)
+            .await
+    }
+
+    async fn fetch_registered_snapshot(
+        &self,
+        config: Arc<Registration>,
+        clear_dirty: bool,
+    ) -> Result<Option<Snapshot>, BoxError> {
+        let result = tokio::select! {
+            biased;
+            _ = config.cancelled.cancelled() => Err("MCP server removed".into()),
+            result = self.fetch_registration_snapshot(config.clone(), clear_dirty) => result,
         };
-        // Clear `dirty` *before* listing, not after. `on_tool_list_changed` runs on the rmcp
-        // service task and can fire while `list_all_tools` is in flight; clearing afterwards
-        // would swallow that notification, and since the server will not re-announce an
-        // already-sent change, the route table would stay stale indefinitely. Clearing first
-        // means a concurrent change re-arms the flag and is picked up by the next refresh.
+        if let Err(err) = &result {
+            *config.status.lock() = if is_authorization_error(err.as_ref()) {
+                McpServerStatus::AuthorizationRequired
+            } else {
+                McpServerStatus::Failed
+            };
+        }
+        result
+    }
+
+    async fn fetch_registration_snapshot(
+        &self,
+        config: Arc<Registration>,
+        clear_dirty: bool,
+    ) -> Result<Option<Snapshot>, BoxError> {
+        // Keep the fetch lock through publication, including bulk refreshes.
+        let guard = config.refresh.clone().lock_owned().await;
+        let session = self.ensure_session(&config).await?;
+        let peer = session.service.lock().await.peer().clone();
+        if !clear_dirty && !session.dirty.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
+        let dirty = DirtyGuard::new(session.dirty.clone());
+        session.dirty.store(false, Ordering::SeqCst);
         if clear_dirty {
-            session.dirty.store(false, Ordering::SeqCst);
-            // SEP-2549 lets a server declare `tools/list` fresh for `ttlMs`, which rmcp
-            // honors with a client-side response cache. An explicit refresh promises a
-            // live listing, so drop the cache first. The notification-driven path keeps
-            // it, since rmcp already invalidates the tool cache on `tools/list_changed`.
             peer.clear_response_cache().await;
         }
-
-        // Capture the server's self-description (title, instructions) from the
-        // initialize handshake so the discovery layer can present each server as
-        // a coherent capability bundle, not just a flat list of tools.
         let meta = McpServerMeta::from_peer_info(&config.id, peer.peer_info().as_deref());
-        let listed = tokio::time::timeout(session::LIST_TOOLS_TIMEOUT, peer.list_all_tools()).await;
-        let tools = match listed {
-            Ok(Ok(tools)) => tools,
-            Ok(Err(err)) => {
-                // The listing failed, so the snapshot was not applied; re-arm the flag so
-                // the next call retries instead of trusting a stale route table.
-                session.dirty.store(true, Ordering::SeqCst);
-                return Err(err.into());
-            }
-            Err(_) => {
-                session.dirty.store(true, Ordering::SeqCst);
-                return Err(format!("MCP server {server_id} tools/list timed out").into());
-            }
-        };
-
+        let metadata_bytes = [&meta.title, &meta.description, &meta.instructions]
+            .into_iter()
+            .flatten()
+            .map(String::len)
+            .sum::<usize>();
+        if metadata_bytes > config.limits.server_metadata_bytes {
+            return Err("MCP server metadata limit exceeded".into());
+        }
+        let tools = tokio::time::timeout(
+            Duration::from_secs(config.timeouts.list_secs),
+            collect_pages(&config.limits, |params| {
+                let peer = peer.clone();
+                async move {
+                    let page = http_client::retry_read(|| peer.list_tools(params.clone())).await?;
+                    Ok((page.tools, page.next_cursor))
+                }
+            }),
+        )
+        .await
+        .map_err(|_| format!("MCP server {} tools/list timed out", config.id))??;
         let routes = self.routes_for_tools(&config.id, tools)?;
-        Ok((routes, meta))
+        Ok(Some(Snapshot {
+            registration: config,
+            session,
+            routes,
+            meta,
+            dirty,
+            _refresh: guard,
+        }))
+    }
+
+    /// Returns connection states without initiating network or process activity.
+    pub async fn server_statuses(&self) -> BTreeMap<String, McpServerStatus> {
+        let registrations: Vec<_> = self.inner.servers.read().values().cloned().collect();
+        let mut states = BTreeMap::new();
+        for registration in registrations {
+            let mut status = *registration.status.lock();
+            if matches!(status, McpServerStatus::Ready | McpServerStatus::Connected)
+                && self.live_session(&registration.id).await.is_none()
+            {
+                status = McpServerStatus::Disconnected;
+            }
+            states.insert(registration.id.clone(), status);
+        }
+        states
     }
 
     /// Returns one [`ToolGroup`] per configured server that currently exposes
@@ -361,31 +466,34 @@ impl McpToolProvider {
     /// startup). Otherwise the failing servers are reported as an aggregated
     /// error.
     async fn refresh_servers(&self, tolerant: bool) -> Result<(), BoxError> {
-        // Fetch concurrently, but publish in server-id order: cross-server name collisions
-        // keep the first route, so response timing must not decide the name's owner.
-        let server_ids = self.server_ids();
+        let registrations = self.inner.servers.read().values().cloned().collect();
+        self.refresh_registrations(registrations, tolerant).await
+    }
+
+    async fn refresh_registrations(
+        &self,
+        registrations: Vec<Arc<Registration>>,
+        tolerant: bool,
+    ) -> Result<(), BoxError> {
+        // Fetch concurrently; retain each fetch guard until ordered publication.
         let results = futures::future::join_all(
-            server_ids
+            registrations
                 .iter()
-                .map(|server_id| self.fetch_server_snapshot(server_id, true)),
+                .map(|registration| self.fetch_registered_snapshot(registration.clone(), true)),
         )
         .await;
-
         let mut errors = Vec::new();
-        for (server_id, result) in server_ids.into_iter().zip(results) {
-            match result {
-                Ok((routes, meta)) => {
-                    let mut index = self.inner.index.write();
-                    index.replace_server_routes(&server_id, routes);
-                    index.metas.insert(server_id, meta);
+        for (registration, result) in registrations.iter().zip(results) {
+            let result = match result {
+                Ok(snapshot) => self.publish_snapshot(snapshot).await,
+                Err(err) => Err(err),
+            };
+            if let Err(err) = result {
+                if tolerant && !registration.required {
+                    log::warn!("MCP server {} discovery failed: {err}", registration.id);
+                } else {
+                    errors.push(format!("{}: {err}", registration.id));
                 }
-                Err(err) if tolerant => {
-                    log::warn!(
-                        "MCP provider {}: failed to refresh server {server_id}: {err}",
-                        self.inner.name
-                    );
-                }
-                Err(err) => errors.push(format!("{server_id}: {err}")),
             }
         }
         if errors.is_empty() {
@@ -395,7 +503,7 @@ impl McpToolProvider {
         }
     }
 
-    fn server_config(&self, server_id: &str) -> Result<Arc<McpServerConfig>, BoxError> {
+    fn server_config(&self, server_id: &str) -> Result<Arc<Registration>, BoxError> {
         self.inner
             .servers
             .read()
@@ -414,28 +522,28 @@ impl McpToolProvider {
         }
     }
 
-    async fn ensure_session(&self, config: &McpServerConfig) -> Result<Arc<McpSession>, BoxError> {
+    async fn ensure_session(
+        &self,
+        config: &Arc<Registration>,
+    ) -> Result<Arc<McpSession>, BoxError> {
         if let Some(session) = self.live_session(&config.id).await {
             return Ok(session);
         }
 
         // Serialize connection establishment per server so concurrent callers
         // racing to (re)connect don't spawn duplicate child processes/sessions.
-        let connect_lock = self
-            .inner
-            .connect_locks
-            .read()
-            .get(&config.id)
-            .cloned()
-            .ok_or_else(|| format!("MCP server {} not configured", config.id))?;
-        let _guard = connect_lock.lock().await;
-
+        let _guard = config.connect.lock().await;
+        if config.cancelled.is_cancelled() {
+            return Err("MCP server removed".into());
+        }
         // Re-check: another caller may have connected while we waited.
         if let Some(session) = self.live_session(&config.id).await {
             return Ok(session);
         }
 
-        let attempt = match self.connect(config, config.lifecycle.into_mode()).await {
+        *config.status.lock() = McpServerStatus::Connecting;
+        let _status_guard = catalog::ConnectingGuard(config);
+        let attempt = tokio::time::timeout(Duration::from_secs(config.timeouts.setup_secs), async { match self.connect(config, config.lifecycle.into_mode()).await {
             Ok(session) => Ok(session),
             // A pre-2026-07-28 server can answer the `server/discover` opener with
             // something other than a JSON-RPC "method not found" — an HTTP error, or,
@@ -454,14 +562,22 @@ impl McpToolProvider {
                 self.connect(config, ClientLifecycleMode::Initialize).await
             }
             Err(err) => Err(err),
-        };
+        } }).await.map_err(|_| format!("MCP server {} setup timed out", config.id))?;
         let session = attempt.map_err(|err| authorization_required_hint(config, err))?;
 
+        let servers = self.inner.servers.read();
+        if !servers
+            .get(&config.id)
+            .is_some_and(|current| Arc::ptr_eq(current, config))
+        {
+            return Err("MCP server registration changed during connection".into());
+        }
         self.inner
             .index
             .write()
             .sessions
             .insert(config.id.clone(), session.clone());
+        *config.status.lock() = McpServerStatus::Connected;
         Ok(session)
     }
 
@@ -475,10 +591,18 @@ impl McpToolProvider {
         config: &McpServerConfig,
         lifecycle: ClientLifecycleMode,
     ) -> Result<Arc<McpSession>, BoxError> {
-        tokio::time::timeout(
-            session::SESSION_SETUP_TIMEOUT,
-            self.connect_inner(config, lifecycle),
-        )
+        tokio::time::timeout(session::SESSION_SETUP_TIMEOUT, async {
+            for delay in [250, 1_000] {
+                match self.connect_inner(config, lifecycle.clone()).await {
+                    Ok(session) => return Ok(session),
+                    Err(err) if http_client::is_transient(err.as_ref()) => {
+                        tokio::time::sleep(Duration::from_millis(delay)).await
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+            self.connect_inner(config, lifecycle).await
+        })
         .await
         .map_err(|_| format!("MCP server {} session setup timed out", config.id))?
     }
@@ -488,16 +612,35 @@ impl McpToolProvider {
         config: &McpServerConfig,
         lifecycle: ClientLifecycleMode,
     ) -> Result<Arc<McpSession>, BoxError> {
-        let dirty = Arc::new(AtomicBool::new(false));
-        let handler = AndaMcpClient::new(dirty.clone(), config.tasks.is_some());
+        let dirty = Arc::new(AtomicBool::new(true));
+        let session_cancelled = CancellationToken::new();
+        let elicitation = if config.elicitation {
+            Some(interaction::ElicitationDispatcher {
+                handler: self
+                    .inner
+                    .elicitation_handler
+                    .clone()
+                    .ok_or("MCP elicitation requires an application handler")?,
+                server_id: config.id.clone(),
+                timeout: Duration::from_secs(config.timeouts.elicitation_secs),
+                session_cancelled: session_cancelled.clone(),
+            })
+        } else {
+            None
+        };
+        let handler = AndaMcpClient::new(dirty.clone(), config.tasks.is_some())
+            .with_elicitation(elicitation.clone());
         // Only a discovery opener can go unanswered by a server that does not know
         // it; the legacy handshake is answered or refused by every MCP server.
         let probe_timeout = (!matches!(lifecycle, ClientLifecycleMode::Initialize))
             .then_some(DISCOVERY_PROBE_TIMEOUT);
         let mut expires_at = None;
+        let mut process = None;
         let service = match &config.transport {
             McpTransportConfig::Stdio(stdio) => {
-                let transport = TokioChildProcess::new(stdio.command())?;
+                let (child, transport) =
+                    bounded::spawn(stdio.command(), config.limits.message_bytes)?;
+                process = Some(child);
                 serve_bounded(
                     serve_client_with_lifecycle(handler, transport, lifecycle),
                     probe_timeout,
@@ -506,8 +649,11 @@ impl McpToolProvider {
             }
             McpTransportConfig::StreamableHttp(http) => match &http.auth {
                 None => {
-                    let transport =
-                        StreamableHttpClientTransport::from_config(http.transport_config()?);
+                    let transport = StreamableHttpClientTransport::with_client(
+                        http_client::McpHttpClient::new(config.limits.message_bytes)?,
+                        http.transport_config()?
+                            .max_sse_event_size(config.limits.message_bytes),
+                    );
                     serve_bounded(
                         serve_client_with_lifecycle(handler, transport, lifecycle),
                         probe_timeout,
@@ -522,8 +668,12 @@ impl McpToolProvider {
                         auth::authorize_client_credentials(http.url.as_str(), cc).await?;
                     expires_at = deadline;
                     let transport = StreamableHttpClientTransport::with_client(
-                        AuthClient::new(ReqwestClient::new(), manager),
-                        http.base_transport_config()?,
+                        AuthClient::new(
+                            http_client::McpHttpClient::new(config.limits.message_bytes)?,
+                            manager,
+                        ),
+                        http.base_transport_config()?
+                            .max_sse_event_size(config.limits.message_bytes),
                     );
                     serve_bounded(
                         serve_client_with_lifecycle(handler, transport, lifecycle),
@@ -541,8 +691,12 @@ impl McpToolProvider {
                     )
                     .await?;
                     let transport = StreamableHttpClientTransport::with_client(
-                        AuthClient::new(ReqwestClient::new(), manager),
-                        http.base_transport_config()?,
+                        AuthClient::new(
+                            http_client::McpHttpClient::new(config.limits.message_bytes)?,
+                            manager,
+                        ),
+                        http.base_transport_config()?
+                            .max_sse_event_size(config.limits.message_bytes),
                     );
                     serve_bounded(
                         serve_client_with_lifecycle(handler, transport, lifecycle),
@@ -557,6 +711,10 @@ impl McpToolProvider {
             .subscribe_tool_changes(&config.id, service.peer(), dirty.clone())
             .await;
         Ok(Arc::new(McpSession {
+            retired: AtomicBool::new(false),
+            _process: process,
+            session_cancelled,
+            elicitation,
             service: Mutex::new(service),
             dirty,
             expires_at,
@@ -657,10 +815,17 @@ impl McpToolProvider {
             auth::begin_authorization_manager(http.url.as_str(), ac, self.scoped_store(server_id))
                 .await?;
 
+        let servers = self.inner.servers.read();
+        if !servers
+            .get(server_id)
+            .is_some_and(|current| Arc::ptr_eq(current, &config))
+        {
+            return Err("MCP server changed during authorization".into());
+        }
         self.inner
             .pending_auth
             .lock()
-            .insert(server_id.to_string(), manager);
+            .insert(server_id.to_string(), (config.clone(), manager));
         Ok(auth_url)
     }
 
@@ -685,14 +850,30 @@ impl McpToolProvider {
         server_id: &str,
         redirect_url: &str,
     ) -> Result<(), BoxError> {
-        let manager = self
+        let (registration, manager) = self
             .inner
             .pending_auth
             .lock()
             .remove(server_id)
             .ok_or_else(|| format!("no pending OAuth authorization for MCP server {server_id}"))?;
 
-        auth::complete_authorization_exchange(manager, redirect_url).await?;
+        let credential_guard = self
+            .inner
+            .credential_store
+            .acquire_refresh_guard(server_id)
+            .await?;
+        tokio::select! {
+            biased;
+            _ = registration.cancelled.cancelled() => return Err("MCP server removed during authorization".into()),
+            result = auth::complete_authorization_exchange(manager, redirect_url) => result?,
+        }
+        drop(credential_guard);
+        if !self
+            .server_config(server_id)
+            .is_ok_and(|current| Arc::ptr_eq(&current, &registration))
+        {
+            return Err("MCP server changed during authorization".into());
+        }
         self.disconnect_server(server_id).await;
         Ok(())
     }
@@ -716,17 +897,24 @@ impl McpToolProvider {
         // keeps that lock across the handshake *and* the insert, so without it a
         // reconnect already in flight would install its session — built with the
         // credentials this call means to retire — right after the removal.
-        let connect_lock = self.inner.connect_locks.read().get(server_id).cloned();
-        let _guard = match &connect_lock {
-            Some(lock) => Some(lock.lock().await),
-            None => None,
+        let Ok(config) = self.server_config(server_id) else {
+            return false;
         };
-        self.inner
-            .index
-            .write()
-            .sessions
-            .remove(server_id)
-            .is_some()
+        let _refresh = config.refresh.lock().await;
+        let _guard = config.connect.lock().await;
+        let servers = self.inner.servers.read();
+        if !servers
+            .get(server_id)
+            .is_some_and(|current| Arc::ptr_eq(current, &config))
+        {
+            return false;
+        }
+        *config.status.lock() = McpServerStatus::Disconnected;
+        let session = self.inner.index.write().sessions.remove(server_id);
+        if let Some(session) = &session {
+            session.retired.store(true, Ordering::SeqCst);
+        }
+        session.is_some()
     }
 
     /// Removes the persisted OAuth credentials for `server_id` and drops its
@@ -741,7 +929,15 @@ impl McpToolProvider {
     /// [`begin_authorization`]: Self::begin_authorization
     /// [`complete_authorization`]: Self::complete_authorization
     pub async fn clear_credentials(&self, server_id: &str) -> Result<(), BoxError> {
+        let _guard = self
+            .inner
+            .credential_store
+            .acquire_refresh_guard(server_id)
+            .await?;
         self.inner.credential_store.clear(server_id).await?;
+        // A connecting client can be waiting for this credential guard while it
+        // owns the refresh lock. Release it before retiring that connection.
+        drop(_guard);
         self.disconnect_server(server_id).await;
         Ok(())
     }
@@ -754,24 +950,8 @@ impl McpToolProvider {
     }
 
     async fn refresh_if_dirty(&self, server_id: &str) -> Result<(), BoxError> {
-        // Atomically claim the refresh so concurrent callers triggered by the
-        // same `tools/list_changed` notification don't all refresh at once.
-        let claimed = self
-            .inner
-            .index
-            .read()
-            .sessions
-            .get(server_id)
-            .map(|session| session.dirty.swap(false, Ordering::SeqCst))
-            .unwrap_or(false);
-        if claimed && let Err(err) = self.refresh_server_inner(server_id, false).await {
-            // Restore the dirty flag so a later call retries the refresh.
-            if let Some(session) = self.inner.index.read().sessions.get(server_id) {
-                session.dirty.store(true, Ordering::SeqCst);
-            }
-            return Err(err);
-        }
-        Ok(())
+        let snapshot = self.fetch_server_snapshot(server_id, false).await?;
+        self.publish_snapshot(snapshot).await
     }
 
     fn routes_for_tools(
@@ -779,9 +959,46 @@ impl McpToolProvider {
         server_id: &str,
         tools: Vec<McpTool>,
     ) -> Result<Vec<McpToolRoute>, BoxError> {
+        let config = self.server_config(server_id)?;
         let mut routes = Vec::new();
         let mut used = BTreeSet::new();
+        let mut tools = tools;
+        tools.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut counts = BTreeMap::<String, usize>::new();
+        for tool in &tools {
+            *counts.entry(sanitize_name_part(&tool.name)).or_default() += 1;
+        }
+        let mut remote_names = BTreeSet::new();
         for tool in tools {
+            if !remote_names.insert(tool.name.to_string()) {
+                return Err("MCP duplicate remote tool name".into());
+            }
+            if serde_json::to_vec(tool.input_schema.as_ref())?.len() > config.limits.schema_bytes
+                || tool.output_schema.as_ref().is_some_and(|schema| {
+                    serde_json::to_vec(schema.as_ref())
+                        .map_or(true, |v| v.len() > config.limits.schema_bytes)
+                })
+                || tool
+                    .description
+                    .as_ref()
+                    .is_some_and(|v| v.len() > config.limits.description_bytes)
+            {
+                return Err(format!(
+                    "MCP tool {} exceeds schema or description limits",
+                    tool.name
+                )
+                .into());
+            }
+            if !router::tool_is_model_visible(&tool) {
+                continue;
+            }
+            if tool
+                .title
+                .as_ref()
+                .is_some_and(|title| title.len() > config.limits.description_bytes)
+            {
+                return Err("MCP tool title limit exceeded".into());
+            }
             let remote_name = tool.name.to_string();
             if !self.includes_tool(server_id, &remote_name) {
                 continue;
@@ -793,7 +1010,9 @@ impl McpToolProvider {
             // is unique: silently reusing it would overwrite the earlier route below, so
             // the local name the model already learned would dispatch to a different remote
             // tool. If no unique name can be found, drop the tool rather than hijack.
-            let mut local_name = self.local_tool_name(server_id, &remote_name, None)?;
+            let collision_key =
+                (counts[&sanitize_name_part(&remote_name)] > 1).then_some(remote_name.as_str());
+            let mut local_name = self.local_tool_name(server_id, &remote_name, collision_key)?;
             let mut attempt = 0usize;
             while used.contains(&local_name) {
                 if attempt >= MAX_LOCAL_NAME_ATTEMPTS {
@@ -817,6 +1036,9 @@ impl McpToolProvider {
                 server_id: server_id.to_string(),
                 remote_name,
                 definition,
+                tool,
+                server_generation: config.generation,
+                catalog_revision: config.revision.load(Ordering::SeqCst),
             });
         }
         Ok(routes)
@@ -857,7 +1079,7 @@ impl McpToolProvider {
         FunctionDefinition {
             name: local_name.to_string(),
             description,
-            parameters: Json::Object((*tool.input_schema).clone()),
+            parameters: router::model_schema(&tool.input_schema),
             strict: Some(false),
         }
     }
@@ -898,44 +1120,102 @@ impl McpToolProvider {
         input: ToolInput<Json>,
         cancellation: CancellationToken,
     ) -> Result<ToolOutput<Json>, BoxError> {
-        let (config, session) = tokio::select! {
+        let config = self.server_config(&route.server_id)?;
+        if route.server_generation != config.generation {
+            return Err("MCP server registration changed; select the tool again".into());
+        }
+        tokio::select! {
             biased;
-            _ = cancellation.cancelled() => return Err("MCP tool call cancelled".into()),
-            setup = async {
-                self.refresh_if_dirty(&route.server_id).await?;
-                let config = self.server_config(&route.server_id)?;
-                let session = self.ensure_session(&config).await?;
-                Ok::<_, BoxError>((config, session))
-            } => setup?,
-        };
+            _ = cancellation.cancelled() => Err("MCP tool call cancelled".into()),
+            _ = config.cancelled.cancelled() => Err("MCP server removed".into()),
+            result = tokio::time::timeout(config.timeouts.call(), self.execute_route(&config, route, input, &cancellation)) =>
+                result.map_err(|_| "MCP logical tool call timed out")?,
+        }
+    }
 
+    async fn execute_route(
+        &self,
+        config: &Arc<Registration>,
+        route: McpToolRoute,
+        input: ToolInput<Json>,
+        cancellation: &CancellationToken,
+    ) -> Result<ToolOutput<Json>, BoxError> {
+        self.refresh_if_dirty(&route.server_id).await?;
+        let _catalog = config.catalog.read().await;
+        let current = self
+            .inner
+            .index
+            .read()
+            .routes
+            .get(&route.name)
+            .cloned()
+            .ok_or("MCP tool was removed; select a tool again")?;
+        if current.server_generation != route.server_generation
+            || current.remote_name != route.remote_name
+            || current.tool != route.tool
+        {
+            return Err("MCP tool catalog changed; select the tool again".into());
+        }
+        let session = self
+            .live_session(&route.server_id)
+            .await
+            .ok_or("MCP session closed; refresh the tool catalog")?;
+        let parallel = config.concurrency == McpConcurrency::Parallel
+            || (config.concurrency == McpConcurrency::ReadOnlyParallel
+                && current
+                    .tool
+                    .annotations
+                    .as_ref()
+                    .and_then(|a| a.read_only_hint)
+                    == Some(true));
+        let (_read, _write) = if parallel {
+            (Some(config.calls.read().await), None)
+        } else {
+            (None, Some(config.calls.write().await))
+        };
+        if session.retired.load(Ordering::SeqCst) {
+            return Err("MCP session was disconnected before execution".into());
+        }
         let arguments = match input.args {
             Json::Object(map) => map,
             Json::Null => Map::new(),
-            other => {
-                return Err(format!(
-                    "MCP tool {} expects JSON object arguments, got {}",
-                    route.name, other
-                )
-                .into());
+            _ => {
+                return Err(
+                    format!("MCP tool {} expects JSON object arguments", route.name).into(),
+                );
             }
         };
-
         let params =
-            CallToolRequestParams::new(route.remote_name.clone()).with_arguments(arguments);
-        // Clone the peer so the session lock is not held across the round-trip.
-        // rmcp multiplexes concurrent requests, so this lets parallel calls to
-        // the same server run concurrently instead of being serialized.
-        let peer = {
-            let service = session.service.lock().await;
-            service.peer().clone()
+            CallToolRequestParams::new(current.remote_name.clone()).with_arguments(arguments);
+        let peer = session.service.lock().await.peer().clone();
+        let result = call_tool_rounds(
+            &current,
+            &peer,
+            params,
+            config.tasks.as_ref(),
+            cancellation,
+            Duration::from_secs(config.timeouts.request_secs),
+            session.elicitation.as_ref(),
+        )
+        .await;
+        let result = match result {
+            Ok(result) => result,
+            Err(err) if is_authorization_error(err.as_ref()) => {
+                *config.status.lock() = McpServerStatus::AuthorizationRequired;
+                let mut output = ToolOutput::new(
+                    serde_json::json!({"error": {"code": "authorization_required", "server_id": config.id}}),
+                );
+                output.is_error = Some(true);
+                return Ok(output);
+            }
+            Err(err) => return Err(err),
         };
-        let result =
-            call_tool_rounds(&route, &peer, params, config.tasks.as_ref(), &cancellation).await?;
-        Ok(mcp_result_to_tool_output(&route, result))
+        let mut output = mcp_result_to_tool_output(&current, result);
+        output.model_output = Some(presentation::present_result(&output.output, &config.limits));
+        Ok(output)
     }
 
-    fn insert_server(&self, server: McpServerConfig) -> Result<(), BoxError> {
+    fn insert_server(&self, server: McpServerConfig) -> Result<Arc<Registration>, BoxError> {
         server.validate()?;
         let server_id = server.id.clone();
         let sanitized = sanitize_name_part(&server_id);
@@ -956,19 +1236,30 @@ impl McpToolProvider {
             .into());
         }
 
-        servers.insert(server_id.clone(), Arc::new(server));
-        self.inner
-            .connect_locks
-            .write()
-            .insert(server_id, Arc::new(Mutex::new(())));
-        Ok(())
+        let generation = self.inner.next_generation.fetch_add(1, Ordering::SeqCst);
+        let registration = Arc::new(Registration::new(server, generation));
+        servers.insert(server_id, registration.clone());
+        Ok(registration)
+    }
+
+    fn remove_registration(&self, expected: &Arc<Registration>) {
+        let mut servers = self.inner.servers.write();
+        if !servers
+            .get(&expected.id)
+            .is_some_and(|current| Arc::ptr_eq(current, expected))
+        {
+            return;
+        }
+        servers.remove(&expected.id);
+        expected.cancelled.cancel();
+        self.inner.index.write().remove_server(&expected.id);
+        self.inner.pending_auth.lock().remove(&expected.id);
     }
 
     fn remove_server_state(&self, server_id: &str) {
-        self.inner.servers.write().remove(server_id);
-        self.inner.connect_locks.write().remove(server_id);
-        self.inner.index.write().remove_server(server_id);
-        self.inner.pending_auth.lock().remove(server_id);
+        if let Ok(registration) = self.server_config(server_id) {
+            self.remove_registration(&registration);
+        }
     }
 }
 
@@ -1007,16 +1298,32 @@ impl ToolProvider<BaseCtx> for McpToolProvider {
     }
 
     fn init(&self, ctx: BaseCtx) -> BoxFut<'_, Result<(), BoxError>> {
-        // Startup must not fail because a single MCP server is unreachable;
-        // failed servers are logged and can be refreshed later, on demand or
-        // via an explicit `refresh()`.
         Box::pin(async move {
             let cancellation = ctx.cancellation_token();
+            let registrations: Vec<_> = self.inner.servers.read().values().cloned().collect();
+            let (background, eager): (Vec<_>, Vec<_>) = registrations
+                .into_iter()
+                .partition(|server| server.startup == McpStartup::Background);
             tokio::select! {
                 biased;
-                _ = cancellation.cancelled() => Err("MCP initialization cancelled".into()),
-                result = self.refresh_servers(true) => result,
+                _ = cancellation.cancelled() => return Err("MCP initialization cancelled".into()),
+                result = self.refresh_registrations(eager, true) => result?,
             }
+            // Eager names are established first; background catalogs are also
+            // published in id order, so response timing never picks name owners.
+            if !background.is_empty() {
+                let provider = self.clone();
+                tokio::spawn(async move {
+                    tokio::select! {
+                        biased;
+                        _ = cancellation.cancelled() => {},
+                        result = provider.refresh_registrations(background, true) => {
+                            if let Err(err) = result { log::warn!("MCP background discovery failed: {err}"); }
+                        }
+                    }
+                });
+            }
+            Ok(())
         })
     }
 
@@ -1053,6 +1360,7 @@ pub struct McpToolProviderBuilder {
     tool_prefix: Option<String>,
     servers: Vec<McpServerConfig>,
     credential_store: Option<Arc<dyn McpCredentialStore>>,
+    elicitation_handler: Option<Arc<dyn McpElicitationHandler>>,
 }
 
 impl McpToolProviderBuilder {
@@ -1088,6 +1396,13 @@ impl McpToolProviderBuilder {
         self
     }
 
+    /// Installs an application callback. Servers must additionally opt in through
+    /// `McpServerConfig::elicitation`; unsupported capabilities remain unadvertised.
+    pub fn elicitation_handler(mut self, handler: Arc<dyn McpElicitationHandler>) -> Self {
+        self.elicitation_handler = Some(handler);
+        self
+    }
+
     /// Builds the provider.
     pub fn build(self) -> Result<McpToolProvider, BoxError> {
         let name = self
@@ -1119,13 +1434,13 @@ impl McpToolProviderBuilder {
                 )
                 .into());
             }
-            servers.insert(server.id.clone(), Arc::new(server));
+            servers.insert(
+                server.id.clone(),
+                Arc::new(Registration::new(server, servers.len() as u64 + 1)),
+            );
         }
 
-        let connect_locks = servers
-            .keys()
-            .map(|id| (id.clone(), Arc::new(Mutex::new(()))))
-            .collect();
+        let next_generation = AtomicU64::new(servers.len() as u64 + 1);
 
         let credential_store = self
             .credential_store
@@ -1136,9 +1451,10 @@ impl McpToolProviderBuilder {
                 name,
                 tool_prefix,
                 servers: RwLock::new(servers),
-                connect_locks: RwLock::new(connect_locks),
+                next_generation,
                 index: RwLock::new(McpToolIndex::default()),
                 credential_store,
+                elicitation_handler: self.elicitation_handler,
                 pending_auth: SyncMutex::new(HashMap::new()),
             }),
         })
@@ -1159,22 +1475,22 @@ impl std::fmt::Debug for McpToolProviderBuilder {
 struct McpToolProviderInner {
     name: String,
     tool_prefix: String,
-    servers: RwLock<BTreeMap<String, Arc<McpServerConfig>>>,
-    /// Per-server lock serializing connection establishment, so concurrent
-    /// callers racing to (re)connect a server don't spawn duplicate sessions.
-    connect_locks: RwLock<BTreeMap<String, Arc<Mutex<()>>>>,
+    servers: RwLock<BTreeMap<String, Arc<Registration>>>,
+    next_generation: AtomicU64,
     index: RwLock<McpToolIndex>,
     /// Application-supplied persistence for OAuth credentials, keyed by server.
     credential_store: Arc<dyn McpCredentialStore>,
+    elicitation_handler: Option<Arc<dyn McpElicitationHandler>>,
     /// In-memory Authorization Code flow state (PKCE verifier + CSRF) held
     /// between `begin_authorization` and `complete_authorization`. This lives in
     /// the process only, so both calls must target the same provider instance.
-    pending_auth: SyncMutex<HashMap<String, AuthorizationManager>>,
+    pending_auth: SyncMutex<HashMap<String, (Arc<Registration>, AuthorizationManager)>>,
 }
 
 #[derive(Default)]
 struct McpToolIndex {
     routes: BTreeMap<String, McpToolRoute>,
+    names: BTreeMap<(String, String), String>,
     sessions: BTreeMap<String, Arc<McpSession>>,
     metas: BTreeMap<String, McpServerMeta>,
 }
@@ -1183,47 +1499,26 @@ impl McpToolIndex {
     fn replace_server_routes(&mut self, server_id: &str, routes: Vec<McpToolRoute>) {
         self.routes.retain(|_, route| route.server_id != server_id);
         for mut route in routes {
-            // Cross-server local-name collision: another server already owns
-            // this local name. Intra-server dedup in `routes_for_tools` cannot
-            // see other servers, so disambiguate the newcomer here with a stable
-            // hash suffix. Without this, a compromised server could publish a
-            // tool whose local name shadows another server's, hijacking calls.
-            if self
-                .routes
-                .get(&route.name)
-                .is_some_and(|existing| existing.server_id != route.server_id)
-            {
-                let disambiguated = shorten_with_hash(
-                    &route.name,
-                    &format!("{}:{}", route.server_id, route.remote_name),
-                );
-                log::warn!(
-                    "MCP local tool name collision on {:?}; remapping server {:?} tool {:?} to {:?}",
-                    route.name,
-                    route.server_id,
-                    route.remote_name,
-                    disambiguated
-                );
-                route.name = disambiguated.clone();
-                route.definition.name = disambiguated;
+            let identity = (route.server_id.clone(), route.remote_name.clone());
+            if let Some(name) = self.names.get(&identity) {
+                route.name.clone_from(name);
+            } else {
+                let base = route.name.clone();
+                for attempt in 0..MAX_LOCAL_NAME_ATTEMPTS {
+                    if !self.names.values().any(|name| name == &route.name) {
+                        break;
+                    }
+                    route.name = shorten_with_hash(
+                        &base,
+                        &format!("{}:{}#{attempt}", route.server_id, route.remote_name),
+                    );
+                }
+                if self.names.values().any(|name| name == &route.name) {
+                    continue;
+                }
+                self.names.insert(identity, route.name.clone());
             }
-
-            // If the disambiguated name still collides with a different server,
-            // drop the tool rather than silently hijack an existing route.
-            if self
-                .routes
-                .get(&route.name)
-                .is_some_and(|existing| existing.server_id != route.server_id)
-            {
-                log::error!(
-                    "MCP tool {:?} from server {:?} dropped: local name {:?} still collides",
-                    route.remote_name,
-                    route.server_id,
-                    route.name
-                );
-                continue;
-            }
-
+            route.definition.name.clone_from(&route.name);
             self.routes.insert(route.name.clone(), route);
         }
     }
@@ -1232,6 +1527,7 @@ impl McpToolIndex {
         self.routes.retain(|_, route| route.server_id != server_id);
         self.sessions.remove(server_id);
         self.metas.remove(server_id);
+        self.names.retain(|(id, _), _| id != server_id);
     }
 }
 
@@ -1306,6 +1602,28 @@ pub struct McpServerConfig {
     /// undeclared, so the server must answer `tools/call` inline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tasks: Option<McpTasksConfig>,
+    /// Bounds on untrusted catalogs, descriptions, and results.
+    #[serde(default)]
+    pub limits: McpLimits,
+    /// Connection, listing, and logical-call deadlines.
+    #[serde(default)]
+    pub timeouts: McpTimeouts,
+    /// Host-authorized parallelism; defaults to serial execution.
+    #[serde(default)]
+    pub concurrency: McpConcurrency,
+    /// Fail engine initialization if this server cannot be discovered.
+    #[serde(default)]
+    pub required: bool,
+    /// Optional background discovery at engine startup.
+    #[serde(default)]
+    pub startup: McpStartup,
+    /// Opt in to standard elicitation using the provider's application handler.
+    #[serde(default)]
+    pub elicitation: bool,
+    /// Enable explicit resources/list, resources/templates/list, and resources/read.
+    /// Resources are not registered as model-facing tools automatically.
+    #[serde(default)]
+    pub resources: bool,
 }
 
 impl McpServerConfig {
@@ -1321,6 +1639,13 @@ impl McpServerConfig {
             exclude: BTreeSet::new(),
             lifecycle: McpLifecycle::default(),
             tasks: None,
+            limits: McpLimits::default(),
+            timeouts: McpTimeouts::default(),
+            concurrency: McpConcurrency::default(),
+            required: false,
+            startup: McpStartup::default(),
+            elicitation: false,
+            resources: false,
         }
     }
 
@@ -1336,6 +1661,13 @@ impl McpServerConfig {
             exclude: BTreeSet::new(),
             lifecycle: McpLifecycle::default(),
             tasks: None,
+            limits: McpLimits::default(),
+            timeouts: McpTimeouts::default(),
+            concurrency: McpConcurrency::default(),
+            required: false,
+            startup: McpStartup::default(),
+            elicitation: false,
+            resources: false,
         }
     }
 
@@ -1343,6 +1675,11 @@ impl McpServerConfig {
         validate_function_name(&sanitize_name_part(&self.id))?;
         if self.id.trim().is_empty() {
             return Err("MCP server id must not be empty".into());
+        }
+        self.limits.validate()?;
+        self.timeouts.validate()?;
+        if self.required && self.startup == McpStartup::Background {
+            return Err("required MCP servers cannot start in the background".into());
         }
         self.transport.validate()
     }
@@ -2136,6 +2473,9 @@ done
     #[test]
     fn converts_mcp_call_result_to_audited_output() {
         let route = McpToolRoute {
+            tool: tool("echo", "Echo"),
+            server_generation: 0,
+            catalog_revision: 0,
             name: "mcp_repo_echo".to_string(),
             server_id: "repo".to_string(),
             remote_name: "echo".to_string(),
@@ -2305,6 +2645,9 @@ done
     #[test]
     fn unsupported_input_rounds_become_tool_level_errors() {
         let route = McpToolRoute {
+            tool: tool("echo", "Echo"),
+            server_generation: 0,
+            catalog_revision: 0,
             name: "mcp_repo_echo".to_string(),
             server_id: "repo".to_string(),
             remote_name: "echo".to_string(),
@@ -2703,3 +3046,7 @@ done
         let _ = std::fs::remove_file(script_path);
     }
 }
+
+#[cfg(test)]
+#[path = "mcp/regression_tests.rs"]
+mod regression_tests;

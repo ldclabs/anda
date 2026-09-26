@@ -191,3 +191,12 @@ terms or conditions.
 [completion-request]: https://docs.rs/anda_core/latest/anda_core/struct.CompletionRequest.html
 [agent-output]: https://docs.rs/anda_core/latest/anda_core/struct.AgentOutput.html
 [license]: ./../LICENSE-MIT
+
+### Tool result presentations
+
+`ToolOutput<T>::model_output` optionally carries a provider-neutral
+`ToolPresentation` (text plus inline `ToolMedia`). The full `output` remains
+available to callers and audit hooks. The runner stores the tagged presentation
+inside `ContentPart::ToolOutput.output`, preserving the tool-call boundary.
+Older serialized outputs default to no override. Result-rewriting hooks must
+update the presentation or clear it so their replacement output is used.

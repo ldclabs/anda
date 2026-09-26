@@ -285,27 +285,55 @@ impl From<ContentPart> for Part {
                 is_error,
                 call_id,
                 ..
-            } => Part {
-                data: PartKind::FunctionResponse {
-                    name,
-                    response: if is_error.is_some_and(|b| b) {
-                        FunctionResponseValue {
-                            error: Some(output),
-                            ..Default::default()
+            } => {
+                let (output, media) = if let Some(view) =
+                    anda_core::ToolPresentation::from_output(&output)
+                {
+                    let mut text = view.text;
+                    let mut parts = Vec::new();
+                    for media in view.media {
+                        if matches!(
+                            media.mime_type.as_str(),
+                            "image/png"
+                                | "image/jpeg"
+                                | "image/webp"
+                                | "application/pdf"
+                                | "text/plain"
+                        ) {
+                            parts.push(serde_json::json!({"inlineData": {"mimeType": media.mime_type, "data": media.data.to_base64()}}));
+                        } else {
+                            text.push_str(&format!(
+                                "\n[{} tool media omitted: unsupported by this model API]",
+                                media.mime_type
+                            ));
                         }
-                    } else {
-                        FunctionResponseValue {
-                            output: Some(output),
-                            ..Default::default()
-                        }
+                    }
+                    (Value::String(text), (!parts.is_empty()).then_some(parts))
+                } else {
+                    (output, None)
+                };
+                Part {
+                    data: PartKind::FunctionResponse {
+                        name,
+                        response: if is_error.is_some_and(|b| b) {
+                            FunctionResponseValue {
+                                error: Some(output),
+                                ..Default::default()
+                            }
+                        } else {
+                            FunctionResponseValue {
+                                output: Some(output),
+                                ..Default::default()
+                            }
+                        },
+                        id: call_id,
+                        will_continue: None,
+                        scheduling: None,
+                        parts: media,
                     },
-                    id: call_id,
-                    will_continue: None,
-                    scheduling: None,
-                    parts: None,
-                },
-                ..Default::default()
-            },
+                    ..Default::default()
+                }
+            }
             ContentPart::Any(json) => part_from_any(json),
             _ => Part {
                 data: PartKind::Text(serde_json::to_string(&value).unwrap_or_default()),
@@ -2899,6 +2927,36 @@ mod tests {
                     }
                 ]
             })
+        );
+    }
+}
+
+#[cfg(test)]
+mod tool_presentation_tests {
+    use super::*;
+    #[test]
+    fn tool_media_keeps_its_call_boundary() {
+        let output = anda_core::ToolPresentation {
+            text: "visible".into(),
+            media: vec![anda_core::ToolMedia {
+                mime_type: "image/png".into(),
+                data: anda_core::ByteBufB64::from(vec![1, 2, 3]),
+            }],
+        }
+        .into_output();
+        let part = Part::from(anda_core::ContentPart::ToolOutput {
+            name: "mcp_test_echo".into(),
+            output,
+            is_error: Some(false),
+            call_id: Some("call-1".into()),
+            remote_id: None,
+        });
+        let result = serde_json::to_value(part).unwrap();
+        assert_eq!(result["functionResponse"]["id"], "call-1");
+        assert_eq!(result["functionResponse"]["response"]["output"], "visible");
+        assert_eq!(
+            result["functionResponse"]["parts"][0]["inlineData"]["data"],
+            "AQID"
         );
     }
 }

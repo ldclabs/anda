@@ -755,7 +755,9 @@ fn push_message_input(
 }
 
 fn tool_output_to_string(output: &Json) -> String {
-    serde_json::to_string(output).unwrap_or_default()
+    anda_core::ToolPresentation::from_output(output)
+        .map(|view| view.text_fallback())
+        .unwrap_or_else(|| serde_json::to_string(output).unwrap_or_default())
 }
 
 /// Builds the Chat Completions content part for a media or file payload given
