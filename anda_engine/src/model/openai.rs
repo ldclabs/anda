@@ -758,46 +758,40 @@ fn tool_output_to_string(output: &Json) -> String {
     serde_json::to_string(output).unwrap_or_default()
 }
 
-/// Builds the Chat Completions content part for a media or file payload:
-/// media mime types use the lazily built URL, anything else falls back to a
-/// `file` part with the lazily built raw payload.
-fn media_content_part(
-    mime_type: &str,
-    url: impl FnOnce() -> Json,
-    file_data: impl FnOnce() -> Json,
-) -> Result<Json, BoxError> {
+/// Builds the Chat Completions content part for a media or file payload given
+/// as an `https:` or `data:` URL. Video keeps the `video_url` part accepted by
+/// compatible providers (OpenAI itself rejects video input).
+fn media_content_part(mime_type: &str, url: &str) -> Result<Json, BoxError> {
     Ok(match mime_type {
         mt if mt.starts_with("image") => json!({
             "type": "image_url",
             "image_url": {
-                "url": url(),
+                "url": url,
             },
         }),
-        mt if mt.starts_with("video") => {
-            return Err("OpenAI Chat Completions does not support video input".into());
-        }
+        mt if mt.starts_with("video") => json!({
+            "type": "video_url",
+            "video_url": {
+                "url": url,
+            },
+        }),
         mt if mt.starts_with("audio") => {
             let format = match mt {
                 "audio/wav" | "audio/x-wav" | "audio/wave" => "wav",
                 "audio/mpeg" | "audio/mp3" => "mp3",
                 _ => return Err("OpenAI Chat Completions audio input requires WAV or MP3".into()),
             };
-            let value = url();
-            let (data, _) = value.as_str().and_then(inline_data_from_data_url).ok_or(
+            let (data, _) = inline_data_from_data_url(url).ok_or(
                 "OpenAI Chat Completions audio input requires inline data, not a remote URL",
             )?;
             json!({"type": "input_audio", "input_audio": {"data": data.to_base64(), "format": format}})
         }
         _ => {
-            let data = file_data();
-            if data
-                .as_str()
-                .is_some_and(|data| data.starts_with("https://") || data.starts_with("http://"))
-            {
+            if !url.starts_with("data:") {
                 return Err("OpenAI Chat Completions does not support file URLs; use inline data or the Responses adapter".into());
             }
             json!({"type": "file", "file": {
-                "file_data": data,
+                "file_data": url,
                 "filename": if mime_type == "application/pdf" { "attachment.pdf" } else { "attachment" },
             }})
         }
@@ -862,15 +856,13 @@ fn to_message_inputs(msg: &Message) -> Result<Vec<MessageInput>, BoxError> {
             } if file_uri.starts_with("data:") || file_uri.starts_with("https://") => {
                 content.push(media_content_part(
                     mime_type.as_deref().unwrap_or_default(),
-                    || json!(file_uri),
-                    || json!(file_uri),
+                    file_uri,
                 )?);
             }
             ContentPart::InlineData { data, mime_type } => {
                 content.push(media_content_part(
                     mime_type,
-                    || json!(part_to_data_url(data, Some(mime_type))),
-                    || json!(part_to_data_url(data, Some(mime_type))),
+                    &part_to_data_url(data, Some(mime_type)),
                 )?);
             }
             ContentPart::Any(json) => content.push(chat_completion_content_part_from_any(json)),
@@ -1170,10 +1162,13 @@ fn chat_completion_response_from_stream_chunks(
 
     for chunk in chunks {
         if let Some(error) = chunk.error {
-            let retryable = matches!(
-                error.get("code").and_then(Json::as_str),
-                Some("server_error" | "rate_limit_exceeded")
-            );
+            // OpenAI reports server errors by `type` with a null `code`.
+            let retryable = ["code", "type"].into_iter().any(|key| {
+                matches!(
+                    error.get(key).and_then(Json::as_str),
+                    Some("server_error" | "rate_limit_exceeded")
+                )
+            });
             return Err(Box::new(
                 super::ModelError::new(format!("Completion stream failed: {error}"))
                     .with_retryable(retryable),
@@ -1650,7 +1645,7 @@ impl CompletionFeaturesDyn for CompletionModel {
         r.model = model.clone();
 
         Box::pin(async move {
-            assign_tool_call_ids(&mut req)?;
+            assign_tool_call_ids(&mut req);
             drive_completion::<CompletionModel>(model, move |path| client.post(path), r, req).await
         })
     }
@@ -1884,7 +1879,7 @@ impl CompletionFeaturesDyn for CompletionModelV2 {
         r.model = model.clone();
 
         Box::pin(async move {
-            assign_tool_call_ids(&mut req)?;
+            assign_tool_call_ids(&mut req);
             drive_completion::<CompletionModelV2>(model, move |path| client.post(path), r, req)
                 .await
         })
@@ -2097,12 +2092,21 @@ mod tests {
             .unwrap();
         assert_eq!(output.content, "complete");
         assert!(output.failed_reason.is_none());
-        let error =
-            serde_json::from_value(json!({"error":{"code":"server_error","message":"retry"}}))
-                .unwrap();
-        assert!(crate::model::is_retryable_box_error(
-            &chat_completion_response_from_stream_chunks(vec![error], true).unwrap_err()
-        ));
+        for (error, retryable) in [
+            (json!({"code":"server_error","message":"retry"}), true),
+            (
+                json!({"type":"server_error","code":null,"message":"retry"}),
+                true,
+            ),
+            (
+                json!({"type":"invalid_request_error","code":null,"message":"bad"}),
+                false,
+            ),
+        ] {
+            let chunk = serde_json::from_value(json!({ "error": error })).unwrap();
+            let err = chat_completion_response_from_stream_chunks(vec![chunk], true).unwrap_err();
+            assert_eq!(crate::model::is_retryable_box_error(&err), retryable);
+        }
     }
 
     #[tokio::test]
@@ -2291,6 +2295,10 @@ mod tests {
                     mime_type: "application/pdf".into(),
                     data: b"%PDF-1.4".to_vec().into(),
                 },
+                ContentPart::FileData {
+                    file_uri: "https://example.test/video.mp4".into(),
+                    mime_type: Some("video/mp4".into()),
+                },
             ],
             ..Default::default()
         };
@@ -2312,11 +2320,15 @@ mod tests {
             parts[3]["file"],
             json!({"filename":"attachment.pdf", "file_data":"data:application/pdf;base64,JVBERi0xLjQ="})
         );
+        // OpenAI rejects video, but compatible providers accept `video_url`.
+        assert_eq!(
+            parts[4],
+            json!({"type":"video_url", "video_url":{"url":"https://example.test/video.mp4"}})
+        );
 
         for (mime, uri) in [
             ("audio/wav", "https://example.test/audio.wav"),
             ("application/pdf", "https://example.test/file.pdf"),
-            ("video/mp4", "https://example.test/video.mp4"),
             ("audio/ogg", "data:audio/ogg;base64,AQID"),
         ] {
             let msg = Message {

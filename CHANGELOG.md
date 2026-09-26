@@ -15,6 +15,12 @@ All notable changes to the Anda project will be documented in this file.
 - Pair missing tool-call IDs when replaying foreign histories to OpenAI and
   Anthropic. Document Responses' mandatory streaming and reject unsupported
   stop sequences explicitly.
+- Anthropic keeps a tool strict only when its schema fits the strict subset;
+  tools with other constraints, such as `minimum` on unsigned integers or the
+  default agent `minLength`, are sent as regular tools. Results answering calls
+  kept only in native history are sent unchanged, Chat Completions keeps
+  `video_url` parts for compatible providers, and in-band stream errors typed
+  `server_error` are retried.
 - Session `shell` calls now wait for the process to exit or `yield_time_ms` to
   elapse instead of returning at the first output. Background hooks fire only
   for commands still running after that wait, so foreground results are no

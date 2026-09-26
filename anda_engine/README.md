@@ -150,16 +150,19 @@ Completion adapter behavior:
   for other provider-specific settings. `ThinkingConfig::thinking_budget` is
   signed so `-1` can request dynamic thinking.
 - Anthropic forwards `FunctionDefinition::strict` and closes objects in strict
-  tool and output schemas while preserving optional properties. Common
-  unsupported constraints (including numeric bounds and string lengths) return
-  a local error rather than being discarded. Use supported schemas, or
-  `strict: false` for tools that need schemas outside that subset.
+  tool and output schemas while preserving optional properties. A strict tool
+  whose schema uses unsupported constraints (including numeric bounds and
+  string lengths, such as `minimum: 0` on unsigned integers) is sent as a
+  regular tool with its schema unchanged. In an output schema, such
+  constraints return a local error rather than being discarded.
 - Chat audio inputs must contain inline WAV/MP3 data. Remote audio/file URLs
-  and video input return errors; use Responses for remote file inputs.
+  return errors; use Responses for remote file inputs. Video is sent as a
+  `video_url` part for compatible providers; OpenAI itself rejects it.
   Anthropic inline PDFs use Base64 regardless of whether their bytes are UTF-8.
 - OpenAI and Anthropic pair missing tool-call IDs when replaying neutral
-  history, including repeated calls to the same function. Existing IDs and
-  provider-native `raw_history` remain intact.
+  history, including repeated calls to the same function. Existing IDs,
+  provider-native `raw_history`, and results whose calls exist only in
+  `raw_history` remain intact.
 
 ### Tools and Extensions
 

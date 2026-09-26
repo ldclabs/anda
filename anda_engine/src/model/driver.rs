@@ -232,7 +232,9 @@ pub(crate) async fn drive_completion<W: WireFormat>(
 /// Pairs provider-neutral tool history before replay to APIs requiring call IDs.
 /// Native history is deliberately left untouched. Queues distinguish repeated
 /// calls to the same function, including parallel calls without provider IDs.
-pub(crate) fn assign_tool_call_ids(req: &mut CompletionRequest) -> Result<(), BoxError> {
+/// A result without a call in the neutral history, such as one answering a call
+/// carried by `raw_history` from a provider that omits IDs, is sent unchanged.
+pub(crate) fn assign_tool_call_ids(req: &mut CompletionRequest) {
     let mut parts: Vec<_> = req
         .chat_history
         .iter_mut()
@@ -249,7 +251,6 @@ pub(crate) fn assign_tool_call_ids(req: &mut CompletionRequest) -> Result<(), Bo
                     .push_back((index, call_id.clone().filter(|id| !id.is_empty())));
             }
             ContentPart::ToolOutput { name, call_id, .. } => {
-                let name = name.clone();
                 let result_id = call_id.clone().filter(|id| !id.is_empty());
                 let queue = pending.entry(name.clone()).or_default();
                 let matched = if let Some(id) = &result_id {
@@ -261,9 +262,7 @@ pub(crate) fn assign_tool_call_ids(req: &mut CompletionRequest) -> Result<(), Bo
                         .or_else(|| queue.iter().position(|(_, call_id)| call_id.is_none()))
                         .and_then(|position| queue.remove(position))
                 } else {
-                    Some(queue.pop_front().ok_or_else(|| format!(
-                        "Cannot pair tool result for {name}: missing call ID and matching tool call"
-                    ))?)
+                    queue.pop_front()
                 };
                 if let Some((call_index, call_id)) = matched {
                     let id = result_id
@@ -287,7 +286,6 @@ pub(crate) fn assign_tool_call_ids(req: &mut CompletionRequest) -> Result<(), Bo
             *call_id = Some(format!("call_anda_{:032x}", rand::random::<u128>()));
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -314,36 +312,44 @@ mod tests {
             ],
             ..Default::default()
         };
-        assign_tool_call_ids(&mut req).unwrap();
+        assign_tool_call_ids(&mut req);
         assert!(
             matches!(&req.content[0], ContentPart::ToolCall {call_id:Some(id),..} if id == "persisted")
         );
         let first = req.content.clone();
-        assign_tool_call_ids(&mut req).unwrap();
+        assign_tool_call_ids(&mut req);
         assert_eq!(req.content, first);
     }
 
     #[test]
-    fn idless_results_require_a_matching_call_and_raw_history_is_untouched() {
-        let result = ContentPart::ToolOutput {
-            name: "lookup".into(),
-            output: json!("ok"),
-            call_id: None,
-            is_error: None,
-            remote_id: None,
-        };
-        let raw = json!({"opaque":"native state"});
+    fn results_answering_native_calls_and_raw_history_are_untouched() {
+        // An OpenAI-compatible provider without tool-call IDs: the call lives in
+        // raw history and its result carries an empty ID.
+        let raw = json!({"role":"assistant","tool_calls":[{"id":"","type":"function",
+            "function":{"name":"lookup","arguments":"{}"}}]});
+        let content = vec![
+            ContentPart::ToolOutput {
+                name: "lookup".into(),
+                output: json!("ok"),
+                call_id: Some(String::new()),
+                is_error: None,
+                remote_id: None,
+            },
+            ContentPart::ToolOutput {
+                name: "legacy".into(),
+                output: json!("ok"),
+                call_id: None,
+                is_error: None,
+                remote_id: None,
+            },
+        ];
         let mut req = CompletionRequest {
             raw_history: vec![raw.clone()],
-            content: vec![result],
+            content: content.clone(),
             ..Default::default()
         };
-        assert!(
-            assign_tool_call_ids(&mut req)
-                .unwrap_err()
-                .to_string()
-                .contains("Cannot pair")
-        );
+        assign_tool_call_ids(&mut req);
+        assert_eq!(req.content, content);
         assert_eq!(req.raw_history, vec![raw]);
     }
 }

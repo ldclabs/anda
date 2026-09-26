@@ -30,10 +30,7 @@ impl From<ModelEffort> for types::ThinkingLevel {
 fn apply_effort(config: &mut types::GenerationConfig, model: &str, effort: ModelEffort) {
     let model = model.trim_start_matches("models/");
     let thinking = config.thinking_config.get_or_insert_default();
-    if model
-        .trim_start_matches("models/")
-        .starts_with("gemini-2.5-")
-    {
+    if model.starts_with("gemini-2.5-") {
         let pro = model.contains("-pro");
         thinking.thinking_level = None;
         thinking.thinking_budget = Some(match effort {

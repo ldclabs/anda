@@ -461,7 +461,7 @@ impl CompletionFeaturesDyn for CompletionModel {
         r.model = model.clone();
 
         Box::pin(async move {
-            assign_tool_call_ids(&mut req)?;
+            assign_tool_call_ids(&mut req);
             drive_completion::<CompletionModel>(model, move |path| client.post(path), r, req).await
         })
     }
@@ -620,8 +620,17 @@ impl WireFormat for CompletionModel {
             .flatten()
             .filter(|tool| tool.strict == Some(true))
         {
-            if let Some(schema) = &mut tool.input_schema {
-                normalize_output_schema(schema)?;
+            let Some(schema) = &mut tool.input_schema else {
+                continue;
+            };
+            // Generated tool schemas routinely carry bounds outside the strict
+            // subset (`minimum: 0` on unsigned integers, `minLength`). Such a
+            // tool is sent as a regular tool with its schema unchanged.
+            let mut strict_schema = schema.clone();
+            if normalize_output_schema(&mut strict_schema).is_ok() {
+                *schema = strict_schema;
+            } else {
+                tool.strict = None;
             }
         }
         Ok(())
@@ -708,6 +717,9 @@ mod tests {
             "id":{"type":"string"}, "optional":{"type":["object","null"], "properties":{"name":{"type":"string"}}},
             "literal":{"type":"object", "properties":{}, "default":{"minimum":3}}
         }});
+        let bounded = json!({"type":"object", "properties":{
+            "prompt":{"type":"string", "minLength":1}, "limit":{"type":"integer", "minimum":0}
+        }});
         let mut request = types::CreateMessageParams {
             output_config: Some(types::OutputConfig {
                 effort: None,
@@ -733,10 +745,24 @@ mod tests {
                     strict: Some(false),
                     ..Default::default()
                 },
+                FunctionDefinition {
+                    name: "bounded".into(),
+                    parameters: bounded.clone(),
+                    strict: Some(true),
+                    ..Default::default()
+                },
             ],
             false,
         );
         <CompletionModel as WireFormat>::finalize_request(&mut request).unwrap();
+        let mut unsupported_output = request.clone();
+        unsupported_output.output_config.as_mut().unwrap().format = Some(types::JsonOutputFormat {
+            schema: bounded.clone(),
+            r#type: types::JsonOutputFormatType::JsonSchema,
+        });
+        assert!(
+            <CompletionModel as WireFormat>::finalize_request(&mut unsupported_output).is_err()
+        );
         let value = serde_json::to_value(request).unwrap();
         let prepared = &value["output_config"]["format"]["schema"];
         assert_eq!(prepared["required"], json!(["id"]));
@@ -753,6 +779,9 @@ mod tests {
         assert_eq!(value["tools"][0]["input_schema"], *prepared);
         assert_eq!(value["tools"][0]["strict"], true);
         assert_eq!(value["tools"][1]["input_schema"]["minimum"], 0);
+        // Strict tools outside the supported subset degrade to regular tools.
+        assert_eq!(value["tools"][2]["input_schema"], bounded);
+        assert!(value["tools"][2].get("strict").is_none());
         for mut invalid in [
             json!({"type":"object","additionalProperties":true}),
             json!({"type":"object","properties":{"n":{"type":"number","minimum":0}}}),
