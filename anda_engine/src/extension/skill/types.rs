@@ -7,6 +7,7 @@
 use anda_core::{BoxError, Json, validate_function_name};
 use serde::{Deserialize, Deserializer, Serialize, de};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fmt,
@@ -87,7 +88,7 @@ impl FromStr for SkillExecution {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct SkillFrontmatter {
     /// Skill name: 1-64 lowercase alphanumeric + hyphens, no leading/trailing/
-    /// consecutive hyphens. Must match parent directory name.
+    /// consecutive hyphens. Lookup uses this name even when the directory differs.
     pub name: String,
 
     /// What the skill does and when to use it (1-1024 characters).
@@ -229,10 +230,17 @@ pub fn validate_skill_name(name: &str) -> Result<(), BoxError> {
 
 /// Normalise a kebab-case skill name to snake_case for the [`SubAgent`] registry.
 pub fn normalise_skill_agent_name(name: &str) -> String {
-    format!(
-        "skill_{}",
-        name.trim().to_ascii_lowercase().replace('-', "_")
-    )
+    let normalized = name.trim().to_ascii_lowercase().replace('-', "_");
+    if normalized.len() <= 58 {
+        format!("skill_{normalized}")
+    } else {
+        // Keep existing callable names unchanged. Long names use a separate, legal namespace
+        // and a digest prefix, reserving three bytes for SA_; publication also checks collisions.
+        format!(
+            "skillh_{:.54}",
+            format!("{:x}", Sha256::digest(normalized.as_bytes()))
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -333,22 +341,22 @@ fn resolve_execution(fm: &SkillFrontmatter) -> Result<SkillExecution, BoxError> 
 /// Split a `SKILL.md` into YAML frontmatter string and Markdown body.
 fn split_frontmatter(content: &str) -> Result<(&str, &str), BoxError> {
     let content = content.trim();
-    if !content.starts_with("---") {
+    let mut lines = content.split_inclusive('\n');
+    let opening = lines.next().ok_or("missing YAML frontmatter")?;
+    if opening.trim() != "---" {
         return Err("SKILL.md must start with YAML frontmatter (---)".into());
     }
-    let after_open = &content[3..];
-    let close_pos = after_open
-        .find("\n---")
-        .ok_or("missing closing --- in YAML frontmatter")?;
-
-    let frontmatter = &after_open[..close_pos];
-    let body_start = 3 + close_pos + 4; // skip opening "---", frontmatter, "\n---"
-    let body = if body_start < content.len() {
-        content[body_start..].trim()
-    } else {
-        ""
-    };
-    Ok((frontmatter, body))
+    let mut offset = opening.len();
+    for line in lines {
+        if line.trim() == "---" {
+            return Ok((
+                &content[opening.len()..offset],
+                content[offset + line.len()..].trim(),
+            ));
+        }
+        offset += line.len();
+    }
+    Err("missing closing --- in YAML frontmatter".into())
 }
 
 fn parse_skill_frontmatter(yaml_str: &str) -> Result<SkillFrontmatter, BoxError> {
@@ -421,14 +429,14 @@ pub fn parse_skill_md(base_dir: PathBuf, content: &str) -> Result<Skill, BoxErro
     // Validate required fields.
     validate_skill_name(&fm.name)?;
 
-    if fm.description.is_empty() {
+    if fm.description.trim().is_empty() {
         return Err("SKILL.md frontmatter missing required field: description".into());
     }
-    if fm.description.len() > 1024 {
+    if fm.description.chars().count() > 1024 {
         return Err("SKILL.md description must not exceed 1024 characters".into());
     }
     if let Some(compat) = &fm.compatibility
-        && (compat.is_empty() || compat.len() > 500)
+        && (compat.trim().is_empty() || compat.chars().count() > 500)
     {
         return Err("SKILL.md compatibility must be 1-500 characters".into());
     }
@@ -439,13 +447,13 @@ pub fn parse_skill_md(base_dir: PathBuf, content: &str) -> Result<Skill, BoxErro
 
     let execution = resolve_execution(&fm)?;
 
-    // An empty list means "not declared": the manager falls back to its default tool set.
+    // Preserve declaration presence separately from the resolved token list.
     let tools = match &fm.allowed_tools {
         Some(at) => split_tokens(at),
         None => Vec::new(),
     };
 
-    // An empty list means "not declared": the subagent accepts every offered resource.
+    // Explicitly empty tags remain distinct from an absent declaration.
     let tags = match &fm.resource_tags {
         Some(tags) => split_tokens(tags),
         None => Vec::new(),
@@ -517,73 +525,23 @@ pub fn format_skill_md(skill: &Skill) -> Result<String, BoxError> {
 // Directory loading
 // ---------------------------------------------------------------------------
 
-/// Recursively find all `SKILL.md` files under `dir`.
+/// Find `SKILL.md` files using the default bounded scan, skipping hidden descendant directories.
+/// Returns an error if the scan is incomplete; use [`super::SkillManager::reload`] for partial
+/// results with structured diagnostics.
 pub async fn find_skill_files(dir: &Path) -> Result<Vec<PathBuf>, BoxError> {
-    let mut result = Vec::new();
-    let mut stack = vec![dir.to_path_buf()];
-
-    while let Some(current) = stack.pop() {
-        let mut entries = tokio::fs::read_dir(&current).await?;
-        while let Some(entry) = entries.next_entry().await? {
-            let ft = entry.file_type().await?;
-            let path = entry.path();
-            if ft.is_dir() {
-                stack.push(path);
-            } else if ft.is_file() && entry.file_name() == "SKILL.md" {
-                result.push(path);
-            }
-        }
+    let scan = super::discovery::scan_files(dir, &super::SkillLimits::default()).await;
+    if scan.report.truncated || !scan.report.diagnostics.is_empty() {
+        return Err(format!("Incomplete skill scan: {:?}", scan.report.diagnostics).into());
     }
-
-    Ok(result)
+    Ok(scan.files)
 }
 
-/// Load all skills from a directory tree.
-///
-/// Returns `skills` where `skills` maps normalised agent name -> [`Skill`].
+/// Load a directory using the same validation, conflict policy and file limits as the manager.
+/// Rejected files are logged and omitted. Use [`super::SkillManager::reload`] to inspect diagnostics.
 pub async fn load_skills_from_dir(dir: &Path) -> Result<BTreeMap<String, Skill>, BoxError> {
-    let files = find_skill_files(dir).await?;
-    let mut skills = BTreeMap::new();
-
-    for path in files {
-        let Some(base_dir) = path.parent() else {
-            continue;
-        };
-        match read_skill_md_text(&path).await {
-            Ok(content) => match parse_skill_md(base_dir.to_path_buf(), &content) {
-                Ok(skill) => {
-                    if skills.contains_key(&skill.agent_name) {
-                        log::warn!(
-                            "duplicate skill name {} at {}, skipping",
-                            skill.agent_name,
-                            path.display()
-                        );
-                    } else {
-                        skills.insert(skill.agent_name.clone(), skill);
-                    }
-                }
-                Err(err) => log::error!("skipping {}: {err}", path.display()),
-            },
-            Err(err) => {
-                log::error!("skipping {}: {err}", path.display());
-            }
-        }
-    }
-
-    Ok(skills)
-}
-
-async fn read_skill_md_text(path: &Path) -> Result<String, BoxError> {
-    let bytes = tokio::fs::read(path)
-        .await
-        .map_err(|err| format!("Failed to read skill file {}: {err}", path.display()))?;
-    decode_skill_md_bytes(bytes).map_err(|_| {
-        format!(
-            "Only UTF-8 or supported text-encoded skill files are supported (path: {})",
-            path.display()
-        )
-        .into()
-    })
+    let manager = super::SkillManager::new(dir.to_path_buf());
+    manager.load().await?;
+    Ok(manager.list())
 }
 
 pub(crate) fn decode_skill_md_bytes(bytes: Vec<u8>) -> Result<String, Vec<u8>> {

@@ -274,3 +274,31 @@ preconditions are validated before commit. All involved stripes are acquired in
 stable order. Each file replacement is atomic; multi-file operations can partially
 succeed and report which operations committed. Neither these locks nor optimistic
 version checks are a transaction against external editors or shell commands.
+
+
+## Skill catalogs
+
+`extension::skill::SkillManager` owns a single published registry: immutable catalog
+entries and their unambiguous delegated callables are replaced under one lock. Root/path
+identities are distinct from frontmatter names and callable names. Host filters apply
+before precedence and conflict resolution. Publication retains sessions only for the same
+winning identity; renames, deletions and vanished roots remove old registrations.
+
+A serialized refresh scans bounded directory trees, reads files through the shared
+no-follow file access layer, parses frontmatter and optional `agents/openai.yaml`, then
+publishes a generation with bounded diagnostics. No unbounded parse cache or per-read
+whole-tree scan is retained. Hosts explicitly reload or invalidate after file notifications;
+known reads validate the selected document and sidecar, and missing names trigger reload.
+Incomplete scans publish verified entries and expose errors/truncation to the host.
+
+The static `skills` tool group contains the compatible name reader `skills_manager`,
+pageable `skills_list`, and package-contained `skills_read`. Resource cursors bind identity,
+metadata and content fingerprints and always recheck current admission. Responses are
+bounded after JSON serialization; resident catalogs shorten descriptions before omitting
+entries. Tools use normal discovery, schema merging, typed hooks and cancellation, without
+adding special completion history or a dynamic tool provider. Host snapshots expose
+presentation, explicit-only selection policy and dependency preflight metadata. None of
+these metadata fields expands the caller's execution permissions or installs providers.
+
+See [the engine skill guide](../anda_engine/README.md#skill-catalogs-and-resources) for
+limits, refresh semantics and integration details.

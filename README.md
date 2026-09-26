@@ -29,7 +29,7 @@ The core engine lets developers register agents and tools, route model requests 
    `BaseCtx` and `AgentCtx` provide isolated state, cache, object storage, HTTP calls, signed calls, cancellation, and child contexts for each agent or tool.
 
 5. **Extensible memory and skills**
-   Optional extensions provide conversation storage, KIP-based memory tools, filesystem access, shell execution, fetch, notes, todos, and file-backed skills. Coding agents can opt into a shell/session/patch bundle with bounded output, supervised processes, and optional macOS/Linux process sandboxing; restricted file agents can register filesystem tools without granting shell access.
+   Optional extensions provide conversation storage, KIP-based memory tools, filesystem access, shell execution, fetch, notes, todos, and file-backed skills. Coding agents can opt into a shell/session/patch bundle with bounded output, supervised processes, and optional macOS/Linux process sandboxing; restricted file agents can register filesystem tools without granting shell access. File-backed skills include bounded catalogs, stable identities, paginated package resource reads, explicit-use policies, and host-owned dependency preflight.
 
 6. **Discovery-aware tool bundles**
    Static tools, dynamic providers, and MCP servers can expose capability groups so agents can survey related tool bundles with `tools_groups`, then expand a group with `tools_select` only when its schemas are needed.

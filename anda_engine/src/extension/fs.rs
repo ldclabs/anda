@@ -263,6 +263,28 @@ impl ReadTarget {
     }
 }
 
+/// Read an absolute, normalized path through the no-follow file access layer.
+/// Callers must resolve their trusted root first and validate relative components.
+pub(crate) async fn read_regular_file_bounded(
+    path: &Path,
+    limit: u64,
+) -> Result<Vec<u8>, BoxError> {
+    let (file, metadata) = access::open_read(path).await?;
+    ensure_file_size_within_limit(&metadata, path, limit)?;
+    let mut bytes = Vec::new();
+    file.take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .await?;
+    if bytes.len() as u64 > limit {
+        return Err(format!(
+            "File exceeds maximum size of {limit} bytes: {}",
+            path.display()
+        )
+        .into());
+    }
+    Ok(bytes)
+}
+
 impl WriteTarget {
     /// Atomically writes the destination.
     ///

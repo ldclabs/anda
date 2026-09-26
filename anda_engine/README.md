@@ -173,7 +173,7 @@ The `extension` module provides reusable tools for common agent capabilities:
 - `shell`: native or sandboxed shell command execution.
 - `mcp`: MCP servers as runtime-discovered tool providers.
 - `note`: lightweight per-agent note storage.
-- `skill`: file-backed skill loading and lifecycle management.
+- `skill`: file-backed skills with bounded discovery, immutable catalog generations, stable identities, package resource reads, and optional delegated execution.
 - `todo`: session-scoped task tracking.
 
 Filesystem tools enforce configured workspace roots. A native shell's working directory alone does not confine the process: use an isolated host or opt into `NativeRuntime::with_sandbox`. Shell commands receive a restricted environment; only allowlisted host variables and explicitly configured keys are forwarded. Configured environment keys are normalized case-insensitively on Windows.
@@ -199,6 +199,93 @@ A compilable registration and polling example is available in [`examples/workspa
 ```sh
 cargo run -p anda_engine --example workspace_tools
 ```
+
+### Skill catalogs and resources
+
+`SkillManager` keeps `skills_manager({"name":"my-skill"})` for complete, small
+`SKILL.md` reads. Register `manager.tools()` to include `skills_list` and
+`skills_read` as a normal `skills` capability group. See
+[`examples/skills.rs`](examples/skills.rs) for a runnable registration example.
+The manager does not grant filesystem writes, shell execution, or install dependencies.
+To expose skills declaring `execution: subagent`, additionally insert the same
+`Arc<SkillManager>` into `engine.sub_agents_manager()`; inline remains the default.
+
+- `skills_list({"query":null,"cursor":null})` returns at most 20 compact identities
+  per page. Pass `next_cursor` back until it is null. Queries search names and
+  descriptions; an exact name or ID also finds explicit-only skills.
+- `skills_read({"skill":"my-skill","resource":null,"cursor":null})` reads
+  `SKILL.md`. Use an ID from the list to distinguish duplicate names. Set
+  `resource` to a package-relative text path such as `references/guide.md`.
+  Read every page of an instruction document before acting on it. Changed content,
+  package metadata, or resource identity invalidates a continuation; restart without
+  a cursor. Reads revalidate current admission even when a cursor is supplied.
+- `skills_manager` returns an error directing the model to `skills_read` when the
+  complete JSON response would exceed the budget. It never returns partial instructions.
+
+`catalog()` returns immutable host metadata, a generation and structured diagnostics.
+Generation is unchanged by an identical reload. `reload()` / `load()` rescan membership;
+`invalidate()` is a cheap hook for a host-owned filesystem watcher and causes the next
+async list/read to refresh. Concurrent lazy refreshes coalesce. Reads revalidate the
+selected `SKILL.md` and sidecar; a missing name also triggers a scan. Creating a duplicate
+or changing an unrelated file requires invalidation/reload. Synchronous catalog and
+callable lookups use the last published generation. Refreshing a completion request's
+resident tool definitions remains the caller's responsibility; there is no background
+watcher or automatic history rewrite.
+
+Root order determines name precedence. Duplicate names inside the winning root have no
+name-based reader or callable; each admitted copy remains readable by ID. Rejected copies
+are filtered before resolving precedence. IDs are opaque hashes of the canonical file
+location and survive frontmatter renames and root reordering; moving a file changes its ID.
+Only unchanged winning identities retain live delegated sessions. A renamed/deleted skill
+or a vanished root cannot leave a stale callable after reload. Scan failures omit
+unverified files and report diagnostics rather than silently keeping their old callables.
+Existing names retain `skill_*` callables; names longer than 58 characters use a stable
+`skillh_*` hash so all valid 64-character skill names fit the function-name contract.
+
+Defaults are: 6 descendant directory levels, 2,000 directories and 20,000 entries per root;
+1,024 skill files and 32 MiB decoded skill/sidecar content across roots; 512 KiB per
+`SKILL.md`, 32 KiB per sidecar, and 1 MiB per bundled text resource. Hidden descendant
+directories and directory symlinks are not traversed. Configured root aliases are resolved
+before use; descendant symlinks, hardlinks, nonregular files, and parent/path escapes are
+rejected on the opened file handle. Actual bytes and decoded text are both bounded.
+`SkillLimits` configures scan limits, an 8,000-byte resident catalog budget, and a
+32 KiB serialized JSON response budget, within documented hard ceilings in the builder.
+Descriptions are shortened before catalog entries are omitted. Host-supplied custom
+introductory tool descriptions and hook-rewritten outputs are outside these budgets.
+
+Optional `agents/openai.yaml` sections override corresponding frontmatter `metadata`
+sections. Malformed or oversized sidecars reject the skill with a diagnostic, so a broken
+explicit-only policy cannot silently become permissive. Supported text metadata includes
+`interface.display_name`, `interface.short_description`, and `interface.default_prompt`;
+`metadata.short-description` is also supported. UI hints are not automatically executed.
+
+```yaml
+policy:
+  allow_implicit_invocation: false
+interface:
+  short_description: Publish a release when explicitly requested.
+dependencies:
+  tools:
+    - type: tool
+      value: shell
+    - type: mcp
+      value: releases
+```
+
+Explicit-only policy hides automatic catalog/definition listings; exact selection is still
+possible. It is not an authorization boundary. `SkillFilter` controls actual admission.
+`SkillSummary::preflight` compares dependencies with host-approved tool and provider name
+sets and returns missing requirements. Unknown dependency kinds remain missing. Dependency
+metadata never installs, connects, or grants a capability; launcher, OAuth and approval UX
+belong to the application. `allowed-tools` continues to constrain delegated callables;
+including `tools_select` also allows subsequent discovery under the completion runner's
+existing rules. Inline skills retain the calling agent's permissions.
+
+`SkillToolHook`, `SkillsListHook` and `SkillsReadHook` observe/customize ordinary tool calls.
+The read hook includes the resolved skill identity, resource and content fingerprint, so
+hosts can record usage without forwarding conversation history. Old catalog snapshots are
+metadata only and do not authorize later reads. Existing copies of already running
+subagents are not cancelled by removing their catalog entries; hosts own session shutdown.
 
 ### Memory
 

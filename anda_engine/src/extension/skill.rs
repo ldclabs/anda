@@ -1,73 +1,48 @@
-//! Skills manager extension.
+//! File-backed skills with bounded discovery, immutable catalogs and package resource access.
 //!
-//! This module provides:
-//! - Loading skills from directory trees of `SKILL.md` files.
-//! - Reading loaded skill files via the [`SkillManager`] tool.
-//! - Materializing the subset of skills that opted into subagent execution as [`SubAgent`]s.
+//! Register [`SkillManager::tools`] for `skills_manager`, `skills_list`, and `skills_read`.
+//! Skills default to inline execution; only `execution: subagent` creates `SA_` callables.
+//! Register the same manager as a [`SubAgentSet`] when delegated skills are wanted.
+//! Bundled text resources are read through `skills_read` without granting general file or shell
+//! access. Script execution remains subject to the host's workspace and shell permissions.
 //!
-//! Each `SKILL.md` follows the [Agent Skills specification](https://agentskills.io):
-//! YAML frontmatter (`---` delimiters) with `name`, `description`, and optional
-//! `license`, `compatibility`, `metadata`, `allowed-tools` fields. The Markdown body
-//! becomes the skill's instructions.
-//!
-//! # Execution modes
-//!
-//! Skills default to [`SkillExecution::Inline`]: the calling agent reads SKILL.md through the
-//! [`SkillManager`] tool and follows it in its own context, which is what progressive disclosure
-//! means in the specification — the body reaches the agent that holds the conversation, the user,
-//! and the turn's resources.
-//!
-//! A skill can opt into [`SkillExecution::Subagent`] with `execution: subagent` (or
-//! `metadata.execution: subagent`) in its frontmatter. Those skills are additionally exposed as
-//! isolated workers callable as `SA_<agent_name>`. Reserve it for procedures that are genuinely
-//! independent of the conversation — long-running, parallelisable, or context-hungry work — since
-//! a subagent receives only a self-contained prompt plus the resources matching its
-//! `resource-tags`, and has no channel to the user.
-//!
-//! # Bundled files
-//!
-//! A skill's SKILL.md routinely points at scripts and references next to it. Reaching them goes
-//! through the filesystem tools, which are sandboxed to their configured workspaces, so register
-//! [`SkillManager::skills_dirs`] as filesystem workspaces (see [`crate::extension::fs`]) when
-//! wiring the engine. Without that the agent is handed a `base_dir` it is not allowed to read.
-//!
-//! Skill names use kebab-case on disk (e.g. `my-skill`); they are normalised to
-//! snake_case (`skill_my_skill`) for the subagent registry.
+//! [`SkillManager::load`] explicitly reloads membership. Hosts can call [`SkillManager::invalidate`]
+//! after filesystem notifications; the next async read/list coalesces a refresh. Known reads
+//! revalidate their file and metadata, while name misses also refresh. Synchronous catalogs and
+//! callable lookups always use the last published snapshot, never perform filesystem I/O.
 
-use anda_core::{
-    Agent, BoxError, FunctionDefinition, Resource, Tool, ToolOutput, select_resources,
+use crate::{
+    context::BaseCtx,
+    extension::{hooked_call, tool_definition},
+    hook::DynToolHook,
+    subagent::{SubAgent, SubAgentSet},
 };
-use parking_lot::{Mutex, RwLock};
+use anda_core::{
+    Agent, BoxError, FunctionDefinition, Resource, Tool, ToolOutput, ToolSet, select_resources,
+};
+use parking_lot::RwLock;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::{
     any::Any,
     collections::BTreeMap,
-    ffi::OsStr,
     path::{Path, PathBuf},
-    sync::Arc,
-    time::SystemTime,
-};
-
-use crate::{
-    context::{BaseCtx, SUB_AGENT_PREFIX},
-    extension::{
-        fs::{ensure_file_size_within_limit, ensure_regular_file, normalize_relative_path},
-        hooked_call, tool_definition,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
     },
-    hook::DynToolHook,
-    subagent::{SubAgent, SubAgentSet},
 };
 
+mod catalog;
+mod discovery;
+mod tools;
 mod types;
+pub use catalog::*;
+use catalog::{Catalog, Entry, digest, truncate};
+#[cfg(test)]
+use discovery::MAX_SKILL_FILE_BYTES;
+pub use tools::*;
 pub use types::*;
-
-// ---------------------------------------------------------------------------
-// SkillManager
-// ---------------------------------------------------------------------------
-
-const MAX_SKILL_FILE_BYTES: u64 = 512 * 1024;
-
 /// Arguments for reading a skill via the [`SkillManager`] tool.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -99,58 +74,31 @@ pub struct SkillContentOutput {
     pub content: String,
 }
 
-/// Decides which skills on disk this manager is allowed to hold.
-///
-/// Returning `false` drops the skill entirely: it is not loaded, not readable through the
-/// [`SkillManager`] tool, absent from the resident catalog in the tool description, and not
-/// callable. That all-or-nothing scope is the point — a host that hides a skill from the user
-/// should not leave it reachable by name.
-///
-/// The manager owns loading; the predicate is where a host expresses whatever policy sits on top,
-/// such as a user-facing enable/disable switch. It receives the parsed [`Skill`], whose `base_dir`
-/// identifies which copy of a shadowed name this is. It runs while holding the manager's internal
-/// locks, so it must not call back into the manager.
+/// Host admission predicate. Rejected identities are absent from catalogs, reads and callables.
+/// The callback executes under internal locks and must not call back into this manager.
 pub type SkillFilter = Arc<dyn Fn(&Skill) -> bool + Send + Sync>;
 
-/// A parsed `SKILL.md` remembered with the size and modification time it was read at.
-struct ParsedSkillFile {
-    len: u64,
-    modified: Option<SystemTime>,
-    /// `None` when the file could not be read or parsed.
-    skill: Option<Skill>,
+#[derive(Default)]
+struct Registry {
+    catalog: Arc<Catalog>,
+    subagents: BTreeMap<String, SubAgent>,
+    epoch: u64,
 }
 
-/// Manages skills loaded from `SKILL.md` files on disk.
-///
-/// [`SkillManager`] implements [`Tool<BaseCtx>`] so that LLMs can read skill files at runtime and
-/// follow them inline, and [`SubAgentSet`] so that the skills which declared
-/// [`SkillExecution::Subagent`] are additionally callable as delegated workers.
+/// Shared skill catalog and optional delegated workers. All published views share one registry
+/// generation; a retained metadata snapshot never authorizes a later read.
 pub struct SkillManager {
-    /// Directory used by skill creation workflows. Loading also includes this directory.
     default_skills_dir: PathBuf,
-    /// Directories scanned for skills, with `default_skills_dir` first.
     skills_dirs: Vec<PathBuf>,
-    skills: RwLock<BTreeMap<String, Skill>>,
-    /// Materialized [`SubAgent`] per skill, keyed by lowercase name.
-    ///
-    /// A `SubAgent` owns its live session registry in `Arc<SubSessions>`, so lookups must hand
-    /// out clones of one stable instance. Rebuilding a `SubAgent` per lookup would give every
-    /// caller a fresh empty registry, and a running session could never be found again.
-    subagents: RwLock<BTreeMap<String, SubAgent>>,
-    /// Host policy over which skills are admissible; `None` admits every skill.
+    registry: RwLock<Registry>,
     filter: RwLock<Option<SkillFilter>>,
-    /// Parse cache for the name scan in [`Self::find_skill_dir`], keyed by file path. A read by
-    /// name must still see every `SKILL.md` (to resolve priority and detect ambiguity), but an
-    /// unchanged file does not need to be read and parsed again on every call.
-    parsed_files: Mutex<BTreeMap<PathBuf, ParsedSkillFile>>,
+    refresh: tokio::sync::Mutex<()>,
+    epoch: AtomicU64,
+    limits: SkillLimits,
     description: String,
     default_skill_tools: Vec<String>,
 }
 
-/// Tools granted to a subagent skill that declares no `allowed-tools`.
-///
-/// Includes [`SkillManager::NAME`] so skills compose: a delegated skill can read another skill's
-/// SKILL.md and follow it inline, the same way its caller would.
 static DEFAULT_SKILL_TOOLS: &[&str] = &[
     "shell",
     "read_file",
@@ -160,488 +108,472 @@ static DEFAULT_SKILL_TOOLS: &[&str] = &[
     "todo",
     "tools_select",
     SkillManager::NAME,
+    SkillsListTool::NAME,
+    SkillsReadTool::NAME,
 ];
 
-fn build_skills_dirs(
-    default_skills_dir: PathBuf,
-    additional_skills_dirs: Vec<PathBuf>,
-) -> Vec<PathBuf> {
-    let mut skills_dirs = vec![default_skills_dir];
-    for dir in additional_skills_dirs {
-        if !skills_dirs.iter().any(|existing| existing == &dir) {
-            skills_dirs.push(dir);
-        }
-    }
-    skills_dirs
-}
-
-fn format_path_list(paths: &[PathBuf]) -> String {
-    paths
-        .iter()
-        .map(|path| path.display().to_string())
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn build_description(default_skills_dir: &Path, skills_dirs: &[PathBuf]) -> String {
-    format!(
-        "Read a skill's SKILL.md by name, following the Agent Skills specification. Agent Skills \
-        are folders of instructions, scripts, and resources. Most skills run inline: this tool \
-        returns the full SKILL.md and you follow it yourself in this conversation, reading the \
-        bundled files it references from `base_dir` as you need them. A skill that declares \
-        `execution: subagent` instead returns a `callable` name to delegate to, which runs it in \
-        an isolated worker that cannot see this conversation or ask the user anything. \
-        Skill directories: {}. Default skill creation directory: {}",
-        format_path_list(skills_dirs),
-        default_skills_dir.display()
-    )
-}
-
 impl SkillManager {
-    /// Tool name used for registration.
+    /// Existing compatibility tool name.
     pub const NAME: &'static str = "skills_manager";
 
-    /// Create a new, empty manager rooted at `skills_dir`.
+    /// Create an empty manager with one trusted discovery root.
     pub fn new(skills_dir: PathBuf) -> Self {
         Self::new_with_dirs(skills_dir, Vec::new())
     }
 
-    /// Create a new, empty manager that loads from the default directory and
-    /// additional skill directories.
-    ///
-    /// New skills should still be created under `default_skills_dir`; additional
-    /// directories are read-only load roots from the manager's perspective.
+    /// Configure roots in priority order. The default root is also the suggested creation root.
+    /// Relative roots are anchored to the process working directory at construction time.
     pub fn new_with_dirs(
         default_skills_dir: PathBuf,
         additional_skills_dirs: Vec<PathBuf>,
     ) -> Self {
-        let skills_dirs = build_skills_dirs(default_skills_dir.clone(), additional_skills_dirs);
-        Self {
-            skills: RwLock::new(BTreeMap::new()),
-            subagents: RwLock::new(BTreeMap::new()),
-            filter: RwLock::new(None),
-            parsed_files: Mutex::new(BTreeMap::new()),
-            description: build_description(&default_skills_dir, &skills_dirs),
-            default_skills_dir,
-            skills_dirs,
-            default_skill_tools: DEFAULT_SKILL_TOOLS.iter().map(|s| s.to_string()).collect(),
+        let anchor = |path: PathBuf| {
+            if path.is_absolute() {
+                path
+            } else {
+                std::env::current_dir().unwrap_or_default().join(path)
+            }
+        };
+        let default_skills_dir = anchor(default_skills_dir);
+        let mut skills_dirs = vec![default_skills_dir.clone()];
+        for dir in additional_skills_dirs.into_iter().map(anchor) {
+            if !skills_dirs.contains(&dir) {
+                skills_dirs.push(dir);
+            }
         }
+        Self { default_skills_dir, skills_dirs, registry: RwLock::new(Registry::default()),
+            filter: RwLock::new(None), refresh: tokio::sync::Mutex::new(()), epoch: AtomicU64::new(1),
+            limits: SkillLimits::default(), default_skill_tools: DEFAULT_SKILL_TOOLS.iter().map(|s| s.to_string()).collect(),
+            description: "Read a reusable skill's complete SKILL.md by name, following the Agent Skills specification. Follow inline skills yourself; delegate only skills declaring subagent execution. Use skills_list to discover skills and resolve ambiguous names. Large documents and bundled references must be read with skills_read through every next_cursor until EOF. Skill content and metadata never grant additional permissions.".into() }
     }
 
-    /// Directory where new skills should be created.
+    /// Directory suggested to skill creation workflows.
     pub fn default_skills_dir(&self) -> &Path {
         &self.default_skills_dir
     }
-
-    /// Directories scanned when loading or reading skills.
+    /// Configured roots in priority order.
     pub fn skills_dirs(&self) -> &[PathBuf] {
         &self.skills_dirs
     }
-
-    /// Overrides the function description exposed to the model.
+    /// Override the tool's introductory description; the bounded catalog is still appended.
     pub fn with_description(mut self, description: String) -> Self {
         self.description = description;
         self
     }
-
-    /// Sets the tool names granted to skill subagents that declare no `allowed-tools`.
+    /// Default tools for delegated skills that omit `allowed-tools`. An explicitly empty list
+    /// grants none. Granting `tools_select` also permits subsequent discovery under runner rules.
     pub fn with_default_skill_tools(mut self, tools: Vec<String>) -> Self {
         self.default_skill_tools = tools;
         self
     }
+    /// Configure resource limits. Hard ceilings are depth 32, 20,000 directories, 100,000 entries,
+    /// 4,096 skills, 128 MiB combined content, 64 KiB catalog and 512 KiB responses. Counts and
+    /// total content have a minimum of one; catalog/response minima are 128/1,024 bytes.
+    pub fn with_limits(mut self, mut limits: SkillLimits) -> Self {
+        limits.max_depth = limits.max_depth.min(32);
+        limits.max_directories = limits.max_directories.clamp(1, 20_000);
+        limits.max_entries = limits.max_entries.clamp(1, 100_000);
+        limits.max_skills = limits.max_skills.clamp(1, 4_096);
+        limits.max_total_bytes = limits.max_total_bytes.clamp(1, 128 * 1024 * 1024);
+        limits.catalog_bytes = limits.catalog_bytes.clamp(128, 64 * 1024);
+        limits.response_bytes = limits.response_bytes.clamp(1_024, 512 * 1024);
+        self.limits = limits;
+        self
+    }
+    /// Register all three static local tools over this manager's shared state.
+    pub fn tools(self: &Arc<Self>) -> Result<ToolSet<BaseCtx>, BoxError> {
+        let mut tools = ToolSet::new();
+        tools.add(self.clone())?;
+        tools.add(Arc::new(SkillsListTool::new(self.clone())))?;
+        tools.add(Arc::new(SkillsReadTool::new(self.clone())))?;
+        Ok(tools)
+    }
+    /// Invalidate membership after a filesystem or host configuration change. No I/O is done here.
+    pub fn invalidate(&self) {
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+    }
 
-    /// Installs the [`SkillFilter`] deciding which skills are admissible; `None` admits every one.
-    ///
-    /// Anything the new predicate rejects is dropped immediately, so the manager never holds an
-    /// inadmissible skill and the caller does not have to remember to reload. Skills the previous
-    /// filter had rejected stay gone until the next [`Self::load`] re-reads them from disk.
+    /// Replace the host admission policy and immediately remove rejected identities. Newly
+    /// admitted files are discovered on the next async access or explicit reload.
     pub fn set_skill_filter(&self, filter: Option<SkillFilter>) {
-        // One lock order everywhere: `filter`, then `subagents`, then `skills` — the order
-        // `replace_skills` and `upsert_skill` take. Holding `filter` for the whole prune is also
-        // what stops a concurrent reload or read from reinstating what this prune removes: both
-        // hold it as a reader across their own insert, so they land either wholly before this
-        // swap or wholly after it, never straddling it.
         let mut current = self.filter.write();
         *current = filter;
-        let Some(filter) = current.as_ref() else {
-            return;
-        };
-
-        let mut subagents = self.subagents.write();
-        let mut skills = self.skills.write();
-        skills.retain(|name, skill| {
-            let admitted = filter(skill);
-            if !admitted {
-                subagents.remove(name);
+        let mut registry = self.registry.write();
+        let entries = registry.catalog.entries.values().cloned().collect();
+        let report = SkillLoadReport::default();
+        self.publish(&mut registry, entries, report, current.as_ref());
+        self.invalidate();
+    }
+    /// Last published immutable metadata and diagnostics, without filesystem I/O.
+    pub fn catalog(&self) -> Arc<SkillCatalogSnapshot> {
+        Arc::new(self.registry.read().catalog.snapshot())
+    }
+    /// Compatibility reload API. Inspect [`Self::catalog`] for per-file failures and truncation.
+    pub async fn load(&self) -> Result<(), BoxError> {
+        let report = self.reload().await?;
+        for diagnostic in &report.diagnostics {
+            log::warn!(
+                "skill {} at {}: {}",
+                diagnostic.kind,
+                diagnostic.path.display(),
+                diagnostic.message
+            );
+        }
+        Ok(())
+    }
+    /// Rescan and publish all roots atomically. Missing roots become empty; invalid or unreadable
+    /// files are omitted with diagnostics. No stale entries survive a successful publication.
+    pub async fn reload(&self) -> Result<SkillLoadReport, BoxError> {
+        let _guard = self.refresh.lock().await;
+        self.scan_and_publish().await
+    }
+    async fn ensure_loaded(&self) -> Result<(), BoxError> {
+        if self.registry.read().epoch == self.epoch.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let _guard = self.refresh.lock().await;
+        if self.registry.read().epoch != self.epoch.load(Ordering::Acquire) {
+            self.scan_and_publish().await?;
+        }
+        Ok(())
+    }
+    async fn scan_and_publish(&self) -> Result<SkillLoadReport, BoxError> {
+        let epoch = self.epoch.load(Ordering::Acquire);
+        let mut entries = Vec::new();
+        let mut report = SkillLoadReport::default();
+        let mut bytes = 0usize;
+        let mut visited = 0;
+        'roots: for (rank, root) in self.skills_dirs.iter().enumerate() {
+            let scan = discovery::scan_files(root, &self.limits).await;
+            report.rejected += scan.report.rejected;
+            report.truncated |= scan.report.truncated;
+            for diagnostic in scan.report.diagnostics {
+                report.note(&diagnostic.kind, diagnostic.path, diagnostic.message);
             }
-            admitted
-        });
-    }
-
-    /// Whether `skill` passes the installed [`SkillFilter`], as of this instant.
-    ///
-    /// The verdict is stale the moment the lock drops, so this is only for deciding whether to
-    /// keep reading — anything that *writes* to the registry must hold `filter` across its own
-    /// insert instead, the way [`Self::upsert_skill`] and [`Self::replace_skills`] do.
-    fn admits(&self, skill: &Skill) -> bool {
-        match self.filter.read().as_ref() {
-            Some(filter) => filter(skill),
-            None => true,
-        }
-    }
-
-    /// Materializes a skill into its callable [`SubAgent`].
-    ///
-    /// `allowed-tools` is an upper bound, per the Agent Skills specification: a skill that
-    /// declares it is granted exactly those tools and nothing else. Only a skill that omits the
-    /// field inherits [`Self::default_skill_tools`] — an explicitly empty `allowed-tools` asks for
-    /// no tools and gets none. Unioning the defaults in would turn a restriction into an
-    /// escalation — SKILL.md files are third-party content on disk, so a manifest asking for
-    /// `read_file` must not come back holding `shell`.
-    fn materialize(&self, skill: &Skill) -> SubAgent {
-        let mut agent = SubAgent::from(skill);
-        if !skill.declares_tools() {
-            agent.tools = self.default_skill_tools.clone();
-        }
-        agent
-    }
-
-    async fn read_text_file(&self, path: &Path, max_size: u64) -> Result<String, BoxError> {
-        let meta = tokio::fs::symlink_metadata(path).await.map_err(|err| {
-            format!(
-                "Failed to inspect file metadata (path: {}): {err}",
-                path.display()
-            )
-        })?;
-        ensure_regular_file(&meta, path, "Reading multiply-linked files is not allowed")?;
-        ensure_file_size_within_limit(&meta, path, max_size)?;
-
-        let data = tokio::fs::read(path)
-            .await
-            .map_err(|err| format!("Failed to read file (path: {}): {err}", path.display()))?;
-        types::decode_skill_md_bytes(data).map_err(|_| {
-            format!(
-                "Only UTF-8 or supported text-encoded skill files are supported by skills_manager (path: {})",
-                path.display()
-            )
-            .into()
-        })
-    }
-
-    /// Reads and parses `path`, reusing the cached result while the file's size and
-    /// modification time are unchanged. Unreadable or malformed files yield `None`.
-    ///
-    /// Only the name scan uses this; the skill that is finally returned is always re-read
-    /// through [`Self::read_text_file`] with its safety checks.
-    async fn parse_skill_file(&self, path: &Path, base_dir: &Path) -> Option<Skill> {
-        let meta = tokio::fs::symlink_metadata(path).await.ok()?;
-        let (len, modified) = (meta.len(), meta.modified().ok());
-        if let Some(cached) = self.parsed_files.lock().get(path)
-            && cached.len == len
-            && cached.modified == modified
-        {
-            return cached.skill.clone();
-        }
-
-        let skill = match self.read_text_file(path, MAX_SKILL_FILE_BYTES).await {
-            Ok(content) => parse_skill_md(base_dir.to_path_buf(), &content).ok(),
-            Err(_) => None,
-        };
-        self.parsed_files.lock().insert(
-            path.to_path_buf(),
-            ParsedSkillFile {
-                len,
-                modified,
-                skill: skill.clone(),
-            },
-        );
-        skill
-    }
-
-    /// Index of the configured root `base_dir` sits under, or `skills_dirs.len()` when it sits
-    /// under none — an unplaceable directory sorts last and never wins a priority contest.
-    fn skills_dir_rank(&self, base_dir: &Path) -> usize {
-        self.skills_dirs
-            .iter()
-            .position(|root| base_dir.starts_with(root))
-            .unwrap_or(self.skills_dirs.len())
-    }
-
-    async fn find_skill_dir(&self, name: &str) -> Result<Option<PathBuf>, BoxError> {
-        validate_skill_name(name)?;
-
-        // Candidates carry the rank of the root they came from so a name present in several
-        // roots resolves the way [`Self::load`] resolves it — highest-priority root wins. Only an
-        // ambiguity *within* one root is unresolvable, since there the tie-break would be
-        // directory iteration order.
-        let mut matches: Vec<(usize, PathBuf)> = Vec::new();
-        let push = |base_dir: PathBuf, matches: &mut Vec<(usize, PathBuf)>| {
-            if !matches.iter().any(|(_, path)| path == &base_dir) {
-                matches.push((self.skills_dir_rank(&base_dir), base_dir));
-            }
-        };
-
-        {
-            let skills = self.skills.read();
-            for skill in skills.values() {
-                let dir_name_matches = skill.base_dir.file_name() == Some(OsStr::new(name));
-                if skill.frontmatter.name == name || dir_name_matches {
-                    push(skill.base_dir.clone(), &mut matches);
+            for path in scan.files {
+                if visited == self.limits.max_skills {
+                    report.truncated = true;
+                    report.note("limit", root.clone(), "Global skill count limit reached");
+                    break 'roots;
                 }
-            }
-        }
-
-        for skills_dir in &self.skills_dirs {
-            if skills_dir.is_dir() {
-                for path in find_skill_files(skills_dir).await? {
-                    let Some(base_dir) = path.parent() else {
-                        continue;
-                    };
-                    let base_dir = base_dir.to_path_buf();
-                    let dir_name_matches = base_dir.file_name() == Some(OsStr::new(name));
-                    // Always parse: the filter votes on the parsed skill, so a directory whose
-                    // name alone matches cannot be admitted on the strength of that name.
-                    let parsed = self.parse_skill_file(&path, &base_dir).await;
-                    match parsed {
-                        Some(skill) => {
-                            if (skill.frontmatter.name == name || dir_name_matches)
-                                && self.admits(&skill)
-                            {
-                                push(base_dir, &mut matches);
-                            }
+                visited += 1;
+                match discovery::read_entry(root, &path, rank).await {
+                    Ok((entry, _, size)) => {
+                        bytes = bytes.saturating_add(size);
+                        if bytes > self.limits.max_total_bytes {
+                            report.truncated = true;
+                            report.note("limit", path, "Combined skill content limit reached");
+                            break 'roots;
                         }
-                        // Unreadable or malformed: still take a directory named after the skill,
-                        // so the read path reports what is wrong with the file rather than
-                        // claiming the skill does not exist.
-                        None if dir_name_matches => push(base_dir, &mut matches),
-                        None => {}
+                        entries.push(entry);
+                    }
+                    Err(error) => {
+                        report.rejected += 1;
+                        report.note("invalid", path, error);
                     }
                 }
             }
         }
+        let filter = self.filter.read();
+        let mut registry = self.registry.write();
+        self.publish(&mut registry, entries, report, filter.as_ref());
+        registry.epoch = epoch;
+        Ok(registry.catalog.report.clone())
+    }
 
-        let Some(best) = matches.iter().map(|(rank, _)| *rank).min() else {
-            return Ok(None);
-        };
-        let mut winners = matches.into_iter().filter(|(rank, _)| *rank == best);
-        let winner = winners.next().map(|(_, path)| path);
-        if winners.next().is_some() {
+    fn publish(
+        &self,
+        registry: &mut Registry,
+        entries: Vec<Entry>,
+        mut report: SkillLoadReport,
+        filter: Option<&SkillFilter>,
+    ) {
+        let mut catalog = Catalog::default();
+        for entry in entries {
+            if filter.is_some_and(|filter| !filter(&entry.skill)) {
+                report.rejected += 1;
+                continue;
+            }
+            // A nested/repeated root cannot create a second identity for the same file.
+            catalog.entries.entry(entry.id.clone()).or_insert(entry);
+        }
+        let mut by_name: BTreeMap<String, Vec<&Entry>> = BTreeMap::new();
+        for entry in catalog.entries.values() {
+            by_name
+                .entry(entry.skill.agent_name.clone())
+                .or_default()
+                .push(entry);
+        }
+        for (name, mut copies) in by_name {
+            copies.sort_by_key(|entry| (entry.rank, &entry.skill.base_dir));
+            let first = copies[0];
+            // Callable hash collisions must never route one frontmatter name to another.
+            let collision = copies
+                .iter()
+                .any(|entry| entry.skill.frontmatter.name != first.skill.frontmatter.name);
+            if collision || copies.get(1).is_some_and(|entry| entry.rank == first.rank) {
+                report.note(
+                    "conflict",
+                    first.skill.base_dir.clone(),
+                    format!(
+                        "multiple skills named {:?}; select by ID",
+                        first.skill.frontmatter.name
+                    ),
+                );
+            } else {
+                catalog.winners.insert(name, first.id.clone());
+            }
+        }
+        report.loaded = catalog.entries.len();
+        let identities = catalog
+            .entries
+            .values()
+            .map(|entry| (&entry.id, &entry.fingerprint, entry.rank))
+            .collect::<Vec<_>>();
+        catalog.fingerprint =
+            digest(&serde_json::to_vec(&(identities, &report)).expect("catalog data serializes"));
+        report.generation = registry.catalog.report.generation
+            + u64::from(catalog.fingerprint != registry.catalog.fingerprint);
+        catalog.report = report;
+        let mut agents = BTreeMap::new();
+        for (name, id) in &catalog.winners {
+            let entry = &catalog.entries[id];
+            if !entry.skill.is_subagent() {
+                continue;
+            }
+            let mut agent = SubAgent::from(entry.skill.as_ref());
+            if !entry.skill.declares_tools() {
+                agent.tools = self.default_skill_tools.clone();
+            }
+            if registry.catalog.winners.get(name) == Some(id)
+                && let Some(old) = registry.subagents.get(name)
+            {
+                agent.subsessions = old.subsessions.clone();
+            }
+            agents.insert(name.clone(), agent);
+        }
+        registry.subagents = agents;
+        registry.catalog = Arc::new(catalog);
+    }
+
+    async fn read_selected(
+        &self,
+        selector: &str,
+    ) -> Result<(SkillSummary, String, Entry), BoxError> {
+        if !selector.starts_with("skill://") {
+            validate_skill_name(selector)?;
+        }
+        if selector.len() > 128 {
+            return Err("Invalid skill identity".into());
+        }
+        self.ensure_loaded().await?;
+        let mut last_error = None;
+        for attempt in 0..2 {
+            let entry = self.registry.read().catalog.resolve(selector)?.cloned();
+            if let Some(entry) = entry {
+                let path = entry.skill.base_dir.join("SKILL.md");
+                match discovery::read_entry(&entry.root, &path, entry.rank).await {
+                    Ok((fresh, content, _))
+                        if fresh.id == entry.id && fresh.fingerprint == entry.fingerprint =>
+                    {
+                        let summary = self.current_summary(&fresh)?;
+                        if !selector.starts_with("skill://") && !summary.active {
+                            return Err(
+                                "Skill name changed precedence during read; retry or select by ID"
+                                    .into(),
+                            );
+                        }
+                        return Ok((summary, content, fresh));
+                    }
+                    Ok(_) => (),
+                    Err(error) => last_error = Some(error),
+                }
+            }
+            if attempt == 0 {
+                self.reload().await?;
+            }
+        }
+        if let Some(error) = last_error {
+            return Err(error);
+        }
+        let registry = self.registry.read();
+        if let Some(entry) = registry.catalog.entries.values().find(|entry| {
+            entry
+                .skill
+                .base_dir
+                .file_name()
+                .is_some_and(|name| name == selector)
+        }) {
             return Err(format!(
-                "multiple skills named {:?} exist under configured skills directories: {}",
-                name,
-                format_path_list(&self.skills_dirs)
+                "SKILL.md frontmatter name {:?} must match requested skill name {selector:?}",
+                entry.skill.frontmatter.name
             )
             .into());
         }
-        Ok(winner)
+        if let Some(diagnostic) = registry
+            .catalog
+            .report
+            .diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic
+                    .path
+                    .parent()
+                    .and_then(Path::file_name)
+                    .is_some_and(|name| name == selector)
+            })
+        {
+            return Err(diagnostic.message.clone().into());
+        }
+        Err(format!("skill {selector:?} not found; reload after changing skill files").into())
     }
 
-    fn display_path(&self, path: &Path) -> String {
-        for skills_dir in &self.skills_dirs {
-            if let Ok(stripped) = path.strip_prefix(skills_dir) {
-                return normalize_relative_path(stripped);
-            }
+    fn current_summary(&self, entry: &Entry) -> Result<SkillSummary, BoxError> {
+        let filter = self.filter.read();
+        if filter.as_ref().is_some_and(|filter| !filter(&entry.skill)) {
+            return Err("Skill is no longer available".into());
         }
-
-        if let Ok(canonical_path) = std::fs::canonicalize(path) {
-            for skills_dir in &self.skills_dirs {
-                if let Ok(root) = std::fs::canonicalize(skills_dir)
-                    && let Ok(stripped) = canonical_path.strip_prefix(&root)
-                {
-                    return normalize_relative_path(stripped);
-                }
-            }
+        let registry = self.registry.read();
+        let current = registry
+            .catalog
+            .entries
+            .get(&entry.id)
+            .ok_or("Skill is no longer available")?;
+        if current.fingerprint != entry.fingerprint {
+            return Err("Skill changed during read; retry".into());
         }
-
-        path.display().to_string()
+        Ok(registry.catalog.summary(current))
     }
 
     async fn read_skill_action(&self, args: SkillArgs) -> Result<SkillContentOutput, BoxError> {
+        // Preserve the existing name-only wire contract; IDs are accepted by skills_read.
         validate_skill_name(&args.name)?;
-        let skill_dir = self
-            .find_skill_dir(&args.name)
-            .await?
-            .ok_or_else(|| format!("skill {:?} not found", args.name))?;
-        let target = skill_dir.join("SKILL.md");
-
-        let content = self.read_text_file(&target, MAX_SKILL_FILE_BYTES).await?;
-        let skill = parse_skill_md(skill_dir, &content)?;
-        // `find_skill_dir` falls back to scanning disk, so a skill the filter rejects is still
-        // sitting there to be found by name. It has to read as absent, or hiding a skill would
-        // amount to hiding it only from the catalog.
-        if !self.admits(&skill) {
-            return Err(format!("skill {:?} not found", args.name).into());
-        }
-        if skill.frontmatter.name != args.name {
-            return Err(format!(
-                "SKILL.md frontmatter name {:?} must match requested skill name {:?}",
-                skill.frontmatter.name, args.name
-            )
-            .into());
-        }
-        let callable = skill
-            .is_subagent()
-            .then(|| format!("{SUB_AGENT_PREFIX}{}", skill.agent_name));
-        let base_dir = skill.base_dir.display().to_string();
-        self.upsert_skill(skill.clone());
-
-        Ok(SkillContentOutput {
-            name: skill.frontmatter.name,
-            description: skill.frontmatter.description,
-            execution: skill.execution,
-            callable,
-            base_dir,
-            path: self.display_path(&target),
-            content,
-        })
-    }
-
-    /// Recursively load all `SKILL.md` files from the configured directories.
-    pub async fn load(&self) -> Result<(), BoxError> {
-        let mut skills = BTreeMap::new();
-        let mut loaded_dirs = 0usize;
-
-        for skills_dir in &self.skills_dirs {
-            if !skills_dir.is_dir() {
-                log::error!(
-                    "skills directory {} does not exist, skipping load",
-                    skills_dir.display()
-                );
-                continue;
-            }
-
-            loaded_dirs += 1;
-            for (agent_name, skill) in load_skills_from_dir(skills_dir).await? {
-                // Filter before the duplicate check, not after: rejecting the copy in the
-                // higher-priority directory has to promote the next one, the way a host's
-                // enable/disable switch is expected to behave.
-                if !self.admits(&skill) {
-                    continue;
-                }
-                #[allow(clippy::map_entry)]
-                if skills.contains_key(&agent_name) {
-                    log::warn!(
-                        "duplicate skill name {} at {}, skipping",
-                        agent_name,
-                        skill.base_dir.join("SKILL.md").display()
-                    );
-                } else {
-                    skills.insert(agent_name, skill);
-                }
-            }
-        }
-
-        if loaded_dirs == 0 {
-            return Ok(());
-        }
-
-        log::info!(
-            "loaded {} skill(s) from {} configured skill directories: {}",
-            skills.len(),
-            loaded_dirs,
-            format_path_list(&self.skills_dirs)
-        );
-        self.replace_skills(skills);
-        Ok(())
-    }
-
-    /// Replaces the loaded skills and materialized subagents as one update, carrying over the
-    /// live session registry of every skill that survived the reload.
-    ///
-    /// Only skills that opted into [`SkillExecution::Subagent`] become callables; inline skills
-    /// are loaded and readable but never appear in the model's tool list.
-    fn replace_skills(&self, mut skills: BTreeMap<String, Skill>) {
-        // `load` filtered while reading disk, but a `set_skill_filter` can land in between. Hold
-        // the filter across the swap and re-apply whichever policy is installed when it lands,
-        // or a reload in flight would silently reinstate a skill the host just disabled.
-        let filter = self.filter.read();
-        if let Some(filter) = filter.as_ref() {
-            skills.retain(|_, skill| filter(skill));
-        }
-
-        let mut subagents = self.subagents.write();
-        let rebuilt = skills
+        let (summary, content, _) = self.read_selected(&args.name).await?;
+        let target = summary.base_dir.join("SKILL.md");
+        let path = self
+            .skills_dirs
             .iter()
-            .filter(|(_, skill)| skill.is_subagent())
-            .map(|(name, skill)| {
-                let mut agent = self.materialize(skill);
-                if let Some(existing) = subagents.get(name) {
-                    agent.subsessions = existing.subsessions.clone();
-                }
-                (name.clone(), agent)
-            })
-            .collect();
-        *subagents = rebuilt;
-        *self.skills.write() = skills;
+            .find_map(|root| target.strip_prefix(root).ok())
+            .map(crate::extension::fs::normalize_relative_path)
+            .unwrap_or_else(|| target.display().to_string());
+        let output = SkillContentOutput {
+            name: summary.name,
+            description: summary.description,
+            execution: summary.execution,
+            callable: summary.callable,
+            base_dir: summary.base_dir.display().to_string(),
+            path,
+            content,
+        };
+        if serde_json::to_vec(&output)?.len() > self.limits.response_bytes {
+            return Err(format!("Skill exceeds inline response budget; read the complete document with skills_read using skill {:?} and follow next_cursor until EOF", summary.id).into());
+        }
+        Ok(output)
     }
 
-    /// Inserts or refreshes one skill after a direct `SKILL.md` read.
-    ///
-    /// Reading a skill makes a newly created subagent skill immediately callable without a full
-    /// reload. Keep the stable materialized agent in sync with the parsed skill while preserving
-    /// any live sessions already owned by that skill, and drop the callable when the skill on disk
-    /// switched back to inline execution.
-    fn upsert_skill(&self, skill: Skill) {
-        // Keeps "the registry never holds a skill the filter rejects" true at the one place that
-        // inserts, independently of every caller remembering to check. The filter stays held
-        // across the insert so a `set_skill_filter` racing this read cannot be undone by it.
-        let filter = self.filter.read();
-        if let Some(filter) = filter.as_ref()
-            && !filter(&skill)
-        {
-            return;
-        }
-        let name = skill.agent_name.clone();
-        let mut subagents = self.subagents.write();
-        if skill.is_subagent() {
-            let mut agent = self.materialize(&skill);
-            if let Some(existing) = subagents.get(&name) {
-                agent.subsessions = existing.subsessions.clone();
-            }
-            subagents.insert(name.clone(), agent);
-        } else {
-            subagents.remove(&name);
-        }
-        self.skills.write().insert(name, skill);
-    }
-
-    /// Retrieve the full [`Skill`] by its normalised name.
+    /// Retrieve the winning skill by its normalized callable name, without I/O.
     pub fn get_skill(&self, lowercase_name: &str) -> Option<Skill> {
-        self.skills.read().get(lowercase_name).cloned()
+        let registry = self.registry.read();
+        let id = registry.catalog.winners.get(lowercase_name)?;
+        Some(registry.catalog.entries.get(id)?.skill.as_ref().clone())
     }
-
-    /// Return the loaded skills that opted into [`SkillExecution::Subagent`], materialized as
-    /// [`SubAgent`]s. Inline skills are excluded: they are followed by the calling agent through
-    /// the [`SkillManager`] tool rather than dispatched as callables.
+    /// All unambiguous delegated workers, including explicit-only skills, for host inspection.
     pub fn subagents(&self) -> Vec<SubAgent> {
-        self.subagents.read().values().cloned().collect::<Vec<_>>()
+        self.registry.read().subagents.values().cloned().collect()
     }
-
-    /// Return all loaded skills.
+    /// Compatibility view of unambiguous winning skills, keyed by normalized callable name.
     pub fn list(&self) -> BTreeMap<String, Skill> {
-        self.skills.read().clone()
+        let registry = self.registry.read();
+        registry
+            .catalog
+            .winners
+            .iter()
+            .map(|(name, id)| {
+                (
+                    name.clone(),
+                    registry.catalog.entries[id].skill.as_ref().clone(),
+                )
+            })
+            .collect()
     }
-
-    /// Renders the resident catalog of loaded skills appended to the tool description.
-    ///
-    /// Progressive disclosure defers a skill's *body*, not its existence: the name and the
-    /// description have to stay resident or the model cannot know there is anything to pull in.
-    /// Subagent skills get that from their `SA_` definitions, but inline skills appear in no tool
-    /// list at all, so without this catalog the only way to reach one would be to guess its name.
     fn skills_catalog(&self) -> String {
-        let skills = self.skills.read();
-        if skills.is_empty() {
+        let registry = self.registry.read();
+        let mut entries = registry
+            .catalog
+            .entries
+            .values()
+            .filter(|entry| entry.metadata.policy.allow_implicit_invocation)
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|entry| (&entry.skill.frontmatter.name, entry.rank, &entry.id));
+        if entries.is_empty() {
             return String::new();
         }
-
-        let mut catalog = String::from("\nLoaded skills (name, execution, description):");
-        for skill in skills.values() {
-            catalog.push_str(&format!(
-                "\n- {} [{}]: {}",
-                skill.frontmatter.name, skill.execution, skill.frontmatter.description
-            ));
+        let header = "\nLoaded skills (name, execution, description):";
+        let lines = entries
+            .into_iter()
+            .map(|entry| {
+                let description = entry
+                    .metadata
+                    .interface
+                    .short_description
+                    .as_deref()
+                    .unwrap_or(&entry.skill.frontmatter.description)
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                (
+                    format!(
+                        "\n- {} [{}]: ",
+                        entry.skill.frontmatter.name, entry.skill.execution
+                    ),
+                    description,
+                )
+            })
+            .collect::<Vec<_>>();
+        let full_bytes = header.len()
+            + lines
+                .iter()
+                .map(|(prefix, description)| prefix.len() + description.len())
+                .sum::<usize>();
+        if full_bytes <= self.limits.catalog_bytes {
+            return format!(
+                "{header}{}",
+                lines
+                    .into_iter()
+                    .map(|(prefix, description)| prefix + &description)
+                    .collect::<String>()
+            );
         }
-        catalog
+        // Allocate names first, then divide remaining bytes fairly between descriptions.
+        let mut output = header.to_string();
+        let mut names_bytes = 0;
+        let mut count = 0;
+        for (prefix, _) in &lines {
+            if header.len() + names_bytes + prefix.len() + 80 > self.limits.catalog_bytes {
+                break;
+            }
+            names_bytes += prefix.len();
+            count += 1;
+        }
+        let description_budget = self
+            .limits
+            .catalog_bytes
+            .saturating_sub(header.len() + names_bytes + 80)
+            / count.max(1);
+        for (prefix, description) in lines.iter().take(count) {
+            output.push_str(prefix);
+            output.push_str(truncate(description, description_budget));
+        }
+        let omitted = lines.len() - count;
+        if omitted > 0 {
+            output.push_str(&format!(
+                "\n{omitted} additional skills omitted; use skills_list to discover them."
+            ));
+        } else {
+            output
+                .push_str("\nDescriptions shortened; use skills_list and skills_read for details.");
+        }
+        truncate(&output, self.limits.catalog_bytes).into()
     }
 }
 
@@ -649,1013 +581,73 @@ impl SubAgentSet for SkillManager {
     fn into_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
         self
     }
-
-    // Every lookup below goes through `subagents`, not `skills`: inline skills are followed by the
-    // calling agent through the `skills_manager` tool and must never be dispatchable as callables.
-    fn contains_lowercase(&self, lowercase_name: &str) -> bool {
-        self.subagents.read().contains_key(lowercase_name)
+    fn contains_lowercase(&self, name: &str) -> bool {
+        self.registry.read().subagents.contains_key(name)
     }
-
-    fn get_lowercase(&self, lowercase_name: &str) -> Option<SubAgent> {
-        // Clone the materialized instance so the returned agent shares the live session
-        // registry; building a fresh `SubAgent` here would hand out an empty one.
-        self.subagents.read().get(lowercase_name).cloned()
+    fn get_lowercase(&self, name: &str) -> Option<SubAgent> {
+        self.registry.read().subagents.get(name).cloned()
     }
-
     fn definitions(&self, names: Option<&[String]>) -> Vec<FunctionDefinition> {
-        let subagents = self.subagents.read();
-        match names {
-            None => subagents.values().map(|agent| agent.definition()).collect(),
-            Some(names) => names
-                .iter()
-                .filter_map(|name| {
-                    subagents
-                        .get(&name.to_ascii_lowercase())
-                        .map(|agent| agent.definition())
-                })
-                .collect(),
-        }
-    }
-
-    fn select_resources(&self, name: &str, resources: &mut Vec<Resource>) -> Vec<Resource> {
-        if resources.is_empty() {
-            return Vec::new();
-        }
-
-        self.subagents
-            .read()
-            .get(&name.to_ascii_lowercase())
-            .map(|agent| {
-                let supported_tags = agent.supported_resource_tags();
-                select_resources(resources, &supported_tags)
+        let registry = self.registry.read();
+        registry
+            .subagents
+            .iter()
+            .filter(|(name, _)| match names {
+                Some(names) => names
+                    .iter()
+                    .any(|requested| requested.eq_ignore_ascii_case(name)),
+                None => registry
+                    .catalog
+                    .winners
+                    .get(*name)
+                    .and_then(|id| registry.catalog.entries.get(id))
+                    .is_some_and(|entry| entry.metadata.policy.allow_implicit_invocation),
             })
+            .map(|(_, agent)| agent.definition())
+            .collect()
+    }
+    fn select_resources(&self, name: &str, resources: &mut Vec<Resource>) -> Vec<Resource> {
+        self.get_lowercase(&name.to_ascii_lowercase())
+            .map(|agent| select_resources(resources, &agent.supported_resource_tags()))
             .unwrap_or_default()
     }
 }
-
 impl Tool<BaseCtx> for SkillManager {
     type Args = SkillArgs;
     type Output = SkillContentOutput;
-
     fn name(&self) -> String {
-        Self::NAME.to_string()
+        Self::NAME.into()
     }
-
     fn description(&self) -> String {
         format!("{}{}", self.description, self.skills_catalog())
     }
-
     fn definition(&self) -> FunctionDefinition {
         let mut definition = tool_definition::<Self::Args>(self.name(), self.description());
-        definition.parameters["description"] = "Read a reusable skill's SKILL.md file content by skill name. Create or update skills by editing files directly with shell or file tools, then reload the manager.".into();
+        definition.parameters["description"] = "Read a reusable skill's SKILL.md file content by skill name. Create or update skills with separately authorized file tools, then reload or invalidate the manager. Use skills_read for paginated documents and package resources.".into();
         definition
     }
-
+    fn group(&self) -> Option<anda_core::ToolGroupInfo> {
+        Some(tools::skill_group())
+    }
     async fn call(
         &self,
         ctx: BaseCtx,
         args: Self::Args,
         _resources: Vec<Resource>,
     ) -> Result<ToolOutput<Self::Output>, BoxError> {
-        hooked_call(&ctx, args, |args| async move {
-            Ok(ToolOutput::new(self.read_skill_action(args).await?))
+        use anda_core::StateFeatures;
+        hooked_call(&ctx, args, |args| async {
+            let cancellation = ctx.cancellation_token();
+            tokio::select! {
+                _ = cancellation.cancelled() => Err("call was cancelled".into()),
+                result = self.read_skill_action(args) => result.map(ToolOutput::new),
+            }
         })
         .await
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{context::BaseCtx, engine::EngineBuilder, subagent::SubAgentSet};
-    use serde_json::json;
-    use std::sync::Arc;
-
-    fn mock_ctx() -> BaseCtx {
-        EngineBuilder::new().mock_ctx().base
-    }
-
-    /// Builds a `SKILL.md`; `frontmatter` holds extra raw YAML lines such as
-    /// `"execution: subagent"` or `"allowed-tools: shell fetch"`.
-    fn skill_md(name: &str, description: &str, body: &str, frontmatter: &[&str]) -> String {
-        let mut content = format!("---\nname: {name}\ndescription: {description}\n");
-        for line in frontmatter {
-            content.push_str(line);
-            content.push('\n');
-        }
-        content.push_str("---\n\n");
-        content.push_str(body);
-        if !body.ends_with('\n') {
-            content.push('\n');
-        }
-        content
-    }
-
-    // -- Tool definition --
-
-    #[test]
-    fn skill_manager_tool_definition_schema() {
-        let mgr = SkillManager::new(PathBuf::from("/tmp/skills"));
-        let def = mgr.definition();
-        assert_eq!(def.name, "skills_manager");
-        assert!(def.description.contains("Agent Skills specification"));
-        assert_eq!(def.parameters["additionalProperties"], json!(false));
-        assert_eq!(def.parameters["required"], json!(["name"]));
-        assert!(def.parameters["properties"].get("action").is_none());
-    }
-
-    // -- integration: load and read --
-
-    #[tokio::test]
-    async fn load_and_read_from_temp_dir() {
-        let tmp =
-            std::env::temp_dir().join(format!("anda-skills-test-{:016x}", rand::random::<u64>()));
-        tokio::fs::create_dir_all(tmp.join("alpha")).await.unwrap();
-        tokio::fs::create_dir_all(tmp.join("beta-skill"))
-            .await
-            .unwrap();
-
-        tokio::fs::write(
-            tmp.join("alpha/SKILL.md"),
-            "\
----
-name: alpha
-description: Alpha skill for testing.
----
-
-Alpha instructions.
-",
-        )
-        .await
-        .unwrap();
-
-        tokio::fs::write(
-            tmp.join("beta-skill/SKILL.md"),
-            "\
----
-name: beta-skill
-description: Beta skill for testing.
-license: MIT
-execution: subagent
-allowed-tools: shell fetch
----
-
-Beta instructions.
-",
-        )
-        .await
-        .unwrap();
-
-        let mgr = SkillManager::new(tmp.clone());
-        mgr.load().await.unwrap();
-
-        // Alpha declares no execution mode, so it stays inline: loaded and readable, never
-        // callable.
-        assert!(mgr.list().contains_key("skill_alpha"));
-        assert!(!mgr.contains_lowercase("skill_alpha"));
-        assert!(mgr.get_lowercase("skill_alpha").is_none());
-
-        assert!(mgr.contains_lowercase("skill_beta_skill"));
-        assert!(!mgr.contains_lowercase("skill_gamma"));
-
-        // `allowed-tools` is an upper bound: beta gets exactly what it asked for, and none of the
-        // manager defaults are unioned in.
-        let beta = mgr.get_lowercase("skill_beta_skill").unwrap();
-        assert_eq!(beta.tools, vec!["shell", "fetch"]);
-        assert!(beta.instructions.contains("Beta instructions."));
-
-        let beta_skill = mgr.get_skill("skill_beta_skill").unwrap();
-        assert_eq!(beta_skill.frontmatter.license.as_deref(), Some("MIT"));
-
-        let beta_content = mgr
-            .call_raw(mock_ctx(), json!({ "name": "beta-skill" }), Vec::new())
-            .await
-            .unwrap();
-        assert_eq!(beta_content.output["name"], json!("beta-skill"));
-        assert_eq!(beta_content.output["execution"], json!("subagent"));
-        assert_eq!(
-            beta_content.output["callable"],
-            json!("SA_skill_beta_skill")
-        );
-        assert_eq!(beta_content.output["path"], json!("beta-skill/SKILL.md"));
-        assert_eq!(
-            beta_content.output["base_dir"],
-            json!(tmp.join("beta-skill").display().to_string())
-        );
-        assert!(
-            beta_content.output["content"]
-                .as_str()
-                .unwrap()
-                .contains("Beta instructions.")
-        );
-
-        // An inline skill reports no callable; the agent follows the returned content itself.
-        let alpha_content = mgr
-            .call_raw(mock_ctx(), json!({ "name": "alpha" }), Vec::new())
-            .await
-            .unwrap();
-        assert_eq!(alpha_content.output["execution"], json!("inline"));
-        assert!(alpha_content.output.get("callable").is_none());
-
-        // Gamma delegates without declaring tools, so it inherits the manager defaults.
-        tokio::fs::create_dir_all(tmp.join("gamma")).await.unwrap();
-        tokio::fs::write(
-            tmp.join("gamma/SKILL.md"),
-            skill_md(
-                "gamma",
-                "Gamma skill for testing.",
-                "Gamma instructions.",
-                &["execution: subagent"],
-            ),
-        )
-        .await
-        .unwrap();
-
-        mgr.load().await.unwrap();
-
-        assert!(mgr.contains_lowercase("skill_gamma"));
-        assert!(tmp.join("gamma/SKILL.md").exists());
-        assert_eq!(
-            mgr.get_lowercase("skill_gamma").unwrap().tools,
-            DEFAULT_SKILL_TOOLS
-        );
-
-        // Verify on-disk content is valid SKILL.md.
-        let on_disk = tokio::fs::read_to_string(tmp.join("gamma/SKILL.md"))
-            .await
-            .unwrap();
-        let reparsed = parse_skill_md(tmp.to_path_buf(), &on_disk).unwrap();
-        assert_eq!(reparsed.frontmatter.name, "gamma");
-
-        // Definitions cover the two subagent skills only; alpha never reaches the model's tool
-        // list.
-        let defs = mgr.definitions(None);
-        assert_eq!(defs.len(), 2);
-        assert!(!defs.iter().any(|def| def.name == "skill_alpha"));
-
-        let defs_filtered = mgr.definitions(Some(&["skill_gamma".to_string()]));
-        assert_eq!(defs_filtered.len(), 1);
-        assert_eq!(defs_filtered[0].name, "skill_gamma");
-
-        assert!(
-            mgr.definitions(Some(&["skill_alpha".to_string()]))
-                .is_empty()
-        );
-
-        // Clean up.
-        let _ = tokio::fs::remove_dir_all(&tmp).await;
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn reading_a_skill_refreshes_the_materialized_subagent() {
-        let root = std::env::temp_dir().join(format!(
-            "anda-skills-read-refresh-{:016x}",
-            rand::random::<u64>()
-        ));
-        let skill_dir = root.join("alpha");
-        tokio::fs::create_dir_all(&skill_dir).await.unwrap();
-        tokio::fs::write(
-            skill_dir.join("SKILL.md"),
-            skill_md(
-                "alpha",
-                "Alpha skill before refresh.",
-                "Original instructions.",
-                &["execution: subagent"],
-            ),
-        )
-        .await
-        .unwrap();
-
-        let mgr = SkillManager::new(root.clone());
-
-        // A direct read loads a newly created skill without requiring a separate full reload.
-        mgr.call_raw(mock_ctx(), json!({"name": "alpha"}), Vec::new())
-            .await
-            .unwrap();
-        let before = mgr
-            .get_lowercase("skill_alpha")
-            .expect("the directly read skill must be callable");
-        assert!(before.instructions.contains("Original instructions."));
-
-        tokio::fs::write(
-            skill_dir.join("SKILL.md"),
-            skill_md(
-                "alpha",
-                "Alpha skill after refresh.",
-                "Updated instructions.",
-                &["execution: subagent"],
-            ),
-        )
-        .await
-        .unwrap();
-        mgr.call_raw(mock_ctx(), json!({"name": "alpha"}), Vec::new())
-            .await
-            .unwrap();
-
-        let after = mgr
-            .get_lowercase("skill_alpha")
-            .expect("the refreshed skill must remain callable");
-        assert_eq!(after.description, "Alpha skill after refresh.");
-        assert!(after.instructions.contains("Updated instructions."));
-        assert!(
-            Arc::ptr_eq(&before.subsessions, &after.subsessions),
-            "refreshing instructions must not disconnect live sessions"
-        );
-        assert_eq!(
-            mgr.definitions(Some(&["skill_alpha".to_string()]))[0].description,
-            after.definition().description
-        );
-
-        // Switching the skill back to inline on disk retires the callable.
-        tokio::fs::write(
-            skill_dir.join("SKILL.md"),
-            skill_md(
-                "alpha",
-                "Alpha skill, now inline.",
-                "Inline instructions.",
-                &[],
-            ),
-        )
-        .await
-        .unwrap();
-        let output = mgr
-            .call_raw(mock_ctx(), json!({"name": "alpha"}), Vec::new())
-            .await
-            .unwrap();
-        assert_eq!(output.output["execution"], json!("inline"));
-        assert!(mgr.get_lowercase("skill_alpha").is_none());
-        assert!(mgr.list().contains_key("skill_alpha"));
-
-        let _ = tokio::fs::remove_dir_all(&root).await;
-    }
-
-    #[tokio::test]
-    async fn load_and_read_platform_encoded_skill_file_when_available() {
-        let Some(encoding) =
-            anda_core::platform_text_encoding().filter(|encoding| encoding.name() != "UTF-8")
-        else {
-            return;
-        };
-        let Some(marker) = [
-            "中文",
-            "café",
-            "日本語",
-            "한국어",
-            "тест",
-            "γειά",
-            "שלום",
-            "مرحبا",
-        ]
-        .into_iter()
-        .find(|candidate| {
-            let (bytes, _, had_errors) = encoding.encode(candidate);
-            !had_errors && std::str::from_utf8(&bytes).is_err()
-        }) else {
-            return;
-        };
-
-        let tmp =
-            std::env::temp_dir().join(format!("anda-skills-legacy-{:016x}", rand::random::<u64>()));
-        tokio::fs::create_dir_all(tmp.join("legacy-skill"))
-            .await
-            .unwrap();
-        let body = format!("Legacy encoded skill marker: {marker}");
-        let content = skill_md(
-            "legacy-skill",
-            "Legacy encoded skill for testing.",
-            &body,
-            &["execution: subagent"],
-        );
-        let (encoded, _, had_errors) = encoding.encode(&content);
-        assert!(!had_errors);
-        assert!(std::str::from_utf8(encoded.as_ref()).is_err());
-        tokio::fs::write(tmp.join("legacy-skill/SKILL.md"), encoded.as_ref())
-            .await
-            .unwrap();
-
-        let mgr = SkillManager::new(tmp.clone());
-        mgr.load().await.unwrap();
-
-        assert!(mgr.contains_lowercase("skill_legacy_skill"));
-        let agent = mgr.get_lowercase("skill_legacy_skill").unwrap();
-        assert!(agent.instructions.contains(&body));
-
-        let output = mgr
-            .call_raw(mock_ctx(), json!({ "name": "legacy-skill" }), Vec::new())
-            .await
-            .unwrap();
-        assert_eq!(output.output["name"], json!("legacy-skill"));
-        assert!(output.output["content"].as_str().unwrap().contains(&body));
-
-        let _ = tokio::fs::remove_dir_all(&tmp).await;
-    }
-
-    #[tokio::test]
-    async fn load_and_read_from_multiple_dirs() {
-        let root =
-            std::env::temp_dir().join(format!("anda-skills-multi-{:016x}", rand::random::<u64>()));
-        let default_dir = root.join("default");
-        let extra_dir = root.join("extra");
-
-        tokio::fs::create_dir_all(default_dir.join("alpha"))
-            .await
-            .unwrap();
-        tokio::fs::create_dir_all(extra_dir.join("beta"))
-            .await
-            .unwrap();
-
-        tokio::fs::write(
-            default_dir.join("alpha/SKILL.md"),
-            skill_md(
-                "alpha",
-                "Alpha skill from default directory.",
-                "Alpha instructions.",
-                &[],
-            ),
-        )
-        .await
-        .unwrap();
-
-        tokio::fs::write(
-            extra_dir.join("beta/SKILL.md"),
-            skill_md(
-                "beta",
-                "Beta skill from extra directory.",
-                "Beta instructions.",
-                &["execution: subagent"],
-            ),
-        )
-        .await
-        .unwrap();
-
-        let mgr = SkillManager::new_with_dirs(
-            default_dir.clone(),
-            vec![extra_dir.clone(), default_dir.clone()],
-        );
-        let expected_dirs = vec![default_dir.clone(), extra_dir.clone()];
-        assert_eq!(mgr.default_skills_dir(), default_dir.as_path());
-        assert_eq!(mgr.skills_dirs(), expected_dirs.as_slice());
-
-        mgr.load().await.unwrap();
-
-        assert!(mgr.list().contains_key("skill_alpha"));
-        assert!(mgr.contains_lowercase("skill_beta"));
-
-        let beta_content = mgr
-            .call_raw(mock_ctx(), json!({ "name": "beta" }), Vec::new())
-            .await
-            .unwrap();
-        assert_eq!(beta_content.output["name"], json!("beta"));
-        assert_eq!(beta_content.output["callable"], json!("SA_skill_beta"));
-        assert_eq!(beta_content.output["path"], json!("beta/SKILL.md"));
-        assert!(
-            beta_content.output["content"]
-                .as_str()
-                .unwrap()
-                .contains("Beta instructions.")
-        );
-
-        // Creation workflows should keep using the original default directory.
-        assert!(mgr.default_skills_dir().ends_with("default"));
-
-        let _ = tokio::fs::remove_dir_all(&root).await;
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn manager_custom_options_lists_subagents_and_selects_resource_paths() {
-        let root = std::env::temp_dir().join(format!(
-            "anda-skills-manager-{:016x}",
-            rand::random::<u64>()
-        ));
-        tokio::fs::create_dir_all(root.join("alpha")).await.unwrap();
-        tokio::fs::write(
-            root.join("alpha/SKILL.md"),
-            skill_md(
-                "alpha",
-                "Alpha skill for manager coverage.",
-                "Alpha body.",
-                &[
-                    "execution: subagent",
-                    "allowed-tools: shell todo shell custom_tool",
-                ],
-            ),
-        )
-        .await
-        .unwrap();
-        tokio::fs::create_dir_all(root.join("inline-one"))
-            .await
-            .unwrap();
-        tokio::fs::write(
-            root.join("inline-one/SKILL.md"),
-            skill_md(
-                "inline-one",
-                "Inline skill for manager coverage.",
-                "Inline body.",
-                &[],
-            ),
-        )
-        .await
-        .unwrap();
-        tokio::fs::create_dir_all(root.join("locked-down"))
-            .await
-            .unwrap();
-        tokio::fs::write(
-            root.join("locked-down/SKILL.md"),
-            skill_md(
-                "locked-down",
-                "Delegates but asks for no tools.",
-                "Locked body.",
-                &["execution: subagent", "allowed-tools: []"],
-            ),
-        )
-        .await
-        .unwrap();
-
-        let mgr = Arc::new(
-            SkillManager::new(root.clone())
-                .with_description("custom skill reader".to_string())
-                .with_default_skill_tools(vec!["read_file".to_string(), "todo".to_string()]),
-        );
-        assert_eq!(mgr.description(), "custom skill reader");
-        assert_eq!(mgr.list().len(), 0);
-
-        mgr.load().await.unwrap();
-        assert_eq!(mgr.list().len(), 3);
-
-        // Inline skills are in no tool list, so the description carries the resident catalog:
-        // without it the model would have to guess that `inline-one` exists.
-        let description = mgr.description();
-        assert!(
-            description.starts_with("custom skill reader"),
-            "{description}"
-        );
-        assert!(
-            description.contains("- inline-one [inline]: Inline skill for manager coverage."),
-            "{description}"
-        );
-        assert!(
-            description.contains("- alpha [subagent]: Alpha skill for manager coverage."),
-            "{description}"
-        );
-
-        // Only the skills that opted in are materialized, and their declared tools replace the
-        // configured defaults rather than merging with them.
-        let subagents = mgr.subagents();
-        assert_eq!(subagents.len(), 2);
-        assert_eq!(subagents[0].name, "skill_alpha");
-        assert_eq!(subagents[0].tools, vec!["shell", "todo", "custom_tool"]);
-        // An empty `allowed-tools` is a declaration of none, not an omission, so the manager's
-        // defaults do not fill it in.
-        assert_eq!(subagents[1].name, "skill_locked_down");
-        assert!(subagents[1].tools.is_empty());
-
-        let any = mgr.clone().into_any();
-        assert!(any.downcast_ref::<SkillManager>().is_some());
-
-        let mut resources = vec![Resource {
-            _id: 1,
-            name: "text".to_string(),
-            tags: vec!["text".to_string()],
-            ..Default::default()
-        }];
-        assert!(SubAgentSet::select_resources(mgr.as_ref(), "missing", &mut resources).is_empty());
-        // Inline skills are not callables, so they never claim resources.
-        assert!(
-            SubAgentSet::select_resources(mgr.as_ref(), "skill_inline_one", &mut resources)
-                .is_empty()
-        );
-        assert_eq!(resources.len(), 1);
-        // A subagent skill that declares no `resource-tags` takes what the caller offers.
-        let selected = SubAgentSet::select_resources(mgr.as_ref(), "skill_alpha", &mut resources);
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].name, "text");
-        assert!(resources.is_empty());
-        assert!(
-            SubAgentSet::select_resources(mgr.as_ref(), "skill_alpha", &mut resources).is_empty()
-        );
-
-        let _ = tokio::fs::remove_dir_all(&root).await;
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn manager_finds_frontmatter_names_and_reports_duplicates_or_bad_files() {
-        let root =
-            std::env::temp_dir().join(format!("anda-skills-find-{:016x}", rand::random::<u64>()));
-        let default_dir = root.join("default");
-        let extra_dir = root.join("extra");
-        tokio::fs::create_dir_all(default_dir.join("folder-name"))
-            .await
-            .unwrap();
-        tokio::fs::create_dir_all(extra_dir.join("duplicate-one"))
-            .await
-            .unwrap();
-        tokio::fs::create_dir_all(extra_dir.join("duplicate-two"))
-            .await
-            .unwrap();
-        tokio::fs::create_dir_all(extra_dir.join("bad"))
-            .await
-            .unwrap();
-
-        tokio::fs::write(
-            default_dir.join("folder-name/SKILL.md"),
-            skill_md(
-                "frontmatter-name",
-                "Looked up by parsed frontmatter.",
-                "Frontmatter body.",
-                &["execution: subagent"],
-            ),
-        )
-        .await
-        .unwrap();
-        tokio::fs::write(
-            extra_dir.join("duplicate-one/SKILL.md"),
-            skill_md("dupe", "Duplicate one.", "One.", &[]),
-        )
-        .await
-        .unwrap();
-        tokio::fs::write(
-            extra_dir.join("duplicate-two/SKILL.md"),
-            skill_md("dupe", "Duplicate two.", "Two.", &[]),
-        )
-        .await
-        .unwrap();
-        tokio::fs::write(extra_dir.join("bad/SKILL.md"), "not frontmatter")
-            .await
-            .unwrap();
-
-        let mgr = SkillManager::new_with_dirs(default_dir.clone(), vec![extra_dir.clone()]);
-        mgr.load().await.unwrap();
-        assert!(mgr.contains_lowercase("skill_frontmatter_name"));
-
-        let read = mgr
-            .call_raw(mock_ctx(), json!({"name": "frontmatter-name"}), Vec::new())
-            .await
-            .unwrap();
-        assert_eq!(read.output["callable"], json!("SA_skill_frontmatter_name"));
-        assert_eq!(read.output["path"], json!("folder-name/SKILL.md"));
-
-        let duplicate = mgr
-            .call_raw(mock_ctx(), json!({"name": "dupe"}), Vec::new())
-            .await
-            .unwrap_err();
-        assert!(duplicate.to_string().contains("multiple skills named"));
-
-        let missing = mgr
-            .call_raw(mock_ctx(), json!({"name": "missing"}), Vec::new())
-            .await
-            .unwrap_err();
-        assert!(missing.to_string().contains("skill \"missing\" not found"));
-
-        let invalid = mgr
-            .call_raw(mock_ctx(), json!({"name": "Bad"}), Vec::new())
-            .await
-            .unwrap_err();
-        assert!(invalid.to_string().contains("invalid character"));
-
-        let _ = tokio::fs::remove_dir_all(&root).await;
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn manager_read_rejects_unsafe_large_non_utf8_or_mismatched_skill_files() {
-        let root =
-            std::env::temp_dir().join(format!("anda-skills-errors-{:016x}", rand::random::<u64>()));
-        tokio::fs::create_dir_all(root.join("mismatch"))
-            .await
-            .unwrap();
-        tokio::fs::write(
-            root.join("mismatch/SKILL.md"),
-            skill_md(
-                "other-name",
-                "Mismatched frontmatter name.",
-                "Mismatch body.",
-                &[],
-            ),
-        )
-        .await
-        .unwrap();
-
-        let mgr = SkillManager::new(root.clone());
-        let mismatch = mgr
-            .call_raw(mock_ctx(), json!({"name": "mismatch"}), Vec::new())
-            .await
-            .unwrap_err();
-        assert!(
-            mismatch
-                .to_string()
-                .contains("must match requested skill name")
-        );
-
-        tokio::fs::create_dir_all(root.join("binary"))
-            .await
-            .unwrap();
-        tokio::fs::write(root.join("binary/SKILL.md"), vec![0x81, 0x00])
-            .await
-            .unwrap();
-        let binary = mgr
-            .call_raw(mock_ctx(), json!({"name": "binary"}), Vec::new())
-            .await
-            .unwrap_err();
-        assert!(
-            binary
-                .to_string()
-                .contains("Only UTF-8 or supported text-encoded skill files")
-        );
-
-        tokio::fs::create_dir_all(root.join("large")).await.unwrap();
-        tokio::fs::write(
-            root.join("large/SKILL.md"),
-            vec![b'a'; MAX_SKILL_FILE_BYTES as usize + 1],
-        )
-        .await
-        .unwrap();
-        let large = mgr
-            .call_raw(mock_ctx(), json!({"name": "large"}), Vec::new())
-            .await
-            .unwrap_err();
-        assert!(large.to_string().contains("exceeds maximum"));
-
-        let missing_dirs = SkillManager::new(root.join("missing-default"));
-        missing_dirs.load().await.unwrap();
-        assert!(missing_dirs.list().is_empty());
-
-        let _ = tokio::fs::remove_dir_all(&root).await;
-    }
-
-    #[tokio::test]
-    async fn load_uses_frontmatter_name_when_dir_differs() {
-        let tmp = std::env::temp_dir().join(format!(
-            "anda-skills-mismatch-{:016x}",
-            rand::random::<u64>()
-        ));
-        tokio::fs::create_dir_all(tmp.join("wrong-dir"))
-            .await
-            .unwrap();
-
-        tokio::fs::write(
-            tmp.join("wrong-dir/SKILL.md"),
-            "\
----
-name: correct-name
-description: Name does not match directory.
----
-
-Body.
-",
-        )
-        .await
-        .unwrap();
-
-        let mgr = SkillManager::new(tmp.clone());
-        mgr.load().await.unwrap();
-
-        assert!(mgr.list().contains_key("skill_correct_name"));
-
-        let _ = tokio::fs::remove_dir_all(&tmp).await;
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn tool_requires_name() {
-        let tmp = std::env::temp_dir().join(format!(
-            "anda-skills-requires-name-{:016x}",
-            rand::random::<u64>()
-        ));
-        let mgr = SkillManager::new(tmp.clone());
-
-        let err = mgr
-            .call_raw(mock_ctx(), json!({}), Vec::new())
-            .await
-            .unwrap_err();
-
-        assert!(err.to_string().contains("missing field `name`"));
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn tool_rejects_mutation_fields() {
-        let tmp = std::env::temp_dir().join(format!(
-            "anda-skills-rejects-action-{:016x}",
-            rand::random::<u64>()
-        ));
-        let mgr = SkillManager::new(tmp.clone());
-
-        let err = mgr
-            .call_raw(
-                mock_ctx(),
-                json!({
-                    "action": "create",
-                    "name": "golf"
-                }),
-                Vec::new(),
-            )
-            .await
-            .unwrap_err();
-
-        assert!(err.to_string().contains("unknown field `action`"));
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn sub_agents_manager_register_skills_manager() {
-        let tmp =
-            std::env::temp_dir().join(format!("anda-skills-val-{:016x}", rand::random::<u64>()));
-        let tool = SkillManager::new(tmp.clone());
-        let engine = EngineBuilder::new().empty().await.unwrap();
-        assert!(engine.sub_agents_manager().insert(Arc::new(tool)).is_none());
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn name_scan_reuses_parsed_files_until_they_change() {
-        let root = std::env::temp_dir().join(format!(
-            "anda-skills-parse-cache-{:016x}",
-            rand::random::<u64>()
-        ));
-        write_subagent_skill(&root, "worker", "worker", "First instructions.").await;
-        let mgr = SkillManager::new(root.clone());
-        mgr.load().await.unwrap();
-
-        let read = mgr
-            .call_raw(mock_ctx(), json!({ "name": "worker" }), Vec::new())
-            .await
-            .unwrap();
-        assert!(
-            read.output["content"]
-                .as_str()
-                .unwrap()
-                .contains("First instructions.")
-        );
-        assert_eq!(mgr.parsed_files.lock().len(), 1);
-
-        // Changing the file (here its declared name and size) invalidates the cached parse, so
-        // the scan finds the new name and the old name no longer resolves to a matching skill.
-        write_subagent_skill(&root, "worker", "renamed-worker", "Second, longer text.").await;
-        let read = mgr
-            .call_raw(mock_ctx(), json!({ "name": "renamed-worker" }), Vec::new())
-            .await
-            .unwrap();
-        assert!(
-            read.output["content"]
-                .as_str()
-                .unwrap()
-                .contains("Second, longer text.")
-        );
-        let err = mgr
-            .call_raw(mock_ctx(), json!({ "name": "worker" }), Vec::new())
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("renamed-worker"), "{err}");
-
-        let _ = tokio::fs::remove_dir_all(&root).await;
-    }
-
-    /// Writes `<root>/<dir>/SKILL.md` for a subagent skill named `name`.
-    async fn write_subagent_skill(root: &Path, dir: &str, name: &str, body: &str) {
-        let skill_dir = root.join(dir);
-        tokio::fs::create_dir_all(&skill_dir).await.unwrap();
-        tokio::fs::write(
-            skill_dir.join("SKILL.md"),
-            skill_md(
-                name,
-                &format!("{name} skill for filter testing."),
-                body,
-                &["execution: subagent"],
-            ),
-        )
-        .await
-        .unwrap();
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_rejected_skill_is_invisible_everywhere() {
-        let root =
-            std::env::temp_dir().join(format!("anda-skills-filter-{:016x}", rand::random::<u64>()));
-        write_subagent_skill(&root, "kept", "kept", "Kept instructions.").await;
-        write_subagent_skill(&root, "hidden", "hidden", "Hidden instructions.").await;
-
-        let mgr = SkillManager::new(root.clone());
-        mgr.set_skill_filter(Some(Arc::new(|skill: &Skill| {
-            skill.frontmatter.name != "hidden"
-        })));
-        mgr.load().await.unwrap();
-
-        assert!(mgr.list().contains_key("skill_kept"));
-        assert!(mgr.contains_lowercase("skill_kept"));
-
-        // Not loaded, not callable, absent from the resident catalog, and — because
-        // `find_skill_dir` would otherwise turn it up on disk — not readable by name either.
-        assert!(!mgr.list().contains_key("skill_hidden"));
-        assert!(!mgr.contains_lowercase("skill_hidden"));
-        assert!(mgr.get_skill("skill_hidden").is_none());
-        assert!(!mgr.description().contains("hidden"));
-        let err = mgr
-            .call_raw(mock_ctx(), json!({ "name": "hidden" }), Vec::new())
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("not found"), "{err}");
-        // A rejected read must not sneak the skill back in through `upsert_skill`.
-        assert!(!mgr.contains_lowercase("skill_hidden"));
-
-        let _ = tokio::fs::remove_dir_all(&root).await;
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn rejecting_the_winning_copy_promotes_the_next_directory() {
-        let root = std::env::temp_dir().join(format!(
-            "anda-skills-filter-shadow-{:016x}",
-            rand::random::<u64>()
-        ));
-        let personal = root.join("personal");
-        let bundled = root.join("bundled");
-        write_subagent_skill(&personal, "dup", "dup", "Personal instructions.").await;
-        write_subagent_skill(&bundled, "dup", "dup", "Bundled instructions.").await;
-
-        let mgr = SkillManager::new_with_dirs(personal.clone(), vec![bundled.clone()]);
-        mgr.load().await.unwrap();
-        assert!(
-            mgr.get_lowercase("skill_dup")
-                .unwrap()
-                .instructions
-                .contains("Personal instructions.")
-        );
-
-        // The filter runs before the duplicate check, so rejecting the higher-priority copy hands
-        // the name to the next directory instead of dropping the skill entirely.
-        let personal_dir = personal.join("dup");
-        mgr.set_skill_filter(Some(Arc::new(move |skill: &Skill| {
-            skill.base_dir != personal_dir
-        })));
-        mgr.load().await.unwrap();
-        assert!(
-            mgr.get_lowercase("skill_dup")
-                .unwrap()
-                .instructions
-                .contains("Bundled instructions.")
-        );
-
-        let _ = tokio::fs::remove_dir_all(&root).await;
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn reading_a_shadowed_name_resolves_by_directory_priority() {
-        let root = std::env::temp_dir().join(format!(
-            "anda-skills-read-shadow-{:016x}",
-            rand::random::<u64>()
-        ));
-        let personal = root.join("personal");
-        let bundled = root.join("bundled");
-        write_subagent_skill(&personal, "dup", "dup", "Personal instructions.").await;
-        write_subagent_skill(&bundled, "dup", "dup", "Bundled instructions.").await;
-
-        let mgr = SkillManager::new_with_dirs(personal.clone(), vec![bundled.clone()]);
-        mgr.load().await.unwrap();
-
-        // The same name in two roots is what shadowing *is*; `load` already resolves it by
-        // priority, so reading it by name must not report it as an unresolvable duplicate.
-        let read = mgr
-            .call_raw(mock_ctx(), json!({ "name": "dup" }), Vec::new())
-            .await
-            .unwrap();
-        assert!(
-            read.output["content"]
-                .as_str()
-                .unwrap()
-                .contains("Personal instructions.")
-        );
-
-        // Two copies inside one root stay ambiguous: there is no priority to break the tie.
-        write_subagent_skill(&personal, "dup-alias", "dup", "Second personal copy.").await;
-        let err = mgr
-            .call_raw(mock_ctx(), json!({ "name": "dup" }), Vec::new())
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("multiple skills named"), "{err}");
-
-        let _ = tokio::fs::remove_dir_all(&root).await;
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn installing_a_filter_drops_what_it_rejects_without_a_reload() {
-        let root = std::env::temp_dir().join(format!(
-            "anda-skills-filter-prune-{:016x}",
-            rand::random::<u64>()
-        ));
-        write_subagent_skill(&root, "alpha", "alpha", "Alpha instructions.").await;
-
-        let mgr = SkillManager::new(root.clone());
-        mgr.load().await.unwrap();
-        assert!(mgr.contains_lowercase("skill_alpha"));
-
-        mgr.set_skill_filter(Some(Arc::new(|_: &Skill| false)));
-        assert!(mgr.list().is_empty());
-        assert!(!mgr.contains_lowercase("skill_alpha"));
-
-        // Clearing the filter does not resurrect anything on its own; the next load re-reads disk.
-        mgr.set_skill_filter(None);
-        assert!(mgr.list().is_empty());
-        mgr.load().await.unwrap();
-        assert!(mgr.contains_lowercase("skill_alpha"));
-
-        let _ = tokio::fs::remove_dir_all(&root).await;
-    }
-}
+mod catalog_tests;
+#[cfg(test)]
+mod tests;
