@@ -2,6 +2,20 @@
 
 All notable changes to the Anda project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed — anda_engine
+
+- Align Completion budget, reasoning effort, strict schemas, media inputs, and
+  Anthropic Bearer version headers with the provider APIs. Gemini thinking
+  budgets now accept `-1` for dynamic thinking.
+- Reject incomplete streams before exposing tool calls, preserve Gemini signed
+  Parts, distinguish safety feedback from blocking, and normalize omitted
+  Gemini function arguments to empty objects.
+- Pair missing tool-call IDs when replaying foreign histories to OpenAI and
+  Anthropic. Document Responses' mandatory streaming and reject unsupported
+  stop sequences explicitly.
+
 ## [0.16.1] — 2026-09-25
 
 This release moves the AndaDB stack to 0.14, upgrades the cloud and TEE

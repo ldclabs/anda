@@ -11,7 +11,7 @@ use anda_core::{
 use std::collections::BTreeMap;
 
 use super::driver::{SamplingOptions, WireFormat, drive_completion};
-use super::{CompletionFeaturesDyn, ModelEffort, request_client_builder};
+use super::{CompletionFeaturesDyn, ModelEffort, ModelError, request_client_builder};
 
 pub mod types;
 
@@ -24,6 +24,44 @@ impl From<ModelEffort> for types::ThinkingLevel {
             ModelEffort::High => Self::High,
             ModelEffort::Max => Self::High,
         }
+    }
+}
+
+fn apply_effort(config: &mut types::GenerationConfig, model: &str, effort: ModelEffort) {
+    let model = model.trim_start_matches("models/");
+    let thinking = config.thinking_config.get_or_insert_default();
+    if model
+        .trim_start_matches("models/")
+        .starts_with("gemini-2.5-")
+    {
+        let pro = model.contains("-pro");
+        thinking.thinking_level = None;
+        thinking.thinking_budget = Some(match effort {
+            ModelEffort::Minimal => {
+                if pro {
+                    128
+                } else {
+                    0
+                }
+            }
+            ModelEffort::Low => 1024,
+            ModelEffort::Medium => 4096,
+            ModelEffort::High => 16384,
+            ModelEffort::Max => {
+                if pro {
+                    32768
+                } else {
+                    24576
+                }
+            }
+        });
+    } else {
+        thinking.thinking_budget = None;
+        thinking.thinking_level = Some(match effort {
+            ModelEffort::Minimal if model.contains("-pro") => types::ThinkingLevel::Low,
+            ModelEffort::Medium if model.starts_with("gemini-3-pro") => types::ThinkingLevel::High,
+            effort => effort.into(),
+        });
     }
 }
 
@@ -129,12 +167,11 @@ impl CompletionModel {
     /// Sets the default thinking effort for compatible models
     pub fn with_effort(mut self, effort: Option<ModelEffort>) -> Self {
         if let Some(effort) = effort {
-            let thinking_config = self
-                .default_request
-                .generation_config
-                .thinking_config
-                .get_or_insert_with(types::ThinkingConfig::default);
-            thinking_config.thinking_level = Some(effort.into());
+            apply_effort(
+                &mut self.default_request.generation_config,
+                &self.model,
+                effort,
+            );
         }
         self
     }
@@ -170,11 +207,11 @@ fn append_gemini_parts(target: &mut Vec<types::Part>, parts: Vec<types::Part>) {
                     thought_signature,
                     data: types::PartKind::Text(text),
                 },
-            ) if *last_thought == thought => {
+            ) if *last_thought == thought
+                && last_signature.is_none()
+                && thought_signature.is_none() =>
+            {
                 last_text.push_str(&text);
-                if let Some(signature) = thought_signature {
-                    *last_signature = Some(signature);
-                }
             }
             (_, part) => target.push(part),
         }
@@ -259,6 +296,21 @@ fn response_from_stream_chunks(
         return Err("No streamed Gemini response".into());
     }
 
+    if !prompt_feedback
+        .as_ref()
+        .is_some_and(types::PromptFeedback::is_blocked)
+        && candidates.values().any(|candidate| {
+            candidate
+                .finish_reason
+                .as_ref()
+                .is_none_or(|reason| matches!(reason, types::FinishReason::FinishReasonUnspecified))
+        })
+    {
+        return Err(Box::new(
+            ModelError::new("Gemini stream ended before finishReason").with_retryable(true),
+        ));
+    }
+
     Ok(types::GenerateContentResponse {
         candidates: candidates.into_values().collect(),
         prompt_feedback,
@@ -311,7 +363,11 @@ impl WireFormat for CompletionModel {
         Ok(())
     }
 
-    fn apply_sampling(r: &mut Self::Request, options: SamplingOptions) -> Result<(), BoxError> {
+    fn apply_sampling(
+        r: &mut Self::Request,
+        options: SamplingOptions,
+        model: &str,
+    ) -> Result<(), BoxError> {
         if let Some(temperature) = options.temperature {
             r.generation_config.temperature = Some(temperature);
         }
@@ -319,11 +375,7 @@ impl WireFormat for CompletionModel {
             r.generation_config.max_output_tokens = Some(max_tokens as i32);
         }
         if let Some(effort) = options.effort {
-            let thinking_config = r
-                .generation_config
-                .thinking_config
-                .get_or_insert_with(types::ThinkingConfig::default);
-            thinking_config.thinking_level = Some(effort.into());
+            apply_effort(&mut r.generation_config, model, effort);
         }
         if let Some(output_schema) = options.output_schema {
             r.generation_config.response_mime_type = Some("application/json".to_string());
@@ -366,7 +418,10 @@ impl WireFormat for CompletionModel {
         }
     }
 
-    fn aggregate_stream(items: Vec<Self::StreamItem>) -> Result<Self::Response, BoxError> {
+    fn aggregate_stream(
+        items: Vec<Self::StreamItem>,
+        _done: bool,
+    ) -> Result<Self::Response, BoxError> {
         response_from_stream_chunks(items)
     }
 
@@ -415,6 +470,125 @@ mod tests {
     use http::{HeaderMap, Method, StatusCode};
     use reqwest::header::ACCEPT;
     use serde_json::{Value, json};
+
+    #[test]
+    fn thinking_configuration_matches_model_generation() {
+        for (model, minimal, maximum) in [
+            ("gemini-2.5-pro", 128, 32768),
+            ("gemini-2.5-flash", 0, 24576),
+            ("gemini-2.5-flash-lite", 0, 24576),
+        ] {
+            let mut request = Client::new("fake", None)
+                .completion_model(model)
+                .with_effort(Some(ModelEffort::Minimal))
+                .default_request;
+            let config = request.generation_config.thinking_config.as_ref().unwrap();
+            assert_eq!(config.thinking_budget, Some(minimal));
+            assert!(config.thinking_level.is_none());
+            <CompletionModel as WireFormat>::apply_sampling(
+                &mut request,
+                SamplingOptions {
+                    effort: Some(ModelEffort::Max),
+                    temperature: None,
+                    max_output_tokens: None,
+                    output_schema: None,
+                    stop: None,
+                },
+                model,
+            )
+            .unwrap();
+            assert_eq!(
+                request
+                    .generation_config
+                    .thinking_config
+                    .unwrap()
+                    .thinking_budget,
+                Some(maximum)
+            );
+        }
+        let mut config = types::GenerationConfig {
+            thinking_config: Some(
+                serde_json::from_value(json!({"includeThoughts": true, "thinkingBudget": -1}))
+                    .unwrap(),
+            ),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&config).unwrap()["thinkingConfig"]["thinkingBudget"],
+            -1
+        );
+        apply_effort(&mut config, "gemini-3-flash-preview", ModelEffort::Medium);
+        let thinking = config.thinking_config.as_ref().unwrap();
+        assert!(thinking.thinking_budget.is_none());
+        assert!(thinking.include_thoughts);
+        assert_eq!(thinking.thinking_level, Some(types::ThinkingLevel::Medium));
+        apply_effort(&mut config, "gemini-3-pro-preview", ModelEffort::Minimal);
+        assert_eq!(
+            config.thinking_config.unwrap().thinking_level,
+            Some(types::ThinkingLevel::Low)
+        );
+    }
+
+    #[test]
+    fn streaming_preserves_signed_parts_and_rejects_unfinished_candidates() {
+        let parts = vec![
+            json!({"text":"hello"}),
+            json!({"text":" world", "thoughtSignature":"sig1"}),
+            json!({"text":"!", "thoughtSignature":"sig2"}),
+            json!({"text":"", "thoughtSignature":"sig3"}),
+        ];
+        let mut chunks: Vec<types::GenerateContentResponse> = parts
+            .iter()
+            .map(|part| {
+                serde_json::from_value(json!({
+                    "candidates":[{"content":{"role":"model","parts":[part]}}]
+                }))
+                .unwrap()
+            })
+            .collect();
+        let error = response_from_stream_chunks(chunks.clone()).unwrap_err();
+        assert!(crate::model::is_retryable_box_error(&error));
+        chunks
+            .push(serde_json::from_value(json!({"candidates":[{"finishReason":"STOP"}]})).unwrap());
+        let output = response_from_stream_chunks(chunks)
+            .unwrap()
+            .try_into(vec![], vec![])
+            .unwrap();
+        assert_eq!(output.raw_history[0]["parts"], json!(parts));
+        assert_eq!(output.content, "hello world!");
+        assert_eq!(
+            output.chat_history[0].text().as_deref(),
+            Some("hello world!")
+        );
+
+        let incomplete_call = serde_json::from_value(json!({"candidates":[{"content":{"parts":[{"functionCall":{"name":"lookup","args":{}}}]}}]})).unwrap();
+        assert!(response_from_stream_chunks(vec![incomplete_call]).is_err());
+    }
+
+    #[test]
+    fn prompt_safety_feedback_only_fails_when_blocked() {
+        for feedback in [
+            json!({}),
+            json!({"safetyRatings":[]}),
+            json!({"blockReason":"BLOCK_REASON_UNSPECIFIED"}),
+        ] {
+            let response: types::GenerateContentResponse = serde_json::from_value(json!({
+                "promptFeedback":feedback,
+                "candidates":[{"content":{"role":"model","parts":[{"text":"ok"}]},"finishReason":"STOP"}]
+            })).unwrap();
+            assert!(!response.maybe_failed());
+            let out = response.try_into(vec![], vec![]).unwrap();
+            assert!(out.failed_reason.is_none());
+            assert_eq!(out.content, "ok");
+        }
+        let blocked =
+            serde_json::from_value(json!({"promptFeedback":{"blockReason":"SAFETY"}})).unwrap();
+        let out = response_from_stream_chunks(vec![blocked])
+            .unwrap()
+            .try_into(vec![], vec![])
+            .unwrap();
+        assert!(out.failed_reason.is_some());
+    }
 
     async fn complete(
         model: &CompletionModel,
@@ -614,15 +788,15 @@ mod tests {
         let first = &response.candidates[0];
         assert_eq!(first.content.role, Some(types::Role::Model));
         assert!(matches!(
-            &first.content.parts[1],
+            &first.content.parts[2],
             types::Part {
                 thought: Some(true),
                 thought_signature: Some(signature),
                 data: types::PartKind::Text(text),
-            } if signature == "sig-1" && text == "think more"
+            } if signature == "sig-1" && text == " more"
         ));
         assert!(matches!(
-            &first.content.parts[2].data,
+            &first.content.parts[3].data,
             types::PartKind::FunctionCall { name, args, .. }
                 if name == "lookup" && args.as_ref() == Some(&json!({"q": "anda"}))
         ));

@@ -18,21 +18,23 @@
 //!   the returned `raw_history` contains only this turn's additions.
 
 use anda_core::{
-    AgentOutput, BoxError, CompletionRequest, FunctionDefinition, Json, Message, ModelEffort,
+    AgentOutput, BoxError, CompletionRequest, ContentPart, FunctionDefinition, Json, Message,
+    ModelEffort,
 };
 use log::{Level::Debug, log_enabled};
 use serde::{Serialize, de::DeserializeOwned};
+use std::collections::{HashMap, VecDeque};
 
 use crate::model::{
-    execute_completion_request_with_retry, read_completion_response_bytes, read_sse_json_events,
+    execute_completion_request_with_retry, read_completion_response_bytes, read_completion_stream,
     streaming_completion_request,
 };
 use crate::{rfc3339_datetime, unix_ms};
 
 /// Sampling and output-shaping options forwarded to the provider.
 ///
-/// A provider maps the options it supports onto its own request fields and
-/// ignores the rest.
+/// A provider maps these options onto its own request fields and reports
+/// unsupported options instead of silently ignoring them.
 pub(crate) struct SamplingOptions {
     pub temperature: Option<f64>,
     pub max_output_tokens: Option<usize>,
@@ -72,7 +74,11 @@ pub(crate) trait WireFormat {
     fn push_message(r: &mut Self::Request, msg: Message) -> Result<(), BoxError>;
 
     /// Maps supported sampling options onto request fields.
-    fn apply_sampling(r: &mut Self::Request, options: SamplingOptions) -> Result<(), BoxError>;
+    fn apply_sampling(
+        r: &mut Self::Request,
+        options: SamplingOptions,
+        model: &str,
+    ) -> Result<(), BoxError>;
 
     /// Maps a non-empty tool list (and the required-choice flag) onto the
     /// request.
@@ -80,7 +86,9 @@ pub(crate) trait WireFormat {
 
     /// Final request adjustments after all content is applied (for example
     /// forcing stream flags or stream usage options).
-    fn finalize_request(_r: &mut Self::Request) {}
+    fn finalize_request(_r: &mut Self::Request) -> Result<(), BoxError> {
+        Ok(())
+    }
 
     /// Whether this request executes as a stream.
     fn is_stream(r: &Self::Request) -> bool;
@@ -89,7 +97,10 @@ pub(crate) trait WireFormat {
     fn endpoint(r: &Self::Request, model: &str) -> String;
 
     /// Aggregates deserialized stream items into a full response.
-    fn aggregate_stream(items: Vec<Self::StreamItem>) -> Result<Self::Response, BoxError>;
+    fn aggregate_stream(
+        items: Vec<Self::StreamItem>,
+        done: bool,
+    ) -> Result<Self::Response, BoxError>;
 
     /// Parses a non-streaming response body. The second tuple element is an
     /// optional provider-native assistant message captured verbatim for the
@@ -173,13 +184,14 @@ pub(crate) async fn drive_completion<W: WireFormat>(
             output_schema: req.output_schema,
             stop: req.stop,
         },
+        &model,
     )?;
 
     if !req.tools.is_empty() {
         W::apply_tools(&mut r, req.tools, req.tool_choice_required);
     }
 
-    W::finalize_request(&mut r);
+    W::finalize_request(&mut r)?;
 
     let stream = W::is_stream(&r);
     let path = W::endpoint(&r, &model);
@@ -194,8 +206,9 @@ pub(crate) async fn drive_completion<W: WireFormat>(
         },
         |response| async {
             if stream {
-                let items = read_sse_json_events::<W::StreamItem>(response, &model).await?;
-                Ok((W::aggregate_stream(items)?, None))
+                let (items, done) =
+                    read_completion_stream::<W::StreamItem>(response, &model).await?;
+                Ok((W::aggregate_stream(items, done)?, None))
             } else {
                 let data = read_completion_response_bytes(response, &model).await?;
                 W::parse_response(&model, &data)
@@ -214,4 +227,123 @@ pub(crate) async fn drive_completion<W: WireFormat>(
         log::debug!(model = model, usage:serde = output.usage; "Completion response");
     }
     Ok(output)
+}
+
+/// Pairs provider-neutral tool history before replay to APIs requiring call IDs.
+/// Native history is deliberately left untouched. Queues distinguish repeated
+/// calls to the same function, including parallel calls without provider IDs.
+pub(crate) fn assign_tool_call_ids(req: &mut CompletionRequest) -> Result<(), BoxError> {
+    let mut parts: Vec<_> = req
+        .chat_history
+        .iter_mut()
+        .flat_map(|msg| &mut msg.content)
+        .chain(&mut req.content)
+        .collect();
+    let mut pending = HashMap::<String, VecDeque<(usize, Option<String>)>>::new();
+    for index in 0..parts.len() {
+        match &*parts[index] {
+            ContentPart::ToolCall { name, call_id, .. } => {
+                pending
+                    .entry(name.clone())
+                    .or_default()
+                    .push_back((index, call_id.clone().filter(|id| !id.is_empty())));
+            }
+            ContentPart::ToolOutput { name, call_id, .. } => {
+                let name = name.clone();
+                let result_id = call_id.clone().filter(|id| !id.is_empty());
+                let queue = pending.entry(name.clone()).or_default();
+                let matched = if let Some(id) = &result_id {
+                    // A persisted result may already carry an ID although its
+                    // original foreign call did not. Reuse that ID on replay.
+                    queue
+                        .iter()
+                        .position(|(_, call_id)| call_id.as_ref() == Some(id))
+                        .or_else(|| queue.iter().position(|(_, call_id)| call_id.is_none()))
+                        .and_then(|position| queue.remove(position))
+                } else {
+                    Some(queue.pop_front().ok_or_else(|| format!(
+                        "Cannot pair tool result for {name}: missing call ID and matching tool call"
+                    ))?)
+                };
+                if let Some((call_index, call_id)) = matched {
+                    let id = result_id
+                        .or(call_id)
+                        .unwrap_or_else(|| format!("call_anda_{:032x}", rand::random::<u128>()));
+                    if let ContentPart::ToolCall { call_id, .. } = &mut parts[call_index] {
+                        *call_id = Some(id.clone());
+                    }
+                    if let ContentPart::ToolOutput { call_id, .. } = &mut parts[index] {
+                        *call_id = Some(id);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for part in parts {
+        if let ContentPart::ToolCall { call_id, .. } = part
+            && call_id.as_ref().is_none_or(String::is_empty)
+        {
+            *call_id = Some(format!("call_anda_{:032x}", rand::random::<u128>()));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn replay_reuses_ids_already_persisted_on_results() {
+        let mut req = CompletionRequest {
+            content: vec![
+                ContentPart::ToolCall {
+                    name: "lookup".into(),
+                    args: json!({}),
+                    call_id: None,
+                },
+                ContentPart::ToolOutput {
+                    name: "lookup".into(),
+                    output: json!("ok"),
+                    call_id: Some("persisted".into()),
+                    is_error: None,
+                    remote_id: None,
+                },
+            ],
+            ..Default::default()
+        };
+        assign_tool_call_ids(&mut req).unwrap();
+        assert!(
+            matches!(&req.content[0], ContentPart::ToolCall {call_id:Some(id),..} if id == "persisted")
+        );
+        let first = req.content.clone();
+        assign_tool_call_ids(&mut req).unwrap();
+        assert_eq!(req.content, first);
+    }
+
+    #[test]
+    fn idless_results_require_a_matching_call_and_raw_history_is_untouched() {
+        let result = ContentPart::ToolOutput {
+            name: "lookup".into(),
+            output: json!("ok"),
+            call_id: None,
+            is_error: None,
+            remote_id: None,
+        };
+        let raw = json!({"opaque":"native state"});
+        let mut req = CompletionRequest {
+            raw_history: vec![raw.clone()],
+            content: vec![result],
+            ..Default::default()
+        };
+        assert!(
+            assign_tool_call_ids(&mut req)
+                .unwrap_err()
+                .to_string()
+                .contains("Cannot pair")
+        );
+        assert_eq!(req.raw_history, vec![raw]);
+    }
 }

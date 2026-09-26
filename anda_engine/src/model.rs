@@ -205,6 +205,8 @@ pub struct ModelConfig {
 
     #[serde(default)]
     /// Whether to request streaming completions from this model.
+    /// The OpenAI Responses adapter always streams and aggregates the result,
+    /// regardless of this setting.
     pub stream: bool,
 }
 
@@ -1132,10 +1134,10 @@ pub fn request_client_builder() -> reqwest::ClientBuilder {
 
 const SSE_DONE_MARKER: &[u8] = b"data: [DONE]";
 
-pub(crate) async fn read_sse_json_events<T>(
+pub(crate) async fn read_completion_stream<T>(
     response: reqwest::Response,
     model: &str,
-) -> Result<Vec<T>, BoxError>
+) -> Result<(Vec<T>, bool), BoxError>
 where
     T: DeserializeOwned,
 {
@@ -1171,12 +1173,22 @@ where
         // streams are not rescanned from the start on every chunk.
         let start = scanned.saturating_sub(SSE_DONE_MARKER.len());
         if body_contains_sse_done(&body, start) {
-            return parse_streaming_json_events(&body, model);
+            return Ok((parse_streaming_json_events(&body, model)?, true));
         }
         scanned = body.len();
     }
 
-    parse_streaming_json_events(&body, model)
+    Ok((parse_streaming_json_events(&body, model)?, false))
+}
+
+#[cfg(test)]
+async fn read_sse_json_events<T: DeserializeOwned>(
+    response: reqwest::Response,
+    model: &str,
+) -> Result<Vec<T>, BoxError> {
+    read_completion_stream(response, model)
+        .await
+        .map(|(events, _)| events)
 }
 
 /// Returns true when a `data: [DONE]` line exists at or after `from`.
@@ -1350,6 +1362,73 @@ mod tests {
     use anda_core::FunctionDefinition;
     use http::{HeaderMap, HeaderValue, StatusCode};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn prematurely_closed_provider_streams_are_retried() {
+        use serde_json::json;
+        let chat = json!({"id":"r","model":"test","choices":[{"index":0,"delta":{"role":"assistant","content":"ok"}}]});
+        let gemini = json!({"candidates":[{"content":{"role":"model","parts":[{"text":"ok"}]}}]});
+        let anthropic = json!({"type":"message_start","message":{"id":"r","type":"message","role":"assistant","model":"test","content":[{"type":"text","text":"ok"}],"usage":{}}});
+        let cases = [
+            (
+                "openai",
+                vec![chat],
+                vec![json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]})],
+            ),
+            (
+                "gemini",
+                vec![gemini],
+                vec![json!({"candidates":[{"finishReason":"STOP"}]})],
+            ),
+            (
+                "anthropic",
+                vec![anthropic],
+                vec![
+                    json!({"type":"message_delta","delta":{"stop_reason":"end_turn"}}),
+                    json!({"type":"message_stop"}),
+                ],
+            ),
+        ];
+        for (family, initial, terminal) in cases {
+            let encode = |events: Vec<Json>| {
+                events
+                    .into_iter()
+                    .map(|event| format!("data: {event}\n\n"))
+                    .collect::<String>()
+                    .into_bytes()
+            };
+            let incomplete = test_support::MockResponse {
+                status: StatusCode::OK,
+                headers: test_support::sse_headers(),
+                body: encode(initial.clone()),
+            };
+            let complete = test_support::MockResponse {
+                body: encode(initial.into_iter().chain(terminal).collect()),
+                ..incomplete.clone()
+            };
+            let (endpoint, state) =
+                test_support::spawn_retry_mock_server(vec![incomplete, complete]).await;
+            let config = ModelConfig {
+                family: family.into(),
+                model: "test".into(),
+                api_base: endpoint,
+                api_key: "fake".into(),
+                stream: true,
+                ..Default::default()
+            };
+            let model = config.model(test_support::no_proxy_client()).unwrap();
+            let output = model
+                .completion(CompletionRequest {
+                    prompt: "hello".into(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(output.content, "ok", "{family}");
+            assert!(output.failed_reason.is_none(), "{family}");
+            assert_eq!(state.lock().unwrap().1, 2, "{family}");
+        }
+    }
 
     #[derive(Clone)]
     struct TestCompleter {

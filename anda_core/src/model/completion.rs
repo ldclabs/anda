@@ -129,6 +129,8 @@ pub struct CompletionRequest {
     pub output_schema: Option<Json>,
 
     /// The stop sequence to be sent to the completion model provider.
+    /// OpenAI's Responses adapter rejects non-empty sequences because that API
+    /// does not support them.
     pub stop: Option<Vec<String>>,
 
     /// The name or label of the model to be used for the completion request.

@@ -1153,6 +1153,18 @@ impl From<ContentPart> for ContentBlock {
                     cache_control: None,
                 }
             }
+            ContentPart::InlineData { mime_type, data } if mime_type == "application/pdf" => {
+                ContentBlock::Document {
+                    source: DocumentSource::Base64 {
+                        media_type: mime_type,
+                        data: data.to_base64(),
+                    },
+                    cache_control: None,
+                    citations: None,
+                    context: None,
+                    title: None,
+                }
+            }
             ContentPart::InlineData { mime_type, data } => match String::from_utf8(data.0) {
                 Ok(text) => ContentBlock::Document {
                     source: DocumentSource::Text {
@@ -1380,7 +1392,7 @@ impl From<FunctionDefinition> for Tool {
             defer_loading: None,
             eager_input_streaming: None,
             input_examples: None,
-            strict: None,
+            strict: def.strict,
         }
     }
 }
@@ -2342,7 +2354,7 @@ mod tests {
                 "additionalProperties": false
             }))
         );
-        assert!(tool.strict.is_none());
+        assert_eq!(tool.strict, Some(true));
     }
 
     #[test]

@@ -123,11 +123,43 @@ can be used when requesting definitions.
 
 Built-in provider adapters include:
 
-- `openai`: OpenAI-compatible Responses API style completion.
+- `openai`: Responses API for model names starting with `gpt`, otherwise Chat Completions.
+- `openai-response`: Explicit Responses API selection for any model name.
 - `anthropic`: Anthropic Messages API completion.
 - `gemini`: Google Gemini completion.
 
 Custom providers can implement `CompletionFeaturesDyn` and be wrapped with `Model::with_completer`.
+
+Completion adapter behavior:
+
+- Chat Completions sends `max_completion_tokens` for an explicit output budget.
+  A default request template containing only `max_tokens` opts into the legacy
+  field for compatible endpoints; DeepSeek model names also use that field.
+- Responses always uses streaming transport and `store: false`, then returns
+  the aggregated `AgentOutput`. Its `with_stream` setting is retained for source
+  compatibility but has no effect. Non-empty stop sequences return an error.
+- Incomplete streams return retryable errors. Chat accepts an explicit finish
+  reason or `[DONE]` (for compatible providers omitting the reason); Gemini
+  requires a finish reason or prompt blocking; Anthropic requires both a stop
+  reason and `message_stop`.
+- Anthropic maps minimal/low effort to `low`, and medium/high/max to their
+  corresponding API values. Gemini 2.5 maps minimal/low/medium/high/max to
+  budgets of 0/1024/4096/16384/24576 tokens; Pro uses 128 for minimal and 32768
+  for max. Gemini 3 uses thinking levels, mapping minimal to low on Pro and
+  medium to high on the original Gemini 3 Pro. Use a default request template
+  for other provider-specific settings. `ThinkingConfig::thinking_budget` is
+  signed so `-1` can request dynamic thinking.
+- Anthropic forwards `FunctionDefinition::strict` and closes objects in strict
+  tool and output schemas while preserving optional properties. Common
+  unsupported constraints (including numeric bounds and string lengths) return
+  a local error rather than being discarded. Use supported schemas, or
+  `strict: false` for tools that need schemas outside that subset.
+- Chat audio inputs must contain inline WAV/MP3 data. Remote audio/file URLs
+  and video input return errors; use Responses for remote file inputs.
+  Anthropic inline PDFs use Base64 regardless of whether their bytes are UTF-8.
+- OpenAI and Anthropic pair missing tool-call IDs when replaying neutral
+  history, including repeated calls to the same function. Existing IDs and
+  provider-native `raw_history` remain intact.
 
 ### Tools and Extensions
 

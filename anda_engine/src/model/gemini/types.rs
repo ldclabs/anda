@@ -119,7 +119,7 @@ impl GenerateContentResponse {
             ..Default::default()
         };
 
-        if let Some(feedback) = self.prompt_feedback {
+        if let Some(feedback) = self.prompt_feedback.filter(PromptFeedback::is_blocked) {
             output.failed_reason = serde_json::to_string(&feedback).ok();
         } else {
             let candidate = self.candidates.pop().ok_or("No completion choice")?;
@@ -150,7 +150,9 @@ impl GenerateContentResponse {
     }
 
     pub fn maybe_failed(&self) -> bool {
-        self.prompt_feedback.is_some()
+        self.prompt_feedback
+            .as_ref()
+            .is_some_and(PromptFeedback::is_blocked)
             || !self.candidates.iter().any(|candidate| {
                 !candidate.content.parts.is_empty()
                     && candidate
@@ -349,7 +351,7 @@ impl From<Part> for ContentPart {
             },
             PartKind::FunctionCall { name, args, id } => ContentPart::ToolCall {
                 name,
-                args: args.unwrap_or_default(),
+                args: args.unwrap_or_else(|| json!({})),
                 call_id: id,
             },
             PartKind::FunctionResponse {
@@ -546,9 +548,23 @@ impl From<Message> for Content {
 
 impl From<Content> for Message {
     fn from(content: Content) -> Self {
+        // Native parts (including signatures) are already in raw_history. Join
+        // adjacent neutral text fragments without inserting stream boundaries.
+        let mut parts = Vec::new();
+        for part in content.parts {
+            let part: ContentPart = part.into();
+            match (parts.last_mut(), part) {
+                (Some(ContentPart::Text { text: previous }), ContentPart::Text { text })
+                | (
+                    Some(ContentPart::Reasoning { text: previous }),
+                    ContentPart::Reasoning { text },
+                ) => previous.push_str(&text),
+                (_, part) => parts.push(part),
+            }
+        }
         Self {
             role: content.role.unwrap_or_default().to_string(),
-            content: content.parts.into_iter().map(|v| v.into()).collect(),
+            content: parts,
             ..Default::default()
         }
     }
@@ -1348,6 +1364,14 @@ pub struct PromptFeedback {
     pub safety_ratings: Option<Vec<SafetyRating>>,
 }
 
+impl PromptFeedback {
+    pub(crate) fn is_blocked(&self) -> bool {
+        self.block_reason
+            .as_ref()
+            .is_some_and(|reason| !matches!(reason, BlockReason::BlockReasonUnspecified))
+    }
+}
+
 /// Reason why a prompt was blocked by the model
 #[derive(Debug, Clone, Default, PartialEq)]
 pub enum BlockReason {
@@ -1433,9 +1457,10 @@ pub struct ThinkingConfig {
     /// Indicates whether to include thoughts in the response. If true, thoughts
     /// are returned only when available.
     pub include_thoughts: bool,
-    /// The number of thoughts tokens that the model should generate.
+    /// The thinking token budget. `-1` selects dynamic thinking; `0` disables
+    /// thinking on models that support it.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub thinking_budget: Option<u32>,
+    pub thinking_budget: Option<i32>,
     /// Controls the maximum depth of the model's internal reasoning process before it produces a response. If not specified, the default is HIGH. Recommended for Gemini 3 or later models. Use with earlier models results in an error.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking_level: Option<ThinkingLevel>,
@@ -2081,7 +2106,7 @@ mod tests {
             call_without_args,
             ContentPart::ToolCall {
                 name: "empty".to_string(),
-                args: Value::Null,
+                args: json!({}),
                 call_id: None
             }
         );

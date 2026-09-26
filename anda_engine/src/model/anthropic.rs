@@ -11,7 +11,7 @@ use anda_core::{
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-use super::driver::{SamplingOptions, WireFormat, drive_completion};
+use super::driver::{SamplingOptions, WireFormat, assign_tool_call_ids, drive_completion};
 use super::{CompletionFeaturesDyn, ModelEffort, ModelError, request_client_builder};
 
 pub mod types;
@@ -20,9 +20,9 @@ impl From<ModelEffort> for types::OutputEffort {
     fn from(value: ModelEffort) -> Self {
         match value {
             ModelEffort::Minimal => Self::Low,
-            ModelEffort::Low => Self::Medium,
-            ModelEffort::Medium => Self::High,
-            ModelEffort::High => Self::XHigh,
+            ModelEffort::Low => Self::Low,
+            ModelEffort::Medium => Self::Medium,
+            ModelEffort::High => Self::High,
             ModelEffort::Max => Self::Max,
         }
     }
@@ -97,13 +97,14 @@ impl Client {
     /// Creates a POST request builder for the specified API path
     fn post(&self, path: &str) -> reqwest::RequestBuilder {
         let url = format!("{}{}", self.endpoint, path);
+        let request = self
+            .http
+            .post(url)
+            .header("anthropic-version", &self.api_version);
         if self.bearer_auth {
-            self.http.post(url).bearer_auth(&self.api_key)
+            request.bearer_auth(&self.api_key)
         } else {
-            self.http
-                .post(url)
-                .header("x-api-key", &self.api_key)
-                .header("anthropic-version", &self.api_version)
+            request.header("x-api-key", &self.api_key)
         }
     }
 
@@ -363,6 +364,7 @@ fn response_from_stream_events(
     let mut content = Vec::<Option<types::ContentBlock>>::new();
     let mut json_buffers = BTreeMap::<usize, String>::new();
     let mut saw_message = false;
+    let mut saw_stop = false;
 
     for event in events {
         match event {
@@ -418,14 +420,19 @@ fn response_from_stream_events(
                     .with_retryable(retryable),
                 ));
             }
-            types::StreamEvent::MessageStop
-            | types::StreamEvent::Ping
-            | types::StreamEvent::Any(_) => {}
+            types::StreamEvent::MessageStop => saw_stop = true,
+            types::StreamEvent::Ping | types::StreamEvent::Any(_) => {}
         }
     }
 
     if !saw_message {
         return Err("No streamed Anthropic message".into());
+    }
+    if !saw_stop || stop_reason.is_none() {
+        return Err(Box::new(
+            ModelError::new("Anthropic stream ended before message_stop and stop_reason")
+                .with_retryable(true),
+        ));
     }
 
     Ok(types::CreateMessageResponse {
@@ -447,16 +454,101 @@ impl CompletionFeaturesDyn for CompletionModel {
         self.model.clone()
     }
 
-    fn completion(&self, req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
+    fn completion(&self, mut req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
         let model = self.model.clone();
         let client = self.client.clone();
         let mut r = self.default_request.clone();
         r.model = model.clone();
 
         Box::pin(async move {
+            assign_tool_call_ids(&mut req)?;
             drive_completion::<CompletionModel>(model, move |path| client.post(path), r, req).await
         })
     }
+}
+
+/// Close object schemas without making optional properties required. Reject
+/// common unsupported constraints rather than silently weakening the schema.
+fn normalize_output_schema(schema: &mut Value) -> Result<(), BoxError> {
+    let Some(map) = schema.as_object_mut() else {
+        return Ok(());
+    };
+    for key in [
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "multipleOf",
+        "minLength",
+        "maxLength",
+        "maxItems",
+        "uniqueItems",
+        "contains",
+        "minContains",
+        "maxContains",
+    ] {
+        if map.contains_key(key) {
+            return Err(format!(
+                "Anthropic structured outputs do not support schema constraint {key}"
+            )
+            .into());
+        }
+    }
+    if map
+        .get("minItems")
+        .is_some_and(|value| !matches!(value.as_u64(), Some(0 | 1)))
+    {
+        return Err("Anthropic structured outputs only support minItems of 0 or 1".into());
+    }
+    if map
+        .get("$ref")
+        .and_then(Value::as_str)
+        .is_some_and(|reference| !reference.starts_with('#'))
+    {
+        return Err(
+            "Anthropic structured outputs do not support external schema references".into(),
+        );
+    }
+    let object = map.contains_key("properties")
+        || match map.get("type") {
+            Some(Value::String(kind)) => kind == "object",
+            Some(Value::Array(kinds)) => kinds.iter().any(|kind| kind == "object"),
+            _ => false,
+        };
+    if object {
+        let additional = map
+            .entry("additionalProperties")
+            .or_insert(Value::Bool(false));
+        if *additional != Value::Bool(false) {
+            return Err("Anthropic structured outputs require additionalProperties: false".into());
+        }
+    }
+    for key in [
+        "properties",
+        "$defs",
+        "$def",
+        "definitions",
+        "patternProperties",
+    ] {
+        if let Some(Value::Object(children)) = map.get_mut(key) {
+            for child in children.values_mut() {
+                normalize_output_schema(child)?;
+            }
+        }
+    }
+    for key in ["items", "not", "if", "then", "else"] {
+        if let Some(child) = map.get_mut(key) {
+            normalize_output_schema(child)?;
+        }
+    }
+    for key in ["anyOf", "allOf", "oneOf", "prefixItems"] {
+        if let Some(Value::Array(children)) = map.get_mut(key) {
+            for child in children {
+                normalize_output_schema(child)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 impl WireFormat for CompletionModel {
@@ -479,7 +571,11 @@ impl WireFormat for CompletionModel {
         Ok(())
     }
 
-    fn apply_sampling(r: &mut Self::Request, options: SamplingOptions) -> Result<(), BoxError> {
+    fn apply_sampling(
+        r: &mut Self::Request,
+        options: SamplingOptions,
+        _model: &str,
+    ) -> Result<(), BoxError> {
         if let Some(temperature) = options.temperature {
             r.temperature = Some(temperature as f32);
         }
@@ -510,6 +606,27 @@ impl WireFormat for CompletionModel {
         });
     }
 
+    fn finalize_request(r: &mut Self::Request) -> Result<(), BoxError> {
+        if let Some(format) = r
+            .output_config
+            .as_mut()
+            .and_then(|config| config.format.as_mut())
+        {
+            normalize_output_schema(&mut format.schema)?;
+        }
+        for tool in r
+            .tools
+            .iter_mut()
+            .flatten()
+            .filter(|tool| tool.strict == Some(true))
+        {
+            if let Some(schema) = &mut tool.input_schema {
+                normalize_output_schema(schema)?;
+            }
+        }
+        Ok(())
+    }
+
     fn is_stream(r: &Self::Request) -> bool {
         r.stream == Some(true)
     }
@@ -518,7 +635,10 @@ impl WireFormat for CompletionModel {
         "/messages".to_string()
     }
 
-    fn aggregate_stream(items: Vec<Self::StreamItem>) -> Result<Self::Response, BoxError> {
+    fn aggregate_stream(
+        items: Vec<Self::StreamItem>,
+        _done: bool,
+    ) -> Result<Self::Response, BoxError> {
         response_from_stream_events(items)
     }
 
@@ -582,6 +702,127 @@ mod tests {
     use reqwest::header::ACCEPT;
     use serde_json::json;
 
+    #[test]
+    fn strict_schemas_close_objects_and_preserve_optional_fields() {
+        let schema = json!({"type":"object", "required":["id"], "properties":{
+            "id":{"type":"string"}, "optional":{"type":["object","null"], "properties":{"name":{"type":"string"}}},
+            "literal":{"type":"object", "properties":{}, "default":{"minimum":3}}
+        }});
+        let mut request = types::CreateMessageParams {
+            output_config: Some(types::OutputConfig {
+                effort: None,
+                format: Some(types::JsonOutputFormat {
+                    schema: schema.clone(),
+                    r#type: types::JsonOutputFormatType::JsonSchema,
+                }),
+            }),
+            ..Default::default()
+        };
+        <CompletionModel as WireFormat>::apply_tools(
+            &mut request,
+            vec![
+                FunctionDefinition {
+                    name: "lookup".into(),
+                    parameters: schema.clone(),
+                    strict: Some(true),
+                    ..Default::default()
+                },
+                FunctionDefinition {
+                    name: "ordinary".into(),
+                    parameters: json!({"type":"number","minimum":0}),
+                    strict: Some(false),
+                    ..Default::default()
+                },
+            ],
+            false,
+        );
+        <CompletionModel as WireFormat>::finalize_request(&mut request).unwrap();
+        let value = serde_json::to_value(request).unwrap();
+        let prepared = &value["output_config"]["format"]["schema"];
+        assert_eq!(prepared["required"], json!(["id"]));
+        assert_eq!(prepared["additionalProperties"], false);
+        assert_eq!(
+            prepared["properties"]["optional"]["additionalProperties"],
+            false
+        );
+        assert!(prepared["properties"]["optional"].get("required").is_none());
+        assert_eq!(
+            prepared["properties"]["literal"]["default"],
+            json!({"minimum":3})
+        );
+        assert_eq!(value["tools"][0]["input_schema"], *prepared);
+        assert_eq!(value["tools"][0]["strict"], true);
+        assert_eq!(value["tools"][1]["input_schema"]["minimum"], 0);
+        for mut invalid in [
+            json!({"type":"object","additionalProperties":true}),
+            json!({"type":"object","properties":{"n":{"type":"number","minimum":0}}}),
+            json!({"type":"array","minItems":2}),
+        ] {
+            assert!(normalize_output_schema(&mut invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn bearer_auth_keeps_the_configured_api_version() {
+        for bearer in [false, true] {
+            let request = Client::new_with_client("fake-key", None, no_proxy_client())
+                .with_bearer_auth(bearer)
+                .with_api_version("2023-06-01".into())
+                .post("/messages")
+                .build()
+                .unwrap();
+            assert_eq!(request.headers()["anthropic-version"], "2023-06-01");
+            assert_eq!(request.headers().contains_key("authorization"), bearer);
+            assert_eq!(request.headers().contains_key("x-api-key"), !bearer);
+        }
+    }
+
+    #[test]
+    fn pdf_encoding_does_not_depend_on_utf8_validity() {
+        for bytes in [b"%PDF-1.4\nASCII PDF".to_vec(), vec![0xff, 0xfe]] {
+            let data = anda_core::ByteBufB64(bytes);
+            let expected = data.to_base64();
+            let block: types::ContentBlock = ContentPart::InlineData {
+                mime_type: "application/pdf".into(),
+                data,
+            }
+            .into();
+            let value = serde_json::to_value(block).unwrap();
+            assert_eq!(
+                value["source"],
+                json!({"type":"base64","media_type":"application/pdf","data":expected})
+            );
+        }
+    }
+
+    #[test]
+    fn stream_needs_message_stop_before_exposing_tool_calls() {
+        let start = json!({"type":"message_start","message":{
+            "id":"msg", "type":"message", "role":"assistant", "model":"claude", "usage":{}, "content":[]
+        }});
+        let tool = json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call","name":"lookup","input":{}}});
+        let events = [
+            start,
+            tool,
+            json!({"type":"message_delta","delta":{"stop_reason":"tool_use"}}),
+        ];
+        let parse = || {
+            events
+                .iter()
+                .map(|event| serde_json::from_value(event.clone()).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let err = response_from_stream_events(parse()).unwrap_err();
+        assert!(crate::model::is_retryable_box_error(&err));
+        let mut complete = parse();
+        complete.push(types::StreamEvent::MessageStop);
+        let output = response_from_stream_events(complete)
+            .unwrap()
+            .try_into(vec![], vec![])
+            .unwrap();
+        assert_eq!(output.tool_calls.len(), 1);
+    }
+
     async fn complete(
         model: &CompletionModel,
         req: CompletionRequest,
@@ -623,15 +864,15 @@ mod tests {
         );
         assert_eq!(
             types::OutputEffort::from(ModelEffort::Low),
-            types::OutputEffort::Medium
+            types::OutputEffort::Low
         );
         assert_eq!(
             types::OutputEffort::from(ModelEffort::Medium),
-            types::OutputEffort::High
+            types::OutputEffort::Medium
         );
         assert_eq!(
             types::OutputEffort::from(ModelEffort::High),
-            types::OutputEffort::XHigh
+            types::OutputEffort::High
         );
         assert_eq!(
             types::OutputEffort::from(ModelEffort::Max),
@@ -909,7 +1150,7 @@ mod tests {
         assert_eq!(sent["stop_sequences"], json!(["END"]));
         assert_eq!(sent["tools"][0]["name"], "lookup");
         assert_eq!(sent["tool_choice"]["type"], "any");
-        assert_eq!(sent["output_config"]["effort"], "xhigh");
+        assert_eq!(sent["output_config"]["effort"], "high");
         assert_eq!(sent["output_config"]["format"]["type"], "json_schema");
         assert_eq!(
             sent["output_config"]["format"]["schema"],

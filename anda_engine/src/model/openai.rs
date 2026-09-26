@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, HashMap};
 
 pub mod types;
 
-use super::driver::{SamplingOptions, WireFormat, drive_completion};
+use super::driver::{SamplingOptions, WireFormat, assign_tool_call_ids, drive_completion};
 use super::{CompletionFeaturesDyn, ModelEffort, request_client_builder};
 use crate::unix_ms;
 
@@ -290,7 +290,8 @@ pub(crate) fn parse_tool_arguments(arguments: &str) -> Json {
 /// Reports whether a `finish_reason` indicates a usable completion.
 ///
 /// An empty string means the provider omitted the field or sent `null` (both map to `""` via
-/// `null_default`), and a stream can also end without any chunk carrying one. That is an
+/// `null_default`). Streams must separately prove completion with a finish reason or
+/// `[DONE]` before reaching this conversion. An omitted reason is an
 /// absent verdict, not a failure verdict — several OpenAI-compatible providers omit it — so
 /// it is treated as success. Classifying it as a failure would abort the run with a blank
 /// failure reason and withhold the turn's text, reasoning, and tool calls from the output.
@@ -764,34 +765,43 @@ fn media_content_part(
     mime_type: &str,
     url: impl FnOnce() -> Json,
     file_data: impl FnOnce() -> Json,
-) -> Json {
-    match mime_type {
+) -> Result<Json, BoxError> {
+    Ok(match mime_type {
         mt if mt.starts_with("image") => json!({
             "type": "image_url",
             "image_url": {
                 "url": url(),
             },
         }),
-        mt if mt.starts_with("video") => json!({
-            "type": "video_url",
-            "video_url": {
-                "url": url(),
-            },
-        }),
-        mt if mt.starts_with("audio") => json!({
-            "type": "input_audio",
-            "input_audio": {
-                "data": url(),
-                "format": if mt.contains("wav") { "wav" } else { "mp3" },
-            },
-        }),
-        _ => json!({
-            "type": "file",
-            "file": {
-                "file_data": file_data(),
-            },
-        }),
-    }
+        mt if mt.starts_with("video") => {
+            return Err("OpenAI Chat Completions does not support video input".into());
+        }
+        mt if mt.starts_with("audio") => {
+            let format = match mt {
+                "audio/wav" | "audio/x-wav" | "audio/wave" => "wav",
+                "audio/mpeg" | "audio/mp3" => "mp3",
+                _ => return Err("OpenAI Chat Completions audio input requires WAV or MP3".into()),
+            };
+            let value = url();
+            let (data, _) = value.as_str().and_then(inline_data_from_data_url).ok_or(
+                "OpenAI Chat Completions audio input requires inline data, not a remote URL",
+            )?;
+            json!({"type": "input_audio", "input_audio": {"data": data.to_base64(), "format": format}})
+        }
+        _ => {
+            let data = file_data();
+            if data
+                .as_str()
+                .is_some_and(|data| data.starts_with("https://") || data.starts_with("http://"))
+            {
+                return Err("OpenAI Chat Completions does not support file URLs; use inline data or the Responses adapter".into());
+            }
+            json!({"type": "file", "file": {
+                "file_data": data,
+                "filename": if mime_type == "application/pdf" { "attachment.pdf" } else { "attachment" },
+            }})
+        }
+    })
 }
 
 fn chat_completion_text_content_part_from_json(value: &Json) -> Json {
@@ -811,7 +821,7 @@ fn chat_completion_content_part_from_any(value: &Json) -> Json {
     }
 }
 
-fn to_message_inputs(msg: &Message) -> Vec<MessageInput> {
+fn to_message_inputs(msg: &Message) -> Result<Vec<MessageInput>, BoxError> {
     let mut messages: Vec<MessageInput> = Vec::new();
     let mut content: Vec<Json> = Vec::new();
     let mut tool_calls: Vec<ToolCallOutput> = Vec::new();
@@ -854,14 +864,14 @@ fn to_message_inputs(msg: &Message) -> Vec<MessageInput> {
                     mime_type.as_deref().unwrap_or_default(),
                     || json!(file_uri),
                     || json!(file_uri),
-                ));
+                )?);
             }
             ContentPart::InlineData { data, mime_type } => {
                 content.push(media_content_part(
                     mime_type,
                     || json!(part_to_data_url(data, Some(mime_type))),
-                    || json!(data),
-                ));
+                    || json!(part_to_data_url(data, Some(mime_type))),
+                )?);
             }
             ContentPart::Any(json) => content.push(chat_completion_content_part_from_any(json)),
             v => content.push(json!({
@@ -871,7 +881,7 @@ fn to_message_inputs(msg: &Message) -> Vec<MessageInput> {
         }
     }
     push_message_input(&mut messages, msg, &mut content, &mut tool_calls);
-    messages
+    Ok(messages)
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -889,6 +899,8 @@ pub struct Choice {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ChatCompletionStreamChunk {
+    #[serde(default)]
+    error: Option<Json>,
     #[serde(default)]
     id: String,
     #[serde(default)]
@@ -1145,6 +1157,7 @@ impl ChatCompletionChoiceStreamBuilder {
 
 fn chat_completion_response_from_stream_chunks(
     chunks: Vec<ChatCompletionStreamChunk>,
+    done: bool,
 ) -> Result<CompletionResponse, BoxError> {
     let mut id = String::new();
     let mut object = String::new();
@@ -1156,6 +1169,16 @@ fn chat_completion_response_from_stream_chunks(
     let mut choices = BTreeMap::<usize, ChatCompletionChoiceStreamBuilder>::new();
 
     for chunk in chunks {
+        if let Some(error) = chunk.error {
+            let retryable = matches!(
+                error.get("code").and_then(Json::as_str),
+                Some("server_error" | "rate_limit_exceeded")
+            );
+            return Err(Box::new(
+                super::ModelError::new(format!("Completion stream failed: {error}"))
+                    .with_retryable(retryable),
+            ));
+        }
         if id.is_empty() {
             id = chunk.id;
         }
@@ -1192,6 +1215,16 @@ fn chat_completion_response_from_stream_chunks(
 
     if choices.is_empty() {
         return Err("No streamed completion choice".into());
+    }
+    if !done
+        && choices
+            .values()
+            .any(|choice| choice.finish_reason.is_empty())
+    {
+        return Err(Box::new(
+            super::ModelError::new("Completion stream ended before finish_reason or [DONE]")
+                .with_retryable(true),
+        ));
     }
     if object == "chat.completion.chunk" || object.is_empty() {
         object = "chat.completion".to_string();
@@ -1596,6 +1629,9 @@ impl CompletionModel {
     }
 
     /// Sets a default request template for the model
+    ///
+    /// Setting only `max_tokens` opts into that legacy budget field. Otherwise
+    /// per-request output budgets use `max_completion_tokens` (except DeepSeek).
     pub fn with_default_request(mut self, req: ChatCompletionRequest) -> Self {
         self.default_request = req;
         self
@@ -1607,13 +1643,14 @@ impl CompletionFeaturesDyn for CompletionModel {
         self.model.clone()
     }
 
-    fn completion(&self, req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
+    fn completion(&self, mut req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
         let model = self.model.clone();
         let client = self.client.clone();
         let mut r = self.default_request.clone();
         r.model = model.clone();
 
         Box::pin(async move {
+            assign_tool_call_ids(&mut req)?;
             drive_completion::<CompletionModel>(model, move |path| client.post(path), r, req).await
         })
     }
@@ -1640,18 +1677,32 @@ impl WireFormat for CompletionModel {
     }
 
     fn push_message(r: &mut Self::Request, msg: Message) -> Result<(), BoxError> {
-        for input in to_message_inputs(&msg) {
+        for input in to_message_inputs(&msg)? {
             r.messages.push(serde_json::to_value(input)?);
         }
         Ok(())
     }
 
-    fn apply_sampling(r: &mut Self::Request, options: SamplingOptions) -> Result<(), BoxError> {
+    fn apply_sampling(
+        r: &mut Self::Request,
+        options: SamplingOptions,
+        _model: &str,
+    ) -> Result<(), BoxError> {
         if let Some(temperature) = options.temperature {
             r.temperature = Some(temperature);
         }
         if let Some(max_tokens) = options.max_output_tokens {
-            r.max_tokens = Some(max_tokens as u64);
+            // An explicitly configured legacy field is an opt-in for compatible
+            // endpoints that have not adopted max_completion_tokens.
+            if (r.max_tokens.is_some() && r.max_completion_tokens.is_none())
+                || r.model.starts_with("deepseek")
+            {
+                r.max_tokens = Some(max_tokens as u64);
+                r.max_completion_tokens = None;
+            } else {
+                r.max_completion_tokens = Some(max_tokens as u64);
+                r.max_tokens = None;
+            }
         }
         if let Some(effort) = options.effort {
             r.reasoning_effort = Some(effort.into());
@@ -1689,7 +1740,10 @@ impl WireFormat for CompletionModel {
         }
     }
 
-    fn finalize_request(r: &mut Self::Request) {
+    fn finalize_request(r: &mut Self::Request) -> Result<(), BoxError> {
+        if r.max_completion_tokens.is_some() {
+            r.max_tokens = None;
+        }
         // Real OpenAI streaming omits usage unless `stream_options.include_usage`
         // is requested, which would leave billing and context budgeting at 0.
         if r.stream == Some(true) && r.stream_options.is_none() {
@@ -1698,6 +1752,7 @@ impl WireFormat for CompletionModel {
                 ..Default::default()
             });
         }
+        Ok(())
     }
 
     fn is_stream(r: &Self::Request) -> bool {
@@ -1708,8 +1763,11 @@ impl WireFormat for CompletionModel {
         "/chat/completions".to_string()
     }
 
-    fn aggregate_stream(items: Vec<Self::StreamItem>) -> Result<Self::Response, BoxError> {
-        chat_completion_response_from_stream_chunks(items)
+    fn aggregate_stream(
+        items: Vec<Self::StreamItem>,
+        done: bool,
+    ) -> Result<Self::Response, BoxError> {
+        chat_completion_response_from_stream_chunks(items, done)
     }
 
     fn parse_response(
@@ -1783,7 +1841,8 @@ impl CompletionModelV2 {
         }
     }
 
-    /// Sets whether the completion request should run in streaming mode
+    /// Retained for source compatibility. The Responses adapter always streams
+    /// and aggregates a complete response; this argument has no effect.
     pub fn with_stream(mut self, stream: bool) -> Self {
         self.default_request.stream = Some(stream);
         self
@@ -1818,13 +1877,14 @@ impl CompletionFeaturesDyn for CompletionModelV2 {
         self.model.clone()
     }
 
-    fn completion(&self, req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
+    fn completion(&self, mut req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
         let model = self.model.clone();
         let client = self.client.clone();
         let mut r = self.default_request.clone();
         r.model = model.clone();
 
         Box::pin(async move {
+            assign_tool_call_ids(&mut req)?;
             drive_completion::<CompletionModelV2>(model, move |path| client.post(path), r, req)
                 .await
         })
@@ -1852,7 +1912,11 @@ impl WireFormat for CompletionModelV2 {
         Ok(())
     }
 
-    fn apply_sampling(r: &mut Self::Request, options: SamplingOptions) -> Result<(), BoxError> {
+    fn apply_sampling(
+        r: &mut Self::Request,
+        options: SamplingOptions,
+        _model: &str,
+    ) -> Result<(), BoxError> {
         if let Some(temperature) = options.temperature {
             r.temperature = Some(temperature);
         }
@@ -1875,6 +1939,9 @@ impl WireFormat for CompletionModelV2 {
                 "structured_output".to_string(),
                 output_schema,
             ));
+        }
+        if options.stop.is_some_and(|stop| !stop.is_empty()) {
+            return Err("The OpenAI Responses API does not support stop sequences".into());
         }
         Ok(())
     }
@@ -1904,11 +1971,12 @@ impl WireFormat for CompletionModelV2 {
         });
     }
 
-    fn finalize_request(r: &mut Self::Request) {
+    fn finalize_request(r: &mut Self::Request) -> Result<(), BoxError> {
         // The Responses API adapter always streams and never stores responses,
         // regardless of `with_stream` or `with_default_request` overrides.
         r.stream = Some(true);
         r.additional_parameters.store = Some(false);
+        Ok(())
     }
 
     fn is_stream(r: &Self::Request) -> bool {
@@ -1919,7 +1987,10 @@ impl WireFormat for CompletionModelV2 {
         "/responses".to_string()
     }
 
-    fn aggregate_stream(items: Vec<Self::StreamItem>) -> Result<Self::Response, BoxError> {
+    fn aggregate_stream(
+        items: Vec<Self::StreamItem>,
+        _done: bool,
+    ) -> Result<Self::Response, BoxError> {
         responses_response_from_stream_events(items)
     }
 
@@ -1970,6 +2041,176 @@ mod tests {
     use http::{HeaderMap, Method, StatusCode};
     use reqwest::header::ACCEPT;
     use serde_json::{Map, json};
+
+    #[test]
+    fn completion_budget_supports_an_explicit_legacy_template() {
+        for (legacy, modern) in [(None, None), (Some(12), None), (Some(12), Some(13))] {
+            let mut request = ChatCompletionRequest {
+                max_tokens: legacy,
+                max_completion_tokens: modern,
+                ..Default::default()
+            };
+            <CompletionModel as WireFormat>::apply_sampling(
+                &mut request,
+                SamplingOptions {
+                    max_output_tokens: Some(99),
+                    temperature: None,
+                    effort: None,
+                    output_schema: None,
+                    stop: None,
+                },
+                "o3",
+            )
+            .unwrap();
+            <CompletionModel as WireFormat>::finalize_request(&mut request).unwrap();
+            if legacy.is_some() && modern.is_none() {
+                assert_eq!(request.max_tokens, Some(99));
+                assert!(request.max_completion_tokens.is_none());
+            } else {
+                assert_eq!(request.max_completion_tokens, Some(99));
+                assert!(request.max_tokens.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn chat_stream_eof_is_not_a_completion_but_done_supports_compatible_providers() {
+        for delta in [
+            json!({"content":"partial"}),
+            json!({"tool_calls":[{
+                "index":0,"id":"call","type":"function","function":{"name":"lookup","arguments":"{"}
+            }]}),
+        ] {
+            let chunk =
+                || serde_json::from_value(json!({"choices":[{"index":0,"delta":delta}]})).unwrap();
+            let err =
+                chat_completion_response_from_stream_chunks(vec![chunk()], false).unwrap_err();
+            assert!(crate::model::is_retryable_box_error(&err));
+        }
+        let chunk = serde_json::from_value(
+            json!({"choices":[{"index":0,"delta":{"role":"assistant","content":"complete"}}]}),
+        )
+        .unwrap();
+        let output = chat_completion_response_from_stream_chunks(vec![chunk], true)
+            .unwrap()
+            .try_into(vec![], vec![])
+            .unwrap();
+        assert_eq!(output.content, "complete");
+        assert!(output.failed_reason.is_none());
+        let error =
+            serde_json::from_value(json!({"error":{"code":"server_error","message":"retry"}}))
+                .unwrap();
+        assert!(crate::model::is_retryable_box_error(
+            &chat_completion_response_from_stream_chunks(vec![error], true).unwrap_err()
+        ));
+    }
+
+    #[tokio::test]
+    async fn responses_reject_unsupported_stop_sequences_before_connecting() {
+        let model =
+            Client::new_with_client("fake", Some("http://127.0.0.1:1".into()), no_proxy_client())
+                .completion_model_v2("test");
+        let error = model
+            .completion(CompletionRequest {
+                prompt: "hi".into(),
+                stop: Some(vec!["END".into()]),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not support stop sequences")
+        );
+    }
+
+    #[tokio::test]
+    async fn adapters_pair_foreign_idless_tool_history_and_preserve_native_prefix() {
+        for responses in [false, true] {
+            let body = if responses {
+                format!(
+                    "data: {}\n\n",
+                    json!({"type":"response.completed","response":{"id":"r","created_at":1,"model":"test","output":[],"status":"completed"}})
+                )
+            } else {
+                json!({"id":"r","object":"chat.completion","created":1,"model":"test","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}).to_string()
+            };
+            let (endpoint, state) = spawn_mock_server(
+                StatusCode::OK,
+                if responses {
+                    sse_headers()
+                } else {
+                    HeaderMap::new()
+                },
+                body,
+            )
+            .await;
+            let client = Client::new_with_client("fake", Some(endpoint), no_proxy_client());
+            let model: Box<dyn CompletionFeaturesDyn> = if responses {
+                Box::new(client.completion_model_v2("test"))
+            } else {
+                Box::new(client.completion_model("test"))
+            };
+            let prefix = if responses {
+                json!({"type":"message","role":"user","content":[{"type":"input_text","text":"original"}]})
+            } else {
+                json!({"role":"user","content":"original"})
+            };
+            let call = |id: Option<&str>| ContentPart::ToolCall {
+                name: "lookup".into(),
+                args: json!({}),
+                call_id: id.map(str::to_string),
+            };
+            let result = |id: Option<&str>| ContentPart::ToolOutput {
+                name: "lookup".into(),
+                output: json!("ok"),
+                call_id: id.map(str::to_string),
+                is_error: None,
+                remote_id: None,
+            };
+            model
+                .completion(CompletionRequest {
+                    raw_history: vec![prefix.clone()],
+                    chat_history: vec![Message {
+                        role: "assistant".into(),
+                        content: vec![call(None), call(None), call(Some("keep"))],
+                        ..Default::default()
+                    }],
+                    role: Some("tool".into()),
+                    content: vec![result(None), result(None), result(Some("keep"))],
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let request: Json = serde_json::from_slice(&recorded(&state).body).unwrap();
+            let messages = if responses {
+                &request["input"]
+            } else {
+                &request["messages"]
+            };
+            assert_eq!(messages[0], prefix);
+            let (ids, results): (Vec<_>, Vec<_>) = if responses {
+                (
+                    (1..=3).map(|i| messages[i]["call_id"].clone()).collect(),
+                    (4..=6).map(|i| messages[i]["call_id"].clone()).collect(),
+                )
+            } else {
+                (
+                    (0..3)
+                        .map(|i| messages[1]["tool_calls"][i]["id"].clone())
+                        .collect(),
+                    (2..=4)
+                        .map(|i| messages[i]["tool_call_id"].clone())
+                        .collect(),
+                )
+            };
+            assert_eq!(ids, results);
+            assert_ne!(ids[0], ids[1]);
+            assert!(!ids[0].as_str().unwrap().is_empty());
+            assert_eq!(ids[2], "keep");
+        }
+    }
 
     #[test]
     fn client_defaults_usage_display_service_tier_and_effort_mappings() {
@@ -2030,61 +2271,64 @@ mod tests {
     }
 
     #[test]
-    fn to_message_inputs_serializes_remote_and_inline_media_variants() {
+    fn chat_media_inputs_use_provider_encodings() {
         let msg = Message {
-            role: "user".to_string(),
+            role: "user".into(),
             content: vec![
                 ContentPart::FileData {
-                    file_uri: "https://example.test/image.png".to_string(),
-                    mime_type: Some("image/png".to_string()),
+                    file_uri: "https://example.test/image.png".into(),
+                    mime_type: Some("image/png".into()),
+                },
+                ContentPart::InlineData {
+                    mime_type: "audio/mpeg".into(),
+                    data: vec![7, 8, 9].into(),
                 },
                 ContentPart::FileData {
-                    file_uri: "https://example.test/video.mp4".to_string(),
-                    mime_type: Some("video/mp4".to_string()),
-                },
-                ContentPart::FileData {
-                    file_uri: "https://example.test/audio.wav".to_string(),
-                    mime_type: Some("audio/wav".to_string()),
-                },
-                ContentPart::FileData {
-                    file_uri: "https://example.test/file.bin".to_string(),
-                    mime_type: Some("application/octet-stream".to_string()),
+                    file_uri: "data:audio/wav;base64,AQID".into(),
+                    mime_type: Some("audio/wav".into()),
                 },
                 ContentPart::InlineData {
-                    mime_type: "image/png".to_string(),
-                    data: ic_auth_types::ByteBufB64(vec![1, 2, 3]),
-                },
-                ContentPart::InlineData {
-                    mime_type: "video/mp4".to_string(),
-                    data: ic_auth_types::ByteBufB64(vec![4, 5, 6]),
-                },
-                ContentPart::InlineData {
-                    mime_type: "audio/mpeg".to_string(),
-                    data: ic_auth_types::ByteBufB64(vec![7, 8, 9]),
-                },
-                ContentPart::InlineData {
-                    mime_type: "application/octet-stream".to_string(),
-                    data: ic_auth_types::ByteBufB64(vec![10, 11, 12]),
+                    mime_type: "application/pdf".into(),
+                    data: b"%PDF-1.4".to_vec().into(),
                 },
             ],
             ..Default::default()
         };
+        let value = serde_json::to_value(to_message_inputs(&msg).unwrap()).unwrap();
+        let parts = &value[0]["content"];
+        assert_eq!(
+            parts[0]["image_url"]["url"],
+            "https://example.test/image.png"
+        );
+        assert_eq!(
+            parts[1]["input_audio"],
+            json!({"format":"mp3", "data":"BwgJ"})
+        );
+        assert_eq!(
+            parts[2]["input_audio"],
+            json!({"format":"wav", "data":"AQID"})
+        );
+        assert_eq!(
+            parts[3]["file"],
+            json!({"filename":"attachment.pdf", "file_data":"data:application/pdf;base64,JVBERi0xLjQ="})
+        );
 
-        let inputs = to_message_inputs(&msg);
-        assert_eq!(inputs.len(), 1);
-        let value = serde_json::to_value(&inputs[0]).unwrap();
-        let content = value["content"].as_array().unwrap();
-
-        assert_eq!(content[0]["type"], "image_url");
-        assert_eq!(content[1]["type"], "video_url");
-        assert_eq!(content[2]["type"], "input_audio");
-        assert_eq!(content[2]["input_audio"]["format"], "wav");
-        assert_eq!(content[3]["type"], "file");
-        assert_eq!(content[4]["type"], "image_url");
-        assert_eq!(content[5]["type"], "video_url");
-        assert_eq!(content[6]["type"], "input_audio");
-        assert_eq!(content[6]["input_audio"]["format"], "mp3");
-        assert_eq!(content[7]["type"], "file");
+        for (mime, uri) in [
+            ("audio/wav", "https://example.test/audio.wav"),
+            ("application/pdf", "https://example.test/file.pdf"),
+            ("video/mp4", "https://example.test/video.mp4"),
+            ("audio/ogg", "data:audio/ogg;base64,AQID"),
+        ] {
+            let msg = Message {
+                role: "user".into(),
+                content: vec![ContentPart::FileData {
+                    file_uri: uri.into(),
+                    mime_type: Some(mime.into()),
+                }],
+                ..Default::default()
+            };
+            assert!(to_message_inputs(&msg).is_err(), "{mime}");
+        }
     }
 
     #[test]
@@ -2146,7 +2390,7 @@ mod tests {
             .unwrap(),
         ];
 
-        let response = chat_completion_response_from_stream_chunks(chunks).unwrap();
+        let response = chat_completion_response_from_stream_chunks(chunks, false).unwrap();
         assert_eq!(response.service_tier, Some(ServiceTier::Priority));
         assert_eq!(response.system_fingerprint.as_deref(), Some("fp_stream"));
         let choice = &response.choices[0];
@@ -2171,7 +2415,7 @@ mod tests {
         );
 
         assert!(
-            chat_completion_response_from_stream_chunks(Vec::new())
+            chat_completion_response_from_stream_chunks(Vec::new(), false)
                 .unwrap_err()
                 .to_string()
                 .contains("No streamed completion choice")
@@ -2290,7 +2534,8 @@ mod tests {
         assert_eq!(sent["messages"][0]["role"], "system");
         assert_eq!(sent["messages"][1]["role"], "user");
         assert_eq!(sent["temperature"], 0.2);
-        assert_eq!(sent["max_tokens"], 64);
+        assert_eq!(sent["max_completion_tokens"], 64);
+        assert!(sent.get("max_tokens").is_none());
         assert_eq!(sent["stop"], json!(["END"]));
         assert_eq!(sent["reasoning_effort"], "low");
         assert_eq!(sent["response_format"]["type"], "json_schema");
@@ -2730,6 +2975,7 @@ mod tests {
         };
 
         let values = to_message_inputs(&msg)
+            .unwrap()
             .into_iter()
             .map(serde_json::to_value)
             .collect::<Result<Vec<_>, _>>()
@@ -2774,6 +3020,7 @@ mod tests {
         };
 
         let values = to_message_inputs(&msg)
+            .unwrap()
             .into_iter()
             .map(serde_json::to_value)
             .collect::<Result<Vec<_>, _>>()
@@ -2803,6 +3050,7 @@ mod tests {
         };
 
         let values = to_message_inputs(&msg)
+            .unwrap()
             .into_iter()
             .map(serde_json::to_value)
             .collect::<Result<Vec<_>, _>>()
@@ -2836,6 +3084,7 @@ mod tests {
         };
 
         let values = to_message_inputs(&msg)
+            .unwrap()
             .into_iter()
             .map(serde_json::to_value)
             .collect::<Result<Vec<_>, _>>()
@@ -3092,7 +3341,7 @@ mod tests {
             .unwrap(),
         ];
 
-        let response = chat_completion_response_from_stream_chunks(chunks).unwrap();
+        let response = chat_completion_response_from_stream_chunks(chunks, false).unwrap();
         assert!(!response.maybe_failed());
 
         let output = response.try_into(vec![], vec![]).unwrap();
@@ -3138,7 +3387,7 @@ mod tests {
             .unwrap(),
         ];
 
-        let response = chat_completion_response_from_stream_chunks(chunks).unwrap();
+        let response = chat_completion_response_from_stream_chunks(chunks, false).unwrap();
         assert!(matches!(
             response.service_tier,
             Some(ServiceTier::Other(ref tier)) if tier == "economy"
@@ -3365,7 +3614,7 @@ mod tests {
             }))
             .unwrap(),
         ];
-        let chat_response = chat_completion_response_from_stream_chunks(chunks).unwrap();
+        let chat_response = chat_completion_response_from_stream_chunks(chunks, false).unwrap();
         assert_eq!(chat_response.object, "custom.chunk");
         assert_eq!(
             chat_response.choices[0].logprobs.as_ref().unwrap().content[0].top_logprobs[0].token,
