@@ -29,7 +29,7 @@ Anda は、モデル、ツール、メモリ、ほかのエージェントを 1 
    `BaseCtx` と `AgentCtx` は、各 agent または tool に対して、分離された state、cache、object storage、HTTP calls、signed calls、cancellation、child contexts を提供します。
 
 5. **拡張可能なメモリとスキル**
-   オプションの extensions は、conversation storage、KIP ベースの memory tools、filesystem、shell、fetch、notes、todos、ファイルベースの skills を提供します。
+   オプションの extensions は、conversation storage、KIP ベースの memory tools、filesystem、shell、fetch、notes、todos、ファイルベースの skills を提供します。コーディング agent は、出力制限、プロセス管理、任意の macOS/Linux プロセスサンドボックスに対応する shell/session/patch ツールセットを選択できます。ファイル操作に限定する agent は shell を登録せずに利用できます。
 
 6. **発見フローに対応したツールバンドル**
    静的 tools、動的 providers、MCP servers は capability groups を公開できるため、agents は `tools_groups` で関連ツールのまとまりを確認し、schema が必要になった時だけ `tools_select` で group を展開できます。

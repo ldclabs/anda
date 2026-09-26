@@ -29,7 +29,7 @@ Anda 是一个用于构建 AI 智能体的 Rust 框架，可以把模型、工�
    `BaseCtx` 和 `AgentCtx` 为每个 agent 或 tool 提供隔离 state、cache、object storage、HTTP 调用、signed calls、cancellation 和 child contexts。
 
 5. **可扩展的记忆与技能**
-   可选 extensions 提供 conversation storage、基于 KIP 的 memory tools、filesystem、shell、fetch、notes、todos，以及文件驱动的 skills。
+   可选 extensions 提供 conversation storage、基于 KIP 的 memory tools、filesystem、shell、fetch、notes、todos，以及文件驱动的 skills。编码 agent 可选用 shell/session/patch 工具组合，支持有界输出、进程监管和可选的 macOS/Linux 进程沙箱；受限文件 agent 可以只注册文件工具，不开放 shell。
 
 6. **支持发现流程的工具组**
    静态 tools、动态 providers 和 MCP servers 可以暴露 capability groups，让 agents 先用 `tools_groups` 浏览相关工具包，再在需要 schema 时通过 `tools_select` 展开某个 group。

@@ -131,18 +131,13 @@ impl Tool<BaseCtx> for EditFileTool {
                 .into());
             }
 
-            let target = scope.open_edit(&args.path).await?;
+            let resolved = super::resolve_write_path_in_workspaces(scope.roots(), &args.path).await?;
+            let _guards = super::locks::lock_paths([resolved.path.as_path()], &ctx.cancellation_token()).await?;
+            let mut target = scope.open_edit(&args.path).await?;
             let workspace_display = target.workspace.display().to_string();
-            let resolved_path = &target.path;
+            let resolved_path = target.path.clone();
 
-            let data = tokio::fs::read(resolved_path).await.map_err(|err| {
-                format!(
-                    "Failed to read file (workspace: {}, requested_path: {}, resolved_path: {}): {err}",
-                    workspace_display,
-                    args.path,
-                    resolved_path.display()
-                )
-            })?;
+            let data = target.read_bytes().await?;
             let original_size = data.len() as u64;
             let decoded = decode_file_text(data).map_err(|_| {
                 format!(

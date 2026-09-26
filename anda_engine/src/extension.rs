@@ -67,6 +67,7 @@ pub mod note;
 pub mod shell;
 pub mod skill;
 pub mod todo;
+pub mod workspace;
 
 /// Builds a strict [`FunctionDefinition`] from a typed argument schema.
 ///
@@ -171,6 +172,18 @@ mod tests {
             EditFileTool::new(dir.clone()).definition(),
             WriteFileTool::new(dir.clone()).definition(),
             SearchFileTool::new(dir.clone()).definition(),
+            fs::ApplyPatchTool::new(dir.clone()).definition(),
+            shell::ShellCommandTool::new(
+                Arc::new(StubRuntime {
+                    workspace: dir.clone(),
+                }),
+                vec![],
+            )
+            .definition(),
+            shell::ShellSessionTool::new(Arc::new(StubRuntime {
+                workspace: dir.clone(),
+            }))
+            .definition(),
             TodoTool::new().definition(),
             NoteTool::new().definition(),
             ShellTool::new(
@@ -213,7 +226,7 @@ mod tests {
     #[test]
     fn extension_tool_definitions_are_strict_and_union_free() {
         let definitions = extension_tool_definitions();
-        assert_eq!(definitions.len(), 9);
+        assert_eq!(definitions.len(), 12);
 
         for definition in definitions {
             let tool = &definition.name;

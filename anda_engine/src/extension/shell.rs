@@ -26,10 +26,16 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+mod command;
 /// Host runtime implementation.
 pub mod native;
+mod output;
+mod sandbox;
 
-pub use native::NativeRuntime;
+pub use command::*;
+pub use native::{NativeRuntime, NativeShell};
+pub use output::{DEFAULT_OUTPUT_BYTES, OutputPreview, preview_output};
+pub use sandbox::{SandboxNetwork, SandboxPolicy};
 
 use crate::{
     context::BaseCtx,
@@ -79,6 +85,29 @@ const SAFE_ENV_VARS: &[&str] = &[
 /// Runtime abstraction used by [`ShellTool`] to execute shell commands.
 #[async_trait]
 pub trait Executor: Send + Sync {
+    /// Optional process-session capabilities. Legacy executors remain valid.
+    fn capabilities(&self) -> ExecutorCapabilities {
+        ExecutorCapabilities::default()
+    }
+
+    /// Starts a bounded process session. Executors must reject unsupported options.
+    async fn execute_session(
+        &self,
+        _ctx: BaseCtx,
+        _input: CommandArgs,
+        _envs: HashMap<String, String>,
+    ) -> Result<CommandOutput, BoxError> {
+        Err("This executor does not support process sessions".into())
+    }
+
+    /// Interacts with a session after verifying its host-created scope and caller.
+    async fn interact_session(
+        &self,
+        _ctx: BaseCtx,
+        _input: SessionArgs,
+    ) -> Result<SessionOutput, BoxError> {
+        Err("This executor does not support process sessions".into())
+    }
     /// Return the human-readable name of this runtime environment.
     ///
     /// Used in logs and diagnostics (e.g., `"native"`, `"sandbox"`).
@@ -322,11 +351,11 @@ impl ShellTool {
         if self.runtime.name() == "native" {
             // For native runtime, we allow safe environment variables from the host process
             for key in SAFE_ENV_VARS {
-                let candidate = key.trim();
-                if candidate.is_empty() || !is_valid_env_var_name(candidate) {
+                let candidate = normalized_env_key(key);
+                if candidate.is_empty() || !is_valid_env_var_name(candidate.as_ref()) {
                     continue;
                 }
-                if let Ok(val) = std::env::var(candidate) {
+                if let Ok(val) = std::env::var(candidate.as_ref()) {
                     out.insert(candidate.to_string(), val);
                 }
             }
@@ -339,12 +368,12 @@ impl ShellTool {
         }
 
         for key in env_keys.iter() {
-            let candidate = key.trim();
-            if candidate.is_empty() || !is_valid_env_var_name(candidate) {
+            let candidate = normalized_env_key(key);
+            if candidate.is_empty() || !is_valid_env_var_name(candidate.as_ref()) {
                 continue;
             }
-            if !out.contains_key(candidate)
-                && let Some(env) = self.envs.iter().find(|env| env.key == candidate)
+            if !out.contains_key(candidate.as_ref())
+                && let Some(env) = self.envs.iter().find(|env| env.key == candidate.as_ref())
             {
                 out.insert(candidate.to_string(), env.value.clone());
             }
@@ -436,10 +465,21 @@ impl Tool<BaseCtx> for ShellTool {
     }
 }
 
+fn normalized_env_key(key: &str) -> std::borrow::Cow<'_, str> {
+    #[cfg(windows)]
+    {
+        std::borrow::Cow::Owned(key.trim().to_ascii_uppercase())
+    }
+    #[cfg(not(windows))]
+    {
+        std::borrow::Cow::Borrowed(key.trim())
+    }
+}
+
 fn normalize_custom_envs(envs: Vec<CustomEnv>) -> Vec<CustomEnv> {
     let mut by_key = HashMap::new();
     for mut env in envs {
-        env.key = env.key.trim().to_string();
+        env.key = normalized_env_key(&env.key).into_owned();
         env.description = env.description.trim().to_string();
         if env.key.is_empty() || !is_valid_env_var_name(&env.key) {
             continue;
@@ -524,9 +564,11 @@ fn format_output_preview(
         }
     };
     let max_preview_bytes = MAX_OUTPUT_BYTES.saturating_sub(detail.len() + 64);
-    let cutoff = truncate_utf8_to_max_bytes(&mut text, max_preview_bytes).unwrap_or(text.len());
+    let preview = preview_output(&text, max_preview_bytes);
+    let cutoff = text.len() - preview.omitted_bytes;
+    text = preview.text;
     text.push_str(&format!(
-        "\n... [{stream_name} truncated at {cutoff} bytes{detail}]"
+        "\n... [{stream_name} truncated; {cutoff} bytes retained{detail}]"
     ));
     text
 }
@@ -549,6 +591,13 @@ fn decode_shell_output_with_encoding(bytes: &[u8], fallback_encoding: &'static E
 }
 
 pub(crate) fn complete_shell_output_prefix_len(bytes: &[u8]) -> usize {
+    // Match decode_shell_output's UTF-8 preference even on a legacy Windows
+    // code page. A trailing incomplete UTF-8 sequence belongs to the next read.
+    match std::str::from_utf8(bytes) {
+        Ok(_) => return bytes.len(),
+        Err(error) if error.error_len().is_none() => return error.valid_up_to(),
+        Err(_) => {}
+    }
     complete_shell_output_prefix_len_with_encoding(bytes, shell_output_encoding())
 }
 
@@ -695,7 +744,12 @@ async fn persist_raw_output(
     );
     let path = temp_dir.join(file_name);
 
-    tokio::fs::write(&path, build_raw_output_bytes(stdout, stderr)).await?;
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(&path).await?;
+    tokio::io::AsyncWriteExt::write_all(&mut file, &build_raw_output_bytes(stdout, stderr)).await?;
     Ok(Some(path.display().to_string()))
 }
 

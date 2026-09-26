@@ -132,23 +132,12 @@ impl Tool<BaseCtx> for ReadFileTool {
         let ctx = &ctx;
         hooked_call(ctx, args, |args| async move {
             let scope = WorkspaceScope::for_call(ctx.meta(), &self.workspaces).await;
-            let target = scope.open_read(&args.path).await?;
-            let workspace_display = target.workspace.display().to_string();
-            let meta = target.metadata;
-            let resolved_path = target.path;
-
-            let data = tokio::fs::read(&resolved_path).await.map_err(|err| {
-                format!(
-                    "Failed to read file (workspace: {}, requested_path: {}, resolved_path: {}): {err}",
-                    workspace_display,
-                    args.path,
-                    resolved_path.display()
-                )
-            })?;
+            let mut target = scope.open_read(&args.path).await?;
+            let data = target.read_bytes().await?;
             let mut output = ReadFileOutput {
                 content: String::new(),
                 encoding: UTF8_ENCODING.to_string(),
-                size: meta.len(),
+                size: data.len() as u64,
                 ..Default::default()
             };
             if let Some(kind) = infer2::get(&data) {

@@ -126,9 +126,17 @@ impl Tool<BaseCtx> for WriteFileTool {
         let ctx = &ctx;
         hooked_call(ctx, args, |args| async move {
             let scope = WorkspaceScope::for_call(ctx.meta(), &self.workspaces).await;
+            let resolved =
+                super::resolve_write_path_in_workspaces(scope.roots(), &args.path).await?;
+            let _guards =
+                super::locks::lock_paths([resolved.path.as_path()], &ctx.cancellation_token())
+                    .await?;
             let target = scope.open_write(&args.path).await?;
             let workspace_display = target.workspace.display().to_string();
 
+            if args.content.len() > (super::MAX_FILE_SIZE_BYTES as usize * 4 / 3 + 4) {
+                return Err("Write input exceeds maximum file size".into());
+            }
             let data = decode_content(
                 args.content,
                 &args.encoding,

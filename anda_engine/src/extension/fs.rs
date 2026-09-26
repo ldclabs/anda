@@ -4,7 +4,7 @@
 //! limits, and atomic write helpers used by the read, write, search, and edit
 //! filesystem tools. Public tool structs are re-exported from the submodules.
 //!
-//! All four tools report the same capability group via [`fs_tool_group_info`],
+//! All workspace file tools report the capability group via [`fs_tool_group_info`],
 //! so the discovery layer presents them to the model as one workspace bundle.
 
 use anda_core::{
@@ -18,7 +18,15 @@ use std::{
     fs::{Metadata, Permissions},
     path::{Component, Path, PathBuf},
 };
+use tokio::io::AsyncReadExt;
+#[cfg(test)]
 use tokio::io::AsyncWriteExt;
+
+mod access;
+mod locks;
+mod patch;
+mod patch_parser;
+pub use patch::*;
 
 mod edit;
 mod read;
@@ -35,7 +43,7 @@ pub const FS_TOOL_GROUP_ID: &str = "fs_workspace";
 
 /// Returns the shared [`ToolGroupInfo`] for the filesystem workspace tools.
 ///
-/// Every `read_file` / `search_file` / `edit_file` / `write_file` tool reports
+/// Each read, search, edit, write, and apply_patch tool reports
 /// this so the registry presents them as one bundle. The registry fills in the
 /// member list from the tools actually registered.
 pub fn fs_tool_group_info() -> ToolGroupInfo {
@@ -44,7 +52,7 @@ pub fn fs_tool_group_info() -> ToolGroupInfo {
         title: "Filesystem workspace".to_string(),
         description: "Read, search, edit, and write files within the agent's sandboxed workspace directories.".to_string(),
         instructions: Some(
-            "These tools share one set of sandboxed workspace directories; paths are workspace-relative and access outside the workspace is denied. Typical flow: use `search_file` to locate content and `read_file` to inspect it (paging large files with offset/limit), then `edit_file` for targeted in-place changes or `write_file` to create or replace a whole file.".to_string(),
+            "Use the registered members of this group for workspace-scoped file operations. Relative paths resolve in configured root order; request metadata can prioritize a subdirectory but does not grant access or revoke the default roots. Coding agents can use shell for reading and searching and register only dedicated editing tools. search_file matches paths, not file contents.".to_string(),
         ),
     }
 }
@@ -111,6 +119,7 @@ pub(crate) struct ReadTarget {
     pub(crate) workspace: PathBuf,
     pub(crate) path: PathBuf,
     pub(crate) metadata: Metadata,
+    file: tokio::fs::File,
 }
 
 /// A write destination resolved inside a workspace.
@@ -123,7 +132,6 @@ pub(crate) struct WriteTarget {
     pub(crate) workspace: PathBuf,
     pub(crate) path: PathBuf,
     pub(crate) existing: Option<Metadata>,
-    requested: String,
 }
 
 impl WorkspaceScope {
@@ -157,7 +165,7 @@ impl WorkspaceScope {
     /// enforces the regular-file, hard-link, and size-limit checks.
     pub(crate) async fn open_read(&self, user_path: &str) -> Result<ReadTarget, BoxError> {
         let resolved = resolve_read_path_in_workspaces(&self.workspaces, user_path).await?;
-        let metadata = read_target_metadata(&resolved, user_path).await?;
+        let (file, metadata) = access::open_read(&resolved.path).await?;
         ensure_regular_file(
             &metadata,
             &resolved.path,
@@ -169,6 +177,7 @@ impl WorkspaceScope {
             workspace: resolved.workspace,
             path: resolved.path,
             metadata,
+            file,
         })
     }
 
@@ -179,21 +188,15 @@ impl WorkspaceScope {
     /// regular-file, hard-link, and size-limit checks.
     pub(crate) async fn open_edit(&self, user_path: &str) -> Result<ReadTarget, BoxError> {
         let resolved = resolve_write_path_in_workspaces(&self.workspaces, user_path).await?;
-        let metadata = match tokio::fs::metadata(&resolved.path).await {
-            Ok(metadata) => metadata,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return Err(format!(
-                    "Path does not point to an existing file (workspace: {}, requested_path: {}, resolved_path: {})",
-                    resolved.workspace.display(),
-                    user_path,
-                    resolved.path.display()
+        let (file, metadata) =
+            access::open_read(&resolved.path)
+                .await
+                .map_err(|err| -> BoxError {
+                    format!(
+                    "Path does not point to an existing file (requested_path: {user_path}): {err}"
                 )
-                .into());
-            }
-            Err(err) => {
-                return Err(metadata_error(&resolved, user_path, err));
-            }
-        };
+                .into()
+                })?;
 
         ensure_regular_file(
             &metadata,
@@ -206,6 +209,7 @@ impl WorkspaceScope {
             workspace: resolved.workspace,
             path: resolved.path,
             metadata,
+            file,
         })
     }
 
@@ -235,18 +239,8 @@ impl WorkspaceScope {
             workspace: resolved.workspace,
             path: resolved.path,
             existing,
-            requested: user_path.to_string(),
         })
     }
-}
-
-async fn read_target_metadata(
-    resolved: &ResolvedFilePath,
-    user_path: &str,
-) -> Result<Metadata, BoxError> {
-    tokio::fs::metadata(&resolved.path)
-        .await
-        .map_err(|err| metadata_error(resolved, user_path, err))
 }
 
 fn metadata_error(resolved: &ResolvedFilePath, user_path: &str, err: std::io::Error) -> BoxError {
@@ -260,9 +254,22 @@ fn metadata_error(resolved: &ResolvedFilePath, user_path: &str, err: std::io::Er
 }
 
 impl ReadTarget {
+    /// Read from the validated handle, bounding actual bytes even if the file grows.
+    pub(crate) async fn read_bytes(&mut self) -> Result<Vec<u8>, BoxError> {
+        let mut bytes = Vec::new();
+        (&mut self.file)
+            .take(MAX_FILE_SIZE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .await?;
+        if bytes.len() as u64 > MAX_FILE_SIZE_BYTES {
+            return Err("File grew beyond the maximum file size of 10 MiB".into());
+        }
+        Ok(bytes)
+    }
+
     /// Atomically replaces the file's content, preserving its permissions.
     pub(crate) async fn write_atomic(&self, data: &[u8]) -> Result<(), BoxError> {
-        atomic_write_file(&self.path, data, Some(&self.metadata.permissions())).await
+        access::replace(&self.path, data, Some(&self.metadata.permissions())).await
     }
 }
 
@@ -272,25 +279,11 @@ impl WriteTarget {
     /// For a new file the missing parent directories are created first and the
     /// file gets default permissions; an existing file keeps its permissions.
     pub(crate) async fn write_atomic(&self, data: &[u8]) -> Result<(), BoxError> {
-        if self.existing.is_none()
-            && let Some(parent) = self.path.parent()
-        {
-            tokio::fs::create_dir_all(parent).await.map_err(|err| {
-                format!(
-                    "Failed to create parent directories (workspace: {}, requested_path: {}, resolved_path: {}, parent_path: {}): {err}",
-                    self.workspace.display(),
-                    self.requested,
-                    self.path.display(),
-                    parent.display()
-                )
-            })?;
-        }
-
         let permissions = self
             .existing
             .as_ref()
             .map(|metadata| metadata.permissions());
-        atomic_write_file(&self.path, data, permissions.as_ref()).await
+        access::replace(&self.path, data, permissions.as_ref()).await
     }
 }
 
@@ -791,9 +784,9 @@ fn link_count(metadata: &Metadata) -> u64 {
 
 #[cfg(windows)]
 fn link_count(_metadata: &Metadata) -> u64 {
-    // Rust stable does not currently expose a portable, stable Windows hard-link
-    // count API on `std::fs::Metadata`. Returning 1 avoids false positive blocks
-    // and keeps Windows builds stable until a supported API is available.
+    // Metadata alone has no stable link-count accessor on Windows. Workspace
+    // reads and mutations additionally validate the opened handle's link count
+    // in access.rs; metadata-only callers must not rely on this fallback.
     1
 }
 
@@ -803,22 +796,26 @@ fn link_count(_metadata: &Metadata) -> u64 {
 }
 
 /// Atomically writes data to a file by first writing to a temporary file and then renaming it into place.
+/// Relative paths, including a bare filename, resolve against the current directory.
 pub async fn atomic_write_file(
     target_path: &Path,
     data: &[u8],
     existing_permissions: Option<&Permissions>,
 ) -> Result<(), BoxError> {
-    let temp_path =
-        write_temp_file_for_atomic_replace(target_path, data, existing_permissions).await?;
-
-    if let Err(err) = commit_atomic_replace(&temp_path, target_path).await {
-        let _ = tokio::fs::remove_file(&temp_path).await;
-        return Err(err);
-    }
-
-    Ok(())
+    let parent = target_path.parent().ok_or("Missing parent directory")?;
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    let parent = tokio::fs::canonicalize(parent).await?;
+    let name = target_path.file_name().ok_or("Missing file name")?;
+    access::replace(&parent.join(name), data, existing_permissions)
+        .await
+        .map_err(|err| format!("Failed to atomically replace file: {err}").into())
 }
 
+#[cfg(test)]
 pub(crate) async fn write_temp_file_for_atomic_replace(
     target_path: &Path,
     data: &[u8],
@@ -897,6 +894,7 @@ pub(crate) async fn write_temp_file_for_atomic_replace(
     .into())
 }
 
+#[cfg(test)]
 pub(crate) async fn commit_atomic_replace(
     temp_path: &Path,
     target_path: &Path,
@@ -913,6 +911,7 @@ pub(crate) async fn commit_atomic_replace(
         })
 }
 
+#[cfg(test)]
 fn atomic_temp_path(target_path: &Path) -> Result<PathBuf, BoxError> {
     let parent = target_path.parent().ok_or_else(|| {
         format!(
@@ -1284,6 +1283,20 @@ mod tests {
         );
 
         let _ = tokio::fs::remove_dir_all(selected.workspace).await;
+    }
+
+    #[tokio::test]
+    async fn atomic_write_accepts_a_bare_relative_filename() {
+        // Keep the process-wide current directory unchanged while testing the public API.
+        let target = PathBuf::from(format!(
+            ".anda-atomic-relative-{:032x}",
+            rand::random::<u128>()
+        ));
+        atomic_write_file(&target, b"first", None).await.unwrap();
+        assert_eq!(tokio::fs::read(&target).await.unwrap(), b"first");
+        atomic_write_file(&target, b"second", None).await.unwrap();
+        assert_eq!(tokio::fs::read(&target).await.unwrap(), b"second");
+        tokio::fs::remove_file(target).await.unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]

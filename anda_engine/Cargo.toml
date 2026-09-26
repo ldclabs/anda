@@ -40,6 +40,7 @@ parking_lot = { workspace = true }
 tokio-util = { workspace = true }
 structured-logger = { workspace = true }
 schemars = { workspace = true }
+sha2 = { workspace = true }
 reqwest = { workspace = true }
 rand = { workspace = true }
 moka = { workspace = true }
@@ -58,7 +59,7 @@ tokio = { workspace = true, features = ["test-util"] }
 libc = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_Globalization"] }
+windows-sys = { workspace = true, features = ["Win32_Globalization", "Win32_Storage_FileSystem", "Win32_Foundation"] }
 
 [package.metadata.docs.rs]
 all-features = true

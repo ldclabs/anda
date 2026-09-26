@@ -232,3 +232,43 @@ Host --> Caller : response
 - Memory is an extension layer. Conversation/resource storage uses AndaDB collections, and persistent knowledge operations are exposed as KIP tools backed by Cognitive Nexus.
 - Web3, TEE, ICP, and IC-COSE integrations are implementation choices behind `Web3SDK`, `HttpFeatures`, `KeysFeatures`, `CanisterCaller`, or `ObjectStore`. They are not mandatory architecture layers for the engine itself.
 - `anda_web3_client` supplies optional `client` and `tee` backends. The generic client needs an explicit identity or root secret; identity-only clients cannot derive keys. Its default IC agent verifies queries, and an injected agent must share the client principal. Both backends use `anda_core::cbor_rpc` for bounded signed-RPC responses while retaining their own signing mechanisms. See the [client configuration](../anda_web3_client/README.md#configuration).
+
+
+## Workspace execution and editing
+
+`extension::workspace` exposes opt-in registration bundles. `coding_tools` combines
+`ShellCommandTool`, `ShellSessionTool`, and `ApplyPatchTool` for the same local
+workspace. Read/search/list operations remain shell commands in this bundle.
+`readonly_file_tools` and `file_tools` support hosts that do not grant execution.
+Existing `ShellTool`, filesystem tools and provider-neutral core contracts remain
+available; no default engine export or management permission is broadened.
+
+Session execution is an optional capability on `shell::Executor`. `NativeRuntime`
+owns admission, scoped lookup, output buffers, a capped raw log, process deadlines,
+and retention. Host-installed `ShellSessionScope` capabilities propagate through
+context state; RPC metadata cannot create one. Lookups additionally verify engine,
+caller and agent. Input and polling on one process are serialized; different
+sessions can run concurrently. Hooks continue to publish background progress and
+completion, with bounded hook waits so supervision stays responsive. Scoped
+cancellation and runtime teardown stop processes. On Unix, session completion
+terminates descendants remaining in the launched shell's process group before
+draining output. The legacy shell path keeps its previous background lifecycle
+for compatibility.
+
+An optional immutable `SandboxPolicy` transforms both legacy and session launches
+into platform-sandboxed commands. macOS uses Seatbelt and Linux uses bubblewrap;
+unsupported or unavailable backends fail closed. Platform runtime files, declared
+roots and networking are explicit host policy. Tool arguments cannot grant more
+permissions. Application approval UX, secret configuration and remote execution
+remain outside this extension. PTY allocation is opt-in on Unix; the native Windows
+executor uses pipes, and Windows process isolation requires a custom executor.
+
+Filesystem reads use opened, validated regular-file handles and bound actual bytes.
+Cooperating edit/write/patch calls share bounded lock stripes. Unix writes use a
+pinned directory descriptor for temporary creation and atomic rename; Windows
+pins directory handles and validates reparse points and link counts. Patch parsing,
+path resolution, exact matching, encoding, size limits and optional SHA-256
+preconditions are validated before commit. All involved stripes are acquired in
+stable order. Each file replacement is atomic; multi-file operations can partially
+succeed and report which operations committed. Neither these locks nor optimistic
+version checks are a transaction against external editors or shell commands.

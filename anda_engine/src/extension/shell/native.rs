@@ -2,8 +2,9 @@
 //!
 //! This runtime launches commands on the host operating system and optionally
 //! streams long-running output through background hooks. It is intended for
-//! trusted environments; for untrusted commands, supply a sandboxed
-//! [`Executor`](crate::extension::shell::Executor) implementation instead.
+//! trusted environments by default. Opt into [`NativeRuntime::with_sandbox`]
+//! or supply an isolated [`Executor`](crate::extension::shell::Executor) when
+//! the host must enforce process filesystem and network restrictions.
 
 use anda_core::{BoxError, StateFeatures, ToolOutput};
 use async_trait::async_trait;
@@ -31,6 +32,55 @@ use crate::{
     hook::{BackgroundHandle, DynToolJsonHook, ToolBackgroundHook, ToolHook},
 };
 
+#[cfg(unix)]
+mod pty;
+mod sessions;
+
+/// Host-selected shell dialect. Model requests cannot change the executable.
+#[derive(Debug, Clone, Copy)]
+pub enum NativeShell {
+    /// POSIX sh without login startup files.
+    Sh,
+    /// Bash without profile or rc files.
+    Bash,
+    /// Zsh without user rc files.
+    Zsh,
+    /// Windows command processor.
+    Cmd,
+    /// PowerShell without profile loading.
+    PowerShell,
+}
+
+impl Default for NativeShell {
+    fn default() -> Self {
+        if cfg!(windows) { Self::Cmd } else { Self::Sh }
+    }
+}
+
+impl NativeShell {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Sh => "sh",
+            Self::Bash => "bash",
+            Self::Zsh => "zsh",
+            Self::Cmd => "cmd.exe",
+            Self::PowerShell => "pwsh",
+        }
+    }
+    fn command(self, script: &str) -> std::process::Command {
+        let (program, args): (&str, &[&str]) = match self {
+            Self::Sh => ("sh", &["-c"]),
+            Self::Bash => ("bash", &["--noprofile", "--norc", "-c"]),
+            Self::Zsh => ("zsh", &["-f", "-c"]),
+            Self::Cmd => ("cmd.exe", &["/D", "/C"]),
+            Self::PowerShell => ("pwsh", &["-NoProfile", "-NonInteractive", "-Command"]),
+        };
+        let mut command = std::process::Command::new(program);
+        command.args(args).arg(script);
+        command
+    }
+}
+
 #[cfg(not(test))]
 const BACKGROUND_PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 #[cfg(test)]
@@ -45,8 +95,8 @@ const OUTPUT_READ_CHUNK_BYTES: usize = 8192;
 const OUTPUT_READER_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 #[cfg(test)]
 const OUTPUT_READER_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
-/// Maximum bytes kept in memory per output stream. When exceeded, the oldest bytes are dropped
-/// so the tail of the output (where errors usually appear) is preserved.
+/// Maximum bytes kept in memory per output stream. Overflow preserves the initial
+/// output and the newest tail while dropping the middle.
 const MAX_STREAM_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 /// Maximum bytes for a single background progress chunk pushed through hooks.
 const MAX_PROGRESS_CHUNK_BYTES: usize = 16 * 1024;
@@ -63,24 +113,49 @@ type OutputReaderHandle = tokio::task::JoinHandle<std::io::Result<()>>;
 /// In-memory capture of one output stream, bounded by [`MAX_STREAM_BUFFER_BYTES`].
 ///
 /// Offsets used by progress tracking are absolute stream offsets: `trimmed` counts the bytes
-/// already dropped from the head, and `data` holds the bytes from `trimmed` onwards.
-#[derive(Default)]
+/// passed by the tail buffer, and `data` holds bytes from `trimmed` onwards.
+/// `head` retains a stable prefix separately after the first overflow.
 struct StreamBuffer {
+    limit: usize,
+    head: Vec<u8>,
     data: Vec<u8>,
     trimmed: usize,
 }
 
+impl Default for StreamBuffer {
+    fn default() -> Self {
+        Self::bounded(MAX_STREAM_BUFFER_BYTES)
+    }
+}
+
 impl StreamBuffer {
+    fn bounded(limit: usize) -> Self {
+        Self {
+            limit,
+            head: Vec::new(),
+            data: Vec::new(),
+            trimmed: 0,
+        }
+    }
     #[cfg(test)]
     fn from_bytes(data: Vec<u8>) -> Self {
-        Self { data, trimmed: 0 }
+        Self {
+            data,
+            ..Default::default()
+        }
     }
 
     fn append(&mut self, chunk: &[u8]) {
         self.data.extend_from_slice(chunk);
-        if self.data.len() > MAX_STREAM_BUFFER_BYTES {
-            // Drop down to 7/8 of the cap so trimming is amortized instead of per-append.
-            let excess = self.data.len() - MAX_STREAM_BUFFER_BYTES / 8 * 7;
+        if self.head.is_empty() && self.data.len() > self.limit {
+            let end = complete_shell_output_prefix_len(&self.data[..self.limit / 2]);
+            self.head.extend_from_slice(&self.data[..end]);
+        }
+        let tail_budget = self.limit - self.head.len();
+        if self.data.len() > tail_budget {
+            // Preserve the beginning and end; amortize middle removal.
+            let excess = self.data.len() - tail_budget / 8 * 7;
+            let excess = complete_shell_output_prefix_len(&self.data[..excess]);
             self.data.drain(..excess);
             self.trimmed += excess;
         }
@@ -99,10 +174,11 @@ impl StreamBuffer {
 
         let marker = format!(
             "[{} bytes of {stream_name} dropped: output exceeded the {} MiB in-memory buffer]\n",
-            self.trimmed,
-            MAX_STREAM_BUFFER_BYTES / 1024 / 1024,
+            self.trimmed.saturating_sub(self.head.len()),
+            self.limit / 1024 / 1024,
         );
-        let mut bytes = Vec::with_capacity(marker.len() + self.data.len());
+        let mut bytes = Vec::with_capacity(self.head.len() + marker.len() + self.data.len());
+        bytes.extend_from_slice(&self.head);
         bytes.extend_from_slice(marker.as_bytes());
         bytes.extend_from_slice(&self.data);
         bytes
@@ -141,13 +217,17 @@ struct RunningProcess {
     stderr_reader: OutputReaderHandle,
 }
 
-/// Native runtime — full access, runs on Mac/Linux/Docker/Raspberry Pi
+/// Host command runtime; unrestricted unless configured with an OS sandbox.
 pub struct NativeRuntime {
     workspace: PathBuf,
     temp_dir: PathBuf,
     insecure: bool,
     background_progress_interval: std::time::Duration,
     auto_background_after: std::time::Duration,
+    sessions: std::sync::Arc<sessions::SessionStore>,
+    session_limits: super::SessionLimits,
+    session_shell: NativeShell,
+    sandbox: Option<super::SandboxPolicy>,
 }
 
 impl NativeRuntime {
@@ -181,18 +261,47 @@ impl NativeRuntime {
             insecure: false,
             background_progress_interval: BACKGROUND_PROGRESS_INTERVAL,
             auto_background_after: AUTO_BACKGROUND_AFTER,
+            sessions: Default::default(),
+            session_limits: Default::default(),
+            session_shell: Default::default(),
+            sandbox: None,
         }
+    }
+
+    /// Selects the shell used by legacy and session commands, without login profiles.
+    pub fn session_shell(self, shell: NativeShell) -> Self {
+        Self {
+            session_shell: shell,
+            sessions: Default::default(),
+            ..self
+        }
+    }
+
+    /// Enforces an immutable OS sandbox for both legacy and session commands.
+    /// Fails when the platform backend is missing; never retries unrestricted.
+    pub fn with_sandbox(self, policy: super::SandboxPolicy) -> Result<Self, BoxError> {
+        policy.validate_platform()?;
+        Ok(Self {
+            sandbox: Some(policy),
+            sessions: Default::default(),
+            ..self
+        })
     }
 
     /// Overrides the temporary directory used for raw output files.
     pub fn temp_dir(self, temp_dir: PathBuf) -> Self {
-        Self { temp_dir, ..self }
+        Self {
+            temp_dir,
+            sessions: Default::default(),
+            ..self
+        }
     }
 
     /// Allows commands to inherit the process environment.
     pub fn insecure(self) -> Self {
         Self {
             insecure: true,
+            sessions: Default::default(),
             ..self
         }
     }
@@ -242,6 +351,13 @@ impl NativeRuntime {
         let hook = ctx.get_state::<ShellToolHook>();
         let workspace = self.requested_workspace(&ctx).await;
         let workspace_str = workspace.to_string_lossy().to_string();
+        if let Some(policy) = &self.sandbox {
+            command = policy.wrap(
+                command,
+                &tokio::fs::canonicalize(workspace.as_ref()).await?,
+                false,
+            )?;
+        }
 
         // Put the child in its own process group so a cancellation can signal the whole group,
         // including any descendants the shell spawns. Without this, killing only the direct child
@@ -270,11 +386,7 @@ impl NativeRuntime {
         let mut child = match cmd.spawn() {
             Ok(child) => child,
             Err(err) => {
-                return Ok(ExecOutput {
-                    workspace: Some(workspace_str),
-                    stderr: Some(format!("Failed to spawn process: {err}")),
-                    ..Default::default()
-                });
+                return Err(format!("Failed to spawn process: {err}").into());
             }
         };
         let pid = child.id();
@@ -451,6 +563,31 @@ impl NativeRuntime {
 
 #[async_trait]
 impl Executor for NativeRuntime {
+    fn capabilities(&self) -> super::ExecutorCapabilities {
+        super::ExecutorCapabilities {
+            sessions: true,
+            stdin: self.session_limits.allow_stdin,
+            tty: cfg!(unix) && self.session_limits.allow_pty,
+            sandboxed: self.sandbox.is_some(),
+        }
+    }
+
+    async fn execute_session(
+        &self,
+        ctx: BaseCtx,
+        input: super::CommandArgs,
+        envs: HashMap<String, String>,
+    ) -> Result<super::CommandOutput, BoxError> {
+        self.start_session(ctx, input, envs).await
+    }
+
+    async fn interact_session(
+        &self,
+        ctx: BaseCtx,
+        input: super::SessionArgs,
+    ) -> Result<super::SessionOutput, BoxError> {
+        self.session_action(ctx, input).await
+    }
     fn name(&self) -> &str {
         // Runtime identity, surfaced in diagnostics and used by `ShellTool` to gate
         // host-environment injection (`collect_shell_env_vars`). This must stay "native";
@@ -463,15 +600,7 @@ impl Executor for NativeRuntime {
     }
 
     fn shell(&self) -> &str {
-        #[cfg(not(target_os = "windows"))]
-        {
-            "sh"
-        }
-
-        #[cfg(target_os = "windows")]
-        {
-            "cmd.exe"
-        }
+        self.session_shell.name()
     }
 
     async fn execute(
@@ -480,7 +609,7 @@ impl Executor for NativeRuntime {
         input: ExecArgs,
         envs: HashMap<String, String>,
     ) -> Result<ExecOutput, BoxError> {
-        let cmd = Self::build_shell_command(&input.command);
+        let cmd = self.session_shell.command(&input.command);
         // Background task IDs are prefixed with the tool name (not the runtime name).
         self.execute_command(ctx, super::ShellTool::NAME, cmd, envs, Some(input))
             .await
@@ -1443,6 +1572,7 @@ mod tests {
         let trimmed = StreamBuffer {
             data: b"tail".to_vec(),
             trimmed: 9,
+            ..Default::default()
         };
         let bytes = trimmed.into_bytes("stdout");
         let text = String::from_utf8(bytes).unwrap();
@@ -1452,6 +1582,18 @@ mod tests {
             StreamBuffer::from_bytes(b"plain".to_vec()).into_bytes("stdout"),
             b"plain"
         );
+    }
+
+    #[test]
+    fn capture_omission_keeps_complete_utf8_boundaries() {
+        let mut buffer = StreamBuffer::bounded(128);
+        let text = "汉字🙂".repeat(100);
+        buffer.append(text.as_bytes());
+        assert_eq!(buffer.total_len(), text.len());
+        assert!(buffer.head.len() + buffer.data.len() <= 128);
+        let output = String::from_utf8(buffer.into_bytes("stdout")).unwrap();
+        assert!(output.starts_with("汉字🙂"));
+        assert!(output.ends_with("汉字🙂"));
     }
 
     #[test]
