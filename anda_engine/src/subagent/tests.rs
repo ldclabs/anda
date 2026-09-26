@@ -2650,7 +2650,11 @@ async fn subsession_background_hooks_forward_outputs_and_manage_registry() {
         AgentOutput::default(),
     )
     .await;
-    assert!(recv_subagent_prompt(&mut rx).await.contains("completed"));
+    assert!(
+        recv_subagent_prompt(&mut rx)
+            .await
+            .contains("intermediate output")
+    );
 
     AgentHook::on_background_end(
         session.as_ref(),
@@ -2788,12 +2792,9 @@ async fn subagents_manager_lists_registry_and_active_sessions() {
         ..Default::default()
     };
     let (sender, _rx) = tokio::sync::mpsc::channel(4);
-    agent.subsessions.insert_session(Arc::new(SubSession::new(
-        "plan-1".to_string(),
-        "planner".to_string(),
-        sender,
-        0,
-    )));
+    agent.subsessions.insert_session(Arc::new(
+        SubSession::new("plan-1".to_string(), "planner".to_string(), sender, 0).with_scope(&ctx),
+    ));
     manager.upsert_temporary(agent).unwrap();
 
     let output = Agent::<AgentCtx>::run(
@@ -2924,15 +2925,9 @@ async fn load_restores_all_persisted_subagents() {
 
 fn test_session(id: &str) -> (Arc<SubSession>, tokio::sync::mpsc::Receiver<SubAgentInput>) {
     let (sender, rx) = tokio::sync::mpsc::channel(16);
-    (
-        Arc::new(SubSession::new(
-            id.to_string(),
-            "worker".to_string(),
-            sender,
-            0,
-        )),
-        rx,
-    )
+    let mut session = SubSession::new(id.to_string(), "worker".to_string(), sender, 0);
+    session.scope = SubAgentScope::restore("test-root".into(), SubAgentLimits::default());
+    (Arc::new(session), rx)
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -2979,6 +2974,7 @@ async fn stop_task_command_stops_single_background_task_by_id() {
     let subsessions = Arc::new(SubSessions::default());
     // Keep `_rx` alive so the session's sender stays open and `get_session` treats it as active.
     let (session, _rx) = test_session("job");
+    ctx.base.set_state(session.scope.clone());
     subsessions.insert_session(session.clone());
 
     // Register two background tasks in the session with known tokens.
@@ -3393,12 +3389,10 @@ async fn subagent_status_command_reports_live_session_snapshot() {
     // An active session returns its live snapshot synchronously, without enqueuing into the
     // runner.
     let (sender, mut rx) = tokio::sync::mpsc::channel(4);
-    let session = Arc::new(SubSession::new(
-        "job-1".to_string(),
-        "status_worker".to_string(),
-        sender,
-        0,
-    ));
+    let session = Arc::new(
+        SubSession::new("job-1".to_string(), "status_worker".to_string(), sender, 0)
+            .with_scope(&ctx),
+    );
     register_bg_task(
         &session,
         "fetch:task-1",
@@ -3484,12 +3478,9 @@ async fn subagents_manager_status_reports_session_details_and_filters_by_name() 
         ..Default::default()
     };
     let (sender, _rx) = tokio::sync::mpsc::channel(4);
-    let session = Arc::new(SubSession::new(
-        "job-1".to_string(),
-        "worker".to_string(),
-        sender,
-        0,
-    ));
+    let session = Arc::new(
+        SubSession::new("job-1".to_string(), "worker".to_string(), sender, 0).with_scope(&ctx),
+    );
     session.record_status(SubSessionStatus {
         usage: Usage {
             input_tokens: 10,
@@ -3555,3 +3546,6 @@ async fn subagents_manager_status_reports_session_details_and_filters_by_name() 
     assert_eq!(session["usage"]["input_tokens"], json!(10));
     assert_eq!(session["last_progress"], json!("in progress"));
 }
+
+#[path = "runtime_tests.rs"]
+mod runtime_tests;

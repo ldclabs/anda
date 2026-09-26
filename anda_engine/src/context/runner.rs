@@ -124,6 +124,56 @@ impl CompletionRunner {
         }
     }
 
+    // Every real inference (including handoff) goes through the same admission/accounting point.
+    async fn model_request(&self, req: CompletionRequest) -> Result<AgentOutput, BoxError> {
+        let scope = self.ctx.base.get_state::<crate::subagent::SubAgentScope>();
+        if let Some(scope) = &scope {
+            scope.bind_caller(*self.ctx.caller())?;
+        }
+        let _permit = scope
+            .as_ref()
+            .map(|scope| scope.admit_request())
+            .transpose()?;
+        let output = if let Some(deadline) = scope.as_ref().and_then(|s| s.limits().deadline_ms) {
+            tokio::time::timeout(
+                std::time::Duration::from_millis(deadline.saturating_sub(unix_ms())),
+                self.model.completion(req),
+            )
+            .await
+            .map_err(|_| "subagent root deadline exceeded")??
+        } else {
+            self.model.completion(req).await?
+        };
+        if let Some(scope) = scope {
+            scope.record_usage(&output.usage);
+        }
+        Ok(output)
+    }
+
+    /// Snapshot a safe idle boundary without ending this runner. Provider raw history is excluded.
+    pub fn idle_snapshot(&self) -> Result<AgentOutput, BoxError> {
+        if !self.is_idle() || self.done {
+            return Err("runner is not resumably idle".into());
+        }
+        let mut output = self.last_output.clone().unwrap_or_default();
+        let mut history = self.history_prefix.clone();
+        if self.chat_history.starts_with(&history) {
+            history.clear();
+        }
+        history.extend(self.chat_history.iter().cloned());
+        output.chat_history = history;
+        output.raw_history.clear();
+        output.usage = self.total_usage.clone();
+        output.tools_usage = self.tools_usage.clone();
+        output.artifacts = self.artifacts.clone();
+        output.tool_calls.clear();
+        Ok(output)
+    }
+
+    pub(crate) fn restore_artifacts(&mut self, artifacts: Vec<Resource>) {
+        self.artifacts = artifacts;
+    }
+
     /// Enables unbound mode for the completion runner.
     pub fn unbound(self) -> Self {
         Self {
@@ -665,25 +715,26 @@ impl CompletionRunner {
         }
 
         let token = self.ctx.base.cancellation_token();
-        tokio::select! {
-            _ = token.cancelled() => {
-                // Dropping `inner_next` can abort mid tool-execution. `pending_tool_calls`
-                // was already drained by `execute_pending_tool_calls_into_request`, so the
-                // visible history can end on a `ToolCall` with no matching `ToolOutput`,
-                // which providers reject when the persisted history is replayed. Close the
-                // unanswered calls the same way every other interrupt path does.
-                self.discard_in_flight_request_with_interrupted_tool_outputs(
-                    "tool call interrupted by cancellation",
-                    None,
-                );
-                let output = AgentOutput {
-                    failed_reason: Some("operation cancelled".to_string()),
-                    ..Default::default()
-                };
-                Ok(Some(self.final_output(output)))
-            }
-            res = self.inner_next() => res
-        }
+        let scope = self
+            .ctx
+            .base
+            .get_state::<crate::subagent::SubAgentScope>()
+            .unwrap_or_default();
+        let reason = tokio::select! {
+            biased;
+            _ = token.cancelled() => "operation cancelled",
+            _ = scope.deadline() => "subagent root deadline exceeded",
+            res = self.inner_next() => return res,
+        };
+        // Interrupted tool calls need paired error outputs before history can be replayed.
+        self.discard_in_flight_request_with_interrupted_tool_outputs(
+            "tool call interrupted by cancellation",
+            Some(reason),
+        );
+        Ok(Some(self.final_output(AgentOutput {
+            failed_reason: Some(reason.into()),
+            ..Default::default()
+        })))
     }
 
     /// Summarizes the current conversation into a single handoff message and swaps in a fresh
@@ -748,7 +799,7 @@ impl CompletionRunner {
         let token = self.ctx.cancellation_token();
         let mut output = tokio::select! {
             _ = token.cancelled() => return Err("operation cancelled".into()),
-            result = self.model.completion(summary_req) => result?,
+            result = self.model_request(summary_req) => result?,
         };
         self.accumulate(&output.usage);
         if let Some(reason) = &output.failed_reason {
@@ -1117,7 +1168,7 @@ impl CompletionRunner {
         }
         self.merge_discovered_tools_into_request(&mut req);
 
-        let mut output = self.model.completion(req).await?;
+        let mut output = self.model_request(req).await?;
         output.model = Some(self.model.model_name());
 
         self.current_usage = output.usage.clone();

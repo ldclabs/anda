@@ -112,7 +112,7 @@ impl SubAgentManager {
     /// the matching subagent is reported. Each session entry carries a live status snapshot
     /// (elapsed run time, idle time, token usage, turns, latest progress, and background tasks) so
     /// the parent can poll progress without waiting for hook callbacks.
-    fn catalog(&self, caller: &Principal, name_filter: &str) -> Json {
+    fn catalog(&self, caller: &Principal, scope: &SubAgentScope, name_filter: &str) -> Json {
         let name_filter = name_filter.trim().to_ascii_lowercase();
         let agents = self.agents.read().values().cloned().collect::<Vec<_>>();
         let subagents = agents
@@ -124,7 +124,7 @@ impl SubAgentManager {
                 let name = agent.name.to_ascii_lowercase();
                 let callable = format!("SA_{name}");
                 let has_output_schema = agent.output_schema.is_some();
-                let sessions = agent.subsessions.session_details_for(caller);
+                let sessions = agent.subsessions.session_details_in_scope(caller, scope);
                 let active_sessions = sessions
                     .iter()
                     .map(|detail| detail["session"].clone())
@@ -319,11 +319,19 @@ impl Agent<AgentCtx> for SubAgentManager {
         prompt: String,
         resources: Vec<Resource>,
     ) -> Result<AgentOutput, BoxError> {
+        let scope = ctx.base.get_state::<SubAgentScope>().unwrap_or_default();
+        scope.bind_caller(*ctx.caller())?;
         let args = SubAgentManagerArgs::from_prompt(prompt)?;
         let operation = args.operation.trim().to_ascii_lowercase();
         if matches!(operation.as_str(), "list" | "status" | "catalog") {
             return Ok(AgentOutput {
-                content: self.catalog(ctx.caller(), &args.name).to_string(),
+                content: self
+                    .catalog(
+                        ctx.caller(),
+                        &ctx.base.get_state::<SubAgentScope>().unwrap_or_default(),
+                        &args.name,
+                    )
+                    .to_string(),
                 ..Default::default()
             });
         }
@@ -341,7 +349,7 @@ impl Agent<AgentCtx> for SubAgentManager {
             "persisted": persist,
             "model": selected_model_label(&agent.model),
             "effort": agent.effort,
-            "active_sessions": agent.subsessions.active_session_ids_for(ctx.caller()),
+            "active_sessions": agent.subsessions.session_details_in_scope(ctx.caller(), &ctx.base.get_state::<SubAgentScope>().unwrap_or_default()).iter().map(|v| v["session"].clone()).collect::<Vec<_>>(),
             "hint": "Call the subagent by this callable name. Use a stable session ID for long-running, parallel, asynchronous, or follow-up tasks. If a temporary subagent proves useful, call subagents_manager again with persist=true to save it."
         });
         let Some(task) = task else {

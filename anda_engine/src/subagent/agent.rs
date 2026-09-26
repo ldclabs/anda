@@ -118,11 +118,11 @@ impl Agent<AgentCtx> for SubAgent {
                 "properties": {
                     "prompt": {
                         "type": "string",
-                        "description": "Self-contained task handoff for this subagent. Include objective, context/resources, constraints, dependencies, expected deliverable, success criteria, and what progress/final output should contain. To control or inspect an already-running session, send a control command here instead of a task: `/status` to fetch the session's live progress (elapsed time, token usage, turns, active background tasks) synchronously without disturbing the run, `/steer <guidance>` to adjust course mid-run, `/stop_task <task_id>` to stop one specific background task (a task_id from `/status`) while leaving the session and its other background tasks running, `/stop <reason>` to stop the current task and keep the session idle, or `/cancel <reason>` to end the session runner."
+                        "description": "Self-contained task handoff for this subagent. Include objective, context/resources, constraints, dependencies, expected deliverable, success criteria, and what progress/final output should contain. To control or inspect an already-running session, send a control command here instead of a task: `/message <text>` to queue attributed data without waking an idle worker, `/wait <after_sequence> [timeout_ms]` to wait up to 60 seconds for lifecycle events, `/status` to fetch the session's live progress (elapsed time, token usage, turns, active background tasks) synchronously without disturbing the run, `/steer <guidance>` to adjust course mid-run, `/stop_task <task_id>` to stop one specific background task (a task_id from `/status`) while leaving the session and its other background tasks running, `/stop <reason>` to stop the current task and keep the session idle, or `/cancel <reason>` to end the session runner."
                     },
                     "session": {
                         "type": "string",
-                        "description": "Optional case-insensitive session ID. Leave empty for blocking one-shot work. Provide a stable ID for non-blocking, parallel, asynchronous, or follow-up work; reuse it to continue the same conversation.",
+                        "description": "Optional case-insensitive session alias, at most 128 bytes, isolated by caller and host-created root task scope. Leave empty for blocking one-shot work. Provide a stable ID for non-blocking, parallel, asynchronous, or follow-up work; reuse it to continue the same conversation.",
                         "default": ""
                     },
                     "model": {
@@ -158,6 +158,15 @@ impl Agent<AgentCtx> for SubAgent {
         prompt: String,
         resources: Vec<Resource>,
     ) -> Result<AgentOutput, BoxError> {
+        // Direct Agent::run callers may pass a clone; keep per-worker hook/identity writes local.
+        let mut ctx = ctx;
+        let inherited_state = ctx.base.state.read().clone();
+        ctx.base.state = Arc::new(RwLock::new(inherited_state));
+        let scope = ctx.base.get_state::<SubAgentScope>().unwrap_or_default();
+        ctx.base.set_state(scope.clone());
+        scope.bind_caller(*ctx.caller())?;
+        let handoff = ctx.base.get_state::<SubAgentHandoff>().unwrap_or_default();
+        ctx.base.set_state(SubAgentHandoff::default());
         let agent_hook = ctx.base.get_state::<DynAgentHook>();
 
         let (prompt, resources) = if let Some(hook) = &agent_hook {
@@ -170,7 +179,18 @@ impl Agent<AgentCtx> for SubAgent {
         let model = selected_model_label(&args.model).or_else(|| selected_model_label(&self.model));
         let effort = args.effort.or(self.effort);
 
+        if args
+            .prompt
+            .len()
+            .saturating_add(serde_json::to_vec(&resources)?.len())
+            > scope.limits().max_message_bytes
+        {
+            return Err("subagent input exceeds byte limit".into());
+        }
         let session_id = args.session.trim().to_ascii_lowercase();
+        if session_id.len() > 128 {
+            return Err("subagent session alias exceeds 128 bytes".into());
+        }
         if session_id.is_empty() {
             if args.prompt.trim().is_empty() && resources.is_empty() {
                 return Err("prompt cannot be empty".into());
@@ -179,7 +199,10 @@ impl Agent<AgentCtx> for SubAgent {
             // Keep a copy of the inputs only when a recorder will persist them.
             let recorder = ctx.base.get_state::<SubAgentConversationRecorder>();
             let input_resources = recorder.as_ref().map(|_| resources.clone());
+            ctx.base
+                .set_state(scope.identity(ctx.base.get_state::<ExecutionIdentity>()));
             let req = CompletionRequest {
+                chat_history: handoff.messages.clone(),
                 instructions: self.instructions.clone(),
                 prompt: args.prompt,
                 content: resources_into_content(resources),
@@ -225,7 +248,7 @@ impl Agent<AgentCtx> for SubAgent {
         if let PromptCommand::Command { command, .. } = &input.command
             && command == "status"
         {
-            let rt = match subsessions.get_session_for(ctx.caller(), &session_id) {
+            let rt = match subsessions.get_session_in_scope(ctx.caller(), &scope, &session_id) {
                 Some(session) => AgentOutput {
                     content: session.detail().to_string(),
                     conversation: session.conversation_id(),
@@ -233,18 +256,84 @@ impl Agent<AgentCtx> for SubAgent {
                     ..Default::default()
                 },
                 None => AgentOutput {
-                    content: json!({
-                        "session": session_id,
-                        "agent": agent,
-                        "active": false,
+                    content: scope.terminal(*ctx.caller(), &agent, &session_id).unwrap_or_else(|| json!({
+                        "session": session_id, "agent": agent, "active": false,
                         "note": "session is not active (it may have finished or expired); call again with a non-empty prompt to start a new session."
-                    })
-                    .to_string(),
+                    })).to_string(),
                     session: Some(session_id.clone()),
                     ..Default::default()
                 },
             };
             return finish_with_hook(&agent_hook, &ctx, rt).await;
+        }
+
+        if let PromptCommand::Command { command, .. } = &input.command {
+            if command == "wait" {
+                let words = input
+                    .command
+                    .command_argument()
+                    .unwrap_or_default()
+                    .split_whitespace()
+                    .collect::<Vec<_>>();
+                if words.len() > 2 {
+                    return Err("use /wait <after_sequence> [timeout_ms]".into());
+                }
+                let after = words
+                    .first()
+                    .map(|s| s.parse::<u64>())
+                    .transpose()?
+                    .unwrap_or(0);
+                let timeout = words
+                    .get(1)
+                    .map(|s| s.parse::<u64>())
+                    .transpose()?
+                    .unwrap_or(30_000);
+                let identity = subsessions
+                    .get_session_in_scope(ctx.caller(), &scope, &session_id)
+                    .map(|s| s.execution.id.clone())
+                    .or_else(|| {
+                        scope
+                            .terminal(*ctx.caller(), &agent, &session_id)
+                            .and_then(|v| v["execution"]["id"].as_str().map(str::to_string))
+                    })
+                    .ok_or("subagent session not found in this root scope")?;
+                let result = scope
+                    .wait(
+                        after,
+                        &[identity],
+                        WaitMode::Any,
+                        std::time::Duration::from_millis(timeout),
+                        ctx.cancellation_token(),
+                    )
+                    .await?;
+                return finish_with_hook(
+                    &agent_hook,
+                    &ctx,
+                    AgentOutput {
+                        content: serde_json::to_string(&result)?,
+                        session: Some(session_id),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            }
+            if command == "message" {
+                let session = subsessions
+                    .get_session_in_scope(ctx.caller(), &scope, &session_id)
+                    .ok_or("subagent session not found in this root scope")?;
+                let message = SubAgentMessage {
+                    sender: ctx
+                        .base
+                        .get_state::<ExecutionIdentity>()
+                        .map(|i| i.id)
+                        .unwrap_or_else(|| scope.id().to_string()),
+                    id: format!("msg_{:032x}", rand::random::<u128>()),
+                    content: input.command.command_argument().unwrap_or_default().into(),
+                    resources: input.resources,
+                };
+                let id = session.send(message, MessageDelivery::QueueOnly)?;
+                return finish_with_hook(&agent_hook, &ctx, AgentOutput { content: json!({"accepted": id, "wakes_idle": false, "execution": session.execution}).to_string(), session: Some(session_id), ..Default::default() }).await;
+            }
         }
 
         // `/stop_task <task_id>` stops a single background task running inside the session (a nested
@@ -260,7 +349,7 @@ impl Agent<AgentCtx> for SubAgent {
                 .unwrap_or_default()
                 .trim()
                 .to_string();
-            let rt = match subsessions.get_session_for(ctx.caller(), &session_id) {
+            let rt = match subsessions.get_session_in_scope(ctx.caller(), &scope, &session_id) {
                 Some(session) if task_id.is_empty() => AgentOutput {
                     content: format!(
                         "subagent {agent} session {session_id}: /stop_task requires a task_id argument (see the session's background_tasks in /status)."
@@ -298,20 +387,60 @@ impl Agent<AgentCtx> for SubAgent {
             return finish_with_hook(&agent_hook, &ctx, rt).await;
         }
 
+        let checkpoint_key =
+            SubAgentCheckpoints::key(ctx.caller(), scope.id(), &agent, &session_id);
+        let checkpoint_store = ctx.base.get_state::<SubAgentCheckpoints>();
+        let mut checkpoint = if subsessions
+            .get_session_in_scope(ctx.caller(), &scope, &session_id)
+            .is_none()
+            && (!matches!(&input.command, PromptCommand::Ping) || !input.resources.is_empty())
+            && !matches!(&input.command, PromptCommand::Command { command, .. } if command == "stop" || command == "cancel")
+        {
+            match &checkpoint_store {
+                Some(store) => store.load(&checkpoint_key).await?,
+                None => None,
+            }
+        } else {
+            None
+        };
+        if let Some(saved) = &checkpoint {
+            let parent = ctx.base.get_state::<ExecutionIdentity>().map(|i| i.id);
+            if saved.version != 1
+                || &saved.caller != ctx.caller()
+                || saved.execution.root_id != scope.id()
+                || saved.agent != agent
+                || saved.session != session_id
+                || saved.execution.parent_id != parent
+            {
+                return Err("subagent checkpoint ownership or version mismatch".into());
+            }
+            checkpoint::validate_history(&saved.history)?;
+            scope.restore_usage(saved.root_usage.clone(), saved.root_requests);
+        }
+
         // Join the active session when one exists, otherwise atomically claim the session ID.
         // The bounded loop resolves races with concurrent callers using the same session ID, so
         // two callers can never spawn duplicate runners for one session.
         let mut claimed: Option<(Arc<SubSession>, tokio::sync::mpsc::Receiver<SubAgentInput>)> =
             None;
         for _ in 0..8 {
-            if let Some(session) = subsessions.get_session_for(ctx.caller(), &session_id) {
+            if let Some(session) =
+                subsessions.get_session_in_scope(ctx.caller(), &scope, &session_id)
+            {
                 // Join existing conversation session if it's active
                 let send_result = if matches!(&input.command, PromptCommand::Command { command, .. } if matches!(command.as_str(), "stop" | "cancel"))
                 {
                     session.request_control(input);
                     Ok(())
                 } else {
-                    session.sender.send(input).await
+                    session.validate_input(&input)?;
+                    match session.try_enqueue(input, MessageDelivery::TriggerTurn) {
+                        Ok(()) => Ok(()),
+                        Err((_, input)) if session.sender.is_closed() => {
+                            Err(tokio::sync::mpsc::error::SendError(*input))
+                        }
+                        Err((err, _)) => return Err(err),
+                    }
                 };
                 match send_result {
                     Ok(_) => {
@@ -332,6 +461,9 @@ impl Agent<AgentCtx> for SubAgent {
                             session.agent,
                             session_id,
                         );
+                        if *session.leased.lock() {
+                            return Err("subagent session is closing; retry after cleanup".into());
+                        }
                         subsessions.remove_session_if(&session);
                         input = err.0;
                         continue;
@@ -348,6 +480,11 @@ impl Agent<AgentCtx> for SubAgent {
                 _ => None,
             };
             if let Some(op) = inactive_op {
+                if op == "cancel"
+                    && let Some(store) = &checkpoint_store
+                {
+                    store.remove(&checkpoint_key).await?;
+                }
                 let rt = AgentOutput {
                     content: format!(
                         "subagent {agent} session {session_id} is not active (it may have finished or expired); nothing to {op}. Call again with a non-empty prompt to start a new session."
@@ -358,16 +495,22 @@ impl Agent<AgentCtx> for SubAgent {
                 return finish_with_hook(&agent_hook, &ctx, rt).await;
             }
 
-            let (sender, rx) = tokio::sync::mpsc::channel::<SubAgentInput>(42);
-            let candidate = Arc::new(
-                SubSession::new(
-                    session_id.clone(),
-                    agent.clone(),
-                    sender,
-                    resolve_idle_timeout_ms(self.idle_timeout),
-                )
-                .with_caller(*ctx.caller()),
+            let (sender, rx) = tokio::sync::mpsc::channel::<SubAgentInput>(
+                scope.limits().max_pending_messages.clamp(1, 4096),
             );
+            let mut candidate = SubSession::new(
+                session_id.clone(),
+                agent.clone(),
+                sender,
+                resolve_idle_timeout_ms(self.idle_timeout),
+            )
+            .with_caller(*ctx.caller())
+            .with_scope(&ctx);
+            if let Some(saved) = &checkpoint {
+                candidate.execution = saved.execution.clone();
+                candidate.work_turn.store(saved.turn, Ordering::SeqCst);
+            }
+            let candidate = Arc::new(candidate);
             match subsessions.try_insert_session(candidate.clone()) {
                 None => {
                     claimed = Some((candidate, rx));
@@ -384,6 +527,14 @@ impl Agent<AgentCtx> for SubAgent {
             )
             .into());
         };
+
+        let mut lease = SessionLease::new(subsessions.clone(), session.clone());
+        lease.permit = Some(scope.reserve_session()?);
+        scope.set_activity(&session.execution.id, true);
+        ctx.base.set_state(session.execution.clone());
+        if let Some(store) = &checkpoint_store {
+            store.remove(&checkpoint_key).await?;
+        }
 
         // The session ID is claimed; start a new session runner with this prompt.
         let SubAgentInput {
@@ -406,6 +557,10 @@ impl Agent<AgentCtx> for SubAgent {
         let recorder = ctx.base.get_state::<SubAgentConversationRecorder>();
         let input_resources = recorder.as_ref().map(|_| resources.clone());
         let req = CompletionRequest {
+            chat_history: checkpoint
+                .as_ref()
+                .map(|s| s.history.clone())
+                .unwrap_or(handoff.messages),
             instructions: self.instructions.clone(),
             prompt,
             content: resources_into_content(resources),
@@ -444,8 +599,8 @@ impl Agent<AgentCtx> for SubAgent {
 
         let rt = AgentOutput {
             content: format!(
-                "subagent {} is running in the background with session mode (session: {}). The output will be pushed to you through the hooks.",
-                session.agent, session.id
+                "subagent {} is running in the background with session mode (session: {}, execution: {}). The output will be pushed to you through the hooks.",
+                session.agent, session.id, session.execution.id
             ),
             conversation: conversation.as_ref().map(SubAgentConversationLog::id),
             session: Some(session.id.clone()),
@@ -476,6 +631,7 @@ impl Agent<AgentCtx> for SubAgent {
         // abort an in-flight model request. Instead a bridge task translates cancellation into a
         // graceful `/stop`, matching the semantics of the `/stop` control command.
         let session_token = ctx.base.cancellation_token().child_token();
+        lease.stop_token = Some(session_token.clone());
         if let Some(hook) = &agent_hook {
             // Namespaced by agent: the parent's registry is shared across subagents, and
             // session ids are only unique within one subagent.
@@ -503,12 +659,19 @@ impl Agent<AgentCtx> for SubAgent {
 
         // Enforce the subagent's tool whitelist at execution time for the
         // long-running session runner, mirroring the blocking path.
-        let runner = ctx
+        let mut runner = ctx
             .clone()
             .completion_iter(req, vec![])
             .unbound()
             .with_allowed_callables(Some(self.allowed_callables()));
+        if let Some(saved) = checkpoint.take() {
+            runner.accumulate(&saved.usage);
+            runner.accumulate_tools_usage(&saved.tools_usage);
+            runner.restore_artifacts(saved.artifacts);
+        }
+        session.event(SubAgentEventKind::Started, &AgentOutput::default());
         tokio::spawn(async move {
+            let _lease = lease;
             let mut runner = SubSessionRunner {
                 session: session.clone(),
                 agent_hook,
@@ -592,6 +755,7 @@ impl Agent<AgentCtx> for SubAgent {
                             };
                             conversation.record_output(&mut output, status).await;
                         }
+                        session.finish(&output);
                         if let Some(hook) = &runner.agent_hook {
                             hook.on_background_end(
                                 runner.runner.ctx(),
@@ -604,6 +768,8 @@ impl Agent<AgentCtx> for SubAgent {
                     }
                     Err(err) => {
                         let mut output = runner.latest_output();
+                        output.failed_reason = Some(err.to_string());
+                        output = runner.runner.stop_current_task(output);
                         runner.merge_carried_artifacts(&mut output);
                         if let Some(conversation) = &mut runner.conversation {
                             let status = if conversation.conversation.status
@@ -615,6 +781,7 @@ impl Agent<AgentCtx> for SubAgent {
                             };
                             conversation.record_output(&mut output, status).await;
                         }
+                        session.finish(&output);
                         if let Some(hook) = &runner.agent_hook {
                             hook.on_background_end(
                                 runner.runner.ctx(),
@@ -697,5 +864,37 @@ async fn finish_with_hook(
     match agent_hook {
         Some(hook) => hook.after_agent_run(ctx, rt).await,
         None => Ok(rt),
+    }
+}
+
+// Holds admission and registry ownership across initialization awaits and detached execution.
+struct SessionLease {
+    sessions: Arc<SubSessions>,
+    session: Arc<SubSession>,
+    permit: Option<runtime::ScopePermit>,
+    stop_token: Option<anda_core::CancellationToken>,
+}
+impl SessionLease {
+    fn new(sessions: Arc<SubSessions>, session: Arc<SubSession>) -> Self {
+        *session.leased.lock() = true;
+        Self {
+            sessions,
+            session,
+            permit: None,
+            stop_token: None,
+        }
+    }
+}
+impl Drop for SessionLease {
+    fn drop(&mut self) {
+        if let Some(token) = &self.stop_token {
+            token.cancel();
+        }
+        self.session.finish(&AgentOutput {
+            failed_reason: Some("subagent execution dropped before normal closure".into()),
+            ..Default::default()
+        });
+        *self.session.leased.lock() = false;
+        self.sessions.remove_session_if(&self.session);
     }
 }

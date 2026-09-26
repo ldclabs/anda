@@ -755,10 +755,15 @@ async fn callers_with_the_same_session_id_remain_independent() {
     };
     let a = candid::Principal::self_authenticating([1]);
     let b = candid::Principal::self_authenticating([2]);
-    for (caller, prompt) in [(a, "private-a"), (b, "private-b")] {
+    // Each verified caller retains its own host-created root context across follow-up calls.
+    let contexts = [
+        (ctx.with_caller(a), "private-a"),
+        (ctx.with_caller(b), "private-b"),
+    ];
+    for (caller_ctx, prompt) in &contexts {
         agent
             .run(
-                ctx.with_caller(caller),
+                caller_ctx.clone(),
                 json!({"session":"same","prompt":prompt}).to_string(),
                 vec![],
             )
@@ -768,17 +773,17 @@ async fn callers_with_the_same_session_id_remain_independent() {
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             let mut ready = true;
-            for (caller, expected) in [(a, "private-a"), (b, "private-b")] {
+            for (caller_ctx, expected) in &contexts {
                 let out = agent
                     .run(
-                        ctx.with_caller(caller),
+                        caller_ctx.clone(),
                         json!({"session":"same","prompt":"/status"}).to_string(),
                         vec![],
                     )
                     .await
                     .unwrap();
                 let value: Json = serde_json::from_str(&out.content).unwrap();
-                ready &= value["last_progress"] == expected;
+                ready &= value["last_progress"] == *expected;
             }
             if ready {
                 break;
@@ -796,7 +801,7 @@ async fn callers_with_the_same_session_id_remain_independent() {
     manager.upsert_temporary(agent.clone()).unwrap();
     let out = manager
         .run(
-            ctx.with_caller(b),
+            contexts[1].0.clone(),
             json!({"operation":"list"}).to_string(),
             vec![],
         )
@@ -806,7 +811,7 @@ async fn callers_with_the_same_session_id_remain_independent() {
     assert!(!out.content.contains("private-a"));
     agent
         .run(
-            ctx.with_caller(a),
+            contexts[0].0.clone(),
             json!({"session":"same","prompt":"/cancel finished-a"}).to_string(),
             vec![],
         )

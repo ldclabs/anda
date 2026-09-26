@@ -265,6 +265,17 @@ pub trait AgentHook: Send + Sync {
     ) {
     }
 
+    /// Called when one work turn completes while its session remains available.
+    /// This does not release the background handle; `on_background_end` still closes it.
+    async fn on_background_turn_end(
+        &self,
+        _ctx: &AgentCtx,
+        _session_id: String,
+        _turn: u64,
+        _output: AgentOutput,
+    ) {
+    }
+
     /// Called with the final output from a background agent task.
     async fn on_background_end(&self, _ctx: &AgentCtx, _session_id: String, _output: AgentOutput) {}
 }
@@ -284,6 +295,17 @@ impl DynAgentHook {
 
 #[async_trait]
 impl AgentHook for DynAgentHook {
+    async fn on_background_turn_end(
+        &self,
+        ctx: &AgentCtx,
+        session_id: String,
+        turn: u64,
+        output: AgentOutput,
+    ) {
+        self.inner
+            .on_background_turn_end(ctx, session_id, turn, output)
+            .await;
+    }
     async fn before_agent_run(
         &self,
         ctx: &AgentCtx,

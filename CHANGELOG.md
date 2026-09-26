@@ -4,6 +4,22 @@ All notable changes to the Anda project will be documented in this file.
 
 ## [Unreleased]
 
+### Added — subagent runtime
+
+- Isolate worker session aliases by host-created root scope and caller. Expose
+  execution lineage, work-turn completion hooks, bounded terminal retention,
+  event cursors and cancellable any/all waits.
+- Add attributed queue-only messages, bounded admission, atomic model/session
+  permits, shared inference budgets and absolute runner deadlines.
+- Add optional idle checkpoint storage and explicit neutral-history handoffs.
+  Restore identity/history under current host policy without replaying in-flight
+  tools or persisting provider raw history.
+- Preserve nested worker artifacts and avoid duplicate final delivery after an
+  idle turn result. Coalesce priority controls, protect reused child aliases from
+  stale callbacks, and release initialization reservations on cancellation.
+- Hosts continuing one root task across entry contexts must reinstall its
+  `SubAgentScope`; session aliases no longer implicitly join another root task.
+
 ### Fixed — anda_engine
 
 - Align Completion budget, reasoning effort, strict schemas, media inputs, and

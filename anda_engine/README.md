@@ -100,12 +100,16 @@ Agents receive `AgentCtx`; tools receive `BaseCtx`. Contexts carry caller identi
 
 Context namespaces are derived from agent and tool names so cache and object storage remain isolated between components.
 
-Subagent sessions are scoped by caller principal and session ID. Use
-`SubSessions::get_session_for`, `active_session_ids_for`, and `session_details_for`
-for caller-facing controls and status. The caller-free lookup is intended for
-host administration and returns `None` for an ambiguous ID. Shared callable
-schemas do not include other callers' active session IDs. Background progress
-uses the same `agent:session` task ID as start and end callbacks.
+Subagent sessions are isolated by caller, host-created `SubAgentScope`, worker,
+and alias. Install the same scope clone to continue a root task across engine
+entry contexts. Use `get_session_in_scope` and `session_details_in_scope` for
+model-facing access; legacy caller-only lookups are host administration helpers.
+Turn-completion hooks and bounded event waits are independent of session closure.
+Typed messages distinguish queued notifications from tasks that wake idle workers.
+Shared limits govern residency, concurrent inference, queues and optional budgets.
+Idle checkpoints and explicit provider-neutral handoffs are opt-in host capabilities.
+See [subagent lifecycle and migration](../docs/subagents.md) and the runnable
+[subagent_sessions example](examples/subagent_sessions.rs).
 
 `CompletionStream` preserves follow-up and steering input submitted while a
 model step is pending. Failed context compaction leaves the original runner

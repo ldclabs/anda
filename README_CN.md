@@ -23,7 +23,7 @@ Anda 是一个用于构建 AI 智能体的 Rust 框架，可以把模型、工�
    引擎可以通过 `primary`、`pro`、`flash`、`lite` 等能力标签路由 completion 请求，具体 provider adapter 隐藏在统一的请求和输出契约后面。
 
 3. **运行时编排**
-   `CompletionRunner` 负责迭代模型回合、执行 tool calls、调用 agents、累计 usage、汇总 artifacts、处理 steering/follow-up messages、cancellation，以及长会话的紧凑 continuation handoff。
+   `CompletionRunner` 负责迭代模型回合、执行 tool calls、调用 agents、累计 usage、汇总 artifacts、处理 steering/follow-up messages、cancellation，以及长会话的紧凑 continuation handoff。 Subagents 支持根任务隔离、按轮完成事件、有界消息和共享预算，并可显式启用空闲快照恢复与上下文交接。参见 [subagent 生命周期](./docs/subagents.md)。
 
 4. **隔离的执行上下文**
    `BaseCtx` 和 `AgentCtx` 为每个 agent 或 tool 提供隔离 state、cache、object storage、HTTP 调用、signed calls、cancellation 和 child contexts。

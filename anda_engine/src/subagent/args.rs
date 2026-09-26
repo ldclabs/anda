@@ -16,7 +16,9 @@ pub struct SubAgentArgs {
     /// Session mode keeps the subagent conversation alive across calls with the same session ID.
     /// Follow-up prompts, tool results, and background task results are accumulated into that
     /// conversation, allowing the subagent to preserve state across invocations. Session IDs are
-    /// case-insensitive and scoped to each subagent. A missing session is created automatically.
+    /// case-insensitive and scoped to the caller, host-created root task, and subagent. A missing
+    /// session is created automatically. Hosts continuing a root task must reinstall its
+    /// [`SubAgentScope`] on the new entry context.
     ///
     /// Subagents that need asynchronous tools should use session mode so background tool results can
     /// be fed back into later steps. In normal mode, asynchronous tool results cannot be delivered

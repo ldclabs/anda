@@ -73,6 +73,7 @@ impl SubAgentConversationRecorder {
                 "mode": mode,
                 "parent_agent": ctx.root.agent.clone(),
                 "context_agent": ctx.base.agent.clone(),
+                "execution": ctx.base.get_state::<ExecutionIdentity>(),
                 "model": req.model.clone(),
                 "effort": req.effort,
                 "tools": agent.tools.clone(),

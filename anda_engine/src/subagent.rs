@@ -38,14 +38,23 @@ use crate::{
 
 mod agent;
 mod args;
+mod checkpoint;
 mod conversation;
 mod manager;
+mod runtime;
 mod session;
 
 pub use self::agent::SubAgent;
 pub use self::args::{SubAgentArgs, SubAgentManagerArgs};
+pub use self::checkpoint::{
+    CheckpointStore, SubAgentCheckpoint, SubAgentCheckpoints, SubAgentHandoff,
+};
 pub use self::conversation::{ConversationRecords, SubAgentConversationRecorder};
 pub use self::manager::{SubAgentManager, SubAgentSet, SubAgentSetManager};
+pub use self::runtime::{
+    ExecutionIdentity, MessageDelivery, SubAgentEvent, SubAgentEventKind, SubAgentEvents,
+    SubAgentLimits, SubAgentMessage, SubAgentScope, WaitMode,
+};
 pub use self::session::{BackgroundTaskInfo, SubSession, SubSessionStatus, SubSessions};
 
 use self::args::deserialize_optional_model_effort;

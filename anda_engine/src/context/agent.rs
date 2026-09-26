@@ -123,6 +123,7 @@ impl AgentCtx {
         agents: Arc<AgentSet<AgentCtx>>,
         subagents: Arc<SubAgentSetManager>,
     ) -> Self {
+        base.set_state(crate::subagent::SubAgentScope::default());
         Self {
             base: base.clone(),
             label: String::new(),
@@ -176,13 +177,23 @@ impl AgentCtx {
         agent_label: &str,
         meta: RequestMeta,
     ) -> Result<Self, BoxError> {
+        let base = self.base.child_with(
+            caller,
+            agent_name.to_string(),
+            agent_context_path(agent_name),
+            meta,
+        )?;
+        let limits = self
+            .base
+            .get_state::<crate::subagent::SubAgentScope>()
+            .map(|scope| scope.limits().clone())
+            .unwrap_or_default();
+        base.set_state(crate::subagent::SubAgentScope::new(limits));
+        base.state
+            .write()
+            .remove::<crate::subagent::ExecutionIdentity>();
         Ok(Self {
-            base: self.base.child_with(
-                caller,
-                agent_name.to_string(),
-                agent_context_path(agent_name),
-                meta,
-            )?,
+            base,
             label: agent_label.to_string(),
             root: self.root.clone(),
             models: self.models.clone(),
@@ -214,10 +225,23 @@ impl AgentCtx {
         )
     }
 
-    /// Clones the context with a new caller principal.
+    /// Clones the context with a new caller principal. Changing the caller starts a fresh
+    /// subagent root scope; retain this returned context to continue that caller's task.
     pub fn with_caller(&self, caller: Principal) -> Self {
+        let base = self.base.with_caller(caller);
+        if caller != self.base.caller {
+            let limits = self
+                .base
+                .get_state::<crate::subagent::SubAgentScope>()
+                .map(|scope| scope.limits().clone())
+                .unwrap_or_default();
+            base.set_state(crate::subagent::SubAgentScope::new(limits));
+            base.state
+                .write()
+                .remove::<crate::subagent::ExecutionIdentity>();
+        }
         Self {
-            base: self.base.with_caller(caller),
+            base,
             ..self.clone()
         }
     }

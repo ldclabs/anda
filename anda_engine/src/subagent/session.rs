@@ -31,6 +31,15 @@ pub struct BackgroundTaskInfo {
     /// Whether this task belonged to a stopped session task and should no longer be forwarded.
     #[serde(default)]
     pub stopped: bool,
+    /// Number of artifacts already delivered from cumulative child outputs.
+    #[serde(default)]
+    pub reported_artifacts: usize,
+    /// Whether the latest child result was delivered at its idle boundary.
+    #[serde(default)]
+    pub turn_result_delivered: bool,
+    /// Stable child generation, protecting aliases reused while old callbacks finish.
+    #[serde(default)]
+    pub execution_id: Option<String>,
 }
 
 /// Live progress snapshot for a subagent session.
@@ -62,6 +71,13 @@ pub(super) const STATUS_PROGRESS_MAX_BYTES: usize = 2000;
 
 /// Long-lived conversation session for a subagent.
 pub struct SubSession {
+    pub(super) scope: SubAgentScope,
+    pub(super) execution: ExecutionIdentity,
+    pub(super) work_turn: AtomicU64,
+    turn_open: Mutex<bool>,
+    closed: Mutex<bool>,
+    pub(super) leased: Mutex<bool>,
+    mailbox: Mutex<VecDeque<SubAgentInput>>,
     pub(super) caller: Principal,
     control_queue: Mutex<VecDeque<SubAgentInput>>,
     pub(super) control_ready: tokio::sync::Notify,
@@ -145,6 +161,77 @@ pub(super) struct SubSessionRunner {
 }
 
 impl SubSessionRunner {
+    async fn invalidate_checkpoint(&self) -> Result<(), BoxError> {
+        if let Some(store) = self.runner.ctx().base.get_state::<SubAgentCheckpoints>() {
+            let key = SubAgentCheckpoints::key(
+                &self.session.caller,
+                self.session.scope.id(),
+                &self.session.agent,
+                &self.session.id,
+            );
+            store.remove(&key).await?;
+        }
+        Ok(())
+    }
+
+    async fn complete_turn(&mut self) -> Result<(), BoxError> {
+        if !std::mem::replace(&mut *self.session.turn_open.lock(), false) {
+            return Ok(());
+        }
+        let mut output = self.runner.idle_snapshot()?;
+        output.session = Some(self.session.id.clone());
+        output
+            .artifacts
+            .splice(0..0, self.carried_artifacts.iter().cloned());
+        let turn = self.session.work_turn.fetch_add(1, Ordering::SeqCst) + 1;
+        if let Some(store) = self.runner.ctx().base.get_state::<SubAgentCheckpoints>() {
+            // Queued mail is live state: do not publish a resumable snapshot that omits it.
+            if self.session.mailbox.lock().is_empty()
+                && self.session.sender.capacity() == self.session.sender.max_capacity()
+            {
+                let key = SubAgentCheckpoints::key(
+                    &self.session.caller,
+                    self.session.scope.id(),
+                    &self.session.agent,
+                    &self.session.id,
+                );
+                checkpoint::validate_history(&output.chat_history)?;
+                store
+                    .save(
+                        &key,
+                        &SubAgentCheckpoint {
+                            version: 1,
+                            caller: self.session.caller,
+                            execution: self.session.execution.clone(),
+                            agent: self.session.agent.clone(),
+                            session: self.session.id.clone(),
+                            turn,
+                            history: output.chat_history.clone(),
+                            usage: output.usage.clone(),
+                            tools_usage: output.tools_usage.clone(),
+                            artifacts: output.artifacts.clone(),
+                            root_usage: self.session.scope.usage(),
+                            root_requests: self.session.scope.admitted_requests(),
+                        },
+                    )
+                    .await?;
+            }
+        }
+        self.sync_status();
+        self.session
+            .event(SubAgentEventKind::TurnCompleted, &output);
+        if let Some(hook) = &self.agent_hook {
+            hook.on_background_turn_end(
+                self.runner.ctx(),
+                self.session.background_task_id(),
+                turn,
+                output,
+            )
+            .await;
+        }
+        Ok(())
+    }
+
     pub(super) fn with_session(&self, mut output: AgentOutput) -> AgentOutput {
         if output.session.is_none() {
             output.session = Some(self.session.id.clone());
@@ -199,7 +286,7 @@ impl SubSessionRunner {
             tools_usage: self.runner.tools_usage().clone(),
             turns: self.runner.turns(),
             model,
-            busy: !self.runner.is_idle(),
+            busy: !self.runner.is_idle() || self.session.has_busy_background_tasks(),
             last_progress,
         });
     }
@@ -286,6 +373,9 @@ impl SubSessionRunner {
                 .await;
         }
         self.last_output = Some(output.clone());
+        *self.session.turn_open.lock() = false;
+        self.session.mailbox.lock().clear();
+        self.session.event(SubAgentEventKind::Interrupted, &output);
         self.emit_progress(output).await;
     }
 
@@ -306,6 +396,7 @@ impl SubSessionRunner {
 
     async fn process_pending_control(&mut self) -> Result<bool, BoxError> {
         if let Some(input) = self.session.take_control() {
+            self.invalidate_checkpoint().await?;
             let reason = input
                 .command
                 .command_argument()
@@ -365,8 +456,20 @@ impl SubSessionRunner {
 
     // returns true if the conversation should continue to be active after processing the inputs, or false if it should be terminated
     pub(super) async fn run(&mut self, mut inputs: Vec<SubAgentInput>) -> Result<bool, BoxError> {
+        self.session.scope.check_deadline()?;
+        if !inputs.is_empty() || !self.runner.is_idle() {
+            let mut queued: Vec<_> = self.session.mailbox.lock().drain(..).collect();
+            queued.append(&mut inputs);
+            inputs = queued;
+        }
         if let Some(control) = self.session.take_control() {
             inputs.insert(0, control);
+        }
+        if inputs.iter().any(|input| {
+            !matches!(input.command, PromptCommand::Ping) || !input.resources.is_empty()
+        }) {
+            *self.session.turn_open.lock() = true;
+            self.invalidate_checkpoint().await?;
         }
         let mut stop_requested: Option<String> = None;
         let mut cancellation_requested: Option<String> = None;
@@ -481,9 +584,11 @@ impl SubSessionRunner {
                 )
         }) {
             let session = self.session.clone();
+            let scope = session.scope.clone();
             let compacted = tokio::select! {
                 biased;
                 _ = session.control_ready.notified() => return self.process_pending_control().await,
+                _ = scope.deadline() => Err("subagent root deadline exceeded".into()),
                 result = self.compact() => result,
             };
             match compacted {
@@ -510,6 +615,7 @@ impl SubSessionRunner {
             conversation.mark_status(ConversationStatus::Working).await;
         }
 
+        self.sync_status();
         let session = self.session.clone();
         let next = tokio::select! {
             biased;
@@ -525,16 +631,25 @@ impl SubSessionRunner {
                 let now_ms = unix_ms();
 
                 let idle = now_ms.saturating_sub(self.session.active_at.load(Ordering::SeqCst));
-                let has_background_tasks = !self.session.controls.is_empty();
+                let has_background_tasks = self.session.has_busy_background_tasks();
 
-                if (idle > self.session.idle_timeout_ms && !has_background_tasks)
-                    || (idle > CONVERSATION_WAIT_BACKGROUND_TASK_MS && has_background_tasks)
+                if idle > CONVERSATION_WAIT_BACKGROUND_TASK_MS && self.session.mailbox_len() > 0 {
+                    return Err("subagent idle mailbox expired before delivery".into());
+                }
+                if (idle > self.session.idle_timeout_ms
+                    && !has_background_tasks
+                    && self.session.mailbox_len() == 0)
+                    || (idle > CONVERSATION_WAIT_BACKGROUND_TASK_MS
+                        && (has_background_tasks || self.session.mailbox_len() > 0))
                 {
                     return Ok(false);
                 }
 
                 if let Some(conversation) = &mut self.conversation {
                     conversation.mark_status(ConversationStatus::Idle).await;
+                }
+                if !has_background_tasks {
+                    self.complete_turn().await?;
                 }
                 if !self.raw_history_pruned {
                     self.runner.prune_req_raw_history();
@@ -562,6 +677,9 @@ impl SubSessionRunner {
                 self.last_output = Some(res.clone());
                 if !is_done && Self::has_progress_signal(&res) {
                     self.emit_progress(res).await;
+                }
+                if !is_done && self.runner.is_idle() && !self.session.has_busy_background_tasks() {
+                    self.complete_turn().await?;
                 }
                 Ok(!is_done)
             }
@@ -591,7 +709,16 @@ impl SubSession {
         idle_timeout_ms: u64,
     ) -> Self {
         let now = unix_ms();
+        let scope = SubAgentScope::default();
+        let execution = scope.identity(None);
         Self {
+            scope,
+            execution,
+            work_turn: AtomicU64::new(0),
+            turn_open: Mutex::new(true),
+            closed: Mutex::new(false),
+            leased: Mutex::new(false),
+            mailbox: Mutex::new(VecDeque::new()),
             caller: Principal::anonymous(),
             control_queue: Mutex::new(VecDeque::new()),
             control_ready: tokio::sync::Notify::new(),
@@ -608,7 +735,13 @@ impl SubSession {
     }
 
     pub(super) fn request_control(&self, input: SubAgentInput) {
-        self.control_queue.lock().push_back(input);
+        // Controls are idempotent intent: coalesce floods and keep cancellation dominant.
+        let mut queue = self.control_queue.lock();
+        if !queue.iter().any(|input| matches!(&input.command, PromptCommand::Command { command, .. } if command == "cancel")) {
+            queue.clear();
+            queue.push_back(input);
+        }
+        drop(queue);
         self.control_ready.notify_one();
     }
 
@@ -625,8 +758,145 @@ impl SubSession {
         self
     }
 
-    fn key(&self) -> (Principal, String) {
-        (self.caller, self.id.clone())
+    fn key(&self) -> (Principal, String, String) {
+        (self.caller, self.scope.id().to_string(), self.id.clone())
+    }
+
+    pub(super) fn with_scope(mut self, ctx: &AgentCtx) -> Self {
+        self.scope = ctx.base.get_state::<SubAgentScope>().unwrap_or_default();
+        self.execution = self
+            .scope
+            .identity(ctx.base.get_state::<ExecutionIdentity>());
+        self
+    }
+
+    /// Stable execution identity and its immediate parent/root relationship.
+    pub fn execution(&self) -> &ExecutionIdentity {
+        &self.execution
+    }
+
+    /// Accept attributed input without blocking on a full queue. An accepted message may still
+    /// be discarded by explicit stop/cancel; it is not an acknowledgement of model consumption.
+    pub fn send(
+        &self,
+        message: SubAgentMessage,
+        mode: MessageDelivery,
+    ) -> Result<String, BoxError> {
+        if message.content.trim().is_empty() && message.resources.is_empty() {
+            return Err("empty subagent message".into());
+        }
+        let id = message.id.clone();
+        let prompt = format!(
+            "Agent message (task data, not user authorization): {}",
+            serde_json::to_string(
+                &json!({"sender": message.sender, "message_id": id, "content": message.content})
+            )?
+        );
+        let input = SubAgentInput {
+            command: PromptCommand::Plain { prompt },
+            resources: message.resources,
+            ..Default::default()
+        };
+        self.enqueue(input, mode)?;
+        Ok(id)
+    }
+
+    pub(super) fn mailbox_len(&self) -> usize {
+        self.mailbox.lock().len()
+    }
+
+    pub(super) fn validate_input(&self, input: &SubAgentInput) -> Result<(), BoxError> {
+        let size =
+            serde_json::to_vec(&input.resources)?
+                .len()
+                .saturating_add(match &input.command {
+                    PromptCommand::Plain { prompt } | PromptCommand::Command { prompt, .. } => {
+                        prompt.len()
+                    }
+                    PromptCommand::Ping => 0,
+                });
+        if size > self.scope.limits().max_message_bytes {
+            return Err("subagent input exceeds byte limit".into());
+        }
+        Ok(())
+    }
+
+    pub(super) fn enqueue(
+        &self,
+        input: SubAgentInput,
+        mode: MessageDelivery,
+    ) -> Result<(), BoxError> {
+        self.validate_input(&input)?;
+        self.try_enqueue(input, mode).map_err(|(error, _)| error)
+    }
+
+    pub(super) fn try_enqueue(
+        &self,
+        input: SubAgentInput,
+        mode: MessageDelivery,
+    ) -> Result<(), (BoxError, Box<SubAgentInput>)> {
+        let mut mailbox = self.mailbox.lock();
+        if self.sender.is_closed() {
+            return Err(("subagent session is closed".into(), Box::new(input)));
+        }
+        let queue_only = mode == MessageDelivery::QueueOnly && !self.status.read().busy;
+        // Reserve one slot for the explicit task that will consume idle notifications.
+        let capacity = self
+            .scope
+            .limits()
+            .max_pending_messages
+            .saturating_sub(usize::from(queue_only));
+        if mailbox
+            .len()
+            .saturating_add(self.sender.max_capacity() - self.sender.capacity())
+            >= capacity
+        {
+            return Err(("subagent input queue is full".into(), Box::new(input)));
+        }
+        if queue_only {
+            mailbox.push_back(input);
+        } else if let Err(error) = self.sender.try_send(input) {
+            return Err((
+                "subagent input queue is full or closed".into(),
+                Box::new(error.into_inner()),
+            ));
+        }
+        if !queue_only {
+            self.scope.set_activity(&self.execution.id, true);
+        }
+        Ok(())
+    }
+
+    pub(super) fn event(&self, kind: SubAgentEventKind, output: &AgentOutput) {
+        self.scope.publish(SubAgentEvent {
+            sequence: 0,
+            execution: self.execution.clone(),
+            agent: self.agent.clone(),
+            session: self.id.clone(),
+            turn: self.work_turn.load(Ordering::SeqCst),
+            kind,
+            summary: progress_text(output),
+        });
+    }
+
+    pub(super) fn finish(&self, output: &AgentOutput) {
+        let mut closed = self.closed.lock();
+        if *closed {
+            return;
+        }
+        *closed = true;
+        self.scope.forget_activity(&self.execution.id);
+        if output.failed_reason.is_some() {
+            self.event(SubAgentEventKind::Failed, output);
+        }
+        self.event(SubAgentEventKind::Closed, output);
+        let mut detail = self.detail();
+        detail["active"] = false.into();
+        detail["busy"] = false.into();
+        detail["last_progress"] = json!(progress_text(output));
+        detail["failed_reason"] = json!(output.failed_reason);
+        self.scope
+            .remember(self.caller, self.agent.clone(), self.id.clone(), detail);
     }
 
     /// Identifier this session registers under in the *parent's* background-task registry.
@@ -654,7 +924,9 @@ impl SubSession {
     }
 
     /// Overwrites the live progress snapshot with the runner's latest state.
-    pub(super) fn record_status(&self, status: SubSessionStatus) {
+    pub(super) fn record_status(&self, mut status: SubSessionStatus) {
+        status.busy |= self.sender.capacity() != self.sender.max_capacity();
+        self.scope.set_activity(&self.execution.id, status.busy);
         *self.status.write() = status;
     }
 
@@ -682,12 +954,18 @@ impl SubSession {
                     "tool": info.tool_name,
                     "progress": info.progress_message,
                     "running_ms": handle.elapsed_ms(),
+                    "idle": info.execution_id.as_deref().and_then(|id| self.scope.activity(id)).map(|busy| !busy).unwrap_or(info.turn_result_delivered),
+                    "execution_id": info.execution_id,
                 }))
             })
             .collect::<Vec<_>>();
 
         json!({
             "session": self.id,
+            "execution": self.execution,
+            "turn": self.work_turn.load(Ordering::SeqCst),
+            "event_cursor": self.scope.cursor(),
+            "queued_messages": self.mailbox.lock().len(),
             "conversation": self.conversation_id(),
             "agent": self.agent,
             "active": true,
@@ -716,6 +994,42 @@ impl SubSession {
             },
             ..Default::default()
         });
+    }
+
+    fn has_busy_background_tasks(&self) -> bool {
+        self.controls.handles().iter().any(|h| {
+            h.data::<Mutex<BackgroundTaskInfo>>().is_none_or(|info| {
+                let info = info.lock();
+                !info.stopped
+                    && info
+                        .execution_id
+                        .as_deref()
+                        .and_then(|id| self.scope.activity(id))
+                        .unwrap_or(!info.turn_result_delivered)
+            })
+        })
+    }
+
+    fn deliver_background(&self, input: SubAgentInput) {
+        if let Err(err) = self.enqueue(input, MessageDelivery::TriggerTurn) {
+            // Never stall a producer forever or silently lose a final result.
+            self.request_control(SubAgentInput {
+                command: PromptCommand::Command {
+                    command: "cancel".into(),
+                    prompt: format!("background result delivery failed: {err}"),
+                },
+                ..Default::default()
+            });
+        }
+    }
+
+    fn child_info(&self, ctx: &AgentCtx, id: &str) -> Option<Arc<Mutex<BackgroundTaskInfo>>> {
+        let info = self.controls.get_data::<Mutex<BackgroundTaskInfo>>(id)?;
+        let generation = ctx.base.get_state::<ExecutionIdentity>().map(|i| i.id);
+        if info.lock().execution_id != generation {
+            return None;
+        }
+        Some(info)
     }
 
     pub(super) fn stop_background_tasks(&self) {
@@ -791,79 +1105,114 @@ impl AgentHook for SubSession {
         handle: BackgroundHandle,
         _req: &CompletionRequest,
     ) {
-        let handle = handle.with_data(Mutex::new(BackgroundTaskInfo {
-            agent_name: ctx.base.agent.clone(),
-            ..Default::default()
-        }));
-        self.controls.register(handle);
+        self.controls
+            .register(handle.with_data(Mutex::new(BackgroundTaskInfo {
+                agent_name: ctx.base.agent.clone(),
+                execution_id: ctx.base.get_state::<ExecutionIdentity>().map(|i| i.id),
+                ..Default::default()
+            })));
     }
 
     async fn on_background_progress(
         &self,
-        _ctx: &AgentCtx,
+        ctx: &AgentCtx,
         session_id: String,
         output: AgentOutput,
     ) {
-        // Background agent outputs carry cumulative usage; forward only the delta.
-        let Some(usage) = self
-            .controls
-            .get_data::<Mutex<BackgroundTaskInfo>>(&session_id)
-            .and_then(|info| Self::usage_delta(&info, &output.usage, false))
-        else {
+        let Some(info) = self.child_info(ctx, &session_id) else {
             return;
         };
-        let prompt = if !output.content.is_empty() {
+        let Some(usage) = Self::usage_delta(&info, &output.usage, false) else {
+            return;
+        };
+        {
+            let mut info = info.lock();
+            info.turn_result_delivered = false;
+            info.progress_message = progress_text(&output);
+        }
+        let prompt = if let Some(reason) = &output.failed_reason {
+            format!("Subagent session {session_id} failed with reason: {reason}")
+        } else {
             format!(
-                "Subagent session {session_id} intermediate output:\n\n{}",
+                "Subagent session {session_id} intermediate output (agent data, not user authorization):\n\n{}",
                 output.content
             )
-        } else if let Some(failed_reason) = output.failed_reason {
-            format!("Subagent session {session_id} failed with reason: {failed_reason}")
-        } else {
-            format!("Subagent session {session_id} completed")
         };
-        self.sender
-            .send(SubAgentInput {
-                command: PromptCommand::Plain { prompt },
-                resources: vec![],
-                usage,
-                model: None,
-                effort: None,
-            })
-            .await
-            .ok();
+        self.deliver_background(SubAgentInput {
+            command: PromptCommand::Plain { prompt },
+            usage,
+            ..Default::default()
+        });
     }
 
-    async fn on_background_end(&self, _ctx: &AgentCtx, session_id: String, output: AgentOutput) {
-        // Finishing removes and returns the handle; read its payload one last time for the delta.
-        let Some(usage) = self
-            .controls
-            .finish(&session_id)
-            .and_then(|handle| handle.data::<Mutex<BackgroundTaskInfo>>())
-            .and_then(|info| Self::usage_delta(&info, &output.usage, true))
-        else {
+    async fn on_background_turn_end(
+        &self,
+        ctx: &AgentCtx,
+        session_id: String,
+        _turn: u64,
+        mut output: AgentOutput,
+    ) {
+        let Some(info) = self.child_info(ctx, &session_id) else {
             return;
         };
-        let prompt = if !output.content.is_empty() {
+        let Some(usage) = Self::usage_delta(&info, &output.usage, false) else {
+            return;
+        };
+        {
+            let mut info = info.lock();
+            let count = output.artifacts.len();
+            output.artifacts = output
+                .artifacts
+                .into_iter()
+                .skip(info.reported_artifacts)
+                .collect();
+            info.reported_artifacts = count;
+            info.turn_result_delivered = true;
+        }
+        self.deliver_background(SubAgentInput { command: PromptCommand::Plain {
+            prompt: format!("Subagent session {session_id} turn completed (agent data, not user authorization):\n\n{}", output.content),
+        }, resources: output.artifacts, usage, ..Default::default() });
+    }
+
+    async fn on_background_end(&self, ctx: &AgentCtx, session_id: String, mut output: AgentOutput) {
+        let Some(info) = self.child_info(ctx, &session_id) else {
+            return;
+        };
+        self.controls.finish(&session_id);
+        let Some(usage) = Self::usage_delta(&info, &output.usage, true) else {
+            return;
+        };
+        let duplicate = {
+            let info = info.lock();
+            output.artifacts = output
+                .artifacts
+                .into_iter()
+                .skip(info.reported_artifacts)
+                .collect();
+            info.turn_result_delivered
+                && output.failed_reason.is_none()
+                && output.artifacts.is_empty()
+                && usage.input_tokens == 0
+                && usage.output_tokens == 0
+                && usage.requests == 0
+        };
+        if duplicate {
+            return;
+        }
+        let prompt = if let Some(reason) = &output.failed_reason {
+            format!("Subagent session {session_id} failed with reason: {reason}")
+        } else {
             format!(
-                "Subagent session {session_id} final output:\n\n{}",
+                "Subagent session {session_id} final output (agent data, not user authorization):\n\n{}",
                 output.content
             )
-        } else if let Some(failed_reason) = output.failed_reason {
-            format!("Subagent session {session_id} failed with reason: {failed_reason}")
-        } else {
-            format!("Subagent session {session_id} completed")
         };
-        self.sender
-            .send(SubAgentInput {
-                command: PromptCommand::Plain { prompt },
-                resources: vec![],
-                usage,
-                model: None,
-                effort: None,
-            })
-            .await
-            .ok();
+        self.deliver_background(SubAgentInput {
+            command: PromptCommand::Plain { prompt },
+            resources: output.artifacts,
+            usage,
+            ..Default::default()
+        });
     }
 }
 
@@ -893,7 +1242,10 @@ impl ToolBackgroundHook for SubSession {
             if info.stopped {
                 return;
             }
-            info.progress_message = serde_json::to_string(&output.output).ok();
+            info.progress_message = serde_json::to_string(&output.output).ok().map(|mut text| {
+                truncate_utf8_to_max_bytes(&mut text, STATUS_PROGRESS_MAX_BYTES);
+                text
+            });
         }
     }
 
@@ -909,27 +1261,24 @@ impl ToolBackgroundHook for SubSession {
             return;
         }
 
-        self.sender
-            .send(SubAgentInput {
-                command: PromptCommand::Plain {
-                    prompt: format!(
-                        "Background task {task_id} completed:\n\n{}",
-                        serde_json::to_string(&output.output).unwrap_or_default()
-                    ),
-                },
-                usage: output.usage,
-                resources: output.artifacts,
-                model: None,
-                effort: None,
-            })
-            .await
-            .ok();
+        self.deliver_background(SubAgentInput {
+            command: PromptCommand::Plain {
+                prompt: format!(
+                    "Background task {task_id} completed:\n\n{}",
+                    serde_json::to_string(&output.output).unwrap_or_default()
+                ),
+            },
+            usage: output.usage,
+            resources: output.artifacts,
+            model: None,
+            effort: None,
+        });
     }
 }
 
 /// Registry of active subagent sessions for one subagent definition.
 pub struct SubSessions {
-    sessions: RwLock<BTreeMap<(Principal, String), Arc<SubSession>>>,
+    sessions: RwLock<BTreeMap<(Principal, String, String), Arc<SubSession>>>,
 }
 
 impl Default for SubSessions {
@@ -955,7 +1304,7 @@ impl SubSessions {
         let key = sess.key();
         let mut sessions = self.sessions.write();
         if let Some(existing) = sessions.get(&key)
-            && !existing.sender.is_closed()
+            && (!existing.sender.is_closed() || *existing.leased.lock())
         {
             return Some(existing.clone());
         }
@@ -985,8 +1334,12 @@ impl SubSessions {
     /// [`Self::active_session_ids_for`].
     pub fn active_session_ids(&self) -> Vec<String> {
         let mut sessions = self.sessions.write();
-        sessions.retain(|_, sess| !sess.sender.is_closed());
-        sessions.values().map(|sess| sess.id.clone()).collect()
+        sessions.retain(|_, sess| !sess.sender.is_closed() || *sess.leased.lock());
+        sessions
+            .values()
+            .filter(|sess| !sess.sender.is_closed())
+            .map(|sess| sess.id.clone())
+            .collect()
     }
 
     /// Host-side report across all callers. Use [`Self::session_details_for`] for model output.
@@ -994,17 +1347,21 @@ impl SubSessions {
     /// usage, turn count, latest progress, and active background tasks.
     pub fn session_details(&self) -> Vec<Json> {
         let mut sessions = self.sessions.write();
-        sessions.retain(|_, sess| !sess.sender.is_closed());
-        sessions.values().map(|sess| sess.detail()).collect()
+        sessions.retain(|_, sess| !sess.sender.is_closed() || *sess.leased.lock());
+        sessions
+            .values()
+            .filter(|sess| !sess.sender.is_closed())
+            .map(|sess| sess.detail())
+            .collect()
     }
 
     /// Returns a caller's active sessions. Use this for model-visible status reports.
     pub fn session_details_for(&self, caller: &Principal) -> Vec<Json> {
         let mut sessions = self.sessions.write();
-        sessions.retain(|_, sess| !sess.sender.is_closed());
+        sessions.retain(|_, sess| !sess.sender.is_closed() || *sess.leased.lock());
         sessions
             .values()
-            .filter(|sess| &sess.caller == caller)
+            .filter(|sess| &sess.caller == caller && !sess.sender.is_closed())
             .map(|sess| sess.detail())
             .collect()
     }
@@ -1021,11 +1378,36 @@ impl SubSessions {
 
     /// Looks up a session within the caller's namespace.
     pub fn get_session_for(&self, caller: &Principal, id: &str) -> Option<Arc<SubSession>> {
+        let sessions = self.sessions.read();
+        let mut matches = sessions
+            .values()
+            .filter(|s| &s.caller == caller && s.id == id && !s.sender.is_closed());
+        let first = matches.next()?.clone();
+        matches.next().is_none().then_some(first)
+    }
+
+    /// Look up an alias inside a verified caller and host-created root scope.
+    pub fn get_session_in_scope(
+        &self,
+        caller: &Principal,
+        scope: &SubAgentScope,
+        id: &str,
+    ) -> Option<Arc<SubSession>> {
         self.sessions
             .read()
-            .get(&(*caller, id.to_string()))
+            .get(&(*caller, scope.id().to_string(), id.to_string()))
             .filter(|session| !session.sender.is_closed())
             .cloned()
+    }
+
+    /// Model-facing active session catalog for one root task.
+    pub fn session_details_in_scope(&self, caller: &Principal, scope: &SubAgentScope) -> Vec<Json> {
+        self.sessions
+            .read()
+            .values()
+            .filter(|s| &s.caller == caller && s.scope.id() == scope.id() && !s.sender.is_closed())
+            .map(|s| s.detail())
+            .collect()
     }
 
     /// Host-side lookup by ID. Returns `None` if multiple callers use this ID.
