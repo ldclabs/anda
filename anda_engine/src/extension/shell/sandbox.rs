@@ -26,8 +26,9 @@ pub struct SandboxPolicy {
 }
 
 impl SandboxPolicy {
-    /// Grants writes only within this workspace, plus platform temporary/device
-    /// facilities. Common OS runtime files are readable; other paths require grants.
+    /// Grants writes only within this workspace, `/dev/null`, and (on Linux) a
+    /// private `/tmp`; macOS needs an explicit scratch grant for `TMPDIR`. Common
+    /// OS runtime files are readable; other paths require grants.
     pub fn workspace(workspace: impl AsRef<Path>) -> Result<Self, BoxError> {
         Ok(Self {
             readable: Vec::new(),
@@ -103,7 +104,12 @@ impl SandboxPolicy {
             #[cfg(target_os = "linux")]
             let mut wrapped = {
                 let mut wrapper = Command::new("/usr/bin/bwrap");
-                wrapper.args(["--die-with-parent", "--unshare-all", "--new-session"]);
+                wrapper.args(["--die-with-parent", "--unshare-all"]);
+                // A PTY launch already runs in its own session, and that private
+                // terminal must stay the controlling terminal of the command.
+                if !tty {
+                    wrapper.arg("--new-session");
+                }
                 if self.network == SandboxNetwork::Allow {
                     wrapper.arg("--share-net");
                 }
@@ -122,7 +128,6 @@ impl SandboxPolicy {
                     .args(["--proc", "/proc", "--dev", "/dev", "--chdir"])
                     .arg(cwd)
                     .arg("--");
-                let _ = tty;
                 wrapper
             };
             wrapped.arg(command.get_program()).args(command.get_args());
@@ -223,6 +228,8 @@ fn system_roots() -> Vec<PathBuf> {
         "/etc/ld.so.conf",
         "/etc/alternatives",
         "/etc/localtime",
+        "/etc/hosts",
+        "/etc/resolv.conf",
     ];
     roots
         .iter()

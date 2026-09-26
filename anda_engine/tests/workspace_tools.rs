@@ -828,6 +828,157 @@ async fn pty_is_opt_in_and_reports_terminal_output() {
 }
 
 #[tokio::test]
+async fn patch_deletes_binary_files() {
+    let dir = Directory::new();
+    std::fs::write(
+        dir.path().join("logo.png"),
+        [0x89, b'P', b'N', b'G', 0, 0xff],
+    )
+    .unwrap();
+    let tool = ApplyPatchTool::new(dir.0.clone());
+    let result = tool
+        .call(
+            context(),
+            ApplyPatchArgs {
+                patch: "*** Begin Patch\n*** Delete File: logo.png\n*** End Patch".into(),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .unwrap();
+    assert!(result.output.changes[0].applied);
+    assert!(result.output.diff.contains("Binary file deleted"));
+    assert!(!dir.path().join("logo.png").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn foreground_wait_completes_commands_and_hooks_only_see_background_ones() {
+    use anda_core::ToolOutput;
+    use anda_engine::{
+        extension::shell::{ExecArgs, ExecOutput, ShellToolHook},
+        hook::{BackgroundHandle, ToolHook},
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct Events {
+        start: AtomicUsize,
+        end: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl ToolHook<ExecArgs, ExecOutput> for Events {
+        async fn on_background_start(&self, _: &BaseCtx, _: BackgroundHandle, _: &ExecArgs) {
+            self.start.fetch_add(1, Ordering::SeqCst);
+        }
+        async fn on_background_end(&self, _: &BaseCtx, _: String, _: ToolOutput<ExecOutput>) {
+            self.end.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let dir = Directory::new();
+    let runtime = NativeRuntime::new(dir.0.clone());
+    let ctx = context();
+    let events = Arc::new(Events::default());
+    ctx.set_state(ShellToolHook::new(events.clone()));
+    // Early output must not end the foreground wait before the process exits.
+    let output = runtime
+        .execute_session(
+            ctx.clone(),
+            CommandArgs {
+                command: "printf a; sleep 0.2; printf b".into(),
+                ..Default::default()
+            },
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(output.state, CommandState::Exited);
+    assert_eq!(output.output.stdout.as_deref(), Some("ab"));
+
+    let output = runtime
+        .execute_session(
+            ctx.clone(),
+            CommandArgs {
+                command: "sleep 10".into(),
+                yield_time_ms: Some(50),
+                ..Default::default()
+            },
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(output.state, CommandState::Running);
+    let stopped = runtime
+        .interact_session(
+            ctx.clone(),
+            SessionArgs {
+                task_id: Some(output.task_id),
+                action: SessionAction::Stop,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .command
+        .unwrap();
+    finish(&runtime, &ctx, stopped).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while events.end.load(Ordering::SeqCst) == 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(events.start.load(Ordering::SeqCst), 1);
+    assert_eq!(events.end.load(Ordering::SeqCst), 1);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn read_log_keeps_multibyte_characters_whole() {
+    let dir = Directory::new();
+    let runtime = NativeRuntime::new(dir.0.clone());
+    let ctx = context();
+    let text = "汉字".repeat(10);
+    let output = runtime
+        .execute_session(
+            ctx.clone(),
+            CommandArgs {
+                command: format!("printf '{text}'"),
+                ..Default::default()
+            },
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    let output = finish(&runtime, &ctx, output).await;
+    let (mut offset, mut log_text) = (0, String::new());
+    loop {
+        let log = runtime
+            .interact_session(
+                ctx.clone(),
+                SessionArgs {
+                    task_id: Some(output.task_id.clone()),
+                    action: SessionAction::ReadLog,
+                    max_output_bytes: Some(128),
+                    offset,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .log
+            .unwrap();
+        log_text.push_str(&log.text);
+        offset = log.next_offset;
+        if log.eof {
+            break;
+        }
+    }
+    assert!(!log_text.contains('\u{fffd}'), "{log_text:?}");
+    assert!(log_text.contains(&text));
+}
+
+#[tokio::test]
 async fn coding_bundle_registers_no_redundant_file_read_tools() {
     use anda_engine::extension::workspace::{coding_tools, readonly_file_tools};
     let dir = Directory::new();

@@ -228,6 +228,11 @@ fn group() -> ToolGroupInfo {
 
 /// Session-aware replacement for the legacy ShellTool. Register one, not both;
 /// both use the stable name `shell`. Pair with ShellSessionTool using the same executor.
+///
+/// Argument hooks are typed on this tool's own types (`DynToolHook<CommandArgs,
+/// CommandOutput>`), so an approval gate installed as `ShellToolHook` does not
+/// intercept these calls; `ShellToolHook` and `DynToolJsonHook` only receive the
+/// background events of commands that outlive the foreground wait.
 #[derive(Clone)]
 pub struct ShellCommandTool {
     shell: ShellTool,

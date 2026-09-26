@@ -27,7 +27,7 @@ pub struct FileVersion {
 /// JSON wrapper keeps patch support available to all function-calling providers.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 pub struct ApplyPatchArgs {
-    /// Text between *** Begin Patch and *** End Patch. Supports Add File, Delete File, Update File and Move to; updates use @@ chunks with exact space, '+' or '-' line prefixes. Ambiguous context is rejected.
+    /// Text between *** Begin Patch and *** End Patch. Supports Add File, Delete File, Update File and Move to; updates use @@ chunks with exact space, '+' or '-' line prefixes (a blank line is empty context). Ambiguous context is rejected.
     pub patch: String,
     /// Validate and return the proposed diff and source versions without writing.
     #[serde(default)]
@@ -164,13 +164,16 @@ impl Tool<BaseCtx> for ApplyPatchTool {
                 } else {
                     None
                 };
-                let original_text = original
-                    .as_ref()
-                    .map(|bytes| {
+                let original_text = match (&patch.action, &original) {
+                    (Action::Update { .. }, Some(bytes)) => Some(
                         decode_file_text(bytes.clone())
-                            .map_err(|_| "Patch requires a supported text encoding")
-                    })
-                    .transpose()?;
+                            .map_err(|_| "Patch requires a supported text encoding")?,
+                    ),
+                    // Delete needs no text (and Add rejects existing files below), so
+                    // undecodable content only changes the preview.
+                    (_, Some(bytes)) => decode_file_text(bytes.clone()).ok(),
+                    (_, None) => None,
+                };
                 let before = original_text
                     .as_ref()
                     .map_or("", |decoded| decoded.text.as_str());
@@ -233,12 +236,16 @@ impl Tool<BaseCtx> for ApplyPatchTool {
                     sha256: hash(updated.as_deref()),
                     applied: false,
                 };
-                let diff = diff(
-                    &change.path,
-                    change.destination.as_deref(),
-                    before,
-                    after.as_deref().unwrap_or(""),
-                );
+                let diff = if original.is_some() && original_text.is_none() {
+                    format!("--- {0}\n+++ {0}\nBinary file deleted\n", change.path)
+                } else {
+                    diff(
+                        &change.path,
+                        change.destination.as_deref(),
+                        before,
+                        after.as_deref().unwrap_or(""),
+                    )
+                };
                 prepared.push(Prepared {
                     path: target.path,
                     destination,

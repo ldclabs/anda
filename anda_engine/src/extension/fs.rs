@@ -19,8 +19,6 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 use tokio::io::AsyncReadExt;
-#[cfg(test)]
-use tokio::io::AsyncWriteExt;
 
 mod access;
 mod locks;
@@ -52,7 +50,7 @@ pub fn fs_tool_group_info() -> ToolGroupInfo {
         title: "Filesystem workspace".to_string(),
         description: "Read, search, edit, and write files within the agent's sandboxed workspace directories.".to_string(),
         instructions: Some(
-            "Use the registered members of this group for workspace-scoped file operations. Relative paths resolve in configured root order; request metadata can prioritize a subdirectory but does not grant access or revoke the default roots. Coding agents can use shell for reading and searching and register only dedicated editing tools. search_file matches paths, not file contents.".to_string(),
+            "Use the registered members of this group for workspace-scoped file operations. Relative paths resolve in configured root order; request metadata can prioritize a subdirectory but does not grant access or revoke the default roots. search_file matches paths, not file contents.".to_string(),
         ),
     }
 }
@@ -162,16 +160,11 @@ impl WorkspaceScope {
     ///
     /// Resolves `user_path` against the roots in priority order (following the
     /// read rules: the target must exist and canonicalize inside a root), then
-    /// enforces the regular-file, hard-link, and size-limit checks.
+    /// opens it through `access::open_read`, which enforces the regular-file,
+    /// hard-link, and size-limit checks on the opened handle.
     pub(crate) async fn open_read(&self, user_path: &str) -> Result<ReadTarget, BoxError> {
         let resolved = resolve_read_path_in_workspaces(&self.workspaces, user_path).await?;
         let (file, metadata) = access::open_read(&resolved.path).await?;
-        ensure_regular_file(
-            &metadata,
-            &resolved.path,
-            "Reading multiply-linked file is not allowed",
-        )?;
-        ensure_file_size_within_limit(&metadata, &resolved.path, MAX_FILE_SIZE_BYTES)?;
 
         Ok(ReadTarget {
             workspace: resolved.workspace,
@@ -184,26 +177,23 @@ impl WorkspaceScope {
     /// Opens an existing file for in-place editing.
     ///
     /// Resolves `user_path` with the write rules (symlink targets are refused)
-    /// but requires the destination to already exist, then enforces the
-    /// regular-file, hard-link, and size-limit checks.
+    /// but requires the destination to already exist, then opens it with the
+    /// same handle checks as [`Self::open_read`].
     pub(crate) async fn open_edit(&self, user_path: &str) -> Result<ReadTarget, BoxError> {
         let resolved = resolve_write_path_in_workspaces(&self.workspaces, user_path).await?;
-        let (file, metadata) =
-            access::open_read(&resolved.path)
-                .await
-                .map_err(|err| -> BoxError {
-                    format!(
+        let (file, metadata) = access::open_read(&resolved.path).await.map_err(|err| {
+            let missing = err
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|err| err.kind() == std::io::ErrorKind::NotFound);
+            if missing {
+                format!(
                     "Path does not point to an existing file (requested_path: {user_path}): {err}"
                 )
                 .into()
-                })?;
-
-        ensure_regular_file(
-            &metadata,
-            &resolved.path,
-            "Editing multiply-linked files is not allowed",
-        )?;
-        ensure_file_size_within_limit(&metadata, &resolved.path, MAX_FILE_SIZE_BYTES)?;
+            } else {
+                err
+            }
+        })?;
 
         Ok(ReadTarget {
             workspace: resolved.workspace,
@@ -815,124 +805,6 @@ pub async fn atomic_write_file(
         .map_err(|err| format!("Failed to atomically replace file: {err}").into())
 }
 
-#[cfg(test)]
-pub(crate) async fn write_temp_file_for_atomic_replace(
-    target_path: &Path,
-    data: &[u8],
-    existing_permissions: Option<&Permissions>,
-) -> Result<PathBuf, BoxError> {
-    for _ in 0..16 {
-        let temp_path = atomic_temp_path(target_path)?;
-        let mut file = match tokio::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temp_path)
-            .await
-        {
-            Ok(file) => file,
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(err) => {
-                return Err(format!(
-                    "Failed to create temporary file (target_path: {}, temp_path: {}): {err}",
-                    target_path.display(),
-                    temp_path.display()
-                )
-                .into());
-            }
-        };
-
-        let write_result = async {
-            file.write_all(data)
-                .await
-                .map_err(|err| {
-                    format!(
-                        "Failed to write temporary file (target_path: {}, temp_path: {}): {err}",
-                        target_path.display(),
-                        temp_path.display()
-                    )
-                })?;
-
-            if let Some(permissions) = existing_permissions {
-                tokio::fs::set_permissions(&temp_path, permissions.clone())
-                    .await
-                    .map_err(|err| {
-                        format!(
-                            "Failed to apply file permissions (target_path: {}, temp_path: {}): {err}",
-                            target_path.display(),
-                            temp_path.display()
-                        )
-                    })?;
-            }
-
-            file.sync_all()
-                .await
-                .map_err(|err| {
-                    format!(
-                        "Failed to sync temporary file (target_path: {}, temp_path: {}): {err}",
-                        target_path.display(),
-                        temp_path.display()
-                    )
-                })?;
-
-            Ok::<(), BoxError>(())
-        }
-        .await;
-        drop(file);
-
-        if let Err(err) = write_result {
-            let _ = tokio::fs::remove_file(&temp_path).await;
-            return Err(err);
-        }
-
-        return Ok(temp_path);
-    }
-
-    Err(format!(
-        "Failed to allocate unique temporary file for atomic write (target_path: {})",
-        target_path.display()
-    )
-    .into())
-}
-
-#[cfg(test)]
-pub(crate) async fn commit_atomic_replace(
-    temp_path: &Path,
-    target_path: &Path,
-) -> Result<(), BoxError> {
-    tokio::fs::rename(temp_path, target_path)
-        .await
-        .map_err(|err| {
-            format!(
-                "Failed to atomically replace file (temp_path: {}, target_path: {}): {err}",
-                temp_path.display(),
-                target_path.display()
-            )
-            .into()
-        })
-}
-
-#[cfg(test)]
-fn atomic_temp_path(target_path: &Path) -> Result<PathBuf, BoxError> {
-    let parent = target_path.parent().ok_or_else(|| {
-        format!(
-            "Failed to determine parent directory for write target (target_path: {})",
-            target_path.display()
-        )
-    })?;
-    let file_name = target_path.file_name().ok_or_else(|| {
-        format!(
-            "Failed to determine file name for write target (target_path: {})",
-            target_path.display()
-        )
-    })?;
-
-    let mut temp_name = OsString::from(".");
-    temp_name.push(file_name);
-    temp_name.push(format!(".anda-tmp-{:016x}", rand::random::<u64>()));
-
-    Ok(parent.join(temp_name))
-}
-
 /// Finds the nearest existing path component and returns the missing tail components.
 async fn nearest_existing_ancestor(path: &Path) -> Result<(PathBuf, Vec<OsString>), BoxError> {
     let mut current = path.to_path_buf();
@@ -1314,26 +1186,6 @@ mod tests {
             .unwrap();
         assert_eq!(tokio::fs::read(&target).await.unwrap(), b"second");
 
-        let temp = write_temp_file_for_atomic_replace(&target, b"third", None)
-            .await
-            .unwrap();
-        assert!(
-            temp.file_name()
-                .unwrap()
-                .to_string_lossy()
-                .contains(".anda-tmp-")
-        );
-        commit_atomic_replace(&temp, &target).await.unwrap();
-        assert_eq!(tokio::fs::read(&target).await.unwrap(), b"third");
-
-        let missing_temp = root.join("missing-temp");
-        assert!(
-            commit_atomic_replace(&missing_temp, &target)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("Failed to atomically replace file")
-        );
         assert!(
             atomic_write_file(&root, b"cannot replace a directory", None)
                 .await
@@ -1342,19 +1194,20 @@ mod tests {
                 .contains("Failed to atomically replace file")
         );
         assert!(
-            write_temp_file_for_atomic_replace(&root.join("missing/file.txt"), b"bad", None)
+            atomic_write_file(&root.join("missing/file.txt"), b"bad", None)
                 .await
-                .unwrap_err()
-                .to_string()
-                .contains("Failed to create temporary file")
+                .is_err()
         );
         assert!(
-            write_temp_file_for_atomic_replace(Path::new(""), b"bad", None)
+            atomic_write_file(Path::new(""), b"bad", None)
                 .await
-                .unwrap_err()
-                .to_string()
-                .contains("Failed to determine")
+                .is_err()
         );
+        // Failed writes leave no temporary files behind.
+        let mut entries = tokio::fs::read_dir(&root).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            assert_eq!(entry.file_name(), "file.txt");
+        }
 
         let (ancestor, missing) = nearest_existing_ancestor(&root.join("a/b/c.txt"))
             .await

@@ -28,7 +28,8 @@ pub(super) fn parse(text: &str) -> Result<Vec<Patch>, BoxError> {
     if text.len() > 1024 * 1024 {
         return Err("Patch exceeds 1 MiB".into());
     }
-    let lines = text.lines().collect::<Vec<_>>();
+    // Whitespace around the envelope carries no meaning; lines inside it stay exact.
+    let lines = text.trim().lines().collect::<Vec<_>>();
     if lines.first() != Some(&"*** Begin Patch") || lines.last() != Some(&"*** End Patch") {
         return Err("Expected *** Begin Patch and *** End Patch markers".into());
     }
@@ -85,7 +86,11 @@ pub(super) fn parse(text: &str) -> Result<Vec<Patch>, BoxError> {
                 {
                     let line = lines[index];
                     index += 1;
-                    if let Some(line) = line.strip_prefix(' ') {
+                    if line.is_empty() {
+                        // An empty context line whose leading space was stripped.
+                        chunk.old.push(String::new());
+                        chunk.new.push(String::new());
+                    } else if let Some(line) = line.strip_prefix(' ') {
                         chunk.old.push(line.to_owned());
                         chunk.new.push(line.to_owned());
                     } else if let Some(line) = line.strip_prefix('-') {
@@ -267,5 +272,14 @@ mod tests {
             update("a\r\nb\r\n", &chunks("@@\n a\n-b\n+c")).unwrap(),
             "a\r\nc\r\n"
         );
+    }
+
+    #[test]
+    fn blank_context_lines_and_envelope_whitespace_are_accepted() {
+        assert_eq!(
+            update("a\n\nb\n", &chunks("@@\n a\n\n-b\n+c")).unwrap(),
+            "a\n\nc\n"
+        );
+        assert!(parse("\n*** Begin Patch\n*** Delete File: file\n*** End Patch\n\n").is_ok());
     }
 }

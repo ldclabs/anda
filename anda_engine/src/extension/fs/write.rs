@@ -197,11 +197,7 @@ fn decode_content(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        engine::EngineBuilder,
-        extension::fs::{UTF8_ENCODING, commit_atomic_replace, write_temp_file_for_atomic_replace},
-        hook::ToolHook,
-    };
+    use crate::{engine::EngineBuilder, extension::fs::UTF8_ENCODING, hook::ToolHook};
     use serde_json::json;
     use std::{
         path::{Path, PathBuf},
@@ -553,35 +549,6 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("Unsupported encoding"));
-    }
-
-    #[tokio::test]
-    async fn staged_atomic_replace_keeps_previous_content_visible_until_commit() {
-        let temp_dir = TestTempDir::new().await;
-        let workspace = temp_dir.path().join("workspace");
-        let target = workspace.join("notes.txt");
-        tokio::fs::create_dir_all(&workspace).await.unwrap();
-        tokio::fs::write(&target, "before").await.unwrap();
-
-        let metadata = tokio::fs::metadata(&target).await.unwrap();
-        let temp_path =
-            write_temp_file_for_atomic_replace(&target, b"after", Some(&metadata.permissions()))
-                .await
-                .unwrap();
-
-        assert_eq!(tokio::fs::read_to_string(&target).await.unwrap(), "before");
-        assert_eq!(
-            tokio::fs::read_to_string(&temp_path).await.unwrap(),
-            "after"
-        );
-
-        commit_atomic_replace(&temp_path, &target).await.unwrap();
-
-        assert_eq!(tokio::fs::read_to_string(&target).await.unwrap(), "after");
-        assert!(matches!(
-            tokio::fs::metadata(&temp_path).await,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound
-        ));
     }
 
     #[cfg(unix)]

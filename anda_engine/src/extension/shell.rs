@@ -750,6 +750,9 @@ async fn persist_raw_output(
     options.mode(0o600);
     let mut file = options.open(&path).await?;
     tokio::io::AsyncWriteExt::write_all(&mut file, &build_raw_output_bytes(stdout, stderr)).await?;
+    // tokio completes the last write in the background; surface its error before
+    // handing the path to the caller.
+    tokio::io::AsyncWriteExt::flush(&mut file).await?;
     Ok(Some(path.display().to_string()))
 }
 

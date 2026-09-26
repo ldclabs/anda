@@ -55,6 +55,8 @@ struct Log {
     bytes: usize,
     limit: usize,
     complete: bool,
+    /// Stream of the last logged chunk (true for stderr); labels mark only switches.
+    stream: Option<bool>,
 }
 
 impl Drop for Log {
@@ -235,6 +237,7 @@ impl NativeRuntime {
             bytes: 0,
             limit: limits.max_log_bytes,
             complete: true,
+            stream: None,
         }));
 
         let mut command = self.session_shell.command(&args.command);
@@ -296,20 +299,14 @@ impl NativeRuntime {
         } else {
             args.yield_time_ms.unwrap_or(10_000).min(30_000)
         };
+        // Shared by the foreground wait and the supervisor: like the legacy shell,
+        // hooks only see commands still running once this wait has elapsed.
+        let foreground_deadline = tokio::time::Instant::now() + Duration::from_millis(wait);
         let output_budget = budget(args.max_output_bytes, limits);
         let cancellation = ctx.cancellation_token();
         tokio::spawn(async move {
             let mut guard = guard;
-            let handle = BackgroundHandle::new(&task.id, task.token.clone());
-            let start = async {
-                if let Some(hook) = &json_hook {
-                    hook.on_background_start(&ctx, handle, json!(&args)).await;
-                } else if let Some(hook) = &hook {
-                    hook.on_background_start(&ctx, handle, &legacy_args).await;
-                }
-            };
-            // Hook latency cannot indefinitely delay supervision or cancellation.
-            tokio::select! { _ = task.token.cancelled() => (), _ = tokio::time::sleep_until(deadline) => (), _ = tokio::time::timeout(Duration::from_secs(2), start) => () }
+            let mut backgrounded = false;
             let mut interval = tokio::time::interval(progress_interval);
             let mut stdout_progress = ProgressStreamState::default();
             let mut stderr_progress = ProgressStreamState::default();
@@ -317,6 +314,22 @@ impl NativeRuntime {
             let status = loop {
                 tokio::select! {
                     biased;
+                    // First, so a command the foreground reported as running always
+                    // pairs this start with the end event below.
+                    _ = tokio::time::sleep_until(foreground_deadline), if !backgrounded => {
+                        backgrounded = true;
+                        interval.reset();
+                        let handle = BackgroundHandle::new(&task.id, task.token.clone());
+                        let start = async {
+                            if let Some(hook) = &json_hook {
+                                hook.on_background_start(&ctx, handle, json!(&args)).await;
+                            } else if let Some(hook) = &hook {
+                                hook.on_background_start(&ctx, handle, &legacy_args).await;
+                            }
+                        };
+                        // Hook latency cannot indefinitely delay supervision or cancellation.
+                        tokio::select! { biased; _ = tokio::time::timeout(Duration::from_secs(2), start) => (), _ = task.token.cancelled() => (), _ = tokio::time::sleep_until(deadline) => () }
+                    }
                     _ = task.token.cancelled() => {
                         state = CommandState::Cancelled;
                         kill_process_group(task.pid); let _ = child.start_kill(); break child.wait().await;
@@ -331,7 +344,7 @@ impl NativeRuntime {
                         kill_process_group(task.pid);
                         break status;
                     },
-                    _ = interval.tick() => {
+                    _ = interval.tick(), if backgrounded => {
                         if let Some((stdout, stderr)) = collect_progress_output(&task.stdout, &task.stderr, &mut stdout_progress, &mut stderr_progress).await {
                             let output = output_chunks_to_exec_output(task.pid, &task.workspace, stdout, stderr);
                             let progress = emit_background_progress(&ctx, &task.id, output, json_hook.as_ref(), hook.as_ref());
@@ -380,6 +393,10 @@ impl NativeRuntime {
             };
             task.changed.notify_waiters();
             guard.disarm();
+            if !backgrounded {
+                // The foreground call already returned this result to the caller.
+                return;
+            }
             let final_output = snapshot(&task, &mut (0, 0), super::super::MAX_OUTPUT_BYTES).await;
             let end = async {
                 let is_error = matches!(
@@ -412,7 +429,7 @@ impl NativeRuntime {
             let _ = tokio::time::timeout(Duration::from_secs(2), end).await;
         });
         let mut cursor = entry.interaction.lock().await;
-        wait_output(&entry, &cursor, wait, &cancellation).await?;
+        wait_output(&entry, &cursor, foreground_deadline, true, &cancellation).await?;
         Ok(snapshot(&entry, &mut cursor, output_budget).await)
     }
 
@@ -473,6 +490,12 @@ impl NativeRuntime {
             let mut bytes = vec![0; limit / 3];
             let count = log.file.read(&mut bytes).await?;
             log.file.seek(std::io::SeekFrom::End(0)).await?;
+            // Leave a character split by the byte budget to the next read; a lone
+            // trailing fragment is still returned so reads always make progress.
+            let count = match complete_shell_output_prefix_len(&bytes[..count]) {
+                0 => count,
+                complete => complete,
+            };
             bytes.truncate(count);
             return Ok(SessionOutput {
                 log: Some(LogChunk {
@@ -514,13 +537,9 @@ impl NativeRuntime {
             SessionAction::Poll => (),
             SessionAction::ReadLog | SessionAction::List => unreachable!(),
         }
-        wait_output(
-            &entry,
-            &cursor,
-            args.yield_time_ms.unwrap_or(1000).min(30_000),
-            &cancellation,
-        )
-        .await?;
+        let wait = args.yield_time_ms.unwrap_or(1000).min(30_000);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(wait);
+        wait_output(&entry, &cursor, deadline, false, &cancellation).await?;
         Ok(SessionOutput {
             command: Some(snapshot(&entry, &mut cursor, limit).await),
             ..Default::default()
@@ -571,7 +590,9 @@ fn reader(mut source: Reader, entry: Arc<Entry>, stderr: bool) -> OutputReaderHa
             buffer.lock().await.append(&bytes[..count]);
             entry.changed.notify_waiters();
             let mut log = entry.log.lock().await;
-            let header = if stderr {
+            let header = if log.stream == Some(stderr) {
+                b"".as_slice()
+            } else if stderr {
                 b"\n[stderr]\n".as_slice()
             } else {
                 b"\n[stdout]\n".as_slice()
@@ -589,6 +610,7 @@ fn reader(mut source: Reader, entry: Arc<Entry>, stderr: bool) -> OutputReaderHa
                         log.complete = false;
                     } else {
                         log.bytes += header.len() + retained;
+                        log.stream = Some(stderr);
                     }
                 }
             }
@@ -597,20 +619,23 @@ fn reader(mut source: Reader, entry: Arc<Entry>, stderr: bool) -> OutputReaderHa
     })
 }
 
+/// Waits until the process finishes or the deadline passes. Unless `until_exit`
+/// is set, newly captured output also ends the wait.
 async fn wait_output(
     entry: &Entry,
     cursor: &(usize, usize),
-    wait: u64,
+    deadline: tokio::time::Instant,
+    until_exit: bool,
     cancellation: &CancellationToken,
 ) -> Result<(), BoxError> {
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(wait);
     loop {
         let notified = entry.changed.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
         if entry.status.lock().state != CommandState::Running
-            || entry.stdout.lock().await.total_len() > cursor.0
-            || entry.stderr.lock().await.total_len() > cursor.1
+            || (!until_exit
+                && (entry.stdout.lock().await.total_len() > cursor.0
+                    || entry.stderr.lock().await.total_len() > cursor.1))
         {
             return Ok(());
         }

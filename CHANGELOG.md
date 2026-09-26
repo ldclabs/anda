@@ -15,6 +15,20 @@ All notable changes to the Anda project will be documented in this file.
 - Pair missing tool-call IDs when replaying foreign histories to OpenAI and
   Anthropic. Document Responses' mandatory streaming and reject unsupported
   stop sequences explicitly.
+- Session `shell` calls now wait for the process to exit or `yield_time_ms` to
+  elapse instead of returning at the first output. Background hooks fire only
+  for commands still running after that wait, so foreground results are no
+  longer re-reported as background completions. The docs note that
+  `ShellToolHook` does not gate `ShellCommandTool` or `ShellSessionTool`
+  arguments.
+- `shell_session` log reads no longer split multibyte characters, and the raw
+  log labels only switches between stdout and stderr. Legacy raw-output files
+  are flushed before their path is returned.
+- `apply_patch` deletes non-text files, treats blank lines in update chunks as
+  empty context, and tolerates whitespace around the patch envelope.
+- The Linux sandbox binds `/etc/hosts` and `/etc/resolv.conf` and keeps the PTY
+  as the controlling terminal of tty sessions. `edit_file` reports a missing
+  file only when the file is actually absent.
 
 ## [0.16.1] — 2026-09-25
 

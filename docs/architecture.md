@@ -249,8 +249,9 @@ owns admission, scoped lookup, output buffers, a capped raw log, process deadlin
 and retention. Host-installed `ShellSessionScope` capabilities propagate through
 context state; RPC metadata cannot create one. Lookups additionally verify engine,
 caller and agent. Input and polling on one process are serialized; different
-sessions can run concurrently. Hooks continue to publish background progress and
-completion, with bounded hook waits so supervision stays responsive. Scoped
+sessions can run concurrently. As with the legacy shell, hooks publish start,
+progress and completion only for commands still running after the foreground
+wait, with bounded hook waits so supervision stays responsive. Scoped
 cancellation and runtime teardown stop processes. On Unix, session completion
 terminates descendants remaining in the launched shell's process group before
 draining output. The legacy shell path keeps its previous background lifecycle
