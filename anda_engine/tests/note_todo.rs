@@ -1,5 +1,5 @@
 //! Note/todo lifecycle regressions through the public engine/runner APIs.
-use anda_core::{AgentOutput, CompletionRequest, Tool, ToolCall};
+use anda_core::{AgentOutput, CompletionFeatures, CompletionRequest, Tool, ToolCall};
 use anda_engine::{
     engine::EngineBuilder,
     extension::{
@@ -169,11 +169,12 @@ async fn malformed_todo_call_is_returned_to_model_without_clearing_tasks() {
 
 #[tokio::test]
 async fn note_index_requires_opt_in_and_tool_permission() {
-    for (registered, enabled, allowed) in [
-        (true, false, true),
-        (true, true, false),
-        (true, true, true),
-        (false, true, true),
+    for (registered, enabled, offered, allowed) in [
+        (true, false, true, true),
+        (true, true, true, false),
+        (true, true, false, true),
+        (true, true, true, true),
+        (false, true, true, true),
     ] {
         let model = ScriptedCompleter::new("notes").into_arc();
         let tool = Arc::new(NoteTool::new());
@@ -205,6 +206,11 @@ async fn note_index_requires_opt_in_and_tool_permission() {
             .completion_iter(
                 CompletionRequest {
                     prompt: "work".into(),
+                    tools: if offered {
+                        vec![tool.definition()]
+                    } else {
+                        Vec::new()
+                    },
                     ..Default::default()
                 },
                 vec![],
@@ -217,15 +223,14 @@ async fn note_index_requires_opt_in_and_tool_permission() {
         let first = request_text(&model.requests()[0]);
         assert_eq!(
             first.contains("run the narrow tests first"),
-            registered && enabled && allowed
+            registered && enabled && offered && allowed
         );
-        if registered && enabled && allowed {
-            assert!(
-                serde_json::to_string(&output.chat_history)
-                    .unwrap()
-                    .contains("Saved note index")
-            );
-        }
+        // Request-only context: output history that hosts persist never carries the index.
+        assert!(
+            !serde_json::to_string(&output.chat_history)
+                .unwrap()
+                .contains("Saved note index")
+        );
         runner.follow_up("next step".to_string());
         runner.next().await.unwrap();
         assert!(!request_text(&model.requests()[1]).contains("Saved note index"));
@@ -279,6 +284,7 @@ async fn note_index_refreshes_after_handoff_and_remains_agent_scoped() {
         .completion_iter(
             CompletionRequest {
                 prompt: "start".into(),
+                tools: vec![tool.definition()],
                 ..Default::default()
             },
             vec![],
@@ -307,6 +313,55 @@ async fn note_index_refreshes_after_handoff_and_remains_agent_scoped() {
     assert!(sent.contains("updated knowledge"));
     assert!(!sent.contains("old knowledge"));
     assert!(!sent.contains("other agent private note"));
+}
+
+#[tokio::test]
+async fn resumed_conversations_carry_one_fresh_note_index() {
+    let model = ScriptedCompleter::new("notes").into_arc();
+    let tool = Arc::new(NoteTool::new());
+    let ctx = EngineBuilder::new()
+        .with_model(Model::with_completer(model.clone()))
+        .register_tool(tool.clone())
+        .unwrap()
+        .mock_ctx();
+    ctx.base.set_state(NoteContextConfig::default());
+    tool.call(
+        ctx.child_base("note").unwrap(),
+        NoteArgs {
+            op: Some("set".into()),
+            items: Some(vec![NoteItemInput {
+                id: "fact".into(),
+                content: Some("saved context".into()),
+            }]),
+            ..Default::default()
+        },
+        vec![],
+    )
+    .await
+    .unwrap();
+    // A host persisting each run's output history and resuming from it.
+    let mut history = Vec::new();
+    for prompt in ["first", "second", "third"] {
+        let output = ctx
+            .completion(
+                CompletionRequest {
+                    prompt: prompt.into(),
+                    tools: vec![tool.definition()],
+                    chat_history: history.clone(),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .unwrap();
+        history.extend(output.chat_history);
+    }
+    for request in model.requests() {
+        assert_eq!(
+            request_text(&request).matches("Saved note index").count(),
+            1
+        );
+    }
 }
 
 #[tokio::test]
@@ -345,6 +400,7 @@ async fn note_index_does_not_interrupt_a_tool_response_boundary() {
                     call_id: Some("call-1".into()),
                     remote_id: None,
                 }],
+                tools: vec![tool.definition()],
                 ..Default::default()
             },
             vec![],

@@ -134,11 +134,11 @@ pub struct NoteOutput {
     /// Compact metadata and excerpts, present for list/search.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub entries: Vec<NoteEntry>,
-    /// Character offset into the first read item (zero on initial/full reads).
-    #[serde(default)]
+    /// Character offset into the first read item; omitted when zero (initial/full reads).
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub offset_chars: usize,
-    /// True when more query content is available.
-    #[serde(default)]
+    /// True when more query content is available; omitted when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
     /// Continuation bound to this agent, query, and exact store contents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -474,56 +474,37 @@ fn legacy_store_output(store: LegacyNoteStore) -> NoteOutput {
 
 fn normalize_note_items(items: Vec<NoteItemInput>) -> Result<Vec<NoteItem>, String> {
     validate_inputs(&items, true)?;
-    let mut last_index: HashMap<String, usize> = HashMap::new();
-    for (index, item) in items.iter().enumerate() {
-        let id = item.id.trim();
-        if id.is_empty() {
-            return Err(format!("items[{index}].id cannot be empty"));
-        }
-        last_index.insert(id.to_string(), index);
-    }
-
-    let mut indexes: Vec<usize> = last_index.into_values().collect();
-    indexes.sort_unstable();
-
-    indexes
+    Ok(last_by_id(&items)
         .into_iter()
-        .map(|index| {
-            let item = &items[index];
-            let id = item.id.trim();
-            let Some(content) = item.content.as_deref() else {
-                return Err(format!("items[{index}].content is required"));
-            };
-            let content = content.trim();
-            if content.is_empty() {
-                return Err(format!("items[{index}].content cannot be empty"));
-            }
-
-            Ok(NoteItem {
-                id: id.to_string(),
-                content: content.to_string(),
-            })
+        .map(|index| NoteItem {
+            id: items[index].id.trim().to_string(),
+            content: items[index]
+                .content
+                .as_deref()
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
         })
-        .collect()
+        .collect())
 }
 
 fn normalize_note_ids(items: Vec<NoteItemInput>) -> Result<Vec<String>, String> {
     validate_inputs(&items, false)?;
-    let mut last_index: HashMap<String, usize> = HashMap::new();
-    for (index, item) in items.iter().enumerate() {
-        let id = item.id.trim();
-        if id.is_empty() {
-            return Err(format!("items[{index}].id cannot be empty"));
-        }
-        last_index.insert(id.to_string(), index);
-    }
-
-    let mut indexes: Vec<usize> = last_index.into_values().collect();
-    indexes.sort_unstable();
-    Ok(indexes
+    Ok(last_by_id(&items)
         .into_iter()
         .map(|index| items[index].id.trim().to_string())
         .collect())
+}
+
+/// Positions of the last occurrence of each trimmed ID, in input order.
+fn last_by_id(items: &[NoteItemInput]) -> Vec<usize> {
+    let mut last_index = HashMap::new();
+    for (index, item) in items.iter().enumerate() {
+        last_index.insert(item.id.trim(), index);
+    }
+    let mut indexes: Vec<usize> = last_index.into_values().collect();
+    indexes.sort_unstable();
+    indexes
 }
 
 fn validate_inputs(items: &[NoteItemInput], content_required: bool) -> Result<(), String> {
@@ -531,10 +512,12 @@ fn validate_inputs(items: &[NoteItemInput], content_required: bool) -> Result<()
         return Err("note batch exceeds 2048 items".into());
     }
     for (index, item) in items.iter().enumerate() {
-        if item.id.trim().is_empty() {
+        // Check the trimmed ID that is stored and matched by `ids`.
+        let id = item.id.trim();
+        if id.is_empty() {
             return Err(format!("items[{index}].id cannot be empty"));
         }
-        if item.id.len() > 128 || item.id.chars().any(char::is_control) {
+        if id.len() > 128 || id.chars().any(char::is_control) {
             return Err(format!(
                 "items[{index}].id exceeds 128 bytes or contains control characters"
             ));
@@ -584,6 +567,10 @@ fn joined_len(items: &[NoteItem]) -> usize {
         .map(|item| item.id.chars().count() + item.content.chars().count() + 2)
         .sum::<usize>();
     item_len + delimiter_len
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 fn is_missing_store_object(err: &(dyn std::error::Error + 'static)) -> bool {

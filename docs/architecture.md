@@ -21,9 +21,11 @@ Source map:
 `TodoSession` is a bounded, shared in-memory task list seeded on the runner's
 parent context. Handoff preserves its active tasks in a separate bounded
 neutral-history message. Optional `NoteContextConfig` loads an agent-scoped note
-index once per runner/window, gated by local tool availability and the callable
-allowlist. These extensions use existing tool hooks and object storage; they do
-not introduce a separate event service. See [notes and tasks](note-todo.md).
+index once per runner/window, gated by the request offering the local note tool
+and the callable allowlist. The index is request-only context, replayed after a
+model switch but not added to neutral history. These extensions use existing
+tool hooks and object storage; they do not introduce a separate event service.
+See [notes and tasks](note-todo.md).
 
 ## Runtime View
 

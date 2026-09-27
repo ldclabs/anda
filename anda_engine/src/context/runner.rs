@@ -77,6 +77,9 @@ pub struct CompletionRunner {
     follow_up_message: VecDeque<ContentPart>,
     implicit_context: Option<Message>,
     note_context_loaded: bool,
+    /// Note index sent with this runner's requests. Request-only context: replayed after a
+    /// model switch but kept out of `chat_history`, since each runner loads a fresh one.
+    note_context: Option<Message>,
     pending_tool_calls: Vec<ToolCall>,
     pending_tool_call_raw_history_start: Option<usize>,
     tools_usage: HashMap<String, Usage>,
@@ -114,6 +117,7 @@ impl CompletionRunner {
             follow_up_message: VecDeque::new(),
             implicit_context: None,
             note_context_loaded: false,
+            note_context: None,
             pending_tool_calls: Vec::new(),
             pending_tool_call_raw_history_start: None,
             tools_usage: HashMap::new(),
@@ -1089,11 +1093,12 @@ impl CompletionRunner {
     /// state (thinking signatures and the like) — the very thing `raw_history` exists to preserve —
     /// but a resumed conversation already replays without it, and adapters must tolerate that.
     ///
-    /// The replay is [`Self::history_prefix`] followed by [`Self::chat_history`]: the runner only
-    /// accumulates the messages it generates, so the conversation the caller seeded the request
-    /// with lives nowhere else once the first turn has cleared `req.chat_history` — it survives
-    /// only inside the raw history that is being dropped here. `self.req.chat_history` itself is
-    /// always a subset of `self.chat_history` at this point (the only writer,
+    /// The replay is [`Self::history_prefix`], the runner's note index, then
+    /// [`Self::chat_history`]: the runner only accumulates the messages it generates, so the
+    /// conversation the caller seeded the request with lives nowhere else once the first turn has
+    /// cleared `req.chat_history` — it survives only inside the raw history that is being dropped
+    /// here. Apart from the note index, `self.req.chat_history` is always a subset of
+    /// `self.chat_history` at this point (the other writer,
     /// [`Self::commit_tool_outputs_to_history`], appends to both), so overwriting it neither
     /// duplicates nor drops a message.
     fn sync_model_for_next_turn(&mut self) {
@@ -1112,12 +1117,15 @@ impl CompletionRunner {
             self.pending_tool_call_raw_history_start = None;
             // `reserve_chat_history` seeds `chat_history` with messages that are also in the
             // request, so skip the prefix when it is already at the front.
-            let mut history =
-                Vec::with_capacity(self.history_prefix.len() + self.chat_history.len());
-            if !self.chat_history.starts_with(&self.history_prefix) {
-                history.extend(self.history_prefix.iter().cloned());
-            }
-            history.extend(self.chat_history.iter().cloned());
+            let generated = if self.chat_history.starts_with(&self.history_prefix) {
+                &self.chat_history[self.history_prefix.len()..]
+            } else {
+                &self.chat_history[..]
+            };
+            let mut history = Vec::with_capacity(self.history_prefix.len() + generated.len() + 1);
+            history.extend(self.history_prefix.iter().cloned());
+            history.extend(self.note_context.iter().cloned());
+            history.extend(generated.iter().cloned());
             self.req.chat_history = history;
         }
 
@@ -1180,7 +1188,14 @@ impl CompletionRunner {
             && self.req.role.as_deref() != Some("tool")
         {
             use crate::extension::note::{NoteContextConfig, NoteTool, load_note_summary};
+            // Child contexts inherit the config, so also require that this request offers the
+            // tool: internal or nested completions without it must not load the note store.
             if self.ctx.tools.contains_lowercase(NoteTool::NAME)
+                && self
+                    .req
+                    .tools
+                    .iter()
+                    .any(|tool| tool.name.eq_ignore_ascii_case(NoteTool::NAME))
                 && self.is_callable_allowed(NoteTool::NAME)
                 && let Some(config) = self.ctx.base.get_state::<NoteContextConfig>()
                 && let Some(text) = load_note_summary(&self.ctx, &config).await?
@@ -1192,8 +1207,9 @@ impl CompletionRunner {
                     ..Default::default()
                 };
                 self.req.chat_history.push(message.clone());
-                // Keep the index in neutral history for model switches and persisted output.
-                self.chat_history.push(message);
+                // Not added to `chat_history`: persisted or resumed conversations would otherwise
+                // keep a stale copy beside the fresh index each new runner loads.
+                self.note_context = Some(message);
             }
             self.note_context_loaded = true;
         }
@@ -3929,6 +3945,95 @@ mod tests {
         let second = seen.last().unwrap();
         assert_eq!(second.raw_history, vec![json!({"provider": "provider_a"})]);
         assert!(second.chat_history.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn note_index_is_replayed_after_a_model_switch_but_not_persisted() {
+        use crate::extension::note::{NoteArgs, NoteContextConfig, NoteItemInput, NoteTool};
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (first, _) = provider_model("provider_a", requests.clone());
+        let (second, _) = provider_model("provider_b", requests.clone());
+        let note = Arc::new(NoteTool::new());
+        let ctx = EngineBuilder::new()
+            .with_model(first)
+            .register_tool(note.clone())
+            .unwrap()
+            .mock_ctx();
+        note.call(
+            ctx.child_base(NoteTool::NAME).unwrap(),
+            NoteArgs {
+                op: Some("set".to_string()),
+                items: Some(vec![NoteItemInput {
+                    id: "fact".to_string(),
+                    content: Some("saved context".to_string()),
+                }]),
+                ..Default::default()
+            },
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        ctx.base.set_state(NoteContextConfig::default());
+
+        let mut runner = ctx.clone().completion_iter(
+            CompletionRequest {
+                prompt: "hello".to_string(),
+                tools: vec![note.definition()],
+                chat_history: vec![Message {
+                    role: "user".to_string(),
+                    content: vec![ContentPart::Text {
+                        text: "earlier turn".to_string(),
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            Vec::new(),
+        );
+        runner.set_unbound(true);
+        let output = runner.next().await.unwrap().unwrap();
+        // Hosts persist and resume this history; each new runner loads a fresh index anyway.
+        for history in [
+            output.chat_history,
+            runner.idle_snapshot().unwrap().chat_history,
+        ] {
+            assert!(
+                !serde_json::to_string(&history)
+                    .unwrap()
+                    .contains("Saved note index")
+            );
+        }
+
+        ctx.models.set_model(second);
+        runner.follow_up("and now?".to_string());
+        runner.next().await.unwrap().unwrap();
+
+        let seen = requests.lock().unwrap();
+        let texts = |req: &CompletionRequest| {
+            req.chat_history
+                .iter()
+                .flat_map(|msg| msg.content.iter())
+                .filter_map(|part| match part {
+                    ContentPart::Text { text } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let first_turn = texts(&seen[0]);
+        assert_eq!(first_turn.len(), 2);
+        assert_eq!(first_turn[0], "earlier turn");
+        assert!(first_turn[1].contains("saved context"));
+        // The switched model gets the index once, between the seeded prefix and the runner's
+        // own history.
+        assert_eq!(
+            texts(seen.last().unwrap()),
+            vec![
+                "earlier turn".to_string(),
+                first_turn[1].clone(),
+                "provider_a replied".to_string()
+            ]
+        );
     }
 
     // ── Multiple tool calls in parallel ──

@@ -137,6 +137,31 @@ fn store_reports_validation_and_limit_errors() {
     );
 }
 
+#[test]
+fn write_ids_are_validated_after_trimming() {
+    let mut store = NoteStore::default();
+    let long_id = "a".repeat(128);
+    assert!(
+        store
+            .upsert(
+                vec![
+                    input("build\n", Some("x")),
+                    input(&format!(" {long_id} "), Some("y")),
+                ],
+                NOTE_CHAR_LIMIT,
+            )
+            .unwrap()
+    );
+    assert_eq!(store.items, vec![item("build", "x"), item(&long_id, "y")]);
+    assert!(store.delete(vec![input("\tbuild", None)]).unwrap());
+    assert!(
+        store
+            .upsert(vec![input("a\u{7}b", Some("z"))], NOTE_CHAR_LIMIT)
+            .unwrap_err()
+            .contains("control characters")
+    );
+}
+
 #[tokio::test]
 async fn tool_reads_empty_store_before_first_write() {
     let tool = NoteTool::new();
@@ -170,6 +195,9 @@ async fn tool_persists_items_and_write_outputs_are_compact() {
     assert!(first.output.success);
     assert_eq!(first.output.summary.total, 1);
     assert!(first.output.items.is_empty());
+    let json = serde_json::to_value(&first.output).unwrap();
+    assert!(json.get("offset_chars").is_none());
+    assert!(json.get("truncated").is_none());
 
     let second = tool
         .call(ctx.clone(), NoteArgs::default(), Vec::new())

@@ -84,20 +84,22 @@ an empty result. An explicit empty `ids` list selects nothing.
 `NoteTool::with_response_bytes`, clamped to 2-64 KiB. This counts JSON escaping
 and pagination metadata, not just the note text. Storage writes retain the
 configurable character limit (default 163840, including IDs and separators),
-and are also limited to 2048 items and 1 MiB of encoded item data. New IDs must
-be nonempty, at most 128 bytes, and contain no control characters.
+and are also limited to 2048 items and 1 MiB of encoded item data. New IDs are
+trimmed, then must be nonempty, at most 128 bytes, and free of control
+characters.
 
 A truncated result has `truncated: true` and `next_cursor`. Repeat the same
 operation, IDs, and query with that cursor. The limit may change. Cursors bind
 to the agent, query, and exact stored content; edits invalidate old cursors,
-which return an error asking the caller to restart retrieval.
+which return an error asking the caller to restart retrieval. `truncated` is
+omitted when false.
 
 Even a single large note can span read pages. On each read result,
 `offset_chars` is the Unicode scalar offset of the first returned item's
-content; later items start at zero. Concatenate fragments by ID in cursor
-order. No UTF-8 character is split. A list/search entry has `chars` (total
-content length), `excerpt_offset_chars`, and, for search, `match_offset_chars`.
-Excerpts are bounded previews, not complete notes.
+content (omitted when zero); later items start at zero. Concatenate fragments
+by ID in cursor order. No UTF-8 character is split. A list/search entry has
+`chars` (total content length), `excerpt_offset_chars`, and, for search,
+`match_offset_chars`. Excerpts are bounded previews, not complete notes.
 
 Reads do not accept mutation `items`; writes do not accept query fields. Invalid
 calls preserve the store and return a typed failure. Writes remain compact and
@@ -124,10 +126,13 @@ fn enable_note_index(ctx: &AgentCtx) {
 
 The runner loads one small index before its first regular model request and
 again in a fresh window after successful handoff. It requires the local `note`
-tool to be registered and permitted by the runner's callable allowlist. It
-never inserts an index between a pending tool call and its response. The index
-is preserved in neutral history for model changes. Subsequent turns do not
-repeatedly append it.
+tool to be registered, offered in the runner request's tool definitions, and
+permitted by the runner's callable allowlist; child contexts inherit the config,
+so nested or internal completions that do not offer `note` skip it. It never
+inserts an index between a pending tool call and its response. The index is
+request context: it is replayed after a live model switch but kept out of the
+returned `chat_history`, so persisted or resumed conversations do not
+accumulate stale copies. Subsequent turns do not repeatedly append it.
 
 The index consists of IDs and short escaped excerpts, not an LLM-generated
 summary. It treats notes as historical data and points to `note read/search`.

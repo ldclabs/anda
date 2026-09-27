@@ -19,8 +19,10 @@ pub struct NoteEntry {
 }
 
 /// Opt-in note index injection. Install on the agent's BaseCtx before creating a
-/// runner. The index is loaded once per runner/window only when note is allowed.
-/// Errors are surfaced by the runner rather than mistaken for an empty store.
+/// runner. The index is loaded once per runner/window only when the request offers
+/// the local note tool and the allowlist permits it. It is request context, not
+/// part of the returned chat history. Errors are surfaced by the runner rather than
+/// mistaken for an empty store.
 #[derive(Debug, Clone)]
 pub struct NoteContextConfig {
     /// Maximum rendered UTF-8 bytes, clamped to 512-8192 (default 4096).

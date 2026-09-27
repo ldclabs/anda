@@ -70,6 +70,13 @@ All notable changes to the Anda project will be documented in this file.
 
 ### Fixed — anda_engine
 
+- Opt-in note indexes are request-only context: the runner replays them after a
+  live model switch but keeps them out of the returned `chat_history`, so
+  persisted or resumed conversations no longer accumulate stale copies. An
+  index loads only when the request offers the local `note` tool, so nested and
+  internal completions that inherit `NoteContextConfig` skip the note store.
+- Note writes validate trimmed IDs, matching `ids` lookups, and note results
+  omit `offset_chars` and `truncated` when they are zero or false.
 - Subagent sessions no longer cancel when a background tool or nested worker
   result exceeds the caller input byte limit, and a nested turn result reaches
   the parent once instead of being repeated by the turn-completion notice. Model
