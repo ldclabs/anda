@@ -1,9 +1,13 @@
 //! Optional session shell protocol. Legacy shell arguments and results stay stable.
 
-use super::{CustomEnv, DEFAULT_OUTPUT_BYTES, ExecOutput, Executor, MAX_OUTPUT_BYTES, ShellTool};
+use super::{
+    CustomEnv, DEFAULT_OUTPUT_BYTES, ExecArgs, ExecOutput, Executor, MAX_OUTPUT_BYTES, ShellTool,
+    ShellToolHook,
+};
 use crate::{
     context::BaseCtx,
     extension::{hooked_call, tool_definition},
+    hook::{DynToolHook, ToolHook},
 };
 use anda_core::{BoxError, FunctionDefinition, Resource, Tool, ToolGroupInfo, ToolOutput};
 use schemars::JsonSchema;
@@ -90,6 +94,17 @@ pub struct CommandArgs {
     /// Allocate a PTY; requires host permission. PTY output combines stdout and stderr.
     #[serde(default)]
     pub tty: bool,
+}
+
+impl CommandArgs {
+    /// The fields a legacy [`ShellToolHook`] understands.
+    pub(crate) fn legacy_args(&self) -> ExecArgs {
+        ExecArgs {
+            command: self.command.clone(),
+            env_keys: self.env_keys.clone(),
+            background: self.background,
+        }
+    }
 }
 
 /// State of a supervised shell process.
@@ -226,13 +241,22 @@ fn group() -> ToolGroupInfo {
         instructions: Some("Use shell for reading, searching, building and testing. Use the registered dedicated editing tool for file changes. If shell returns a running task_id, use shell_session to poll, stop or interact with it. A working directory is not a filesystem sandbox.".into()) }
 }
 
+/// Typed hook for [`ShellCommandTool`] calls.
+pub type ShellCommandToolHook = DynToolHook<CommandArgs, CommandOutput>;
+
+/// Typed hook for [`ShellSessionTool`] calls.
+pub type ShellSessionToolHook = DynToolHook<SessionArgs, SessionOutput>;
+
 /// Session-aware replacement for the legacy ShellTool. Register one, not both;
 /// both use the stable name `shell`. Pair with ShellSessionTool using the same executor.
 ///
-/// Argument hooks are typed on this tool's own types (`DynToolHook<CommandArgs,
-/// CommandOutput>`), so an approval gate installed as `ShellToolHook` does not
-/// intercept these calls; `ShellToolHook` and `DynToolJsonHook` only receive the
-/// background events of commands that outlive the foreground wait.
+/// A [`ShellCommandToolHook`] sees the full arguments first. A [`ShellToolHook`]
+/// installed for the legacy tool keeps gating the replacement: its
+/// `before_tool_call` receives the legacy fields (`command`, `env_keys`,
+/// `background`) just before execution, and its rewrites of those fields apply;
+/// its `after_tool_call` receives the legacy part of the result. It also receives
+/// the background events of commands that outlive the foreground wait, as does a
+/// `DynToolJsonHook`.
 #[derive(Clone)]
 pub struct ShellCommandTool {
     shell: ShellTool,
@@ -281,7 +305,15 @@ impl Tool<BaseCtx> for ShellCommandTool {
         args: CommandArgs,
         _: Vec<Resource>,
     ) -> Result<ToolOutput<CommandOutput>, BoxError> {
-        hooked_call(&ctx, args, |args| async {
+        hooked_call(&ctx, args, |mut args| async {
+            // A migrated host's approval gate stays in force instead of failing open.
+            let legacy = ctx.get_state::<ShellToolHook>();
+            if let Some(hook) = &legacy {
+                let gated = hook.before_tool_call(&ctx, args.legacy_args()).await?;
+                args.command = gated.command;
+                args.env_keys = gated.env_keys;
+                args.background = gated.background;
+            }
             let env = self.shell.collect_shell_env_vars(&args.env_keys);
             let output = self
                 .shell
@@ -289,13 +321,45 @@ impl Tool<BaseCtx> for ShellCommandTool {
                 .execute_session(ctx.clone(), args, env)
                 .await?;
             let is_error = matches!(output.state, CommandState::Failed | CommandState::TimedOut);
-            Ok(ToolOutput {
+            let output = ToolOutput {
                 is_error: is_error.then_some(true),
                 ..ToolOutput::new(output)
-            })
+            };
+            match &legacy {
+                Some(hook) => legacy_after_tool_call(&ctx, hook, output).await,
+                None => Ok(output),
+            }
         })
         .await
     }
+}
+
+/// Runs a legacy hook's `after_tool_call` on the legacy part of a session result.
+async fn legacy_after_tool_call(
+    ctx: &BaseCtx,
+    hook: &ShellToolHook,
+    mut output: ToolOutput<CommandOutput>,
+) -> Result<ToolOutput<CommandOutput>, BoxError> {
+    let legacy = hook
+        .after_tool_call(
+            ctx,
+            ToolOutput {
+                output: std::mem::take(&mut output.output.output),
+                model_output: output.model_output.take(),
+                is_error: output.is_error,
+                artifacts: std::mem::take(&mut output.artifacts),
+                usage: std::mem::take(&mut output.usage),
+                tools_usage: std::mem::take(&mut output.tools_usage),
+            },
+        )
+        .await?;
+    output.output.output = legacy.output;
+    output.model_output = legacy.model_output;
+    output.is_error = legacy.is_error;
+    output.artifacts = legacy.artifacts;
+    output.usage = legacy.usage;
+    output.tools_usage = legacy.tools_usage;
+    Ok(output)
 }
 
 /// Bounded, conversation-scoped process interaction tool.

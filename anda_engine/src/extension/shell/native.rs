@@ -252,7 +252,7 @@ impl NativeRuntime {
     ///
     /// Request metadata can select a directory inside this root, but cannot add
     /// a new root. A host that has independently authorized another directory
-    /// can construct a separate runtime for that call. This only controls the
+    /// can run that call on [`Self::for_workspace`]. This only controls the
     /// command's initial working directory: native commands are not sandboxed.
     pub fn new(workspace: PathBuf) -> Self {
         Self {
@@ -265,6 +265,26 @@ impl NativeRuntime {
             session_limits: Default::default(),
             session_shell: Default::default(),
             sandbox: None,
+        }
+    }
+
+    /// Derives a runtime rooted at a directory the host independently authorized,
+    /// keeping this runtime's policy and sharing its process sessions.
+    ///
+    /// Use it instead of a separately constructed runtime for such calls: a
+    /// runtime's sessions end when it is dropped, and `shell_session` on this
+    /// runtime reaches only sessions in its own store.
+    pub fn for_workspace(&self, workspace: PathBuf) -> Self {
+        Self {
+            workspace,
+            temp_dir: self.temp_dir.clone(),
+            insecure: self.insecure,
+            background_progress_interval: self.background_progress_interval,
+            auto_background_after: self.auto_background_after,
+            sessions: self.sessions.clone(),
+            session_limits: self.session_limits.clone(),
+            session_shell: self.session_shell,
+            sandbox: self.sandbox.clone(),
         }
     }
 

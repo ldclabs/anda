@@ -2,6 +2,26 @@
 
 All notable changes to the Anda project will be documented in this file.
 
+## [anda_engine 0.16.3] — 2026-09-28
+
+### Fixed — anda_engine
+
+- **Shell approval gates survive the switch to `ShellCommandTool`** — A
+  `ShellToolHook` installed for the legacy `shell` tool now also gates
+  `ShellCommandTool`: its `before_tool_call` sees the legacy fields just before
+  execution and its rewrites apply, and its `after_tool_call` sees the legacy
+  part of the result. Before, it still received the background events of session
+  commands while their arguments bypassed it. `ShellCommandToolHook` and
+  `ShellSessionToolHook` name the tools' own typed hooks.
+- **Sessions in separately authorized directories** — `NativeRuntime::for_workspace`
+  derives a runtime rooted at another directory that shares the runtime's policy
+  and sessions. A separately constructed runtime, which the docs suggested for
+  such calls, cancelled its sessions when dropped, so a command still running
+  after the foreground wait was killed and `shell_session` could not reach it.
+- **No console windows for session commands on Windows** — Session processes are
+  created with `CREATE_NO_WINDOW`, so a host without a console of its own no
+  longer opens a window per command.
+
 ## [0.16.2] — 2026-09-27
 
 This release adds supervised shell sessions and workspace patches, an isolated

@@ -3,7 +3,7 @@ name = "anda_engine"
 description = "Agents engine for Anda -- an AI agent framework built with Rust, powered by ICP and TEEs."
 repository = "https://github.com/ldclabs/anda/tree/main/anda_engine"
 publish = true
-version = "0.16.2"
+version = "0.16.3"
 edition.workspace = true
 keywords.workspace = true
 categories.workspace = true
@@ -61,7 +61,11 @@ tokio = { workspace = true, features = ["test-util"] }
 libc = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_Globalization", "Win32_Storage_FileSystem", "Win32_Foundation"] }
+windows-sys = { workspace = true, features = [
+  "Win32_Globalization",
+  "Win32_Storage_FileSystem",
+  "Win32_Foundation",
+] }
 
 [package.metadata.docs.rs]
 all-features = true

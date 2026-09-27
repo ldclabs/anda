@@ -1021,3 +1021,128 @@ async fn coding_bundle_registers_no_redundant_file_read_tools() {
         .is_err()
     );
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn legacy_shell_hook_still_gates_session_commands() {
+    use anda_core::{BoxError, ToolOutput};
+    use anda_engine::{
+        extension::shell::{ExecArgs, ExecOutput, ShellCommandTool, ShellToolHook},
+        hook::ToolHook,
+    };
+    use parking_lot::Mutex;
+
+    #[derive(Default)]
+    struct Gate {
+        seen: Mutex<Vec<String>>,
+    }
+    #[async_trait::async_trait]
+    impl ToolHook<ExecArgs, ExecOutput> for Gate {
+        async fn before_tool_call(
+            &self,
+            _: &BaseCtx,
+            mut args: ExecArgs,
+        ) -> Result<ExecArgs, BoxError> {
+            if args.command.contains("marker") {
+                return Err("denied by the host".into());
+            }
+            args.command = args.command.replace("original", "rewritten");
+            Ok(args)
+        }
+        async fn after_tool_call(
+            &self,
+            _: &BaseCtx,
+            output: ToolOutput<ExecOutput>,
+        ) -> Result<ToolOutput<ExecOutput>, BoxError> {
+            self.seen
+                .lock()
+                .push(output.output.stdout.clone().unwrap_or_default());
+            Ok(output)
+        }
+    }
+
+    let dir = Directory::new();
+    let tool = ShellCommandTool::new(Arc::new(NativeRuntime::new(dir.0.clone())), vec![]);
+    let gate = Arc::new(Gate::default());
+    let ctx = context();
+    ctx.set_state(ShellToolHook::new(gate.clone()));
+
+    let denied = tool
+        .call(
+            ctx.clone(),
+            CommandArgs {
+                command: "touch marker".into(),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await;
+    assert!(
+        denied
+            .unwrap_err()
+            .to_string()
+            .contains("denied by the host")
+    );
+    assert!(!dir.path().join("marker").exists());
+
+    let output = tool
+        .call(
+            ctx,
+            CommandArgs {
+                command: "printf original".into(),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .unwrap();
+    assert_eq!(output.output.output.stdout.as_deref(), Some("rewritten"));
+    assert_eq!(*gate.seen.lock(), vec!["rewritten".to_string()]);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn workspace_runtimes_share_sessions_with_their_base() {
+    let base_dir = Directory::new();
+    let granted = Directory::new();
+    let runtime = NativeRuntime::new(base_dir.0.clone());
+    let ctx = context();
+    let output = {
+        let derived = runtime.for_workspace(granted.0.clone());
+        derived
+            .execute_session(
+                ctx.clone(),
+                CommandArgs {
+                    command: "sleep 0.2; printf done".into(),
+                    background: true,
+                    ..Default::default()
+                },
+                Default::default(),
+            )
+            .await
+            .unwrap()
+    };
+    // The derived runtime is gone; its command must live on and stay reachable.
+    assert_eq!(output.state, CommandState::Running);
+    let task_id = output.task_id.clone();
+    let output = finish(&runtime, &ctx, output).await;
+    assert_eq!(output.state, CommandState::Exited);
+    assert_eq!(
+        output.output.workspace.as_deref(),
+        Some(granted.path().to_string_lossy().as_ref())
+    );
+    let log = runtime
+        .interact_session(
+            ctx,
+            SessionArgs {
+                task_id: Some(task_id),
+                action: SessionAction::ReadLog,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .log
+        .unwrap();
+    assert!(log.text.contains("done"), "{}", log.text);
+}

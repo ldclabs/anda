@@ -285,11 +285,7 @@ impl NativeRuntime {
         };
         let hook = ctx.get_state::<ShellToolHook>();
         let json_hook = ctx.get_state::<DynToolJsonHook>();
-        let legacy_args = ExecArgs {
-            command: args.command.clone(),
-            env_keys: args.env_keys.clone(),
-            background: args.background,
-        };
+        let legacy_args = args.legacy_args();
         let progress_interval = self
             .background_progress_interval
             .max(Duration::from_millis(10));
@@ -564,6 +560,14 @@ fn spawn(
     {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
+    }
+    // Sessions are supervised through pipes; without this a host with no console
+    // of its own (a desktop app or service) opens a console window per command.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
     }
     command
         .stdin(if stdin { Stdio::piped() } else { Stdio::null() })
