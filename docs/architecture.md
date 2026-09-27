@@ -18,6 +18,13 @@ Source map:
 - [`memory.rs`](../anda_engine/src/memory.rs): conversation/resource storage and KIP/Cognitive Nexus tools.
 - [`extension`](../anda_engine/src/extension.rs): built-in tool libraries such as filesystem, shell, fetch, skills, notes, todos, and memory.
 
+`TodoSession` is a bounded, shared in-memory task list seeded on the runner's
+parent context. Handoff preserves its active tasks in a separate bounded
+neutral-history message. Optional `NoteContextConfig` loads an agent-scoped note
+index once per runner/window, gated by local tool availability and the callable
+allowlist. These extensions use existing tool hooks and object storage; they do
+not introduce a separate event service. See [notes and tasks](note-todo.md).
+
 ## Runtime View
 
 <style scoped>

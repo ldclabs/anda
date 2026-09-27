@@ -4,6 +4,20 @@ All notable changes to the Anda project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed — notes and session tasks
+
+- Validate todo writes atomically; reject missing items, unknown operations and
+  statuses, empty task fields, and oversized lists. Preserve explicit empty-list
+  clearing, stable IDs, incremental updates, and the cancelled status.
+- Add optional task-change explanations through existing typed hooks and bounded
+  active-task recovery after successful completion-runner handoff.
+- Add bounded note ID reads, listings, literal search, and UTF-8-safe pagination
+  bound to the query and current store. Keep the persisted note shape unchanged.
+- Add opt-in note context indexes and error-preserving `try_load_notes`; preserve
+  the existing full-snapshot convenience loader. Note lock waits respect cancellation.
+- Todo store/session writes now return `Result`; note reads are paged and argument
+  structs gain optional fields. See `docs/note-todo.md` for API migration and limits.
+
 ### Added — subagent runtime
 
 - Isolate worker session aliases by host-created root scope and caller. Expose

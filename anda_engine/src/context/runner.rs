@@ -76,6 +76,7 @@ pub struct CompletionRunner {
     steering_message: Vec<ContentPart>,
     follow_up_message: VecDeque<ContentPart>,
     implicit_context: Option<Message>,
+    note_context_loaded: bool,
     pending_tool_calls: Vec<ToolCall>,
     pending_tool_call_raw_history_start: Option<usize>,
     tools_usage: HashMap<String, Usage>,
@@ -112,6 +113,7 @@ impl CompletionRunner {
             steering_message: Vec::new(),
             follow_up_message: VecDeque::new(),
             implicit_context: None,
+            note_context_loaded: false,
             pending_tool_calls: Vec::new(),
             pending_tool_call_raw_history_start: None,
             tools_usage: HashMap::new(),
@@ -828,14 +830,28 @@ impl CompletionRunner {
         req.content.clear();
         req.documents.clear();
         req.raw_history.clear();
-        req.chat_history = vec![compaction_msg.clone()];
+        let mut restored_history = vec![compaction_msg];
+        if let Some(tasks) = self
+            .ctx
+            .base
+            .get_state::<crate::extension::todo::TodoSession>()
+            && let Some(text) = tasks.format_for_injection()
+        {
+            restored_history.push(Message {
+                role: "assistant".into(),
+                content: vec![text.into()],
+                timestamp: Some(unix_ms()),
+                ..Default::default()
+            });
+        }
+        req.chat_history = restored_history.clone();
         req.tool_choice_required = false;
         req.output_schema = None;
         let mut runner = self
             .ctx
             .clone()
             .completion_iter(req, std::mem::take(&mut self.resources))
-            .reserve_chat_history(vec![compaction_msg]);
+            .reserve_chat_history(restored_history);
         runner.set_unbound(unbound);
         // `self` is finalized above, so its remaining state moves into the replacement runner.
         runner.discovered = std::mem::take(&mut self.discovered);
@@ -1159,6 +1175,28 @@ impl CompletionRunner {
 
         self.sync_model_for_next_turn();
 
+        if !self.note_context_loaded
+            && !pending_tool_calls
+            && self.req.role.as_deref() != Some("tool")
+        {
+            use crate::extension::note::{NoteContextConfig, NoteTool, load_note_summary};
+            if self.ctx.tools.contains_lowercase(NoteTool::NAME)
+                && self.is_callable_allowed(NoteTool::NAME)
+                && let Some(config) = self.ctx.base.get_state::<NoteContextConfig>()
+                && let Some(text) = load_note_summary(&self.ctx, &config).await?
+            {
+                let message = Message {
+                    role: "assistant".into(),
+                    content: vec![text.into()],
+                    timestamp: Some(unix_ms()),
+                    ..Default::default()
+                };
+                self.req.chat_history.push(message.clone());
+                // Keep the index in neutral history for model switches and persisted output.
+                self.chat_history.push(message);
+            }
+            self.note_context_loaded = true;
+        }
         self.turns += 1;
         let mut req = self.req.clone();
         if !pending_tool_calls && let Some(implicit_context) = self.implicit_context.take() {

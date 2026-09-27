@@ -9,7 +9,8 @@
 //! calling agent's context tree, one agent's notes are not visible to another.
 
 use anda_core::{
-    BoxError, FunctionDefinition, Path, PutMode, Resource, StoreFeatures, Tool, ToolOutput,
+    BoxError, FunctionDefinition, Path, PutMode, Resource, StateFeatures, StoreFeatures, Tool,
+    ToolOutput,
 };
 use cbor2::{from_slice, to_canonical_vec};
 use object_store::Error as ObjectStoreError;
@@ -26,6 +27,12 @@ use crate::{
     hook::DynToolHook,
 };
 
+mod query;
+pub use query::{NoteContextConfig, NoteEntry, load_note_summary};
+
+const NOTE_OP_LIST: &str = "list";
+const NOTE_OP_SEARCH: &str = "search";
+
 const NOTE_OP_READ: &str = "read";
 const NOTE_OP_SET: &str = "set";
 const NOTE_OP_UPSERT: &str = "upsert";
@@ -34,28 +41,52 @@ const LEGACY_NOTE_STORE_PATH: &str = "notes";
 const NOTE_CHAR_LIMIT: usize = 163840;
 const NOTE_ENTRY_DELIMITER: &str = "\n---\n";
 
-static VALID_OPS: &[&str] = &[NOTE_OP_READ, NOTE_OP_SET, NOTE_OP_UPSERT, NOTE_OP_DELETE];
+static VALID_OPS: &[&str] = &[
+    NOTE_OP_READ,
+    NOTE_OP_LIST,
+    NOTE_OP_SEARCH,
+    NOTE_OP_SET,
+    NOTE_OP_UPSERT,
+    NOTE_OP_DELETE,
+];
 
 /// Arguments accepted by the note tool.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct NoteArgs {
-    /// read: return notes. set: replace all. upsert: add/update changed ids. delete: remove ids.
+    /// read: paged content. list: short excerpts. search: literal substring.
+    /// set: replace all. upsert: add/update changed IDs. delete: remove IDs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("enum" = [
         NOTE_OP_READ,
+        NOTE_OP_LIST,
+        NOTE_OP_SEARCH,
         NOTE_OP_SET,
         NOTE_OP_UPSERT,
         NOTE_OP_DELETE,
         null
     ], "default" = NOTE_OP_READ))]
     pub op: Option<String>,
-    /// Items for set/upsert/delete. Use null for read. Delete only needs id with content=null.
+    /// Items for set/upsert/delete; null for read/list/search. Delete needs only ID.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub items: Option<Vec<NoteItemInput>>,
+    /// Optional exact note IDs for read/list/search. Omitted means all notes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ids: Option<Vec<String>>,
+    /// Case-sensitive literal substring required by search (1-1024 bytes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    /// Opaque continuation from a previous result. Keep op, IDs, and query unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    /// Maximum returned items, 1-100 (default 20). Responses also have a byte cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
 }
 
 /// Input item accepted by the note tool.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct NoteItemInput {
     /// Stable short note id
     #[serde(default)]
@@ -93,12 +124,25 @@ pub struct NoteOutput {
     pub success: bool,
     /// Store usage summary after the operation.
     pub summary: NoteSummary,
-    /// Full note list. Present only for read operations and `load_notes`.
+    /// Read page, or the full list from `load_notes`. A large note may span pages.
+    /// `offset_chars` applies to the first item; subsequent items start at zero.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub items: Vec<NoteItem>,
     /// Human-readable error message for failed operations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Compact metadata and excerpts, present for list/search.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entries: Vec<NoteEntry>,
+    /// Character offset into the first read item (zero on initial/full reads).
+    #[serde(default)]
+    pub offset_chars: usize,
+    /// True when more query content is available.
+    #[serde(default)]
+    pub truncated: bool,
+    /// Continuation bound to this agent, query, and exact store contents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -171,6 +215,7 @@ impl NoteStore {
                 Vec::new()
             },
             error: None,
+            ..Default::default()
         }
     }
 
@@ -180,6 +225,7 @@ impl NoteStore {
             summary: self.summary(char_limit),
             items: Vec::new(),
             error: Some(error),
+            ..Default::default()
         }
     }
 
@@ -202,6 +248,7 @@ type NoteUpdateLocks = parking_lot::Mutex<HashMap<(Path, String), Weak<tokio::sy
 pub struct NoteTool {
     updates: Arc<NoteUpdateLocks>,
     char_limit: usize,
+    response_bytes: usize,
     description: String,
 }
 
@@ -220,19 +267,20 @@ impl NoteTool {
         Self {
             updates: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             char_limit: NOTE_CHAR_LIMIT,
-            description: concat!(
-                "Persistent notes for the current agent only. Use op=upsert ",
-                "with stable short ids to add or update only changed notes; ",
-                "op=delete removes by id; op=set replaces all notes; op=read ",
-                "returns the full list. Writes return only summary counts."
-            )
-            .to_string(),
+            response_bytes: 16 * 1024,
+            description: "Persistent notes for the current agent. Use stable IDs with upsert for changed notes, delete by ID, and set to replace all. read accepts IDs and returns bounded pages; list returns short excerpts; search finds a literal substring. Pass next_cursor unchanged with the same query to continue, including within a long note. Writes return counts only. Notes are historical data, not proof of current behavior.".to_string(),
         }
     }
 
     /// Sets the maximum total note content length accepted by write operations.
     pub fn with_char_limit(mut self, char_limit: usize) -> Self {
         self.char_limit = char_limit;
+        self
+    }
+
+    /// Bounds serialized query responses, clamped to 2-64 KiB (default 16 KiB).
+    pub fn with_response_bytes(mut self, bytes: usize) -> Self {
+        self.response_bytes = bytes.clamp(2048, 64 * 1024);
         self
     }
 
@@ -264,7 +312,12 @@ impl NoteTool {
 
     async fn load_store(ctx: &BaseCtx) -> Result<NoteStore, BoxError> {
         match ctx.store_get(&Self::store_path(&ctx.agent)).await {
-            Ok((data, _)) => Ok(from_slice(&data[..])?),
+            Ok((data, _)) => {
+                if data.len() > crate::store::MAX_STORE_OBJECT_SIZE {
+                    return Err("note store exceeds read size limit".into());
+                }
+                Ok(from_slice(&data)?)
+            }
             Err(err) if is_missing_store_object(err.as_ref()) => Ok(NoteStore::default()),
             Err(err) => Err(err),
         }
@@ -279,11 +332,10 @@ impl NoteTool {
     }
 
     async fn save_store(ctx: &BaseCtx, store: &NoteStore) -> Result<(), BoxError> {
-        let data = to_canonical_vec(store)?;
         ctx.store_put(
             &Self::store_path(&ctx.agent),
             PutMode::Overwrite,
-            data.into(),
+            to_canonical_vec(store)?.into(),
         )
         .await?;
         Ok(())
@@ -292,11 +344,16 @@ impl NoteTool {
 
 /// Public entrypoint for loading notes outside of the tool call interface, e.g. in agent.
 pub async fn load_notes(ctx: &AgentCtx) -> Option<NoteOutput> {
-    let base_ctx = ctx.child_base(NoteTool::NAME).ok()?;
-    NoteTool::load_store(&base_ctx)
-        .await
-        .ok()
-        .map(|store| store.output(true, true, None))
+    try_load_notes(ctx).await.ok()
+}
+
+/// Loads the complete host-side note snapshot, preserving storage/decode errors.
+/// Model-facing callers should use bounded queries or [`load_note_summary`].
+pub async fn try_load_notes(ctx: &AgentCtx) -> Result<NoteOutput, BoxError> {
+    let base_ctx = ctx.child_base(NoteTool::NAME)?;
+    Ok(NoteTool::load_store(&base_ctx)
+        .await?
+        .output(true, true, None))
 }
 
 /// Loads notes from the pre note store without mutating the current store.
@@ -333,78 +390,59 @@ impl Tool<BaseCtx> for NoteTool {
     ) -> Result<ToolOutput<Self::Output>, BoxError> {
         let ctx = &ctx;
         hooked_call(ctx, args, |args| async move {
-            // Serialize one note document while unrelated agents can update independently.
+            let token = ctx.cancellation_token();
             let lock = self.update_lock(ctx);
-            let _guard = lock.lock().await;
-            let mut store = Self::load_store(ctx).await?;
-            let op = normalize_op(args.op.as_deref());
-            let items = args.items;
-
-            let (output, changed) = match op.as_deref() {
-                Some(NOTE_OP_READ) => (store.output(true, true, Some(self.char_limit)), false),
-                Some(NOTE_OP_SET) => match items {
-                    Some(items) => match store.set(items, self.char_limit) {
-                        Ok(changed) => (store.output(true, false, Some(self.char_limit)), changed),
-                        Err(error) => (store.error_output(error, Some(self.char_limit)), false),
-                    },
-                    None => (
-                        store.error_output(
-                            "items are required for set".into(),
-                            Some(self.char_limit),
-                        ),
-                        false,
-                    ),
-                },
-                Some(NOTE_OP_UPSERT) => match items {
-                    Some(items) => match store.upsert(items, self.char_limit) {
-                        Ok(changed) => (store.output(true, false, Some(self.char_limit)), changed),
-                        Err(error) => (store.error_output(error, Some(self.char_limit)), false),
-                    },
-                    None => (
-                        store.error_output(
-                            "items are required for upsert".into(),
-                            Some(self.char_limit),
-                        ),
-                        false,
-                    ),
-                },
-                Some(NOTE_OP_DELETE) => match items {
-                    Some(items) => match store.delete(items) {
-                        Ok(changed) => (store.output(true, false, Some(self.char_limit)), changed),
-                        Err(error) => (store.error_output(error, Some(self.char_limit)), false),
-                    },
-                    None => (
-                        store.error_output(
-                            "items are required for delete".into(),
-                            Some(self.char_limit),
-                        ),
-                        false,
-                    ),
-                },
-                Some(op) => (
-                    store.error_output(
-                        format!("Unknown op {:?}. Use one of: {}.", op, VALID_OPS.join(", ")),
-                        Some(self.char_limit),
-                    ),
-                    false,
-                ),
-                None => (store.output(true, true, Some(self.char_limit)), false),
+            let _guard = tokio::select! {
+                _ = token.cancelled() => return Err("note call cancelled".into()),
+                guard = lock.lock() => guard,
             };
-
+            let op = normalize_op(args.op.as_deref()).unwrap_or_else(|| NOTE_OP_READ.into());
+            if token.is_cancelled() {
+                return Err("note call cancelled".into());
+            }
+            let mut store = Self::load_store(ctx).await?;
+            let result = if matches!(op.as_str(), NOTE_OP_READ | NOTE_OP_LIST | NOTE_OP_SEARCH) {
+                self.query(ctx, &store, &op, &args)
+                    .map(|output| (output, false))
+            } else if args.ids.is_some()
+                || args.query.is_some()
+                || args.cursor.is_some()
+                || args.limit.is_some()
+            {
+                Err("query fields are only valid for read/list/search".into())
+            } else if !VALID_OPS.contains(&op.as_str()) {
+                Err(format!("Unknown op. Use one of: {}.", VALID_OPS.join(", ")))
+            } else if let Some(items) = &args.items {
+                let changed = match op.as_str() {
+                    NOTE_OP_SET => store.set(items.clone(), self.char_limit),
+                    NOTE_OP_UPSERT => store.upsert(items.clone(), self.char_limit),
+                    NOTE_OP_DELETE => store.delete(items.clone()),
+                    _ => unreachable!(),
+                };
+                changed.map(|changed| (store.output(true, false, Some(self.char_limit)), changed))
+            } else {
+                Err(format!("items are required for {op}"))
+            };
+            let (output, changed) = match result {
+                Ok(result) => result,
+                Err(error) => (store.error_output(error, Some(self.char_limit)), false),
+            };
             if changed {
                 Self::save_store(ctx, &store).await?;
             }
-
-            // Failed operations keep their typed output for the model but are
-            // flagged as errors for hooks, providers, and telemetry.
-            let mut output = ToolOutput::new(output);
-            if !output.output.success {
-                output.is_error = Some(true);
-            }
-            Ok(output)
+            Ok(note_output(output))
         })
         .await
     }
+}
+
+fn note_output(output: NoteOutput) -> ToolOutput<NoteOutput> {
+    let failed = !output.success;
+    let mut output = ToolOutput::new(output);
+    if failed {
+        output.is_error = Some(true);
+    }
+    output
 }
 
 fn normalize_op(op: Option<&str>) -> Option<String> {
@@ -435,6 +473,7 @@ fn legacy_store_output(store: LegacyNoteStore) -> NoteOutput {
 }
 
 fn normalize_note_items(items: Vec<NoteItemInput>) -> Result<Vec<NoteItem>, String> {
+    validate_inputs(&items, true)?;
     let mut last_index: HashMap<String, usize> = HashMap::new();
     for (index, item) in items.iter().enumerate() {
         let id = item.id.trim();
@@ -469,6 +508,7 @@ fn normalize_note_items(items: Vec<NoteItemInput>) -> Result<Vec<NoteItem>, Stri
 }
 
 fn normalize_note_ids(items: Vec<NoteItemInput>) -> Result<Vec<String>, String> {
+    validate_inputs(&items, false)?;
     let mut last_index: HashMap<String, usize> = HashMap::new();
     for (index, item) in items.iter().enumerate() {
         let id = item.id.trim();
@@ -486,7 +526,43 @@ fn normalize_note_ids(items: Vec<NoteItemInput>) -> Result<Vec<String>, String> 
         .collect())
 }
 
+fn validate_inputs(items: &[NoteItemInput], content_required: bool) -> Result<(), String> {
+    if items.len() > 2048 {
+        return Err("note batch exceeds 2048 items".into());
+    }
+    for (index, item) in items.iter().enumerate() {
+        if item.id.trim().is_empty() {
+            return Err(format!("items[{index}].id cannot be empty"));
+        }
+        if item.id.len() > 128 || item.id.chars().any(char::is_control) {
+            return Err(format!(
+                "items[{index}].id exceeds 128 bytes or contains control characters"
+            ));
+        }
+        if content_required {
+            let content = item
+                .content
+                .as_deref()
+                .ok_or_else(|| format!("items[{index}].content is required"))?;
+            if content.trim().is_empty() {
+                return Err(format!("items[{index}].content cannot be empty"));
+            }
+        } else if item.content.is_some() {
+            return Err("delete accepts IDs only".into());
+        }
+    }
+    Ok(())
+}
+
 fn validate_note_size(items: &[NoteItem], char_limit: usize) -> Result<(), String> {
+    if items.len() > 2048
+        || to_canonical_vec(&items)
+            .map_err(|error| error.to_string())?
+            .len()
+            > 1024 * 1024
+    {
+        return Err("note store exceeds 2048 items or 1 MiB encoded data".into());
+    }
     let current = joined_len(items);
     if current > char_limit {
         return Err(format!(
@@ -516,371 +592,5 @@ fn is_missing_store_object(err: &(dyn std::error::Error + 'static)) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{context::AgentCtx, engine::EngineBuilder, hook::ToolHook};
-    use async_trait::async_trait;
-    use std::sync::Arc;
-
-    fn agent_ctx(name: &str) -> AgentCtx {
-        EngineBuilder::new()
-            .mock_ctx()
-            .child(name, name)
-            .expect("create child agent ctx")
-    }
-
-    fn note_ctx(name: &str) -> BaseCtx {
-        agent_ctx(name)
-            .child_base(NoteTool::NAME)
-            .expect("create note tool ctx")
-    }
-
-    fn input(id: &str, content: Option<&str>) -> NoteItemInput {
-        NoteItemInput {
-            id: id.to_string(),
-            content: content.map(ToString::to_string),
-        }
-    }
-
-    fn item(id: &str, content: &str) -> NoteItem {
-        NoteItem {
-            id: id.to_string(),
-            content: content.to_string(),
-        }
-    }
-
-    struct MutatingHook;
-
-    #[async_trait]
-    impl ToolHook<NoteArgs, NoteOutput> for MutatingHook {
-        async fn before_tool_call(
-            &self,
-            _ctx: &BaseCtx,
-            mut args: NoteArgs,
-        ) -> Result<NoteArgs, BoxError> {
-            args.op = Some(NOTE_OP_UPSERT.to_string());
-            args.items = Some(vec![input("hook", Some("hook inserted note"))]);
-            Ok(args)
-        }
-
-        async fn after_tool_call(
-            &self,
-            _ctx: &BaseCtx,
-            mut output: ToolOutput<NoteOutput>,
-        ) -> Result<ToolOutput<NoteOutput>, BoxError> {
-            output.output.summary.limit = Some(1);
-            Ok(output)
-        }
-    }
-
-    #[test]
-    fn store_set_upsert_delete_by_stable_id() {
-        let mut store = NoteStore::default();
-
-        assert!(
-            store
-                .set(
-                    vec![
-                        input("release", Some("remember release checklist")),
-                        input("release", Some("remember launch checklist")),
-                    ],
-                    NOTE_CHAR_LIMIT,
-                )
-                .unwrap()
-        );
-        assert_eq!(
-            store.items,
-            vec![item("release", "remember launch checklist")]
-        );
-
-        assert!(
-            store
-                .upsert(
-                    vec![
-                        input("release", Some("remember stable release tags")),
-                        input("review", Some("prefer focused review notes")),
-                    ],
-                    NOTE_CHAR_LIMIT,
-                )
-                .unwrap()
-        );
-        assert_eq!(
-            store.items,
-            vec![
-                item("release", "remember stable release tags"),
-                item("review", "prefer focused review notes"),
-            ]
-        );
-
-        assert!(store.delete(vec![input("release", None)]).unwrap());
-        assert_eq!(
-            store.items,
-            vec![item("review", "prefer focused review notes")]
-        );
-        assert!(!store.delete(vec![input("missing", None)]).unwrap());
-    }
-
-    #[test]
-    fn store_reports_validation_and_limit_errors() {
-        let mut store = NoteStore::default();
-
-        assert_eq!(
-            store
-                .set(vec![input(" ", Some("content"))], NOTE_CHAR_LIMIT)
-                .unwrap_err(),
-            "items[0].id cannot be empty"
-        );
-        assert_eq!(
-            store
-                .upsert(vec![input("alpha", None)], NOTE_CHAR_LIMIT)
-                .unwrap_err(),
-            "items[0].content is required"
-        );
-        assert_eq!(
-            store
-                .upsert(vec![input("alpha", Some(" "))], NOTE_CHAR_LIMIT)
-                .unwrap_err(),
-            "items[0].content cannot be empty"
-        );
-        assert_eq!(
-            store.delete(vec![input("", None)]).unwrap_err(),
-            "items[0].id cannot be empty"
-        );
-
-        let oversized = "x".repeat(33);
-        assert!(
-            store
-                .set(vec![input("a", Some(&oversized))], 32)
-                .unwrap_err()
-                .contains("32")
-        );
-    }
-
-    #[tokio::test]
-    async fn tool_reads_empty_store_before_first_write() {
-        let tool = NoteTool::new();
-        let output = tool
-            .call(note_ctx("writer"), NoteArgs::default(), Vec::new())
-            .await
-            .unwrap();
-
-        assert!(output.output.success);
-        assert!(output.output.items.is_empty());
-        assert_eq!(output.output.summary.total, 0);
-    }
-
-    #[tokio::test]
-    async fn tool_persists_items_and_write_outputs_are_compact() {
-        let tool = NoteTool::new();
-        let ctx = note_ctx("writer");
-
-        let first = tool
-            .call(
-                ctx.clone(),
-                NoteArgs {
-                    op: Some(NOTE_OP_UPSERT.to_string()),
-                    items: Some(vec![input("release", Some("remember to tag releases"))]),
-                },
-                Vec::new(),
-            )
-            .await
-            .unwrap();
-        assert!(first.output.success);
-        assert_eq!(first.output.summary.total, 1);
-        assert!(first.output.items.is_empty());
-
-        let second = tool
-            .call(ctx.clone(), NoteArgs::default(), Vec::new())
-            .await
-            .unwrap();
-        assert_eq!(
-            second.output.items,
-            vec![item("release", "remember to tag releases")]
-        );
-
-        let third = tool
-            .call(
-                ctx,
-                NoteArgs {
-                    op: Some(NOTE_OP_UPSERT.to_string()),
-                    items: Some(vec![input(
-                        "release",
-                        Some("remember to tag stable releases"),
-                    )]),
-                },
-                Vec::new(),
-            )
-            .await
-            .unwrap();
-        assert!(third.output.success);
-        assert!(third.output.items.is_empty());
-        assert_eq!(third.output.summary.total, 1);
-    }
-
-    #[tokio::test]
-    async fn tool_storage_is_isolated_between_agents() {
-        let tool = NoteTool::new();
-
-        let writer = tool
-            .call(
-                note_ctx("writer"),
-                NoteArgs {
-                    op: Some(NOTE_OP_UPSERT.to_string()),
-                    items: Some(vec![input("owner", Some("writer only note"))]),
-                },
-                Vec::new(),
-            )
-            .await
-            .unwrap();
-        assert!(writer.output.success);
-        assert_eq!(writer.output.summary.total, 1);
-
-        let reviewer = tool
-            .call(note_ctx("reviewer"), NoteArgs::default(), Vec::new())
-            .await
-            .unwrap();
-        assert!(reviewer.output.success);
-        assert!(reviewer.output.items.is_empty());
-    }
-
-    #[tokio::test]
-    async fn tool_reports_validation_errors_and_unknown_ops_without_persisting() {
-        let tool = NoteTool::default()
-            .with_char_limit(32)
-            .with_description("custom note description".to_string());
-        assert_eq!(tool.description(), "custom note description");
-        let ctx = note_ctx("validation");
-
-        let missing_items = tool
-            .call(
-                ctx.clone(),
-                NoteArgs {
-                    op: Some(NOTE_OP_UPSERT.to_string()),
-                    items: None,
-                },
-                Vec::new(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            missing_items.output.error.as_deref(),
-            Some("items are required for upsert")
-        );
-        // A domain failure keeps its typed output but is flagged for hooks,
-        // providers, and telemetry.
-        assert!(!missing_items.output.success);
-        assert_eq!(missing_items.is_error, Some(true));
-        assert_eq!(missing_items.output.summary.limit, Some(32));
-
-        let missing_content = tool
-            .call(
-                ctx.clone(),
-                NoteArgs {
-                    op: Some(NOTE_OP_SET.to_string()),
-                    items: Some(vec![input("entry", None)]),
-                },
-                Vec::new(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            missing_content.output.error.as_deref(),
-            Some("items[0].content is required")
-        );
-        assert_eq!(missing_content.is_error, Some(true));
-
-        let unknown = tool
-            .call(
-                ctx.clone(),
-                NoteArgs {
-                    op: Some("archive".to_string()),
-                    items: None,
-                },
-                Vec::new(),
-            )
-            .await
-            .unwrap();
-        assert!(
-            unknown
-                .output
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("Unknown op"))
-        );
-        assert_eq!(unknown.is_error, Some(true));
-
-        let read = tool
-            .call(ctx, NoteArgs::default(), Vec::new())
-            .await
-            .unwrap();
-        assert!(read.output.items.is_empty());
-        // A successful read is never flagged.
-        assert!(read.output.success);
-        assert_eq!(read.is_error, None);
-    }
-
-    #[tokio::test]
-    async fn tool_hooks_and_load_notes_use_agent_scoped_store() {
-        let engine_ctx = EngineBuilder::new().mock_ctx();
-        let agent = engine_ctx
-            .child("hooked", "hooked")
-            .expect("create child agent ctx");
-        let ctx = agent.child_base(NoteTool::NAME).unwrap();
-        ctx.set_state(NoteToolHook::new(Arc::new(MutatingHook)));
-
-        let tool = NoteTool::new();
-        let output = tool
-            .call(
-                ctx,
-                NoteArgs {
-                    op: Some(NOTE_OP_READ.to_string()),
-                    items: None,
-                },
-                Vec::new(),
-            )
-            .await
-            .unwrap();
-        assert!(output.output.success);
-        assert_eq!(output.output.summary.limit, Some(1));
-
-        let loaded = load_notes(&agent).await.unwrap();
-        assert!(loaded.success);
-        assert_eq!(loaded.items, vec![item("hook", "hook inserted note")]);
-        assert_eq!(loaded.summary.limit, None);
-    }
-
-    #[tokio::test]
-    async fn load_notes_from_legacy_reads_old_store_without_touching_v2() {
-        let agent = agent_ctx("legacy");
-        let mut ctx = agent.child_base(NoteTool::NAME).unwrap();
-        ctx.path = "t:note".into();
-        let legacy = LegacyNoteStore {
-            notes: vec![
-                "remember old release process".to_string(),
-                "prefer concise persisted notes".to_string(),
-            ],
-        };
-        ctx.store_put(
-            &NoteTool::legacy_store_path(&ctx.agent),
-            PutMode::Overwrite,
-            to_canonical_vec(&legacy).unwrap().into(),
-        )
-        .await
-        .unwrap();
-
-        let loaded = load_notes_from_legacy(&agent).await.unwrap();
-        assert!(loaded.success);
-        assert_eq!(
-            loaded.items,
-            vec![
-                item("legacy_1", "remember old release process"),
-                item("legacy_2", "prefer concise persisted notes"),
-            ]
-        );
-        assert_eq!(loaded.summary.total, 2);
-        assert_eq!(loaded.summary.limit, None);
-
-        let current = load_notes(&agent).await.unwrap();
-        assert!(current.items.is_empty());
-    }
-}
+#[path = "note/tests.rs"]
+mod tests;

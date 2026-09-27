@@ -288,7 +288,7 @@ mod tests {
         let note = NoteTool::new().definition().parameters;
         assert_eq!(
             note["properties"]["op"]["enum"],
-            json!(["read", "set", "upsert", "delete", null])
+            json!(["read", "list", "search", "set", "upsert", "delete", null])
         );
         assert_eq!(
             note["properties"]["items"]["items"]["properties"]["content"]["type"],

@@ -31,6 +31,8 @@ Anda は、モデル、ツール、メモリ、ほかのエージェントを 1 
 5. **拡張可能なメモリとスキル**
    オプションの extensions は、conversation storage、KIP ベースの memory tools、filesystem、shell、fetch、notes、todos、ファイルベースの skills を提供します。コーディング agent は、出力制限、プロセス管理、任意の macOS/Linux プロセスサンドボックスに対応する shell/session/patch ツールセットを選択できます。ファイル操作に限定する agent は shell を登録せずに利用できます。ファイルベースの skills は、上限付きカタログ、安定した ID、パッケージ内リソースのページ読み取り、明示的な使用ポリシー、ホスト側の依存関係チェックに対応します。
 
+   ノートは上限付き検索と任意のコンテキスト索引に対応し、検証済みのセッションタスクはコンテキスト圧縮後に復元されます。[ノートとタスク](./docs/note-todo.md)を参照してください。
+
 6. **発見フローに対応したツールバンドル**
    静的 tools、動的 providers、MCP servers は capability groups を公開できるため、agents は `tools_groups` で関連ツールのまとまりを確認し、schema が必要になった時だけ `tools_select` で group を展開できます。
 

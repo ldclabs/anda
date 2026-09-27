@@ -634,6 +634,7 @@ async fn concurrent_note_updates_preserve_both_items() {
             id: id.into(),
             content: Some(id.into()),
         }]),
+        ..Default::default()
     };
     let (first, second) = tokio::join!(
         tool.call(ctx.clone(), args("first"), vec![]),

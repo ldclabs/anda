@@ -44,7 +44,7 @@ use super::{
     runner::{CompletionRunner, CompletionStream},
 };
 use crate::{
-    extension::todo::TodoSession,
+    extension::todo::todo_session,
     model::{Model, Models},
     subagent::{SubAgentSet, SubAgentSetManager},
 };
@@ -362,9 +362,7 @@ impl AgentCtx {
         // per-tool-call child contexts (which snapshot-copy parent state) share
         // one list across the whole conversation. Seed only when absent so a
         // nested runner inherits the parent's list instead of resetting it.
-        if self.base.get_state::<TodoSession>().is_none() {
-            self.base.set_state(TodoSession::new());
-        }
+        todo_session(&self.base);
         CompletionRunner::new(self, req, model, resources)
     }
 

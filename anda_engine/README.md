@@ -176,9 +176,11 @@ The `extension` module provides reusable tools for common agent capabilities:
 - `fs`: workspace-scoped file read, write, search, and edit tools.
 - `shell`: native or sandboxed shell command execution.
 - `mcp`: MCP servers as runtime-discovered tool providers.
-- `note`: lightweight per-agent note storage.
+- `note`: per-agent persistent notes with bounded ID reads, listings, and substring search.
 - `skill`: file-backed skills with bounded discovery, immutable catalog generations, stable identities, package resource reads, and optional delegated execution.
-- `todo`: session-scoped task tracking.
+- `todo`: validated session tasks with incremental updates and bounded recovery after handoff.
+
+Notes have an opt-in context index; task changes use existing typed hooks with an optional explanation. See [notes and tasks](../docs/note-todo.md) for pagination, limits, context lifecycle, and Rust API migration.
 
 Filesystem tools enforce configured workspace roots. A native shell's working directory alone does not confine the process: use an isolated host or opt into `NativeRuntime::with_sandbox`. Shell commands receive a restricted environment; only allowlisted host variables and explicitly configured keys are forwarded. Configured environment keys are normalized case-insensitively on Windows.
 
