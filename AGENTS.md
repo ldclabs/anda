@@ -2,10 +2,20 @@
 
 Guidance for AI coding agents working in this repository.
 
-## Scope
+## Agent Workflow
 
-This file applies to the whole `ldclabs/anda` workspace. Follow more specific
-instructions in nested `AGENTS.md` files if any are added later.
+- Work independently as the current agent. Do not spawn or delegate work to
+  subagents.
+- Before editing, run `git status --short`, confirm the current branch, and
+  inspect existing diffs in the files you intend to change. Preserve the user's
+  existing work; do not overwrite or revert unrelated files or changes.
+- Use `rg` for search and focused reads before editing. Do not assume module
+  boundaries from filenames alone.
+- Before committing, review the final diff and stage only the files or hunks
+  belonging to the requested task.
+- At completion, briefly summarize the changes, the checks actually run and
+  their results, and any checks not run or blocked. Never report an unrun check
+  as passing. When committing, include the branch and commit ID in the summary.
 
 ## Repository Shape
 

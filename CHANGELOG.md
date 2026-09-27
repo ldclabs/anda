@@ -2,9 +2,57 @@
 
 All notable changes to the Anda project will be documented in this file.
 
-## [Unreleased]
+## [0.16.2] — 2026-09-27
 
-### Changed — notes and session tasks
+This release adds supervised shell sessions and workspace patches, an isolated
+subagent runtime, bounded skill catalogs, MCP runtime policies, and paged note
+retrieval to `anda_engine`, and provider-neutral tool result presentations to
+`anda_core`. Only these two crates move to `0.16.2`.
+
+### Changed — workspace
+
+- **Release scope** — `anda_core` and `anda_engine` move to `0.16.2`, and
+  `anda_engine` now requires `anda_core` `0.16.2` for `ToolPresentation`.
+  `anda_engine_server`, `anda_web3_client`, and `anda_cli` have no changes and
+  stay at `0.16.1`.
+
+- **Dependencies** — The workspace requires `rmcp` 3.4.1 and adds `sha2` and
+  `sse-stream`. `anda_engine` also depends on `thiserror` and enables the
+  `Win32_Storage_FileSystem` and `Win32_Foundation` features of `windows-sys`.
+
+### Added — anda_core
+
+- **Tool result presentations** — `ToolOutput<T>` gains an optional
+  `model_output: Option<ToolPresentation>` (text plus inline `ToolMedia`) that
+  the runner sends to the model in place of `output`, which callers and audit
+  hooks still receive in full. The presentation is stored as an explicitly
+  tagged value inside `ContentPart::ToolOutput.output`, so the tool-call boundary
+  and replay across providers are preserved. Older serialized outputs default to
+  no override; struct literals must initialize the new field, and hooks that
+  rewrite results must update or clear it.
+
+### Added — anda_engine: shell sessions and workspace patches
+
+- Add the opt-in `extension::workspace::coding_tools` bundle (`shell`,
+  `shell_session`, `apply_patch`) plus `readonly_file_tools` and `file_tools`.
+  `ShellCommandTool` replaces the legacy `ShellTool` in that bundle (both are
+  named `shell`; register only one). `ExecArgs`, `ExecOutput`, `ShellTool` and
+  custom `Executor`s stay source-compatible; the new session methods on
+  `Executor` default to unsupported.
+- Supervise process sessions scoped by a host-created `ShellSessionScope`, the
+  engine, caller and agent, with `SessionLimits` bounding retained sessions,
+  runtime, output previews and raw logs. Interactive stdin and Unix PTYs require
+  host opt-in. `SandboxPolicy` wraps commands with `sandbox-exec` on macOS or
+  `bwrap` on Linux, denies network by default, and never falls back to
+  unrestricted execution.
+- `apply_patch` prevalidates and locks multi-file patches, supports dry runs and
+  expected SHA-256 versions, preserves encodings and line endings, and never
+  overwrites on add or move. Writes are atomic per file, not across files.
+- Filesystem tools read and replace files through validated no-follow handles,
+  serialize cooperating writes, and bound the bytes actually read. Truncated
+  legacy `shell` output now keeps both its beginning and its tail.
+
+### Changed — anda_engine: notes and session tasks
 
 - Validate todo writes atomically; reject missing items, unknown operations and
   statuses, empty task fields, and oversized lists. Preserve explicit empty-list
@@ -18,7 +66,7 @@ All notable changes to the Anda project will be documented in this file.
 - Todo store/session writes now return `Result`; note reads are paged and argument
   structs gain optional fields. See `docs/note-todo.md` for API migration and limits.
 
-### Added — subagent runtime
+### Added — anda_engine: subagent runtime
 
 - Isolate worker session aliases by host-created root scope and caller. Expose
   execution lineage, work-turn completion hooks, bounded terminal retention,
@@ -34,7 +82,7 @@ All notable changes to the Anda project will be documented in this file.
 - Hosts continuing one root task across entry contexts must reinstall its
   `SubAgentScope`; session aliases no longer implicitly join another root task.
 
-### Added — skill catalogs
+### Added — anda_engine: skill catalogs
 
 - Add `skills_list` and `skills_read` (registered by `SkillManager::tools`) for
   paginated discovery and package-scoped text resources next to the name-only
@@ -46,7 +94,7 @@ All notable changes to the Anda project will be documented in this file.
   descendant directories. Duplicate names within one root are readable by ID
   only, and names over 58 characters use stable `skillh_*` callables.
 
-### Added — MCP runtime policies
+### Added — anda_engine: MCP runtime policies
 
 - Add registration-bound catalog publication, stable collision mappings, bounded
   pagination/transport input, per-server deadlines/concurrency/startup policy,
@@ -58,7 +106,7 @@ All notable changes to the Anda project will be documented in this file.
   supported. Bound discovery outputs and accumulated schemas without weakening
   schema constraints.
 
-### Changed — MCP compatibility
+### Changed — anda_engine: MCP compatibility
 
 - Stdio now forwards platform essentials and explicit environment overrides by
   default. Set `inherit_env = true` only when full inheritance is intended.
