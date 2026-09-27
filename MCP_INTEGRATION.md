@@ -377,6 +377,9 @@ Chat Completions falls back to text. Gemini 3 projects supported image/document
 MIME types into `functionResponse.parts`; older or unknown Gemini model names
 fall back to text. Audio remains available to callers and in the neutral view,
 but these model APIs currently receive a text notice instead of audio bytes.
+Media fallbacks affect only provider requests; persisted neutral history retains
+the original presentation for replay with another model. Anthropic omits blank
+text blocks from image-only results and omits content for empty presentations.
 See [Gemini's function response restrictions](https://ai.google.dev/gemini-api/docs/generate-content/function-calling#multimodal-function-responses).
 
 Hooks that rewrite a result must update `model_output` too, or clear it to use

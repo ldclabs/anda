@@ -70,8 +70,9 @@ pub(crate) trait WireFormat {
     fn append_raw_history(r: &mut Self::Request, raw_history: Vec<Json>) -> usize;
 
     /// Converts one provider-neutral [`Message`] and appends the result (one
-    /// or more wire messages) to the request.
-    fn push_message(r: &mut Self::Request, msg: Message) -> Result<(), BoxError>;
+    /// or more wire messages) to the request. Model-specific fallbacks affect
+    /// only this wire copy; the driver retains the original neutral message.
+    fn push_message(r: &mut Self::Request, msg: Message, model: &str) -> Result<(), BoxError>;
 
     /// Maps supported sampling options onto request fields.
     fn apply_sampling(
@@ -148,7 +149,7 @@ pub(crate) async fn drive_completion<W: WireFormat>(
     let skip_raw = W::append_raw_history(&mut r, req.raw_history);
 
     for msg in req.chat_history {
-        W::push_message(&mut r, msg)?;
+        W::push_message(&mut r, msg, &model)?;
     }
 
     if let Some(mut msg) = req
@@ -157,7 +158,7 @@ pub(crate) async fn drive_completion<W: WireFormat>(
     {
         msg.timestamp = Some(timestamp);
         chat_history.push(msg.clone());
-        W::push_message(&mut r, msg)?;
+        W::push_message(&mut r, msg, &model)?;
     }
 
     let mut content = req.content;
@@ -172,7 +173,7 @@ pub(crate) async fn drive_completion<W: WireFormat>(
             ..Default::default()
         };
         chat_history.push(msg.clone());
-        W::push_message(&mut r, msg)?;
+        W::push_message(&mut r, msg, &model)?;
     }
 
     W::apply_sampling(

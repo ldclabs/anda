@@ -1206,7 +1206,7 @@ impl From<ContentPart> for ContentBlock {
                 ..
             } => ContentBlock::ToolResult {
                 tool_use_id: call_id.unwrap_or_else(|| synthetic_tool_use_id(&name)),
-                content: Some(tool_presentation_content(&output)),
+                content: tool_presentation_content(&output),
                 cache_control: None,
                 is_error,
             },
@@ -1704,14 +1704,17 @@ pub struct StreamError {
     pub message: String,
 }
 
-fn tool_presentation_content(output: &Value) -> ToolResultContent {
+fn tool_presentation_content(output: &Value) -> Option<ToolResultContent> {
     let Some(view) = anda_core::ToolPresentation::from_output(output) else {
-        return ToolResultContent::Text(match output {
+        return Some(ToolResultContent::Text(match output {
             Value::String(s) => s.clone(),
             _ => output.to_string(),
-        });
+        }));
     };
-    let mut blocks = vec![ContentBlock::text(view.text)];
+    let mut blocks = Vec::new();
+    if !view.text.trim().is_empty() {
+        blocks.push(ContentBlock::text(view.text));
+    }
     for media in view.media {
         if media.mime_type.starts_with("image/") {
             blocks.push(ContentBlock::Image {
@@ -1728,7 +1731,7 @@ fn tool_presentation_content(output: &Value) -> ToolResultContent {
             )));
         }
     }
-    ToolResultContent::Blocks(blocks)
+    (!blocks.is_empty()).then_some(ToolResultContent::Blocks(blocks))
 }
 
 #[cfg(test)]
@@ -2928,6 +2931,45 @@ mod tests {
 #[cfg(test)]
 mod tool_presentation_tests {
     use super::*;
+
+    #[test]
+    fn image_only_and_empty_tool_results_omit_blank_text_blocks() {
+        for text in ["", " \n\t"] {
+            for has_image in [false, true] {
+                let output = anda_core::ToolPresentation {
+                    text: text.into(),
+                    media: if has_image {
+                        vec![anda_core::ToolMedia {
+                            mime_type: "image/png".into(),
+                            data: anda_core::ByteBufB64::from(vec![1, 2, 3]),
+                        }]
+                    } else {
+                        vec![]
+                    },
+                }
+                .into_output();
+                let block = ContentBlock::from(anda_core::ContentPart::ToolOutput {
+                    name: "screenshot".into(),
+                    output,
+                    is_error: Some(false),
+                    call_id: Some("call-1".into()),
+                    remote_id: None,
+                });
+                let result = serde_json::to_value(block).unwrap();
+                assert_eq!(result["type"], "tool_result");
+                assert_eq!(result["tool_use_id"], "call-1");
+                assert_eq!(result["is_error"], false);
+                if has_image {
+                    assert_eq!(result["content"].as_array().unwrap().len(), 1);
+                    assert_eq!(result["content"][0]["type"], "image");
+                    assert_eq!(result["content"][0]["source"]["data"], "AQID");
+                } else {
+                    assert!(result.get("content").is_none());
+                }
+            }
+        }
+    }
+
     #[test]
     fn tool_media_keeps_its_call_boundary() {
         let output = anda_core::ToolPresentation {

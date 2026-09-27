@@ -1673,7 +1673,7 @@ impl WireFormat for CompletionModel {
         r.messages.len()
     }
 
-    fn push_message(r: &mut Self::Request, msg: Message) -> Result<(), BoxError> {
+    fn push_message(r: &mut Self::Request, msg: Message, _model: &str) -> Result<(), BoxError> {
         for input in to_message_inputs(&msg)? {
             r.messages.push(serde_json::to_value(input)?);
         }
@@ -1904,7 +1904,7 @@ impl WireFormat for CompletionModelV2 {
         r.input.len()
     }
 
-    fn push_message(r: &mut Self::Request, msg: Message) -> Result<(), BoxError> {
+    fn push_message(r: &mut Self::Request, msg: Message, _model: &str) -> Result<(), BoxError> {
         r.input.extend(types::message_into(msg));
         Ok(())
     }

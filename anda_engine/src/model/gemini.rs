@@ -319,8 +319,8 @@ fn response_from_stream_chunks(
 }
 
 // Gemini 3 function responses support images/documents; older models require
-// a textual result. Leave raw provider history and tool-call boundaries intact.
-fn prepare_tool_presentations(request: &mut CompletionRequest, model: &str) {
+// a textual result. Only adapt the wire copy, preserving neutral and raw history.
+fn prepare_tool_presentations(message: &mut Message, model: &str) {
     if model
         .rsplit('/')
         .next()
@@ -328,12 +328,7 @@ fn prepare_tool_presentations(request: &mut CompletionRequest, model: &str) {
     {
         return;
     }
-    for part in request.content.iter_mut().chain(
-        request
-            .chat_history
-            .iter_mut()
-            .flat_map(|message| message.content.iter_mut()),
-    ) {
+    for part in &mut message.content {
         if let anda_core::ContentPart::ToolOutput { output, .. } = part
             && let Some(view) = anda_core::ToolPresentation::from_output(output)
         {
@@ -347,8 +342,7 @@ impl CompletionFeaturesDyn for CompletionModel {
         self.model.clone()
     }
 
-    fn completion(&self, mut req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
-        prepare_tool_presentations(&mut req, &self.model);
+    fn completion(&self, req: CompletionRequest) -> BoxPinFut<Result<AgentOutput, BoxError>> {
         let model = self.model.clone();
         let client = self.client.clone();
         let r = self.default_request.clone();
@@ -379,7 +373,8 @@ impl WireFormat for CompletionModel {
         r.contents.len()
     }
 
-    fn push_message(r: &mut Self::Request, msg: Message) -> Result<(), BoxError> {
+    fn push_message(r: &mut Self::Request, mut msg: Message, model: &str) -> Result<(), BoxError> {
+        prepare_tool_presentations(&mut msg, model);
         let val = types::Content::from(msg);
         r.contents.push(serde_json::to_value(val)?);
         Ok(())
@@ -1100,29 +1095,114 @@ mod tests {
 #[cfg(test)]
 mod tool_presentation_compat_tests {
     use super::*;
-    #[test]
-    fn older_models_receive_text_without_losing_the_tool_call_id() {
-        let content = anda_core::ContentPart::ToolOutput {
+    use crate::model::test_support::{no_proxy_client, recorded, spawn_mock_server};
+    use anda_core::{ByteBufB64, ContentPart, ToolMedia, ToolPresentation};
+    use http::{HeaderMap, StatusCode};
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn text_fallback_preserves_neutral_media_for_later_model_replay() {
+        let presentation = ToolPresentation {
+            text: "result".into(),
+            media: vec![
+                ToolMedia {
+                    mime_type: "image/png".into(),
+                    data: ByteBufB64::from(vec![1, 2, 3]),
+                },
+                ToolMedia {
+                    mime_type: "audio/wav".into(),
+                    data: ByteBufB64::from(vec![4, 5, 6]),
+                },
+            ],
+        };
+        let content = ContentPart::ToolOutput {
             name: "echo".into(),
             call_id: Some("call-1".into()),
             is_error: None,
             remote_id: None,
-            output: anda_core::ToolPresentation {
-                text: "result".into(),
-                media: vec![anda_core::ToolMedia {
-                    mime_type: "image/png".into(),
-                    data: anda_core::ByteBufB64::from(vec![1, 2, 3]),
+            output: presentation.clone().into_output(),
+        };
+        let history = vec![
+            Message {
+                role: "user".into(),
+                content: vec!["Read the tool media.".to_string().into()],
+                ..Default::default()
+            },
+            Message {
+                role: "assistant".into(),
+                content: vec![ContentPart::ToolCall {
+                    name: "echo".into(),
+                    args: json!({}),
+                    call_id: Some("call-1".into()),
                 }],
-            }
-            .into_output(),
-        };
-        let mut request = CompletionRequest {
-            content: vec![content],
-            ..Default::default()
-        };
-        prepare_tool_presentations(&mut request, "gemini-2.5-pro");
-        assert!(
-            matches!(&request.content[0], anda_core::ContentPart::ToolOutput { output, call_id, .. } if call_id.as_deref() == Some("call-1") && output.as_str().unwrap().contains("omitted"))
-        );
+                ..Default::default()
+            },
+        ];
+        let raw_history = vec![
+            json!({"role":"user","parts":[{"text":"Read the tool media."}]}),
+            json!({"role":"model","parts":[{"functionCall":{"name":"echo","args":{},"id":"call-1"},"thoughtSignature":"provider-signature"}]}),
+        ];
+        let body = serde_json::to_vec(&json!({
+            "candidates": [{
+                "content": {"role":"model", "parts":[{"text":"done"}]},
+                "finishReason":"STOP"
+            }]
+        }))
+        .unwrap();
+        let (endpoint, state) = spawn_mock_server(StatusCode::OK, HeaderMap::new(), body).await;
+        let client = Client::new_with_client("test-key", Some(endpoint), no_proxy_client());
+
+        for model in ["gemini-2.5-pro", "gemini-flash-latest"] {
+            let output = client
+                .completion_model(model)
+                .with_stream(false)
+                .completion(CompletionRequest {
+                    raw_history: raw_history.clone(),
+                    role: Some("tool".into()),
+                    content: vec![content.clone()],
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let sent: Json = serde_json::from_slice(&recorded(&state).body).unwrap();
+            assert_eq!(&sent["contents"].as_array().unwrap()[..2], &raw_history);
+            let result = &sent["contents"][2]["parts"][0]["functionResponse"];
+            assert_eq!(result["id"], "call-1");
+            assert_eq!(result["response"]["output"], presentation.text_fallback());
+            assert!(result.get("parts").is_none());
+            assert_eq!(output.chat_history[0].role, "tool");
+            assert_eq!(output.chat_history[0].content, vec![content.clone()]);
+
+            // Replay the persisted neutral result to a model that supports tool images.
+            let mut replay = history.clone();
+            replay.extend(output.chat_history);
+            client
+                .completion_model("gemini-3-flash")
+                .with_stream(false)
+                .completion(CompletionRequest {
+                    chat_history: replay,
+                    prompt: "Describe the image.".into(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let sent: Json = serde_json::from_slice(&recorded(&state).body).unwrap();
+            let result = &sent["contents"][2]["parts"][0]["functionResponse"];
+            assert_eq!(result["id"], "call-1");
+            assert_eq!(result["parts"][0]["inlineData"]["data"], "AQID");
+            assert_eq!(result["parts"][0]["inlineData"]["mimeType"], "image/png");
+            assert!(
+                result["response"]["output"]
+                    .as_str()
+                    .unwrap()
+                    .contains("audio/wav")
+            );
+            assert!(
+                !result["response"]["output"]
+                    .as_str()
+                    .unwrap()
+                    .contains("image/png")
+            );
+        }
     }
 }

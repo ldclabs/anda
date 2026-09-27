@@ -44,6 +44,9 @@ All notable changes to the Anda project will be documented in this file.
 
 ### Fixed — anda_engine
 
+- Omit blank text blocks from Anthropic image-only tool results, and omit content
+  entirely for empty presentations. Gemini text fallbacks now affect only wire
+  requests, preserving tool media in neutral history for replay across models.
 - Align Completion budget, reasoning effort, strict schemas, media inputs, and
   Anthropic Bearer version headers with the provider APIs. Gemini thinking
   budgets now accept `-1` for dynamic thinking.

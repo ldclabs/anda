@@ -565,7 +565,7 @@ impl WireFormat for CompletionModel {
         r.messages.len()
     }
 
-    fn push_message(r: &mut Self::Request, msg: Message) -> Result<(), BoxError> {
+    fn push_message(r: &mut Self::Request, msg: Message, _model: &str) -> Result<(), BoxError> {
         let val = types::Message::from(msg);
         r.messages.push(serde_json::to_value(val)?);
         Ok(())
