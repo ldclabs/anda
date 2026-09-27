@@ -36,8 +36,9 @@ session stays usable. A work turn may batch several queued inputs and perform
 multiple model requests. It completes only when the runner and its owned
 background work are idle. It is distinct from the model-request count.
 `on_background_end` retains its original session-closure meaning. Both callbacks
-carry cumulative worker usage. Nested forwarding computes deltas and delivers
-artifacts at completion without duplicating the final idle result at closure.
+carry cumulative worker usage. Nested forwarding computes deltas and forwards
+each visible result once: progress carries the output, the turn-completion
+notice adds only new artifacts, and closure does not repeat the final idle result.
 
 Existing `/status`, `/steer`, `/stop`, `/stop_task`, and `/cancel` controls remain.
 `/status` includes execution identity, work-turn count, event cursor, and queued
@@ -62,8 +63,10 @@ Hosts can use `SubSession::send` with typed `SubAgentMessage` and
 slot for the follow-up that will consume them. Full or oversized inputs are
 rejected immediately instead of blocking indefinitely. Explicit stop/cancel may
 discard queued input. Acceptance is not evidence of model consumption or durable
-message delivery. Background result overflow explicitly fails the receiving
-session rather than silently dropping a final result or blocking its producer.
+message delivery. The per-input byte limit applies to caller input, not to
+background results produced by the session's own tools and workers. Background
+result queue overflow explicitly fails the receiving session rather than silently
+dropping a final result or blocking its producer.
 
 `SubAgentScope::events` and `wait` support one or multiple execution IDs. `Any`
 returns on matching activity; `All` requires a terminal turn/session event for
@@ -82,7 +85,10 @@ aggregate token/request budget or absolute deadline. Session aliases are capped
 at 128 bytes. Root scopes and their registries should be released when the host
 finishes the root task.
 
-Session and model admission are atomic and return errors at capacity. RAII guards
+Session admission is atomic and returns an error at capacity. Model requests
+beyond `max_parallel_requests` wait for a free slot instead of failing live root
+or worker turns; cancellation and the root deadline interrupt the wait, and
+exhausted request or token budgets fail immediately. RAII guards
 release reservations when initialization or a model request fails or is cancelled.
 The model permit covers only inference, so a parent awaiting child tools does not
 hold a permit needed by that child. Root, child, and compaction inference through

@@ -412,6 +412,27 @@ fn sse_budget_handles_crlf_boundaries_and_unterminated_events() {
 }
 
 #[test]
+fn excluded_oversized_tools_do_not_fail_the_catalog() {
+    let huge: McpTool = serde_json::from_value(json!({
+        "name": "huge",
+        "description": "x".repeat(McpLimits::default().description_bytes + 1),
+        "inputSchema": {"type": "object"},
+    }))
+    .unwrap();
+    let mut server = McpServerConfig::stdio("test", "unused");
+    server.exclude.insert("huge".into());
+    let provider = McpToolProvider::new(vec![server]).unwrap();
+    let routes = provider
+        .routes_for_tools("test", vec![huge.clone(), remote_tool("small")])
+        .unwrap();
+    assert_eq!(routes.len(), 1);
+    assert_eq!(routes[0].remote_name, "small");
+    // A published tool over budget still rejects the whole catalog.
+    let provider = McpToolProvider::new(vec![McpServerConfig::stdio("test", "unused")]).unwrap();
+    assert!(provider.routes_for_tools("test", vec![huge]).is_err());
+}
+
+#[test]
 fn app_only_tools_stay_out_of_model_catalogs_and_metadata_is_retained() {
     let provider = McpToolProvider::new(vec![McpServerConfig::stdio("test", "unused")]).unwrap();
     let tools = vec![serde_json::from_value(json!({"name":"ui_only","inputSchema":{},"_meta":{"ui":{"visibility":["app"]}}})).unwrap(), serde_json::from_value(json!({"name":"visible","inputSchema":{"type":"object"},"outputSchema":{"type":"object"},"annotations":{"readOnlyHint":true}})).unwrap()];

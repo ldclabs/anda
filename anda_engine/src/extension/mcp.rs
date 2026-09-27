@@ -973,6 +973,13 @@ impl McpToolProvider {
             if !remote_names.insert(tool.name.to_string()) {
                 return Err("MCP duplicate remote tool name".into());
             }
+            let remote_name = tool.name.to_string();
+            // Budgets guard what gets published; a tool the host excluded, or one hidden
+            // from the model, must not fail the whole server.
+            if !router::tool_is_model_visible(&tool) || !self.includes_tool(server_id, &remote_name)
+            {
+                continue;
+            }
             if serde_json::to_vec(tool.input_schema.as_ref())?.len() > config.limits.schema_bytes
                 || tool.output_schema.as_ref().is_some_and(|schema| {
                     serde_json::to_vec(schema.as_ref())
@@ -989,19 +996,12 @@ impl McpToolProvider {
                 )
                 .into());
             }
-            if !router::tool_is_model_visible(&tool) {
-                continue;
-            }
             if tool
                 .title
                 .as_ref()
                 .is_some_and(|title| title.len() > config.limits.description_bytes)
             {
                 return Err("MCP tool title limit exceeded".into());
-            }
-            let remote_name = tool.name.to_string();
-            if !self.includes_tool(server_id, &remote_name) {
-                continue;
             }
 
             // Two remote names can sanitize or hash-truncate onto the same local name, and
@@ -1210,9 +1210,7 @@ impl McpToolProvider {
             }
             Err(err) => return Err(err),
         };
-        let mut output = mcp_result_to_tool_output(&current, result);
-        output.model_output = Some(presentation::present_result(&output.output, &config.limits));
-        Ok(output)
+        Ok(mcp_result_to_tool_output(&current, result, &config.limits))
     }
 
     fn insert_server(&self, server: McpServerConfig) -> Result<Arc<Registration>, BoxError> {
@@ -2483,7 +2481,7 @@ done
         };
         let result = CallToolResult::structured(json!({"ok": true}));
 
-        let output = mcp_result_to_tool_output(&route, result);
+        let output = mcp_result_to_tool_output(&route, result, &McpLimits::default());
         assert_eq!(output.is_error, Some(false));
         assert_eq!(output.usage.requests, 1);
         assert_eq!(output.output["server_id"], "repo");
@@ -2659,7 +2657,11 @@ done
         }))
         .unwrap();
 
-        let output = mcp_result_to_tool_output(&route, input_required_error(&route, &result));
+        let output = mcp_result_to_tool_output(
+            &route,
+            input_required_error(&route, &result),
+            &McpLimits::default(),
+        );
         assert_eq!(output.is_error, Some(true));
         let rendered = output.output.to_string();
         assert!(rendered.contains("pick_root"), "{rendered}");

@@ -349,7 +349,9 @@ the model-facing catalog. `server_statuses()` observes state without connecting.
 | Model result text / decoded media / media blocks | 32 KiB / 5 MiB / 8 |
 
 Repeated cursors and duplicate raw tool names are rejected. Invalid or oversized
-catalogs leave the last published snapshot intact and retryable. SSE budgets
+catalogs leave the last published snapshot intact and retryable. Schema,
+description and title budgets apply only to tools that would be published, so an
+excluded or app-only tool cannot fail its server. SSE budgets
 include raw comments within each event. rmcp still owns lifecycle negotiation,
 JSON-RPC decoding/routing, subscriptions and authentication; the byte/HTTP
 adapters enforce bounds before SDK decoding. Header/body errors omit raw bodies.

@@ -40,7 +40,6 @@ impl McpHttpClient {
             client: Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .connect_timeout(Duration::from_secs(15))
-                .pool_max_idle_per_host(0)
                 .build()?,
             limit,
         })

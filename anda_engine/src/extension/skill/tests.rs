@@ -388,6 +388,16 @@ async fn load_and_read_from_multiple_dirs() {
 
     // Creation workflows should keep using the original default directory.
     assert!(mgr.default_skills_dir().ends_with("default"));
+    let description = mgr.description();
+    assert!(description.contains(&format!(
+        "Skill directories: {}, {}.",
+        default_dir.display(),
+        extra_dir.display()
+    )));
+    assert!(description.contains(&format!(
+        "Default skill creation directory: {}.",
+        default_dir.display()
+    )));
 
     let _ = tokio::fs::remove_dir_all(&root).await;
 }

@@ -171,6 +171,19 @@ impl DiscoveredTools {
             if !seen.insert(key.clone()) {
                 continue;
             }
+            // The model saw this schema in the discovery output, so it stays callable even
+            // when the accumulated request-merge budget below cannot retain it.
+            self.known_names.insert(key.clone());
+            if count_selection {
+                let count = self
+                    .selection_counts
+                    .entry(key.clone())
+                    .and_modify(|count| *count += 1)
+                    .or_insert(1);
+                if *count >= 2 {
+                    self.merge = Some(true);
+                }
+            }
             let old_size = self.definitions.get(&key).map_or(0, |definition| {
                 serde_json::to_vec(definition).map_or(usize::MAX, |v| v.len())
             });
@@ -183,17 +196,6 @@ impl DiscoveredTools {
                     > MAX_DISCOVERY_BYTES
             {
                 continue;
-            }
-            self.known_names.insert(key.clone());
-            if count_selection {
-                let count = self
-                    .selection_counts
-                    .entry(key.clone())
-                    .and_modify(|count| *count += 1)
-                    .or_insert(1);
-                if *count >= 2 {
-                    self.merge = Some(true);
-                }
             }
             if self.definitions.contains_key(&key) || added < MAX_DISCOVERED_REQUEST_TOOLS {
                 let is_new = self.definitions.insert(key, definition).is_none();
@@ -2278,5 +2280,9 @@ mod budget_tests {
         discovered.merge_into_request(&mut request);
         assert!(serde_json::to_vec(&request.tools).unwrap().len() <= MAX_DISCOVERY_BYTES);
         assert!(request.tools.len() < 200);
+        // Schemas beyond the merge budget were still shown to the model, so allowlisted
+        // runners must keep accepting calls to them.
+        assert!(!request.tools.iter().any(|tool| tool.name == "tool_199"));
+        assert!(discovered.contains("tool_199"));
     }
 }

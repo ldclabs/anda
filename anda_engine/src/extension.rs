@@ -128,7 +128,7 @@ mod tests {
         fs::{EditFileTool, ReadFileTool, SearchFileTool, WriteFileTool},
         note::NoteTool,
         shell::{ExecArgs, ExecOutput, Executor, ShellTool},
-        skill::SkillManager,
+        skill::{SkillManager, SkillsListTool, SkillsReadTool},
         todo::TodoTool,
     };
     use anda_core::{Json, Tool};
@@ -194,7 +194,9 @@ mod tests {
                 None,
             )
             .definition(),
-            SkillManager::new(dir).definition(),
+            SkillManager::new(dir.clone()).definition(),
+            SkillsListTool::new(Arc::new(SkillManager::new(dir.clone()))).definition(),
+            SkillsReadTool::new(Arc::new(SkillManager::new(dir))).definition(),
         ]
     }
 
@@ -226,7 +228,7 @@ mod tests {
     #[test]
     fn extension_tool_definitions_are_strict_and_union_free() {
         let definitions = extension_tool_definitions();
-        assert_eq!(definitions.len(), 12);
+        assert_eq!(definitions.len(), 14);
 
         for definition in definitions {
             let tool = &definition.name;

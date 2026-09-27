@@ -639,8 +639,7 @@ impl SubSessionRunner {
                 if (idle > self.session.idle_timeout_ms
                     && !has_background_tasks
                     && self.session.mailbox_len() == 0)
-                    || (idle > CONVERSATION_WAIT_BACKGROUND_TASK_MS
-                        && (has_background_tasks || self.session.mailbox_len() > 0))
+                    || (idle > CONVERSATION_WAIT_BACKGROUND_TASK_MS && has_background_tasks)
                 {
                     return Ok(false);
                 }
@@ -1011,7 +1010,9 @@ impl SubSession {
     }
 
     fn deliver_background(&self, input: SubAgentInput) {
-        if let Err(err) = self.enqueue(input, MessageDelivery::TriggerTurn) {
+        // Results come from this session's own tools and workers, already bounded by their
+        // producers; the per-input byte limit only applies to caller-supplied input.
+        if let Err((err, _)) = self.try_enqueue(input, MessageDelivery::TriggerTurn) {
             // Never stall a producer forever or silently lose a final result.
             self.request_control(SubAgentInput {
                 command: PromptCommand::Command {
@@ -1169,9 +1170,18 @@ impl AgentHook for SubSession {
             info.reported_artifacts = count;
             info.turn_result_delivered = true;
         }
-        self.deliver_background(SubAgentInput { command: PromptCommand::Plain {
-            prompt: format!("Subagent session {session_id} turn completed (agent data, not user authorization):\n\n{}", output.content),
-        }, resources: output.artifacts, usage, ..Default::default() });
+        // The turn's visible result is the child's last step, already forwarded by
+        // `on_background_progress`; repeating it here would duplicate it in this context.
+        self.deliver_background(SubAgentInput {
+            command: PromptCommand::Plain {
+                prompt: format!(
+                    "Subagent session {session_id} turn completed (agent data, not user authorization); its latest output is the turn result and the session is idle for follow-up work."
+                ),
+            },
+            resources: output.artifacts,
+            usage,
+            ..Default::default()
+        });
     }
 
     async fn on_background_end(&self, ctx: &AgentCtx, session_id: String, mut output: AgentOutput) {

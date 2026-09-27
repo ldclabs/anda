@@ -126,27 +126,21 @@ impl CompletionRunner {
 
     // Every real inference (including handoff) goes through the same admission/accounting point.
     async fn model_request(&self, req: CompletionRequest) -> Result<AgentOutput, BoxError> {
-        let scope = self.ctx.base.get_state::<crate::subagent::SubAgentScope>();
-        if let Some(scope) = &scope {
-            scope.bind_caller(*self.ctx.caller())?;
-        }
-        let _permit = scope
-            .as_ref()
-            .map(|scope| scope.admit_request())
-            .transpose()?;
-        let output = if let Some(deadline) = scope.as_ref().and_then(|s| s.limits().deadline_ms) {
-            tokio::time::timeout(
-                std::time::Duration::from_millis(deadline.saturating_sub(unix_ms())),
-                self.model.completion(req),
-            )
-            .await
-            .map_err(|_| "subagent root deadline exceeded")??
-        } else {
-            self.model.completion(req).await?
+        let Some(scope) = self.ctx.base.get_state::<crate::subagent::SubAgentScope>() else {
+            return self.model.completion(req).await;
         };
-        if let Some(scope) = scope {
-            scope.record_usage(&output.usage);
-        }
+        scope.bind_caller(*self.ctx.caller())?;
+        let request = async {
+            let _permit = scope.admit_request().await?;
+            self.model.completion(req).await
+        };
+        // The root deadline also bounds the wait for a request slot.
+        let output = tokio::select! {
+            biased;
+            _ = scope.deadline() => return Err("subagent root deadline exceeded".into()),
+            output = request => output?,
+        };
+        scope.record_usage(&output.usage);
         Ok(output)
     }
 

@@ -237,8 +237,8 @@ async fn terminal_status_survives_session_cleanup() {
     assert_eq!(status["execution"]["id"], session.execution.id);
 }
 
-#[test]
-fn atomic_admission_and_raii_release_share_root_budget() {
+#[tokio::test]
+async fn atomic_admission_and_raii_release_share_root_budget() {
     let scope = SubAgentScope::new(SubAgentLimits {
         max_parallel_requests: 1,
         max_sessions: 1,
@@ -246,12 +246,18 @@ fn atomic_admission_and_raii_release_share_root_budget() {
         max_tokens: Some(10),
         ..Default::default()
     });
-    let permit = scope.admit_request().unwrap();
-    assert!(scope.admit_request().is_err());
+    let permit = scope.admit_request().await.unwrap();
+    // A busy scope queues the request; abandoning the wait admits nothing.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), scope.admit_request())
+            .await
+            .is_err()
+    );
+    assert_eq!(scope.admitted_requests(), 1);
     drop(permit);
-    let permit = scope.admit_request().unwrap();
+    let permit = scope.admit_request().await.unwrap();
     drop(permit);
-    assert!(scope.admit_request().is_err());
+    assert!(scope.admit_request().await.is_err());
     let resident = scope.reserve_session().unwrap();
     assert!(scope.reserve_session().is_err());
     drop(resident);
@@ -265,7 +271,7 @@ fn atomic_admission_and_raii_release_share_root_budget() {
         output_tokens: 2,
         ..Default::default()
     });
-    assert!(scope.admit_request().is_err());
+    assert!(scope.admit_request().await.is_err());
     assert!(scope.bind_caller(Principal::anonymous()).is_ok());
     assert!(scope.bind_caller(Principal::management_canister()).is_err());
 }
@@ -578,36 +584,31 @@ async fn root_deadline_cancels_pending_requests_and_releases_permits() {
     assert!(runner.is_done());
 }
 
-#[test]
-fn concurrent_admission_never_exceeds_capacity() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_admission_waits_without_exceeding_capacity() {
     let scope = SubAgentScope::new(SubAgentLimits {
-        max_parallel_requests: 1,
+        max_parallel_requests: 2,
         ..Default::default()
     });
-    let barrier = Arc::new(std::sync::Barrier::new(16));
-    let release = Arc::new(std::sync::Barrier::new(16));
-    let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    std::thread::scope(|threads| {
-        for _ in 0..16 {
-            let (scope, barrier, release, accepted) = (
-                scope.clone(),
-                barrier.clone(),
-                release.clone(),
-                accepted.clone(),
-            );
-            threads.spawn(move || {
-                barrier.wait();
-                let permit = scope.admit_request();
-                if permit.is_ok() {
-                    accepted.fetch_add(1, Ordering::SeqCst);
-                }
-                release.wait();
-                drop(permit);
-            });
-        }
-    });
-    assert_eq!(accepted.load(Ordering::SeqCst), 1);
-    assert!(scope.admit_request().is_ok());
+    let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let tasks = (0..16)
+        .map(|_| {
+            let (scope, active, peak) = (scope.clone(), active.clone(), peak.clone());
+            tokio::spawn(async move {
+                let _permit = scope.admit_request().await.unwrap();
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+            })
+        })
+        .collect::<Vec<_>>();
+    for task in tasks {
+        task.await.unwrap();
+    }
+    assert!(peak.load(Ordering::SeqCst) <= 2);
+    assert_eq!(scope.admitted_requests(), 16);
 }
 
 #[tokio::test]
@@ -741,4 +742,64 @@ fn closing_runtime_keeps_alias_reserved_until_its_final_callbacks_finish() {
     *old.leased.lock() = false;
     sessions.remove_session_if(&old);
     assert!(sessions.try_insert_session(new).is_none());
+}
+
+#[tokio::test]
+async fn oversized_background_results_are_delivered_without_cancelling_the_session() {
+    let ctx = context();
+    let (parent, mut inbox) = test_session("parent");
+    ToolBackgroundHook::on_background_start(
+        parent.as_ref(),
+        &ctx.base,
+        BackgroundHandle::new("shell:big", anda_core::CancellationToken::new()),
+        Json::Null,
+    )
+    .await;
+    // Background results are produced by the session's own tools, not by the caller, so the
+    // per-input byte limit must not turn a large result into a session cancellation.
+    let output = "x".repeat(SubAgentLimits::default().max_message_bytes * 2);
+    ToolBackgroundHook::on_background_end(
+        parent.as_ref(),
+        &ctx.base,
+        "shell:big".into(),
+        ToolOutput::new(json!(output)),
+    )
+    .await;
+    let input = inbox.try_recv().unwrap();
+    assert!(
+        matches!(input.command, PromptCommand::Plain { ref prompt } if prompt.contains(&output))
+    );
+    assert!(!parent.has_control());
+}
+
+#[tokio::test]
+async fn nested_turn_result_reaches_the_parent_once() {
+    let ctx = context();
+    let (parent, mut inbox) = test_session("parent");
+    ctx.base.set_state(DynAgentHook::new(parent.clone()));
+    let worker = worker();
+    invoke(&worker, &ctx, "task", "job").await.unwrap();
+    let child = session(&worker, &ctx, "job");
+    let mut prompts: Vec<String> = Vec::new();
+    while !prompts
+        .iter()
+        .any(|prompt| prompt.contains("turn completed"))
+    {
+        let input = tokio::time::timeout(Duration::from_secs(3), inbox.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if let PromptCommand::Plain { prompt } = input.command {
+            prompts.push(prompt);
+        }
+    }
+    assert_eq!(
+        prompts
+            .iter()
+            .filter(|prompt| prompt.contains("done: task"))
+            .count(),
+        1,
+        "{prompts:?}"
+    );
+    child.close();
 }

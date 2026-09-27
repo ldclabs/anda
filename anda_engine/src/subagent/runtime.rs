@@ -7,7 +7,8 @@ use std::time::Duration;
 pub struct SubAgentLimits {
     /// Maximum resident background sessions across all worker definitions.
     pub max_sessions: usize,
-    /// Maximum simultaneous model requests, including root and compaction requests.
+    /// Maximum simultaneous model requests, including root and compaction requests. Further
+    /// requests wait for a free slot; cancellation and the root deadline still apply.
     pub max_parallel_requests: usize,
     /// Maximum admitted model requests over this scope's lifetime.
     pub max_requests: Option<u64>,
@@ -131,7 +132,6 @@ struct ScopeState {
     owner: Option<Principal>,
     activity: HashMap<String, bool>,
     sessions: usize,
-    requests_in_flight: usize,
     requests_admitted: u64,
     usage: Usage,
     sequence: u64,
@@ -143,6 +143,7 @@ struct ScopeInner {
     limits: SubAgentLimits,
     state: Mutex<ScopeState>,
     changed: tokio::sync::watch::Sender<u64>,
+    requests: Arc<tokio::sync::Semaphore>,
 }
 /// Host-created task scope. Install a clone in context state to continue the same root task.
 ///
@@ -164,11 +165,15 @@ impl SubAgentScope {
     /// Budget counters must be restored separately with [`Self::restore_usage`].
     pub fn restore(id: String, limits: SubAgentLimits) -> Self {
         let (changed, _) = tokio::sync::watch::channel(0);
+        let requests = limits
+            .max_parallel_requests
+            .clamp(1, tokio::sync::Semaphore::MAX_PERMITS);
         Self(Arc::new(ScopeInner {
             id,
             limits,
             state: Mutex::new(ScopeState::default()),
             changed,
+            requests: Arc::new(tokio::sync::Semaphore::new(requests)),
         }))
     }
     /// Root execution ID.
@@ -252,11 +257,11 @@ impl SubAgentScope {
         Ok(ScopePermit {
             scope: self.clone(),
             session: true,
+            _request: None,
         })
     }
-    pub(crate) fn admit_request(&self) -> Result<ScopePermit, BoxError> {
+    fn check_request_budget(&self, state: &ScopeState) -> Result<(), BoxError> {
         self.check_deadline()?;
-        let mut state = self.0.state.lock();
         if self
             .limits()
             .max_requests
@@ -271,14 +276,20 @@ impl SubAgentScope {
         {
             return Err("subagent root model budget exhausted".into());
         }
-        if state.requests_in_flight >= self.limits().max_parallel_requests {
-            return Err("subagent parallel model request limit reached".into());
-        }
-        state.requests_in_flight += 1;
+        Ok(())
+    }
+    /// Exhausted budgets fail immediately; a busy scope makes the request wait for a slot, so
+    /// transient parallelism never fails live root or worker turns.
+    pub(crate) async fn admit_request(&self) -> Result<ScopePermit, BoxError> {
+        self.check_request_budget(&self.0.state.lock())?;
+        let request = self.0.requests.clone().acquire_owned().await?;
+        let mut state = self.0.state.lock();
+        self.check_request_budget(&state)?;
         state.requests_admitted = state.requests_admitted.saturating_add(1);
         Ok(ScopePermit {
             scope: self.clone(),
             session: false,
+            _request: Some(request),
         })
     }
     pub(crate) fn record_usage(&self, usage: &Usage) {
@@ -386,14 +397,12 @@ impl SubAgentScope {
 pub(crate) struct ScopePermit {
     scope: SubAgentScope,
     session: bool,
+    _request: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 impl Drop for ScopePermit {
     fn drop(&mut self) {
-        let mut state = self.scope.0.state.lock();
         if self.session {
-            state.sessions -= 1;
-        } else {
-            state.requests_in_flight -= 1;
+            self.scope.0.state.lock().sessions -= 1;
         }
     }
 }

@@ -20,6 +20,18 @@ All notable changes to the Anda project will be documented in this file.
 - Hosts continuing one root task across entry contexts must reinstall its
   `SubAgentScope`; session aliases no longer implicitly join another root task.
 
+### Added — skill catalogs
+
+- Add `skills_list` and `skills_read` (registered by `SkillManager::tools`) for
+  paginated discovery and package-scoped text resources next to the name-only
+  `skills_manager`. Catalogs are immutable generations with stable path-based
+  IDs, structured diagnostics, explicit `invalidate`/`reload`, an optional
+  explicit-only policy, presentation metadata and dependency preflight.
+- Bound discovery depth, entries, skill count, file and response sizes; reject
+  symlinked, multiply-linked and oversized skill files and skip hidden
+  descendant directories. Duplicate names within one root are readable by ID
+  only, and names over 58 characters use stable `skillh_*` callables.
+
 ### Added — MCP runtime policies
 
 - Add registration-bound catalog publication, stable collision mappings, bounded
@@ -44,6 +56,18 @@ All notable changes to the Anda project will be documented in this file.
 
 ### Fixed — anda_engine
 
+- Subagent sessions no longer cancel when a background tool or nested worker
+  result exceeds the caller input byte limit, and a nested turn result reaches
+  the parent once instead of being repeated by the turn-completion notice. Model
+  requests beyond `max_parallel_requests` wait for a slot instead of failing the
+  root or worker turn.
+- Tools returned by `tools_select` stay callable in allowlisted runners after the
+  accumulated schema-merge budget is full. An excluded or app-only MCP tool over
+  the schema/description budget no longer fails its server; MCP HTTP clients
+  reuse pooled connections, and results build their model presentation once
+  with the server's limits.
+- `skills_manager` again lists the configured skill directories and the default
+  skill creation directory in its description.
 - Omit blank text blocks from Anthropic image-only tool results, and omit content
   entirely for empty presentations. Gemini text fallbacks now affect only wire
   requests, preserving tool media in neutral history for replay across models.

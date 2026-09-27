@@ -365,6 +365,7 @@ pub(crate) fn unsupported_input_error<'a>(
 pub(crate) fn mcp_result_to_tool_output(
     route: &McpToolRoute,
     result: CallToolResult,
+    limits: &super::McpLimits,
 ) -> ToolOutput<Json> {
     let mut output = ToolOutput::new(json!({
         "server_id": route.server_id,
@@ -373,10 +374,7 @@ pub(crate) fn mcp_result_to_tool_output(
         "content": result.content,
         "_meta": result.meta,
     }));
-    output.model_output = Some(super::presentation::present_result(
-        &output.output,
-        &super::McpLimits::default(),
-    ));
+    output.model_output = Some(super::presentation::present_result(&output.output, limits));
     output.is_error = result.is_error;
     output.usage = Usage {
         requests: 1,
