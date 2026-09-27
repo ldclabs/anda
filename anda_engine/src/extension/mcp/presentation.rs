@@ -10,7 +10,8 @@ pub(super) fn present_result(result: &Json, limits: &McpLimits) -> ToolPresentat
     let mut truncated = false;
     // Reserve space for an unambiguous truncation marker.
     let budget = limits.output_text_bytes.saturating_sub(64);
-    if let Some(value) = result.get("structured_content").filter(|v| !v.is_null()) {
+    let structured = result.get("structured_content").filter(|v| !v.is_null());
+    if let Some(value) = structured {
         append_text(&mut view.text, &value.to_string(), budget, &mut truncated);
     }
     for content in result
@@ -21,7 +22,9 @@ pub(super) fn present_result(result: &Json, limits: &McpLimits) -> ToolPresentat
     {
         match content.get("type").and_then(Json::as_str) {
             Some("text") => {
-                if let Some(text) = content.get("text").and_then(Json::as_str) {
+                if let Some(text) = content.get("text").and_then(Json::as_str)
+                    && !repeats_structured(text, structured)
+                {
                     append_text(&mut view.text, text, budget, &mut truncated);
                 }
             }
@@ -97,6 +100,16 @@ pub(super) fn present_result(result: &Json, limits: &McpLimits) -> ToolPresentat
             .push_str("\n[tool output truncated; full result retained by host]");
     }
     view
+}
+
+/// The MCP spec asks servers returning structured content to repeat it as serialized JSON
+/// in a text block for older clients. Showing both would spend the text budget twice.
+fn repeats_structured(text: &str, structured: Option<&Json>) -> bool {
+    structured.is_some_and(|structured| {
+        let text = text.trim();
+        text.starts_with(['{', '['])
+            && serde_json::from_str::<Json>(text).is_ok_and(|value| &value == structured)
+    })
 }
 
 fn append_text(output: &mut String, text: &str, limit: usize, truncated: &mut bool) {

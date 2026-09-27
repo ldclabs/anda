@@ -113,6 +113,35 @@ mod tests {
         assert!(open_read(&path).await.is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
+
+    #[tokio::test]
+    async fn search_only_ancestors_stay_accessible() {
+        use std::os::unix::fs::PermissionsExt;
+        let root =
+            std::env::temp_dir().join(format!("anda-search-{:032x}", rand::random::<u128>()));
+        let locked = root.join("locked");
+        std::fs::create_dir_all(locked.join("nested")).unwrap();
+        let root = root.canonicalize().unwrap();
+        let locked = root.join("locked");
+        std::fs::write(locked.join("nested/file"), "content").unwrap();
+        // Writable and searchable, but not listable.
+        std::fs::set_permissions(&locked, Permissions::from_mode(0o300)).unwrap();
+        let result = async {
+            let (mut file, _) = open_read(&locked.join("nested/file")).await?;
+            let mut content = String::new();
+            file.read_to_string(&mut content).await?;
+            replace(&locked.join("created"), b"new", None).await?;
+            create(&locked.join("new/deep"), b"deep", None).await?;
+            remove(&locked.join("created")).await?;
+            Ok::<_, BoxError>(content)
+        }
+        .await;
+        std::fs::set_permissions(&locked, Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(result.unwrap(), "content");
+        assert_eq!(std::fs::read(locked.join("new/deep")).unwrap(), b"deep");
+        assert!(!locked.join("created").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[cfg(unix)]
@@ -127,9 +156,28 @@ mod platform {
         path::Component,
     };
 
+    // Ancestors need only search permission, as with path-based access: a workspace below a
+    // traversable but unlistable directory (Android's /data, 0711 homes) must stay reachable.
+    // O_PATH and O_SEARCH descriptors still anchor the *at() calls below.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const DIRECTORY: i32 = libc::O_PATH | libc::O_DIRECTORY;
+    #[cfg(target_vendor = "apple")]
+    const DIRECTORY: i32 = libc::O_SEARCH;
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+    const DIRECTORY: i32 = libc::O_RDONLY | libc::O_DIRECTORY;
+
     fn name(value: &OsStr) -> std::io::Result<CString> {
         CString::new(value.as_bytes())
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in path"))
+    }
+
+    fn open_root() -> std::io::Result<File> {
+        // SAFETY: the literal is NUL-terminated; a successful descriptor transfers to File.
+        let fd = unsafe { libc::open(c"/".as_ptr(), DIRECTORY | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(unsafe { File::from_raw_fd(fd) })
     }
 
     fn open_at(parent: &File, name: &CString, flags: i32) -> std::io::Result<File> {
@@ -161,9 +209,9 @@ mod platform {
             }
         }
         let leaf = parts.pop().ok_or("Path must name a file")?;
-        let mut directory = File::open("/")?;
+        let mut directory = open_root()?;
         for component in parts {
-            directory = match open_at(&directory, &component, libc::O_RDONLY | libc::O_DIRECTORY) {
+            directory = match open_at(&directory, &component, DIRECTORY) {
                 Ok(file) => file,
                 Err(err) if create && err.kind() == std::io::ErrorKind::NotFound => {
                     // SAFETY: the parent descriptor and terminated component are valid.
@@ -175,7 +223,7 @@ mod platform {
                             return Err(err.into());
                         }
                     }
-                    open_at(&directory, &component, libc::O_RDONLY | libc::O_DIRECTORY)?
+                    open_at(&directory, &component, DIRECTORY)?
                 }
                 Err(err) => return Err(err.into()),
             };

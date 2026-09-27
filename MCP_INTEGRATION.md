@@ -371,6 +371,8 @@ schema compaction.
 and inline media. Top-level and content-block `_meta` do not enter that view.
 Unknown content and unsupported media produce explicit text notices; oversized
 text carries a truncation marker. Structured data and content images can coexist.
+A text block that only repeats the structured content as serialized JSON (the
+spec's compatibility copy) is shown once; other text blocks are kept.
 
 The runner persists the explicitly tagged presentation inside the existing
 `ContentPart::ToolOutput.output`, preserving call IDs and tool/user boundaries.

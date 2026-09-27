@@ -269,6 +269,27 @@ fn presentation_preserves_media_and_raw_data_but_excludes_private_metadata() {
     assert_eq!(raw["_meta"]["secret"], "private");
 }
 
+#[test]
+fn presentation_shows_structured_content_once_but_keeps_distinct_text() {
+    let limits = McpLimits::default();
+    // Spec-compliant servers repeat structured content as a serialized text block.
+    let raw = json!({"structured_content":{"value":42,"items":["a"]},"content":[
+        {"type":"text","text":" {\"items\": [\"a\"], \"value\": 42}\n"},
+        {"type":"text","text":"Found 1 item."},
+        {"type":"text","text":"{\"value\":43}"}
+    ]});
+    let view = presentation::present_result(&raw, &limits);
+    assert_eq!(view.text.matches("42").count(), 1);
+    assert!(view.text.contains("Found 1 item."));
+    assert!(view.text.contains("{\"value\":43}"));
+    // Without structured content, JSON text is the only copy and stays visible.
+    let raw = json!({"content":[{"type":"text","text":"{\"value\":42}"}]});
+    assert_eq!(
+        presentation::present_result(&raw, &limits).text,
+        "{\"value\":42}"
+    );
+}
+
 #[tokio::test]
 async fn concurrency_policy_serializes_writes_and_allows_opted_in_reads() {
     for (policy, expected) in [

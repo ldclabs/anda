@@ -121,6 +121,15 @@ All notable changes to the Anda project will be documented in this file.
 - The Linux sandbox binds `/etc/hosts` and `/etc/resolv.conf` and keeps the PTY
   as the controlling terminal of tty sessions. `edit_file` reports a missing
   file only when the file is actually absent.
+- Workspace file tools, `apply_patch`, `skills_read` and `atomic_write_file` again
+  reach files below a directory the process may traverse but not list, such as
+  Android's `/data` or a `0711` home directory. The no-follow walk now opens
+  ancestors with search-only descriptors (`O_PATH` on Linux and Android,
+  `O_SEARCH` on Apple platforms) and still refuses symlinked components.
+- MCP model presentations show structured content once: a text block that only
+  repeats `structuredContent` as serialized JSON, which the MCP spec asks servers
+  to include for older clients, is left out of the model view. Other text blocks
+  and the audited `output` envelope are unchanged.
 
 ## [0.16.1] — 2026-09-25
 
