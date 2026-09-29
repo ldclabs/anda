@@ -842,7 +842,6 @@ async fn select_requested_names_with_model(
             "required": ["tools"],
             "additionalProperties": false
         })),
-        temperature: Some(0.0),
         ..Default::default()
     };
 

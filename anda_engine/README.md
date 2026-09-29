@@ -153,6 +153,9 @@ Completion adapter behavior:
   medium to high on the original Gemini 3 Pro. Use a default request template
   for other provider-specific settings. `ThinkingConfig::thinking_budget` is
   signed so `-1` can request dynamic thinking.
+- Anthropic maps `tool_choice_required` to `tool_choice: any`. Claude Opus 5.5,
+  Claude Sonnet 5.5, and Claude Fable 5.1 reject forced tool choice with a 400,
+  so leave it unset for those models and name the tool in the prompt instead.
 - Anthropic forwards `FunctionDefinition::strict` and closes objects in strict
   tool and output schemas while preserving optional properties. A strict tool
   whose schema uses unsupported constraints (including numeric bounds and

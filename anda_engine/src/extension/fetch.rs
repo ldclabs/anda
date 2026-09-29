@@ -291,7 +291,7 @@ impl Tool<BaseCtx> for FetchWebResourcesTool {
     }
 
     fn description(&self) -> String {
-        "Fetches resources from a given URL and returns the content as text (base64-url encoded if not UTF-8)".to_string()
+        "Fetch a public URL with GET and return the response body. Hosts that resolve to loopback, private, link-local, or other non-public addresses are rejected, and a non-2xx status is an error. The body is returned as-is (HTML is not converted or summarized) after charset decoding; content that is not text comes back base64url-encoded. Bodies over 20 MB are rejected.".to_string()
     }
 
     fn definition(&self) -> FunctionDefinition {
@@ -504,7 +504,7 @@ mod tests {
     async fn fetch_tool_definition_and_http_error_paths_are_stable() {
         let tool = FetchWebResourcesTool::new();
         assert_eq!(tool.name(), FetchWebResourcesTool::NAME);
-        assert!(tool.description().contains("Fetches resources"));
+        assert!(tool.description().contains("Fetch a public URL"));
         let definition = tool.definition();
         assert_eq!(definition.name, FetchWebResourcesTool::NAME);
         assert_eq!(definition.strict, Some(true));

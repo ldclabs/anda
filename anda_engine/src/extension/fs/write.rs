@@ -81,7 +81,7 @@ impl WriteFileTool {
     {
         let workspaces = normalize_workspaces(workspaces);
         let description = format!(
-            "Atomically write files to the filesystem in the workspace directories ({})",
+            "Create or overwrite one file in the workspace directories ({}). Missing parent directories are created, and an existing file is replaced in full, atomically. content is UTF-8 text by default; set encoding to base64 for binary data or to a text encoding such as gbk. Files over 10 MiB are rejected.",
             format_workspaces(&workspaces)
         );
         Self {

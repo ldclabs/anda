@@ -12,6 +12,38 @@ All notable changes to the Anda project will be documented in this file.
   400: leave it unset for those models, name the tool in the prompt, and mark the
   tool `strict` when schema-valid arguments matter.
 
+## [anda_engine 0.16.4] — 2026-09-29
+
+### Fixed — anda_engine
+
+- **`tools_select` works on current Claude models** — The internal selector
+  request no longer sends `temperature: 0.0`. Claude models from Opus 4.7 on
+  reject a non-default temperature with a 400, which the selector swallowed, so
+  selecting tools by `query` silently returned nothing. The structured output
+  schema already constrains the answer.
+- **Context compaction keeps working under preserved thinking** — The summary
+  turn clears `tools`, which invalidates the replayed thinking blocks on Claude
+  Opus 5.5, Claude Sonnet 5.5, and Claude Fable 5.1 (a 400 for accounts the
+  check is enforced on), so `handoff` and subagent compaction failed. That one
+  request now replays the provider-neutral history instead of `raw_history`, as
+  a model switch does; the replacement runner is unchanged.
+
+### Changed — anda_engine
+
+- **Tool descriptions state their contracts** — `read_file`, `edit_file`,
+  `write_file`, `search_file`, and `fetch_web_resources` now describe their
+  actual behavior: paging and the 256 KiB inline cap, that an edit with zero
+  matches succeeds with `total_matches: 0`, parent-directory creation and full
+  overwrite, path-only glob matching and `scan_truncated`, and the public-host,
+  non-2xx, raw-body, and 20 MB rules for fetches. The legacy `ShellTool`
+  `background` parameter describes what the model sees instead of host hook
+  internals.
+- **Docs** — The `anda_engine` README notes that Anthropic maps
+  `tool_choice_required` to `tool_choice: any`, which current Claude models
+  reject.
+- **Dependencies** — `anda_engine` declares its `anda_core` requirement as
+  `0.16` instead of `0.16.2`.
+
 ## [anda_engine 0.16.3] — 2026-09-28
 
 ### Fixed — anda_engine

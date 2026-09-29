@@ -76,7 +76,7 @@ impl EditFileTool {
     {
         let workspaces = normalize_workspaces(workspaces);
         let description = format!(
-            "Atomically edit text files in the workspace directories ({}) by replacing strings",
+            "Replace exact text in one text file in the workspace directories ({}). old_string is matched literally, with no regex or whitespace normalization, and every match is replaced unless limit is set. Zero matches is not an error: the file is left unchanged and total_matches is 0, so check it. The file keeps its original text encoding and is rewritten atomically; binary files and results over 10 MiB are rejected.",
             format_workspaces(&workspaces)
         );
         Self {

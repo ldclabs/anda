@@ -776,6 +776,14 @@ impl CompletionRunner {
         // Clone once for the speculative summary turn; on failure `self.req` stays intact so the
         // runner can continue, and on success it is moved into the replacement runner.
         let mut summary_req = self.req.clone();
+        // The summary turn drops `tools`. Replayed provider thinking blocks are bound to the
+        // tool set they were produced with (Claude's preserved-thinking check rejects them once
+        // it changes), and a summary does not need that reasoning, so this one request replays
+        // the provider-neutral history instead, as a model switch does.
+        if !summary_req.raw_history.is_empty() {
+            summary_req.raw_history.clear();
+            summary_req.chat_history = self.neutral_history();
+        }
         let mut pending_content = std::mem::take(&mut summary_req.content);
         if !summary_req.prompt.is_empty() {
             pending_content.insert(0, std::mem::take(&mut summary_req.prompt).into());
@@ -1115,21 +1123,28 @@ impl CompletionRunner {
             );
             self.req.raw_history.clear();
             self.pending_tool_call_raw_history_start = None;
-            // `reserve_chat_history` seeds `chat_history` with messages that are also in the
-            // request, so skip the prefix when it is already at the front.
-            let generated = if self.chat_history.starts_with(&self.history_prefix) {
-                &self.chat_history[self.history_prefix.len()..]
-            } else {
-                &self.chat_history[..]
-            };
-            let mut history = Vec::with_capacity(self.history_prefix.len() + generated.len() + 1);
-            history.extend(self.history_prefix.iter().cloned());
-            history.extend(self.note_context.iter().cloned());
-            history.extend(generated.iter().cloned());
-            self.req.chat_history = history;
+            self.req.chat_history = self.neutral_history();
         }
 
         self.model = model;
+    }
+
+    /// The conversation so far as provider-neutral messages: [`Self::history_prefix`], the
+    /// note index, then the messages this runner generated. Used in place of `raw_history`
+    /// when the provider-native copy cannot be replayed.
+    fn neutral_history(&self) -> Vec<Message> {
+        // `reserve_chat_history` seeds `chat_history` with messages that are also in the
+        // request, so skip the prefix when it is already at the front.
+        let generated = if self.chat_history.starts_with(&self.history_prefix) {
+            &self.chat_history[self.history_prefix.len()..]
+        } else {
+            &self.chat_history[..]
+        };
+        let mut history = Vec::with_capacity(self.history_prefix.len() + generated.len() + 1);
+        history.extend(self.history_prefix.iter().cloned());
+        history.extend(self.note_context.iter().cloned());
+        history.extend(generated.iter().cloned());
+        history
     }
 
     fn commit_tool_outputs_to_history(&mut self) {
@@ -3360,12 +3375,14 @@ mod tests {
 
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 3);
-        let compaction_raw = serde_json::to_string(&requests[1].raw_history).unwrap();
-        assert!(!compaction_raw.contains("call_stop_test"));
-        assert_eq!(
-            requests[1].raw_history[0]["content"],
-            "planning before tool"
-        );
+        // The summary turn replays the neutral history, where the interrupted call is closed.
+        assert!(requests[1].raw_history.is_empty());
+        assert!(CompletionRunner::unanswered_tool_calls(&requests[1].chat_history).is_empty());
+        assert!(requests[1].chat_history.iter().any(|message| {
+            message.content.iter().any(
+                |part| matches!(part, ContentPart::Text { text } if text == "planning before tool"),
+            )
+        }));
         assert!(requests[1].content.iter().any(|part| matches!(
             part,
             ContentPart::Text { text } if text.trim() == super::COMPACTION_PROMPT.trim()

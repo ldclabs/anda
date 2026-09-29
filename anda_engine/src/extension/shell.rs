@@ -399,7 +399,7 @@ impl Tool<BaseCtx> for ShellTool {
         definition.parameters["properties"]["env_keys"]["description"] =
             self.env_keys_parameter_description().into();
         definition.parameters["properties"]["background"]["description"] = format!(
-            "Whether to run the command in the background immediately (non-blocking). If false, native commands still running after {SHELL_AUTO_BACKGROUND_SECS} seconds are moved to the background automatically instead of returning a timeout error. New stdout/stderr output is pushed through background progress hooks as line-based progress: plain output is emitted as complete lines, multibyte character split boundaries are preserved, and terminal-style rewritten progress regions are normalized to their latest changed visible lines. The final output is pushed through background end hooks when the task completes."
+            "Whether to start the command in the background and return immediately. If false, native commands still running after {SHELL_AUTO_BACKGROUND_SECS} seconds move to the background automatically instead of failing with a timeout. Once a command is in the background, its later output and final result are not part of this tool result; the host may report them later as separate progress and completion updates."
         )
         .into();
         definition

@@ -83,7 +83,7 @@ impl SearchFileTool {
     {
         let workspaces = normalize_workspaces(workspaces);
         let description = format!(
-            "Match filesystem paths with glob patterns in the workspace directories ({})",
+            "Find paths that match a glob pattern (`*`, `?`, `[...]`, and `**` for any depth) in the workspace directories ({}). It matches paths only and does not search file contents. Returns workspace-relative paths up to limit (default 1000); total_matches counts every match, and scan_truncated marks it as a lower bound when the scan hit its internal cap.",
             format_workspaces(&workspaces)
         );
         Self {

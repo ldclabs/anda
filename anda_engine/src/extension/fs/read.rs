@@ -87,7 +87,7 @@ impl ReadFileTool {
     {
         let workspaces = normalize_workspaces(workspaces);
         let description = format!(
-            "Read files from the filesystem in the workspace directories ({})",
+            "Read one file in the workspace directories ({}). Text is decoded from UTF-8 or the host's legacy text encoding and can be paged by line with offset and limit; binary or undecodable files come back base64-encoded, with a MIME type when one is detected. Output is capped at 256 KiB and marked truncated when cut; files over 10 MiB are rejected.",
             format_workspaces(&workspaces)
         );
         Self {
