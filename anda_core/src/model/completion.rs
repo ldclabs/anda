@@ -116,7 +116,12 @@ pub struct CompletionRequest {
     /// The tools to be sent to the completion model provider.
     pub tools: Vec<FunctionDefinition>,
 
-    /// Whether the tool choice is required.
+    /// Whether the model must call a tool this turn.
+    ///
+    /// Adapters map this to the provider's forced tool choice (Anthropic `tool_choice: any`).
+    /// Claude Opus 5.5, Claude Sonnet 5.5, and Claude Fable 5.1 reject forced tool choice with
+    /// a 400: for those models leave this `false`, name the tool in the prompt, and mark the
+    /// tool `strict` when schema-valid arguments matter.
     pub tool_choice_required: bool,
 
     /// Sampling temperature requested from the provider, usually in the `[0.0, 2.0]` range.

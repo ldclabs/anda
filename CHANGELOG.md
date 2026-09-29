@@ -2,6 +2,16 @@
 
 All notable changes to the Anda project will be documented in this file.
 
+## [Unreleased]
+
+### Changed — anda_core
+
+- **Forced tool choice documented** — `CompletionRequest::tool_choice_required`
+  now explains that adapters map it to the provider's forced tool choice, and
+  that Claude Opus 5.5, Claude Sonnet 5.5, and Claude Fable 5.1 reject it with a
+  400: leave it unset for those models, name the tool in the prompt, and mark the
+  tool `strict` when schema-valid arguments matter.
+
 ## [anda_engine 0.16.3] — 2026-09-28
 
 ### Fixed — anda_engine
