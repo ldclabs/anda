@@ -8,7 +8,7 @@
 use anda_core::{
     AgentOutput, BoxError, BoxPinFut, CompletionRequest, FunctionDefinition, Json, Message,
 };
-use serde_json::{Map, Value, json};
+use serde_json::Value;
 use std::collections::BTreeMap;
 
 use super::driver::{SamplingOptions, WireFormat, assign_tool_call_ids, drive_completion};
@@ -467,58 +467,44 @@ impl CompletionFeaturesDyn for CompletionModel {
     }
 }
 
-/// Strict mode checks every enum value against a single declared type, so it
-/// rejects the nullable enum that OpenAI strict mode documents
-/// (`"type": ["string", "null"], "enum": ["a", null]`). Split such an enum into
-/// one branch per declared type.
-fn split_multi_type_enum(map: &mut Map<String, Value>) {
-    let (Some(Value::Array(kinds)), Some(Value::Array(values))) =
-        (map.get("type"), map.get("enum"))
-    else {
-        return;
-    };
-    if map.contains_key("anyOf") {
-        return;
+/// Anthropic caps the strict schemas of one request in total, and a request
+/// over any cap fails with a 400.
+/// <https://platform.claude.com/docs/en/build-with-claude/structured-outputs>
+const MAX_STRICT_TOOLS: usize = 20;
+const MAX_OPTIONAL_PARAMETERS: usize = 24;
+const MAX_UNION_PARAMETERS: usize = 16;
+
+/// What a strict schema spends from the request caps: properties left out of
+/// `required`, and subschemas with `anyOf` or a type array. Every nested schema
+/// is counted, which can only overestimate the API's count.
+#[derive(Clone, Copy, Default)]
+struct StrictCost {
+    optional: usize,
+    unions: usize,
+}
+
+impl StrictCost {
+    fn plus(self, other: Self) -> Self {
+        Self {
+            optional: self.optional + other.optional,
+            unions: self.unions + other.unions,
+        }
     }
-    let mut branches: Vec<Value> = kinds
-        .iter()
-        .filter_map(Value::as_str)
-        .filter_map(|kind| {
-            let values: Vec<&Value> = values
-                .iter()
-                .filter(|value| match kind {
-                    "null" => value.is_null(),
-                    "string" => value.is_string(),
-                    "boolean" => value.is_boolean(),
-                    "integer" => value.is_i64() || value.is_u64(),
-                    "number" => value.is_number(),
-                    _ => false,
-                })
-                .collect();
-            match kind {
-                _ if values.is_empty() => None,
-                "null" => Some(json!({"type": "null"})),
-                _ => Some(json!({"type": kind, "enum": values})),
-            }
-        })
-        .collect();
-    if branches.is_empty() {
-        return;
-    }
-    map.remove("type");
-    map.remove("enum");
-    if branches.len() == 1
-        && let Some(Value::Object(branch)) = branches.pop()
-    {
-        map.extend(branch);
-    } else {
-        map.insert("anyOf".into(), Value::Array(branches));
+
+    fn within_caps(self) -> bool {
+        self.optional <= MAX_OPTIONAL_PARAMETERS && self.unions <= MAX_UNION_PARAMETERS
     }
 }
 
 /// Close object schemas without making optional properties required. Reject
 /// common unsupported constraints rather than silently weakening the schema.
-fn normalize_output_schema(schema: &mut Value) -> Result<(), BoxError> {
+fn normalize_output_schema(schema: &mut Value) -> Result<StrictCost, BoxError> {
+    let mut cost = StrictCost::default();
+    normalize_schema_node(schema, &mut cost)?;
+    Ok(cost)
+}
+
+fn normalize_schema_node(schema: &mut Value, cost: &mut StrictCost) -> Result<(), BoxError> {
     let Some(map) = schema.as_object_mut() else {
         return Ok(());
     };
@@ -558,7 +544,26 @@ fn normalize_output_schema(schema: &mut Value) -> Result<(), BoxError> {
             "Anthropic structured outputs do not support external schema references".into(),
         );
     }
-    split_multi_type_enum(map);
+    // Strict mode checks every enum value against a single declared type, so
+    // it rejects the nullable enum that OpenAI strict mode documents
+    // (`"type": ["string", "null"], "enum": ["a", null]`). The enum already
+    // lists every allowed value, and a bare enum is not a union parameter.
+    if map.contains_key("enum") && map.get("type").is_some_and(Value::is_array) {
+        map.remove("type");
+    }
+    if map.contains_key("anyOf") || map.get("type").is_some_and(Value::is_array) {
+        cost.unions += 1;
+    }
+    if let Some(Value::Object(properties)) = map.get("properties") {
+        let required = map.get("required").and_then(Value::as_array);
+        cost.optional += properties
+            .keys()
+            .filter(|name| {
+                !required
+                    .is_some_and(|required| required.iter().any(|value| value == name.as_str()))
+            })
+            .count();
+    }
     let object = map.contains_key("properties")
         || match map.get("type") {
             Some(Value::String(kind)) => kind == "object",
@@ -582,19 +587,19 @@ fn normalize_output_schema(schema: &mut Value) -> Result<(), BoxError> {
     ] {
         if let Some(Value::Object(children)) = map.get_mut(key) {
             for child in children.values_mut() {
-                normalize_output_schema(child)?;
+                normalize_schema_node(child, cost)?;
             }
         }
     }
     for key in ["items", "not", "if", "then", "else"] {
         if let Some(child) = map.get_mut(key) {
-            normalize_output_schema(child)?;
+            normalize_schema_node(child, cost)?;
         }
     }
     for key in ["anyOf", "allOf", "oneOf", "prefixItems"] {
         if let Some(Value::Array(children)) = map.get_mut(key) {
             for child in children {
-                normalize_output_schema(child)?;
+                normalize_schema_node(child, cost)?;
             }
         }
     }
@@ -657,13 +662,15 @@ impl WireFormat for CompletionModel {
     }
 
     fn finalize_request(r: &mut Self::Request) -> Result<(), BoxError> {
+        let mut spent = StrictCost::default();
         if let Some(format) = r
             .output_config
             .as_mut()
             .and_then(|config| config.format.as_mut())
         {
-            normalize_output_schema(&mut format.schema)?;
+            spent = normalize_output_schema(&mut format.schema)?;
         }
+        let mut strict_tools = 0;
         for tool in r
             .tools
             .iter_mut()
@@ -674,13 +681,17 @@ impl WireFormat for CompletionModel {
                 continue;
             };
             // Generated tool schemas routinely carry bounds outside the strict
-            // subset (`minimum: 0` on unsigned integers, `minLength`). Such a
-            // tool is sent as a regular tool with its schema unchanged.
+            // subset (`minimum: 0` on unsigned integers, `minLength`), and a
+            // tool set can outgrow the request caps. A tool that does not fit
+            // is sent as a regular tool with its schema unchanged.
             let mut strict_schema = schema.clone();
-            if normalize_output_schema(&mut strict_schema).is_ok() {
-                *schema = strict_schema;
-            } else {
-                tool.strict = None;
+            match normalize_output_schema(&mut strict_schema) {
+                Ok(cost) if strict_tools < MAX_STRICT_TOOLS && spent.plus(cost).within_caps() => {
+                    *schema = strict_schema;
+                    spent = spent.plus(cost);
+                    strict_tools += 1;
+                }
+                _ => tool.strict = None,
             }
         }
         Ok(())
@@ -759,29 +770,91 @@ mod tests {
     use anda_core::{ContentPart, FunctionDefinition};
     use http::{HeaderMap, Method, StatusCode};
     use reqwest::header::ACCEPT;
+    use serde_json::{Map, json};
 
     #[test]
-    fn strict_schemas_split_nullable_enums_by_type() {
-        let mut schema = json!({"type":"object", "properties":{
-            "behavior":{"type":["string","null"], "enum":["auto","smooth",null],
-                "description":"Scroll behavior.", "default":null},
-            "kind":{"type":["string","null"], "enum":["shell","agent"]},
-            "nullable":{"type":["string","null"]},
-            "single":{"type":"string", "enum":["a"]}
+    fn strict_schemas_drop_type_arrays_beside_enums_and_count_their_cost() {
+        let mut schema = json!({"type":"object", "required":["behavior","nullable","single","items"],
+            "properties":{
+                "behavior":{"type":["string","null"], "enum":["auto","smooth",null],
+                    "description":"Scroll behavior.", "default":null},
+                "nullable":{"type":["string","null"]},
+                "single":{"type":"string", "enum":["a"]},
+                "items":{"type":"array", "items":{"type":"object", "properties":{
+                    "name":{"type":["string","null"]}, "note":{"type":"string"}
+                }}},
+                "choice":{"anyOf":[{"type":"string"},{"type":"integer"}]}
         }});
-        normalize_output_schema(&mut schema).unwrap();
+        let cost = normalize_output_schema(&mut schema).unwrap();
         let properties = &schema["properties"];
         assert_eq!(
             properties["behavior"],
-            json!({"anyOf":[{"type":"string","enum":["auto","smooth"]},{"type":"null"}],
-                "description":"Scroll behavior.", "default":null})
-        );
-        assert_eq!(
-            properties["kind"],
-            json!({"type":"string","enum":["shell","agent"]})
+            json!({"enum":["auto","smooth",null], "description":"Scroll behavior.", "default":null})
         );
         assert_eq!(properties["nullable"], json!({"type":["string","null"]}));
         assert_eq!(properties["single"], json!({"type":"string","enum":["a"]}));
+        // `nullable`, the nested `name`, and `choice` are unions; `choice` and
+        // the nested `name` and `note` are optional.
+        assert_eq!((cost.unions, cost.optional), (3, 3));
+    }
+
+    #[test]
+    fn strict_tools_beyond_the_request_caps_are_sent_as_regular_tools() {
+        let nullable = |count: usize, optional: bool| {
+            let names: Vec<String> = (0..count).map(|i| format!("p{i}")).collect();
+            let kind = if optional {
+                json!("string")
+            } else {
+                json!(["string", "null"])
+            };
+            let properties: Map<String, Value> = names
+                .iter()
+                .map(|name| (name.clone(), json!({"type": kind})))
+                .collect();
+            let required = if optional { vec![] } else { names };
+            json!({"type":"object", "properties":properties, "required":required,
+                "additionalProperties":false})
+        };
+        let mut schemas = vec![
+            nullable(10, false),
+            nullable(10, false),
+            nullable(5, false),
+            nullable(25, true),
+        ];
+        schemas.extend((0..19).map(|_| nullable(0, false)));
+        let mut request = types::CreateMessageParams {
+            output_config: Some(types::OutputConfig {
+                effort: None,
+                format: Some(types::JsonOutputFormat {
+                    schema: nullable(1, false),
+                    r#type: types::JsonOutputFormatType::JsonSchema,
+                }),
+            }),
+            ..Default::default()
+        };
+        <CompletionModel as WireFormat>::apply_tools(
+            &mut request,
+            schemas
+                .iter()
+                .enumerate()
+                .map(|(i, schema)| FunctionDefinition {
+                    name: format!("tool{i}"),
+                    parameters: schema.clone(),
+                    strict: Some(true),
+                    ..Default::default()
+                })
+                .collect(),
+            false,
+        );
+        <CompletionModel as WireFormat>::finalize_request(&mut request).unwrap();
+        let tools = request.tools.unwrap();
+        let strict: Vec<bool> = tools.iter().map(|tool| tool.strict == Some(true)).collect();
+        // The output schema spends 1 union, so the second 10-union tool and the
+        // 25-optional tool do not fit; the empty tools fill the 20 strict slots.
+        let mut expected = vec![true, false, true, false];
+        expected.extend((0..19).map(|i| i < 18));
+        assert_eq!(strict, expected);
+        assert_eq!(tools[1].input_schema.as_ref(), Some(&schemas[1]));
     }
 
     #[test]

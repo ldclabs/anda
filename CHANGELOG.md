@@ -4,6 +4,23 @@ All notable changes to the Anda project will be documented in this file.
 
 ## [Unreleased]
 
+## [anda_engine 0.16.7] — 2026-10-08
+
+### Fixed — anda_engine
+
+- **Strict tools stay within Anthropic's request caps** — Anthropic caps the
+  strict schemas of one request in total: 20 strict tools, 24 optional
+  parameters, and 16 parameters with `anyOf` or a type array. Hosts with many
+  nullable fields (such as anda-bot's browser tools) exceeded the union cap, and
+  the whole request failed with a 400. The adapter now counts what each strict
+  schema spends, starting with the JSON output schema. A strict tool that would
+  exceed a cap is sent as a regular tool with its schema unchanged, as a tool
+  outside the strict subset already was. Every nested schema is counted, so the
+  count can only overestimate the API's.
+- **Nullable enums no longer spend the union budget** — A multi-type enum is now
+  sent as a bare `enum` (its values already list every allowed type) instead of
+  the `anyOf` split added in 0.16.6, which counted as a union parameter.
+
 ## [anda_engine 0.16.6] — 2026-10-08
 
 ### Fixed — anda_engine
