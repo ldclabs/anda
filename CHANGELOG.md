@@ -4,8 +4,18 @@ All notable changes to the Anda project will be documented in this file.
 
 ## [Unreleased]
 
+## [anda_engine 0.16.6] — 2026-10-08
+
 ### Fixed — anda_engine
 
+- **Strict tools with a nullable enum work on Claude** — Anthropic strict mode
+  checks each enum value against a single declared type, so it rejected the
+  nullable enum that OpenAI strict mode documents (`"type": ["string", "null"]`
+  with `null` in `enum`) with a 400 (`Enum value ... does not match declared
+  type`), and every request offering such a tool failed, including the built-in
+  subagent tools' `effort`. When the Anthropic adapter prepares a strict tool or
+  output schema, it now splits a multi-type enum into an `anyOf` with one branch
+  per declared type. Other providers still receive the schema unchanged.
 - **A session command reported as running always reports its exit** — The
   session supervisor emitted the background start and end events only if it
   moved the command to the background itself. When it first ran after the

@@ -8,7 +8,7 @@
 use anda_core::{
     AgentOutput, BoxError, BoxPinFut, CompletionRequest, FunctionDefinition, Json, Message,
 };
-use serde_json::Value;
+use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 
 use super::driver::{SamplingOptions, WireFormat, assign_tool_call_ids, drive_completion};
@@ -467,6 +467,55 @@ impl CompletionFeaturesDyn for CompletionModel {
     }
 }
 
+/// Strict mode checks every enum value against a single declared type, so it
+/// rejects the nullable enum that OpenAI strict mode documents
+/// (`"type": ["string", "null"], "enum": ["a", null]`). Split such an enum into
+/// one branch per declared type.
+fn split_multi_type_enum(map: &mut Map<String, Value>) {
+    let (Some(Value::Array(kinds)), Some(Value::Array(values))) =
+        (map.get("type"), map.get("enum"))
+    else {
+        return;
+    };
+    if map.contains_key("anyOf") {
+        return;
+    }
+    let mut branches: Vec<Value> = kinds
+        .iter()
+        .filter_map(Value::as_str)
+        .filter_map(|kind| {
+            let values: Vec<&Value> = values
+                .iter()
+                .filter(|value| match kind {
+                    "null" => value.is_null(),
+                    "string" => value.is_string(),
+                    "boolean" => value.is_boolean(),
+                    "integer" => value.is_i64() || value.is_u64(),
+                    "number" => value.is_number(),
+                    _ => false,
+                })
+                .collect();
+            match kind {
+                _ if values.is_empty() => None,
+                "null" => Some(json!({"type": "null"})),
+                _ => Some(json!({"type": kind, "enum": values})),
+            }
+        })
+        .collect();
+    if branches.is_empty() {
+        return;
+    }
+    map.remove("type");
+    map.remove("enum");
+    if branches.len() == 1
+        && let Some(Value::Object(branch)) = branches.pop()
+    {
+        map.extend(branch);
+    } else {
+        map.insert("anyOf".into(), Value::Array(branches));
+    }
+}
+
 /// Close object schemas without making optional properties required. Reject
 /// common unsupported constraints rather than silently weakening the schema.
 fn normalize_output_schema(schema: &mut Value) -> Result<(), BoxError> {
@@ -509,6 +558,7 @@ fn normalize_output_schema(schema: &mut Value) -> Result<(), BoxError> {
             "Anthropic structured outputs do not support external schema references".into(),
         );
     }
+    split_multi_type_enum(map);
     let object = map.contains_key("properties")
         || match map.get("type") {
             Some(Value::String(kind)) => kind == "object",
@@ -709,7 +759,30 @@ mod tests {
     use anda_core::{ContentPart, FunctionDefinition};
     use http::{HeaderMap, Method, StatusCode};
     use reqwest::header::ACCEPT;
-    use serde_json::json;
+
+    #[test]
+    fn strict_schemas_split_nullable_enums_by_type() {
+        let mut schema = json!({"type":"object", "properties":{
+            "behavior":{"type":["string","null"], "enum":["auto","smooth",null],
+                "description":"Scroll behavior.", "default":null},
+            "kind":{"type":["string","null"], "enum":["shell","agent"]},
+            "nullable":{"type":["string","null"]},
+            "single":{"type":"string", "enum":["a"]}
+        }});
+        normalize_output_schema(&mut schema).unwrap();
+        let properties = &schema["properties"];
+        assert_eq!(
+            properties["behavior"],
+            json!({"anyOf":[{"type":"string","enum":["auto","smooth"]},{"type":"null"}],
+                "description":"Scroll behavior.", "default":null})
+        );
+        assert_eq!(
+            properties["kind"],
+            json!({"type":"string","enum":["shell","agent"]})
+        );
+        assert_eq!(properties["nullable"], json!({"type":["string","null"]}));
+        assert_eq!(properties["single"], json!({"type":"string","enum":["a"]}));
+    }
 
     #[test]
     fn strict_schemas_close_objects_and_preserve_optional_fields() {
