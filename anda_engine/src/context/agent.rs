@@ -733,19 +733,7 @@ impl CompletionFeatures for AgentCtx {
         resources: Vec<Resource>,
     ) -> impl Future<Output = Result<AgentOutput, BoxError>> + Send {
         let ctx = self.clone();
-        Box::pin(async move {
-            let mut runner = ctx.completion_iter(req, resources);
-            let mut last: Option<AgentOutput> = None;
-
-            while let Some(step) = runner.next().await? {
-                if step.failed_reason.is_some() {
-                    return Ok(step);
-                }
-                last = Some(step);
-            }
-
-            last.ok_or_else(|| "completion runner returned no output".into())
-        })
+        Box::pin(async move { ctx.completion_iter(req, resources).run_to_end().await })
     }
 }
 

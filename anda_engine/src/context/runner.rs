@@ -27,7 +27,6 @@ use crate::context::{
     AgentCtx, REMOTE_AGENT_PREFIX, REMOTE_TOOL_PREFIX, SUB_AGENT_PREFIX,
     strip_prefix_ignore_ascii_case, strip_routing_prefix,
 };
-use crate::subagent::SubAgentSet;
 use crate::{model::Model, unix_ms};
 
 // The number of turns after which conversation history is compacted. This prevents unbounded
@@ -161,10 +160,7 @@ impl CompletionRunner {
         }
         let mut output = self.last_output.clone().unwrap_or_default();
         let mut history = self.history_prefix.clone();
-        if self.chat_history.starts_with(&history) {
-            history.clear();
-        }
-        history.extend(self.chat_history.iter().cloned());
+        history.extend_from_slice(self.generated_history());
         output.chat_history = history;
         output.raw_history.clear();
         output.usage = self.total_usage.clone();
@@ -492,15 +488,15 @@ impl CompletionRunner {
     /// Stops the current task while keeping the runner reusable for later input.
     ///
     /// This drops in-flight request state, pending tools, queued steering, and queued follow-up
-    /// text, but it does not mark the runner done. The returned output is recorded as the latest
-    /// idle-state output and includes accumulated usage/history so observers can account for work
-    /// already performed before the stop.
+    /// text, but it does not mark the runner done. The conversation the next request replays
+    /// (including a seeded history whose first turn never completed) is kept. The returned output
+    /// is recorded as the latest idle-state output and includes accumulated usage/history so
+    /// observers can account for work already performed before the stop.
     pub fn stop_current_task(&mut self, mut output: AgentOutput) -> AgentOutput {
         self.discard_in_flight_request_with_interrupted_tool_outputs(
             "tool call stopped",
             Some(&output.content),
         );
-        self.req.chat_history.clear();
         self.steering_message.clear();
         self.follow_up_message.clear();
         self.implicit_context = None;
@@ -508,13 +504,7 @@ impl CompletionRunner {
 
         output.tool_calls = self.tool_calls.clone();
         output.artifacts = self.artifacts.clone();
-        output.usage = self.total_usage.clone();
-        output.tools_usage = self.tools_usage.clone();
-
-        output.chat_history.clear();
-        self.last_output = Some(output.clone());
-        output.chat_history = self.chat_history.clone();
-        output
+        self.intermediate_output(output)
     }
 
     /// Drops inline attachment bytes from the provider raw history once the task that sent
@@ -538,11 +528,11 @@ impl CompletionRunner {
         };
         let content = calls
             .into_iter()
-            .map(|call| ContentPart::ToolOutput {
-                name: call.name,
+            .map(|(name, call_id)| ContentPart::ToolOutput {
+                name,
                 output: output.clone(),
                 is_error: Some(true),
-                call_id: call.call_id,
+                call_id,
                 remote_id: None,
             })
             .collect::<Vec<_>>();
@@ -628,29 +618,22 @@ impl CompletionRunner {
             .compact_output_for_request(tool_name, output, &self.req.tools);
     }
 
-    // Drains all queued steering messages into a single user turn. When steering exists, queued
-    // follow-up messages are prepended so the next round sees one combined instruction.
-    fn drain_steering_message(&mut self) -> Option<Vec<ContentPart>> {
-        if self.steering_message.is_empty() {
-            None
-        } else {
-            // Follow-up messages are placed before steering messages to preserve the deferred user
-            // intent when an operator also injects steering.
-            let mut msgs: Vec<ContentPart> = self.follow_up_message.drain(..).collect();
-            msgs.append(&mut self.steering_message);
-            Some(msgs)
-        }
-    }
-
+    // Drains all queued input into a single user turn. Follow-up messages are placed before
+    // steering messages to preserve the deferred user intent when an operator also injects
+    // steering.
     fn drain_queued_message(&mut self) -> Option<Vec<ContentPart>> {
         let mut msgs: Vec<ContentPart> = self.follow_up_message.drain(..).collect();
         msgs.append(&mut self.steering_message);
         if msgs.is_empty() { None } else { Some(msgs) }
     }
 
-    fn drain_follow_up_message(&mut self) -> Option<Vec<ContentPart>> {
-        let msgs: Vec<ContentPart> = self.follow_up_message.drain(..).collect();
-        if msgs.is_empty() { None } else { Some(msgs) }
+    // Like `drain_queued_message`, but only when steering is queued.
+    fn drain_steering_message(&mut self) -> Option<Vec<ContentPart>> {
+        if self.steering_message.is_empty() {
+            None
+        } else {
+            self.drain_queued_message()
+        }
     }
 
     fn set_next_user_content(&mut self, content: Vec<ContentPart>) {
@@ -664,76 +647,48 @@ impl CompletionRunner {
             || !self.req.documents.is_empty()
     }
 
-    fn unanswered_tool_calls(messages: &[Message]) -> Vec<ToolCall> {
-        let mut pending: Vec<ToolCall> = Vec::new();
+    /// Tool calls in `messages` that have no output yet, as `(name, call_id)` pairs. An output
+    /// answers the call with the same id, or the call with the same name when neither has one.
+    fn unanswered_tool_calls(messages: &[Message]) -> Vec<(String, Option<String>)> {
+        let mut pending: Vec<(String, Option<String>)> = Vec::new();
 
-        for message in messages {
-            for part in &message.content {
-                match part {
-                    ContentPart::ToolCall {
-                        name,
-                        args,
-                        call_id,
-                    } => pending.push(ToolCall {
-                        name: name.clone(),
-                        args: args.clone(),
-                        call_id: call_id.clone(),
-                        result: None,
-                        remote_id: None,
-                    }),
-                    ContentPart::ToolOutput { name, call_id, .. } => {
-                        if let Some(pos) =
-                            Self::matching_tool_call_position(&pending, name, call_id.as_deref())
-                        {
-                            pending.remove(pos);
-                        }
-                    }
-                    _ => {}
+        for part in messages.iter().flat_map(|message| &message.content) {
+            match part {
+                ContentPart::ToolCall { name, call_id, .. } => {
+                    pending.push((name.clone(), call_id.clone()));
                 }
+                ContentPart::ToolOutput { name, call_id, .. } => {
+                    if let Some(pos) =
+                        pending.iter().position(|(pending_name, pending_id)| {
+                            match (pending_id, call_id) {
+                                (Some(pending_id), Some(call_id)) => pending_id == call_id,
+                                (None, None) => pending_name == name,
+                                _ => false,
+                            }
+                        })
+                    {
+                        pending.remove(pos);
+                    }
+                }
+                _ => {}
             }
         }
 
         pending
     }
 
-    fn matching_tool_call_position(
-        pending: &[ToolCall],
-        output_name: &str,
-        output_call_id: Option<&str>,
-    ) -> Option<usize> {
-        pending.iter().position(|tool| {
-            Self::tool_call_matches_output(
-                &tool.name,
-                tool.call_id.as_deref(),
-                output_name,
-                output_call_id,
-            )
-        })
-    }
-
-    fn tool_call_matches_output(
-        pending_name: &str,
-        pending_call_id: Option<&str>,
-        output_name: &str,
-        output_call_id: Option<&str>,
-    ) -> bool {
-        match (pending_call_id, output_call_id) {
-            (Some(pending), Some(output)) => pending == output,
-            (None, None) => pending_name == output_name,
-            _ => false,
-        }
-    }
-
     fn discard_pending_tool_call_raw_history(&mut self) {
         if let Some(start) = self.pending_tool_call_raw_history_start.take() {
             self.model
                 .prune_unanswered_tool_calls(&mut self.req.raw_history, start);
+            // While a tool round is pending, the request history holds only that round's
+            // committed outputs, which would be orphaned once their calls are pruned.
+            self.req.chat_history.clear();
         }
     }
 
     fn stream_placeholder(&self) -> Self {
         Self {
-            allowed_callables: self.allowed_callables.clone(),
             done: true,
             unbound: self.unbound,
             turns: self.turns,
@@ -760,15 +715,17 @@ impl CompletionRunner {
         }
 
         let token = self.ctx.base.cancellation_token();
-        let scope = self
-            .ctx
-            .base
-            .get_state::<crate::subagent::SubAgentScope>()
-            .unwrap_or_default();
+        let scope = self.ctx.base.get_state::<crate::subagent::SubAgentScope>();
+        let deadline = async {
+            match &scope {
+                Some(scope) => scope.deadline().await,
+                None => std::future::pending().await,
+            }
+        };
         let reason = tokio::select! {
             biased;
             _ = token.cancelled() => "operation cancelled",
-            _ = scope.deadline() => "subagent root deadline exceeded",
+            _ = deadline => "subagent root deadline exceeded",
             res = self.inner_next() => return res,
         };
         // Interrupted tool calls need paired error outputs before history can be replayed.
@@ -784,10 +741,12 @@ impl CompletionRunner {
 
     /// Summarizes the current conversation into a single handoff message and swaps in a fresh
     /// runner seeded with that summary, discarding the bloated history. Pending tool calls are
-    /// executed first unless queued steering interrupts them; interrupted calls are closed before
-    /// compaction so provider tool-call requirements are not stranded. Queued follow-up or
-    /// steering input is preserved and delivered after the handoff so user intent is not folded
-    /// into the compaction prompt.
+    /// executed first unless queued steering interrupts them; their outputs are summarized with
+    /// the history, and interrupted calls are closed before compaction so provider tool-call
+    /// requirements are not stranded. Pending request input, queued follow-up and steering input,
+    /// and the implicit context move to the replacement runner, so user intent is delivered after
+    /// the handoff instead of being folded into the summary. A failed summary leaves this runner
+    /// usable; outputs of tool calls it already executed stay queued for its next step.
     pub async fn handoff(
         &mut self,
         compaction_prompt: Option<String>,
@@ -795,7 +754,6 @@ impl CompletionRunner {
         if self.done {
             return Err("completion already finalized".into());
         }
-        let unbound = self.unbound;
         let prompt = compaction_prompt.unwrap_or_else(|| COMPACTION_PROMPT.to_string());
 
         if !self.pending_tool_calls.is_empty() {
@@ -807,8 +765,7 @@ impl CompletionRunner {
                     );
                 }
 
-                self.execute_pending_tool_calls_into_request().await?;
-                self.commit_tool_outputs_to_history();
+                self.execute_pending_tool_calls_into_request().await;
             } else {
                 self.discard_in_flight_request_with_interrupted_tool_outputs(
                     "tool call interrupted by steering",
@@ -829,19 +786,21 @@ impl CompletionRunner {
             summary_req.raw_history.clear();
             summary_req.chat_history = self.neutral_history();
         }
-        let mut pending_content = std::mem::take(&mut summary_req.content);
-        if !summary_req.prompt.is_empty() {
-            pending_content.insert(0, std::mem::take(&mut summary_req.prompt).into());
-        }
-        let pending_message = (!pending_content.is_empty()).then(|| Message {
-            role: summary_req.role.take().unwrap_or_else(|| "user".into()),
-            content: pending_content,
+        // Pending tool outputs answer calls already in the history, so they are summarized with
+        // it. Pending user input is not: it becomes the replacement runner's next request.
+        let tool_outputs = (self.req.role.as_deref() == Some("tool")
+            && !self.req.content.is_empty())
+        .then(|| Message {
+            role: "tool".into(),
+            content: self.req.content.clone(),
             ..Default::default()
         });
-        if let Some(message) = &pending_message {
+        if let Some(message) = &tool_outputs {
             summary_req.chat_history.push(message.clone());
         }
         summary_req.role = Some("user".into());
+        summary_req.prompt.clear();
+        summary_req.documents.clear();
         summary_req.content = vec![prompt.into()];
         summary_req.tools.clear();
         summary_req.tool_choice_required = false;
@@ -867,11 +826,10 @@ impl CompletionRunner {
         let summary = output.content.trim().to_string();
         output.model = Some(self.model.model_name());
         output.raw_history.clear();
-        if let Some(mut message) = pending_message {
-            if self.transient_inline_data {
-                strip_inline_data(std::slice::from_mut(&mut message));
-            }
+        if let Some(message) = tool_outputs {
             self.chat_history.push(message);
+            self.req.role = None;
+            self.req.content.clear();
         }
         let output = self.final_output(output);
 
@@ -885,10 +843,6 @@ impl CompletionRunner {
         };
 
         let mut req = std::mem::take(&mut self.req);
-        req.role = None;
-        req.prompt.clear();
-        req.content.clear();
-        req.documents.clear();
         req.raw_history.clear();
         let mut restored_history = vec![compaction_msg];
         if let Some(tasks) = self
@@ -905,19 +859,18 @@ impl CompletionRunner {
             });
         }
         req.chat_history = restored_history.clone();
-        req.tool_choice_required = false;
-        req.output_schema = None;
         let mut runner = self
             .ctx
             .clone()
             .completion_iter(req, std::mem::take(&mut self.resources))
             .reserve_chat_history(restored_history);
-        runner.set_unbound(unbound);
+        runner.set_unbound(self.unbound);
         runner.transient_inline_data = self.transient_inline_data;
         // `self` is finalized above, so its remaining state moves into the replacement runner.
         runner.discovered = std::mem::take(&mut self.discovered);
         runner.follow_up_message = std::mem::take(&mut self.follow_up_message);
         runner.steering_message = std::mem::take(&mut self.steering_message);
+        runner.implicit_context = self.implicit_context.take();
         runner.allowed_callables = self.allowed_callables.take();
         Ok((runner, output))
     }
@@ -938,14 +891,15 @@ impl CompletionRunner {
             self.follow_up_message.push_back(prompt.into());
         }
 
-        if !self.has_request_input() && self.pending_tool_calls.is_empty() {
-            if let Some(content) = self.drain_queued_message() {
-                self.set_next_user_content(content);
-            } else {
-                return Ok(self.final_idle_output());
-            }
+        if self.is_idle() {
+            return Ok(self.final_idle_output());
         }
+        self.run_to_end().await
+    }
 
+    /// Steps until the runner stops producing output, returning the last step, or the first one
+    /// that reports a `failed_reason`.
+    pub(crate) async fn run_to_end(&mut self) -> Result<AgentOutput, BoxError> {
         let mut last: Option<AgentOutput> = None;
         while let Some(step) = self.next().await? {
             if step.failed_reason.is_some() {
@@ -957,14 +911,17 @@ impl CompletionRunner {
         last.ok_or_else(|| "completion runner returned no output".into())
     }
 
-    async fn execute_pending_tool_calls_into_request(&mut self) -> Result<bool, BoxError> {
+    /// Executes the pending tool and agent calls, leaving their outputs as the request content
+    /// for the next turn. Returns `false` when no call was pending.
+    async fn execute_pending_tool_calls_into_request(&mut self) -> bool {
         let tool_calls = std::mem::take(&mut self.pending_tool_calls);
         if tool_calls.is_empty() {
-            return Ok(false);
+            return false;
         }
 
-        let mut tool_call_futs: Vec<BoxPinFut<ToolCall>> = Vec::new();
-        for mut tool in tool_calls.into_iter() {
+        let mut tool_call_futs: Vec<BoxPinFut<(ToolCall, ToolOutput<Json>)>> =
+            Vec::with_capacity(tool_calls.len());
+        for mut tool in tool_calls {
             let tool_name = tool.name.to_ascii_lowercase();
 
             // Enforce the execution-time allowlist before dispatching. The model
@@ -972,15 +929,11 @@ impl CompletionRunner {
             // output); without this check the runner would route it to any
             // registered callable, bypassing a subagent's tool whitelist.
             if !self.is_callable_allowed(&tool_name) {
-                tool.result = Some(ToolOutput {
-                    output: json!({ "error": format!(
-                        "tool {} is not permitted for this agent",
-                        tool.name
-                    )}),
-                    is_error: Some(true),
-                    ..Default::default()
-                });
-                tool_call_futs.push(Box::pin(async move { tool }));
+                let output = tool_error(format!(
+                    "tool {} is not permitted for this agent",
+                    tool.name
+                ));
+                tool_call_futs.push(Box::pin(async move { (tool, output) }));
                 continue;
             }
 
@@ -998,28 +951,18 @@ impl CompletionRunner {
                     meta: None,
                 };
                 tool_call_futs.push(Box::pin(async move {
-                    match ctx.tool_call(input).await {
-                        Ok((res, remote_id)) => {
+                    let output = match ctx.tool_call(input).await {
+                        Ok((output, remote_id)) => {
                             tool.remote_id = remote_id;
-                            tool.result = Some(res);
+                            output
                         }
-                        Err(err) => {
-                            // The tool call failed, but we must not abort the whole conversation:
-                            // surface the error so the LLM can try to correct it and continue.
-                            tool.result = Some(ToolOutput {
-                                output: json!({ "error": format!(
-                                    "tool call failed: {}",
-                                    err
-                                )}),
-                                is_error: Some(true),
-                                ..Default::default()
-                            });
-                        }
-                    }
-                    tool
+                        // The tool call failed, but we must not abort the whole conversation:
+                        // surface the error so the LLM can try to correct it and continue.
+                        Err(err) => tool_error(format!("tool call failed: {err}")),
+                    };
+                    (tool, output)
                 }));
             } else if self.ctx.agents.contains_lowercase(&tool_name)
-                || self.ctx.subagents.contains_lowercase(&tool_name)
                 || strip_prefix_ignore_ascii_case(&tool_name, SUB_AGENT_PREFIX).is_some()
                 || strip_prefix_ignore_ascii_case(&tool_name, REMOTE_AGENT_PREFIX).is_some()
             {
@@ -1048,90 +991,58 @@ impl CompletionRunner {
                     ..Default::default()
                 };
                 tool_call_futs.push(Box::pin(async move {
-                    match ctx.agent_run(input).await {
-                        Ok((res, remote_id)) => {
+                    let output = match ctx.agent_run(input).await {
+                        Ok((output, remote_id)) => {
                             tool.remote_id = remote_id;
-                            tool.result = Some(res.into_tool_output());
+                            output.into_tool_output()
                         }
-                        Err(err) => {
-                            // The agent run failed, but we must not abort the whole conversation:
-                            // surface the error so the LLM can try to correct it and continue.
-                            tool.result = Some(ToolOutput {
-                                output: json!({ "error": format!(
-                                    "agent run failed: {}",
-                                    err
-                                )}),
-                                is_error: Some(true),
-                                ..Default::default()
-                            });
-                        }
-                    }
-                    tool
+                        // The agent run failed, but we must not abort the whole conversation:
+                        // surface the error so the LLM can try to correct it and continue.
+                        Err(err) => tool_error(format!("agent run failed: {err}")),
+                    };
+                    (tool, output)
                 }));
             } else {
-                tool_call_futs.push(Box::pin(async move {
-                    tool.result = Some(ToolOutput {
-                        output: json!({ "error": format!(
-                            "tool call failed: {} not found",
-                            tool.name
-                        )}),
-                        is_error: Some(true),
-                        ..Default::default()
-                    });
-                    tool
-                }));
+                let output = tool_error(format!("tool call failed: {} not found", tool.name));
+                tool_call_futs.push(Box::pin(async move { (tool, output) }));
             }
         }
 
-        let mut tool_calls: Vec<ToolCall> = Vec::new();
-        let mut tool_calls_continue: Vec<ContentPart> = Vec::new();
-        if !tool_call_futs.is_empty() {
-            let results = futures::future::join_all(tool_call_futs).await;
+        for (mut tool, mut res) in futures::future::join_all(tool_call_futs).await {
+            let mut usage = res.usage.clone();
+            // usage.requests originally counts internal calls; reset it to 1 so it
+            // represents this single model-triggered invocation, keeping per-tool call
+            // counts meaningful.
+            usage.requests = 1;
+            self.tools_usage
+                .entry(tool.name.to_ascii_lowercase())
+                .or_default()
+                .accumulate(&usage);
+            self.accumulate_tools_usage(&res.tools_usage);
+            self.accumulate(&res.usage);
+            self.add_discovered_tools_from_output(&tool.name, &res.output);
+            self.compact_discovery_tool_output_for_context(&tool.name, &mut res.output);
 
-            for mut tool in results {
-                if let Some(res) = &mut tool.result {
-                    let mut usage = res.usage.clone();
-                    // usage.requests originally counts internal calls; reset it to 1 so it
-                    // represents this single model-triggered invocation, keeping per-tool call
-                    // counts meaningful.
-                    usage.requests = 1;
-                    self.tools_usage
-                        .entry(tool.name.to_ascii_lowercase())
-                        .and_modify(|u| u.accumulate(&usage))
-                        .or_insert(usage);
-                    self.accumulate_tools_usage(&res.tools_usage);
-                    self.accumulate(&res.usage);
-                    self.add_discovered_tools_from_output(&tool.name, &res.output);
-                    self.compact_discovery_tool_output_for_context(&tool.name, &mut res.output);
+            // Every call needs an output, even a failed one.
+            // GPT-5: An assistant message with 'tool_calls' must be followed by tool messages responding to each 'tool_call_id'.
+            self.req.content.push(ContentPart::ToolOutput {
+                name: tool.name.clone(),
+                output: res
+                    .model_output
+                    .clone()
+                    .map(anda_core::ToolPresentation::into_output)
+                    .unwrap_or_else(|| res.output.clone()),
+                is_error: res.is_error,
+                call_id: tool.call_id.clone(),
+                remote_id: tool.remote_id,
+            });
 
-                    // We can not ignore some tool calls.
-                    // GPT-5: An assistant message with 'tool_calls' must be followed by tool messages responding to each 'tool_call_id'.
-                    tool_calls_continue.push(ContentPart::ToolOutput {
-                        name: tool.name.clone(),
-                        output: res
-                            .model_output
-                            .clone()
-                            .map(anda_core::ToolPresentation::into_output)
-                            .unwrap_or_else(|| res.output.clone()),
-                        is_error: res.is_error,
-                        call_id: tool.call_id.clone(),
-                        remote_id: tool.remote_id,
-                    });
-
-                    self.artifacts.append(&mut res.artifacts);
-                    tool_calls.push(tool);
-                }
-            }
+            self.artifacts.append(&mut res.artifacts);
+            tool.result = Some(res);
+            self.tool_calls.push(tool);
         }
-
-        // Accumulate this round's tool calls.
-        self.tool_calls.append(&mut tool_calls);
         self.req.role = Some("tool".to_string());
-        if !tool_calls_continue.is_empty() {
-            self.req.content.append(&mut tool_calls_continue);
-        }
-
-        Ok(true)
+        true
     }
 
     /// Re-resolves the routed model for the upcoming turn, dropping accumulated
@@ -1182,18 +1093,20 @@ impl CompletionRunner {
     /// note index, then the messages this runner generated. Used in place of `raw_history`
     /// when the provider-native copy cannot be replayed.
     fn neutral_history(&self) -> Vec<Message> {
-        // `reserve_chat_history` seeds `chat_history` with messages that are also in the
-        // request, so skip the prefix when it is already at the front.
-        let generated = if self.chat_history.starts_with(&self.history_prefix) {
-            &self.chat_history[self.history_prefix.len()..]
-        } else {
-            &self.chat_history[..]
-        };
+        let generated = self.generated_history();
         let mut history = Vec::with_capacity(self.history_prefix.len() + generated.len() + 1);
-        history.extend(self.history_prefix.iter().cloned());
+        history.extend_from_slice(&self.history_prefix);
         history.extend(self.note_context.iter().cloned());
-        history.extend(generated.iter().cloned());
+        history.extend_from_slice(generated);
         history
+    }
+
+    /// The messages this runner generated. `reserve_chat_history` seeds `chat_history` with
+    /// messages that are also in the request, so the prefix is skipped when it is at the front.
+    fn generated_history(&self) -> &[Message] {
+        self.chat_history
+            .strip_prefix(self.history_prefix.as_slice())
+            .unwrap_or(&self.chat_history)
     }
 
     fn commit_tool_outputs_to_history(&mut self) {
@@ -1212,8 +1125,42 @@ impl CompletionRunner {
         self.req.role = None;
     }
 
+    /// Loads the note index into the request once per runner, ahead of its first user turn.
+    async fn load_note_context(&mut self) -> Result<(), BoxError> {
+        use crate::extension::note::{NoteContextConfig, NoteTool, load_note_summary};
+
+        if self.note_context_loaded || self.req.role.as_deref() == Some("tool") {
+            return Ok(());
+        }
+        // Child contexts inherit the config, so also require that this request offers the
+        // tool: internal or nested completions without it must not load the note store.
+        if self.ctx.tools.contains_lowercase(NoteTool::NAME)
+            && self
+                .req
+                .tools
+                .iter()
+                .any(|tool| tool.name.eq_ignore_ascii_case(NoteTool::NAME))
+            && self.is_callable_allowed(NoteTool::NAME)
+            && let Some(config) = self.ctx.base.get_state::<NoteContextConfig>()
+            && let Some(text) = load_note_summary(&self.ctx, &config).await?
+        {
+            let message = Message {
+                role: "assistant".into(),
+                content: vec![text.into()],
+                timestamp: Some(unix_ms()),
+                ..Default::default()
+            };
+            self.req.chat_history.push(message.clone());
+            // Not added to `chat_history`: persisted or resumed conversations would otherwise
+            // keep a stale copy beside the fresh index each new runner loads.
+            self.note_context = Some(message);
+        }
+        self.note_context_loaded = true;
+        Ok(())
+    }
+
     async fn inner_next(&mut self) -> Result<Option<AgentOutput>, BoxError> {
-        let mut pending_tool_calls = false;
+        let mut tool_round = false;
         if !self.pending_tool_calls.is_empty()
             && let Some(content) = self.drain_steering_message()
         {
@@ -1221,22 +1168,16 @@ impl CompletionRunner {
                 "tool call interrupted by steering",
                 None,
             );
-            self.req.content = content;
-            self.req.role = Some("user".to_string());
+            self.set_next_user_content(content);
         } else if !self.has_request_input() {
             // Automatically execute the pending tool/agent calls.
-            if self.execute_pending_tool_calls_into_request().await? {
-                pending_tool_calls = true;
-                let follow_up_content: Vec<ContentPart> =
-                    self.drain_follow_up_message().unwrap_or_default();
-
-                if !follow_up_content.is_empty() {
-                    if self.req.content.is_empty() {
-                        self.set_next_user_content(follow_up_content);
-                    } else {
-                        self.commit_tool_outputs_to_history();
-                        self.set_next_user_content(follow_up_content);
-                    }
+            if self.execute_pending_tool_calls_into_request().await {
+                tool_round = true;
+                // Queued follow-up rides along as its own user turn after the tool outputs.
+                let follow_up: Vec<ContentPart> = self.follow_up_message.drain(..).collect();
+                if !follow_up.is_empty() {
+                    self.commit_tool_outputs_to_history();
+                    self.set_next_user_content(follow_up);
                 }
             } else if let Some(content) = self.drain_queued_message() {
                 self.set_next_user_content(content);
@@ -1246,40 +1187,12 @@ impl CompletionRunner {
         }
 
         self.sync_model_for_next_turn();
-
-        if !self.note_context_loaded
-            && !pending_tool_calls
-            && self.req.role.as_deref() != Some("tool")
-        {
-            use crate::extension::note::{NoteContextConfig, NoteTool, load_note_summary};
-            // Child contexts inherit the config, so also require that this request offers the
-            // tool: internal or nested completions without it must not load the note store.
-            if self.ctx.tools.contains_lowercase(NoteTool::NAME)
-                && self
-                    .req
-                    .tools
-                    .iter()
-                    .any(|tool| tool.name.eq_ignore_ascii_case(NoteTool::NAME))
-                && self.is_callable_allowed(NoteTool::NAME)
-                && let Some(config) = self.ctx.base.get_state::<NoteContextConfig>()
-                && let Some(text) = load_note_summary(&self.ctx, &config).await?
-            {
-                let message = Message {
-                    role: "assistant".into(),
-                    content: vec![text.into()],
-                    timestamp: Some(unix_ms()),
-                    ..Default::default()
-                };
-                self.req.chat_history.push(message.clone());
-                // Not added to `chat_history`: persisted or resumed conversations would otherwise
-                // keep a stale copy beside the fresh index each new runner loads.
-                self.note_context = Some(message);
-            }
-            self.note_context_loaded = true;
+        if !tool_round {
+            self.load_note_context().await?;
         }
         self.turns += 1;
         let mut req = self.req.clone();
-        if !pending_tool_calls && let Some(implicit_context) = self.implicit_context.take() {
+        if !tool_round && let Some(implicit_context) = self.implicit_context.take() {
             req.chat_history.push(implicit_context);
         }
         self.merge_discovered_tools_into_request(&mut req);
@@ -1358,16 +1271,11 @@ impl CompletionRunner {
         output
     }
 
+    // Finalizes from the latest intermediate output, whose history `intermediate_output`
+    // already left out.
     fn final_idle_output(&mut self) -> AgentOutput {
-        self.done = true;
-        let mut output = self.last_output.take().unwrap_or_default();
-        output.chat_history = std::mem::take(&mut self.chat_history);
-        output.tool_calls = std::mem::take(&mut self.tool_calls);
-        output.artifacts = std::mem::take(&mut self.artifacts);
-        output.usage = std::mem::take(&mut self.total_usage);
-        output.tools_usage = std::mem::take(&mut self.tools_usage);
-
-        output
+        let output = self.last_output.take().unwrap_or_default();
+        self.final_output(output)
     }
 
     fn final_output(&mut self, mut output: AgentOutput) -> AgentOutput {
@@ -1381,6 +1289,15 @@ impl CompletionRunner {
         output.tools_usage = std::mem::take(&mut self.tools_usage);
 
         output
+    }
+}
+
+/// The error output a failed or rejected call returns to the model.
+fn tool_error(message: String) -> ToolOutput<Json> {
+    ToolOutput {
+        output: json!({ "error": message }),
+        is_error: Some(true),
+        ..Default::default()
     }
 }
 
@@ -1416,8 +1333,10 @@ fn strip_inline_data(messages: &mut [Message]) {
 
 /// Stream wrapper for [`CompletionRunner`].
 ///
-/// Note that a stream is terminal after yielding `None`. If you need resumable idle behavior via
-/// `set_unbound(true)`, drive [`CompletionRunner::next`] directly instead of using this stream.
+/// Note that a stream is terminal after yielding `None` or an error; the runner keeps its state,
+/// so a caller that wants to recover from a failed step drives [`Self::runner`] directly. If you
+/// need resumable idle behavior via `set_unbound(true)`, drive [`CompletionRunner::next`] directly
+/// instead of using this stream.
 ///
 /// While a step is in flight, the `runner` field holds an inert placeholder, so queue mid-run
 /// messages through [`CompletionStream::steer`] and [`CompletionStream::follow_up`] instead of
@@ -1428,6 +1347,9 @@ pub struct CompletionStream {
     pending: Option<PendingCompletion>,
     queued_steering: Vec<ContentPart>,
     queued_follow_up: Vec<ContentPart>,
+    /// Set once a step fails: retrying the same request on every poll would loop forever on a
+    /// persistent error.
+    failed: bool,
 }
 
 type PendingCompletion = BoxPinFut<(CompletionRunner, Result<Option<AgentOutput>, BoxError>)>;
@@ -1439,6 +1361,7 @@ impl CompletionStream {
             pending: None,
             queued_steering: Vec::new(),
             queued_follow_up: Vec::new(),
+            failed: false,
         }
     }
 
@@ -1479,6 +1402,9 @@ impl Stream for CompletionStream {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
+        if this.failed {
+            return Poll::Ready(None);
+        }
 
         if this.pending.is_none() {
             let placeholder = this.runner.stream_placeholder();
@@ -1514,7 +1440,10 @@ impl Stream for CompletionStream {
                         this.runner.done = true;
                         Poll::Ready(None)
                     }
-                    Err(e) => Poll::Ready(Some(Err(e))),
+                    Err(e) => {
+                        this.failed = true;
+                        Poll::Ready(Some(Err(e)))
+                    }
                 }
             }
             Poll::Pending => Poll::Pending,
@@ -1542,7 +1471,7 @@ mod tests {
     use crate::context::test_fixtures::*;
     use crate::{
         engine::EngineBuilder,
-        model::{CompletionFeaturesDyn, Model},
+        model::{CompletionFeaturesDyn, Model, testing::ScriptedCompleter},
         subagent::{SubAgent, SubAgentManager},
     };
 
@@ -3647,6 +3576,9 @@ mod tests {
         let item = stream.next().await;
         assert!(item.is_some());
         assert!(item.unwrap().is_err());
+        // A failed step is not retried on the next poll, which would loop forever on a
+        // persistent error.
+        assert!(stream.next().await.is_none());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -4419,5 +4351,207 @@ mod tests {
         // `set_tools` replaces the offer and forgets what was discovered.
         runner.set_tools(vec![tool("third")]);
         assert!(!runner.discovered.contains("echo_tool"));
+    }
+
+    fn text_message(role: &str, text: &str) -> Message {
+        Message {
+            role: role.to_string(),
+            content: vec![ContentPart::Text {
+                text: text.to_string(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn echo_call() -> ToolCall {
+        ToolCall {
+            name: "echo_tool".to_string(),
+            args: json!({ "input": "hi" }),
+            call_id: Some("echo_call".into()),
+            result: None,
+            remote_id: None,
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stopping_before_the_first_turn_completes_keeps_the_seeded_history() {
+        let completer = ScriptedCompleter::new("scripted")
+            .push_error("model error")
+            .into_arc();
+        let ctx = EngineBuilder::new()
+            .with_model(Model::with_completer(completer.clone()))
+            .mock_ctx();
+        let earlier = text_message("user", "earlier turn");
+        let mut runner = ctx
+            .completion_iter(
+                CompletionRequest {
+                    prompt: "first".to_string(),
+                    chat_history: vec![earlier.clone()],
+                    ..Default::default()
+                },
+                Vec::new(),
+            )
+            .unbound();
+        // The first request never completes, as when a host stop drops it mid-flight.
+        assert!(runner.next().await.is_err());
+        runner.stop_current_task(AgentOutput {
+            content: "stopped".to_string(),
+            ..Default::default()
+        });
+
+        runner.follow_up("second".to_string());
+        assert_eq!(runner.next().await.unwrap().unwrap().content, "second");
+        let requests = completer.requests();
+        assert_eq!(requests[1].chat_history, vec![earlier]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn discarding_a_follow_up_tool_round_leaves_no_orphaned_tool_output() {
+        let completer = ScriptedCompleter::new("scripted")
+            .push_output(AgentOutput {
+                raw_history: vec![json!({
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "echo_call",
+                        "type": "function",
+                        "function": {"name": "echo_tool", "arguments": "{}"}
+                    }]
+                })],
+                tool_calls: vec![echo_call()],
+                ..Default::default()
+            })
+            .push_error("model error")
+            .into_arc();
+        let ctx = EngineBuilder::new()
+            .with_model(Model::with_completer(completer.clone()))
+            .register_tool(Arc::new(EchoTool))
+            .unwrap()
+            .mock_ctx();
+        let mut runner = ctx
+            .completion_iter(
+                CompletionRequest {
+                    prompt: "call tool".to_string(),
+                    ..Default::default()
+                },
+                Vec::new(),
+            )
+            .unbound();
+        runner.next().await.unwrap().unwrap();
+        // A follow-up rides with the tool outputs, which commits them to the request history.
+        runner.follow_up("and then?".to_string());
+        assert!(runner.next().await.is_err());
+        runner.discard_in_flight_request();
+
+        runner.follow_up("retry".to_string());
+        assert_eq!(runner.next().await.unwrap().unwrap().content, "retry");
+        let requests = completer.requests();
+        let retry = requests.last().unwrap();
+        assert!(
+            retry
+                .raw_history
+                .iter()
+                .all(|item| item.get("tool_calls").is_none())
+        );
+        assert!(
+            !retry
+                .chat_history
+                .iter()
+                .flat_map(|message| &message.content)
+                .any(|part| matches!(part, ContentPart::ToolOutput { .. })),
+            "the discarded round's tool output must not outlive its call"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handoff_moves_pending_input_and_implicit_context_to_the_replacement() {
+        let completer = ScriptedCompleter::new("scripted")
+            .push_output(AgentOutput {
+                content: "summary".to_string(),
+                ..Default::default()
+            })
+            .into_arc();
+        let ctx = EngineBuilder::new()
+            .with_model(Model::with_completer(completer.clone()))
+            .mock_ctx();
+        let mut runner = ctx
+            .completion_iter(
+                CompletionRequest {
+                    prompt: "pending task".to_string(),
+                    chat_history: vec![text_message("user", "earlier turn")],
+                    ..Default::default()
+                },
+                Vec::new(),
+            )
+            .unbound();
+        runner.implicit_context(text_message("user", "implicit context"));
+
+        let (mut runner, output) = runner.handoff(None).await.unwrap();
+        assert_eq!(output.content, "summary");
+        assert_eq!(
+            runner.next().await.unwrap().unwrap().content,
+            "pending task"
+        );
+
+        let requests = completer.requests();
+        assert_eq!(requests.len(), 2);
+        let summary_request = format!("{:?}", requests[0]);
+        assert!(summary_request.contains("earlier turn"));
+        assert!(!summary_request.contains("pending task"));
+        assert!(!summary_request.contains("implicit context"));
+        assert_eq!(requests[1].prompt, "pending task");
+        let replayed = requests[1]
+            .chat_history
+            .iter()
+            .filter_map(Message::text)
+            .collect::<Vec<_>>();
+        assert_eq!(replayed, ["summary", "implicit context"]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handoff_failure_keeps_executed_tool_outputs_queued() {
+        let completer = ScriptedCompleter::new("scripted")
+            .push_output(AgentOutput {
+                tool_calls: vec![echo_call()],
+                ..Default::default()
+            })
+            .push_error("summary failed")
+            .into_arc();
+        let ctx = EngineBuilder::new()
+            .with_model(Model::with_completer(completer.clone()))
+            .register_tool(Arc::new(EchoTool))
+            .unwrap()
+            .mock_ctx();
+        let mut runner = ctx
+            .completion_iter(
+                CompletionRequest {
+                    prompt: "call tool".to_string(),
+                    ..Default::default()
+                },
+                Vec::new(),
+            )
+            .unbound();
+        runner.next().await.unwrap().unwrap();
+
+        assert!(runner.handoff(None).await.is_err());
+        assert!(runner.no_pending_tool_calls());
+        // The summary request carried the executed output after its call.
+        let requests = completer.requests();
+        assert!(requests[1].chat_history.iter().any(|message| {
+            message.role == "tool"
+                && matches!(
+                    &message.content[..],
+                    [ContentPart::ToolOutput { call_id, .. }] if call_id.as_deref() == Some("echo_call")
+                )
+        }));
+
+        // The tool already ran, so the next step sends its output instead of dropping it.
+        runner.next().await.unwrap().unwrap();
+        let requests = completer.requests();
+        let next = requests.last().unwrap();
+        assert_eq!(next.role.as_deref(), Some("tool"));
+        assert!(next.content.iter().any(|part| matches!(
+            part,
+            ContentPart::ToolOutput { call_id, .. } if call_id.as_deref() == Some("echo_call")
+        )));
     }
 }

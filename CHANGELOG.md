@@ -4,6 +4,46 @@ All notable changes to the Anda project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed — anda_engine
+
+- **Stopping a task keeps the conversation the runner replays** —
+  `CompletionRunner::stop_current_task` no longer clears the request history.
+  A stop that interrupted the first turn (a subagent or host control drops the
+  in-flight step) used to drop the seeded `chat_history` and the note index, so
+  every later request reached the model without the earlier conversation. The
+  request history is now cleared only together with the pruned raw tool calls
+  of an interrupted tool round.
+- **Discarding a follow-up tool round leaves no orphaned tool output** — When
+  queued follow-up was delivered with tool results and that request failed,
+  `discard_in_flight_request` pruned the raw tool calls but kept the committed
+  tool message, so the next request sent a tool result without its call and the
+  provider rejected it.
+- **`handoff` delivers pending input instead of summarizing it** — Request input
+  the runner had already accepted (an initial prompt, documents, or follow-up
+  promoted after the last reply) now moves to the replacement runner as its next
+  request, along with the implicit context, which was dropped before. Only
+  pending tool outputs are summarized with the history. Previously that input
+  was folded into the summary, so a replacement without other queued input went
+  idle without answering it.
+- **A failed `handoff` keeps executed tool outputs queued** — Pending tool calls
+  run before the summary turn; if the summary then failed, their outputs had
+  already been committed and the next step never sent them to the model. They
+  now stay as request input until a summary succeeds.
+- **`CompletionStream` ends after an error** — A failed step was retried on every
+  poll, so collecting a stream against a persistently failing model (or no
+  configured model) never finished. The runner keeps its state for callers that
+  want to recover through `stream.runner`.
+
+### Changed — anda_engine
+
+- **Simpler completion runner internals** — Tool execution returns its outputs
+  without an infallible `Result` or optional results and shares one error
+  constructor, the unprefixed-subagent dispatch branch that could only fail is
+  gone, and `finalize`, `AgentCtx::completion`, history replay, idle snapshots,
+  queued-input draining, and the note index loader share helpers instead of
+  repeating them. Steps without a subagent scope no longer allocate a default
+  one.
+
 ## [anda_core 0.16.3 / anda_engine 0.16.5] — 2026-10-08
 
 ### Added — anda_engine

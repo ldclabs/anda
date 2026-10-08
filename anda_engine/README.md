@@ -112,9 +112,11 @@ See [subagent lifecycle and migration](../docs/subagents.md) and the runnable
 [subagent_sessions example](examples/subagent_sessions.rs).
 
 `CompletionStream` preserves follow-up and steering input submitted while a
-model step is pending. Failed context compaction leaves the original runner
-usable. Stop/cancel controls interrupt pending subagent work; native shell
-cancellation cleans up the process tree and output readers.
+model step is pending, and ends after it yields an error. Context compaction
+moves pending and queued input to the replacement runner; a failed compaction
+leaves the original runner usable. Stop/cancel controls interrupt pending
+subagent work; native shell cancellation cleans up the process tree and output
+readers.
 
 A long-lived runner can send attachment bytes for one task only:
 `set_transient_inline_data(true)` keeps `InlineData` (and `data:` `FileData`)
