@@ -311,8 +311,17 @@ impl ContentPart {
             ContentPart::FileData {
                 file_uri,
                 mime_type,
-            } => estimate_tokens(file_uri)
-                .saturating_add(mime_type.as_deref().map_or(0, estimate_tokens)),
+            } => {
+                let mut uri = estimate_tokens(file_uri);
+                // A `data:` URI carries the image bytes inline; bound it like `InlineData`.
+                let is_image = |mime: &str| mime.starts_with("image/");
+                if let Some(header) = file_uri.strip_prefix("data:")
+                    && (is_image(header) || mime_type.as_deref().is_some_and(is_image))
+                {
+                    uri = uri.min(MAX_IMAGE_TOKENS);
+                }
+                uri.saturating_add(mime_type.as_deref().map_or(0, estimate_tokens))
+            }
             ContentPart::InlineData { mime_type, data } => {
                 // Base64 expands bytes by ~4/3 and ~4 base64 chars ≈ 1 token, so
                 // the encoded payload is roughly `len / 3` tokens.
@@ -1430,6 +1439,30 @@ mod tests {
         assert_eq!(
             inline("application/pdf", 3_000_000).estimated_tokens(),
             1_000_000 + 4
+        );
+
+        // The same image sent as a `data:` URI is bounded too, whichever side names its type.
+        let payload = "A".repeat(4 * 1024 * 1024);
+        let file = |file_uri: String, mime_type: Option<&str>| ContentPart::FileData {
+            file_uri,
+            mime_type: mime_type.map(str::to_string),
+        };
+        assert_eq!(
+            file(format!("data:image/jpeg;base64,{payload}"), None).estimated_tokens(),
+            MAX_IMAGE_TOKENS
+        );
+        assert_eq!(
+            file(format!("data:;base64,{payload}"), Some("image/png")).estimated_tokens(),
+            MAX_IMAGE_TOKENS + 3
+        );
+        // Other `data:` URIs and remote images keep the URI-based estimate.
+        assert_eq!(
+            file(format!("data:application/pdf;base64,{payload}"), None).estimated_tokens(),
+            estimate_tokens(&format!("data:application/pdf;base64,{payload}"))
+        );
+        assert_eq!(
+            file("https://example.com/a.png".to_string(), Some("image/png")).estimated_tokens(),
+            estimate_tokens("https://example.com/a.png") + 3
         );
     }
 }

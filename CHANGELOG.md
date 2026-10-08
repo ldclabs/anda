@@ -69,11 +69,12 @@ All notable changes to the Anda project will be documented in this file.
 ### Changed — anda_core
 
 - **Inline images are no longer sized by their bytes** —
-  `ContentPart::estimated_tokens` caps an `image/*` `InlineData` part at 5,000
-  tokens. Providers bill an image by its resolution and downscale large ones, so
-  the `len / 3` estimate made one phone photo look like a million tokens and
-  pushed callers into needless context compaction. Other inline data keeps the
-  byte-based estimate.
+  `ContentPart::estimated_tokens` caps an `image/*` `InlineData` part, or a
+  `FileData` part whose `data:` URI carries an image, at 5,000 tokens. Providers
+  bill an image by its resolution and downscale large ones, so the `len / 3`
+  estimate made one phone photo look like a million tokens and pushed callers
+  into needless context compaction. Other inline data keeps the byte-based
+  estimate.
 - **Forced tool choice documented** — `CompletionRequest::tool_choice_required`
   now explains that adapters map it to the provider's forced tool choice, and
   that Claude Opus 5.5, Claude Sonnet 5.5, and Claude Fable 5.1 reject it with a
