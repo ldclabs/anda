@@ -82,13 +82,10 @@ impl NoteTool {
             .collect();
         // Bind continuations to both the scope/query and exact contents, including old stores
         // without a version field. Limit/response budget may change between pages.
-        let fingerprint = format!(
-            "{:x}",
-            Sha256::digest(
-                to_canonical_vec(&(ctx.path().to_string(), &ctx.agent, op, &ids, query, store))
-                    .map_err(|error| error.to_string())?
-            )
-        );
+        let fingerprint = hex::encode(Sha256::digest(
+            to_canonical_vec(&(ctx.path().to_string(), &ctx.agent, op, &ids, query, store))
+                .map_err(|error| error.to_string())?,
+        ));
         let (mut index, mut offset) = decode_cursor(args.cursor.as_deref(), &fingerprint)?;
         if args.cursor.is_some() && (index >= selected.len() || (op != NOTE_OP_READ && offset != 0))
         {

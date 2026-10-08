@@ -97,7 +97,7 @@ struct Prepared {
 fn hash(bytes: Option<&[u8]>) -> String {
     bytes.map_or_else(
         || "missing".into(),
-        |bytes| format!("{:x}", Sha256::digest(bytes)),
+        |bytes| hex::encode(Sha256::digest(bytes)),
     )
 }
 

@@ -238,7 +238,7 @@ pub fn normalise_skill_agent_name(name: &str) -> String {
         // and a digest prefix, reserving three bytes for SA_; publication also checks collisions.
         format!(
             "skillh_{:.54}",
-            format!("{:x}", Sha256::digest(normalized.as_bytes()))
+            hex::encode(Sha256::digest(normalized.as_bytes()))
         )
     }
 }

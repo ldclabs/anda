@@ -30,6 +30,7 @@ mime = { workspace = true }
 serde = { workspace = true }
 serde_bytes = { workspace = true }
 serde_json = { workspace = true, features = ["preserve_order"] }
+hex = { workspace = true }
 http = { workspace = true }
 object_store = { workspace = true }
 ic_auth_types = { workspace = true, features = ["xid"] }

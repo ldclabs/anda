@@ -288,7 +288,7 @@ impl SkillSummary {
 }
 
 pub(super) fn digest(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    hex::encode(Sha256::digest(bytes))
 }
 pub(super) fn truncate(text: &str, bytes: usize) -> &str {
     let mut end = bytes.min(text.len());

@@ -94,6 +94,11 @@ All notable changes to the Anda project will be documented in this file.
   queued-input draining, and the note index loader share helpers instead of
   repeating them. Steps without a subagent scope no longer allocate a default
   one.
+- **Dependencies** — The workspace requires `rmcp` 3.5 and `sha2` 0.11.
+  `sse-stream` stays on 0.2, the version rmcp builds its `BoxedSseResponse`
+  from, and `anda_engine` hex-encodes SHA-256 digests through `hex`, since
+  `sha2` 0.11 output no longer formats with `{:x}`; the encoded strings, and so
+  checkpoint keys and patch hashes, are unchanged.
 
 ## [anda_engine 0.16.4] — 2026-09-29
 

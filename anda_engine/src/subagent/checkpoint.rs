@@ -56,12 +56,9 @@ impl SubAgentCheckpoints {
     }
     pub(super) fn key(caller: &Principal, scope: &str, agent: &str, session: &str) -> String {
         // Hash structured components; aliases cannot inject object-store paths.
-        format!(
-            "{:x}",
-            Sha256::digest(
-                serde_json::to_vec(&(caller, scope, agent, session)).expect("string tuple")
-            )
-        )
+        hex::encode(Sha256::digest(
+            serde_json::to_vec(&(caller, scope, agent, session)).expect("string tuple"),
+        ))
     }
     pub(super) async fn load(&self, key: &str) -> Result<Option<SubAgentCheckpoint>, BoxError> {
         self.0.load(key).await
