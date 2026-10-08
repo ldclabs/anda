@@ -1204,40 +1204,46 @@ impl MemoryManagement {
     /// host that installed its own vocabulary would find the same command
     /// working for the owner and failing for every tenant.
     async fn provision(&self, caller: &Principal) -> Result<(), KipError> {
+        // Boxed: the Nexus steps make a ~40 KB future, which every request future
+        // that may provision would otherwise carry inline, layer by layer — enough
+        // to overflow a 2 MiB stack in debug builds.
         self.provisioned
-            .try_get_with_by_ref(caller, async {
-                let principal_id = tenant_principal(caller);
-                let space_id = tenant_space(caller);
-                self.nexus
-                    .governance()
-                    .ensure_principal(PrincipalDraft {
-                        principal_id: principal_id.clone(),
-                        // Recorded, never read by an authorization decision. A caller
-                        // here is an ic-auth Principal, which may stand for a person or
-                        // for another agent; the deployment is what knows which, and can
-                        // correct the record through the Governance API.
-                        principal_class: principal_class::HUMAN.to_string(),
-                        display_name: caller.to_string(),
-                        auth_provider: "ic-auth".to_string(),
-                        auth_subject: caller.to_string(),
-                    })
-                    .await?;
-                self.nexus
-                    .store
-                    .open_or_create_space(SpaceDraft {
-                        space_id: space_id.clone(),
-                        name: format!("Memory of {caller}"),
-                        description: "A caller's own MemorySpace.".to_string(),
-                        owner_principal: principal_id,
-                        ..Default::default()
-                    })
-                    .await?;
-                let environment = self.nexus.store.schema_environment(DEFAULT_SPACE).await?;
-                self.nexus
-                    .ensure_schema(&space_id, environment.lock)
-                    .await?;
-                Ok::<(), KipError>(())
-            })
+            .try_get_with_by_ref(
+                caller,
+                Box::pin(async {
+                    let principal_id = tenant_principal(caller);
+                    let space_id = tenant_space(caller);
+                    self.nexus
+                        .governance()
+                        .ensure_principal(PrincipalDraft {
+                            principal_id: principal_id.clone(),
+                            // Recorded, never read by an authorization decision. A caller
+                            // here is an ic-auth Principal, which may stand for a person or
+                            // for another agent; the deployment is what knows which, and can
+                            // correct the record through the Governance API.
+                            principal_class: principal_class::HUMAN.to_string(),
+                            display_name: caller.to_string(),
+                            auth_provider: "ic-auth".to_string(),
+                            auth_subject: caller.to_string(),
+                        })
+                        .await?;
+                    self.nexus
+                        .store
+                        .open_or_create_space(SpaceDraft {
+                            space_id: space_id.clone(),
+                            name: format!("Memory of {caller}"),
+                            description: "A caller's own MemorySpace.".to_string(),
+                            owner_principal: principal_id,
+                            ..Default::default()
+                        })
+                        .await?;
+                    let environment = self.nexus.store.schema_environment(DEFAULT_SPACE).await?;
+                    self.nexus
+                        .ensure_schema(&space_id, environment.lock)
+                        .await?;
+                    Ok::<(), KipError>(())
+                }),
+            )
             .await
             .map_err(|err| (*err).clone())
     }

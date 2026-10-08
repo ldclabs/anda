@@ -69,6 +69,13 @@ All notable changes to the Anda project will be documented in this file.
   that sends tool outputs left queued by a failed `handoff` or a failed request
   inserted the implicit context as a user message between the calls and their
   outputs. It now waits for the next user turn, like the note index.
+- **Per-caller memory requests no longer carry the provisioning future inline** —
+  Under `Tenancy::PerCallerSpace` every KIP tool call embedded the ~43 KB future
+  that provisions a caller's Principal and Space, and each layer above it
+  reserved that much again, so debug builds overflowed a 2 MiB thread stack (the
+  `per_caller_spaces_isolate_one_tenant_from_another` test aborted with
+  `anda_cognitive_nexus` 0.14.3). Provisioning is boxed, which shrinks a memory
+  tool call future from 48 KB to 6 KB.
 
 ### Changed — anda_core
 
