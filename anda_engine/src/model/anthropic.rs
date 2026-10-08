@@ -1477,4 +1477,35 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn prune_inline_media_covers_anthropic_media_blocks() {
+        let bytes = b"inline attachment bytes".to_vec();
+        let encoded = anda_core::ByteBufB64(bytes.clone()).to_base64();
+        let msg = anda_core::Message {
+            role: "user".into(),
+            content: vec![
+                "look".to_string().into(),
+                ContentPart::InlineData {
+                    mime_type: "image/png".into(),
+                    data: anda_core::ByteBufB64(bytes.clone()),
+                },
+                ContentPart::InlineData {
+                    mime_type: "application/pdf".into(),
+                    data: anda_core::ByteBufB64(bytes),
+                },
+            ],
+            ..Default::default()
+        };
+        let mut raw = vec![serde_json::to_value(types::Message::from(msg)).unwrap()];
+        crate::model::raw::prune_inline_media(&mut raw);
+        let sent = serde_json::to_string(&raw).unwrap();
+        assert!(!sent.contains(&encoded), "{sent}");
+        assert!(sent.contains("[inline image/png data omitted]"), "{sent}");
+        assert!(
+            sent.contains("[inline application/pdf data omitted]"),
+            "{sent}"
+        );
+        assert!(sent.contains("look"), "{sent}");
+    }
 }

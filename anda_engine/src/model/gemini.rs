@@ -1090,6 +1090,37 @@ mod tests {
         assert_eq!(output.usage.output_tokens, 1);
         assert_eq!(output.chat_history.len(), 1);
     }
+
+    #[test]
+    fn prune_inline_media_covers_gemini_inline_parts() {
+        let bytes = b"inline attachment bytes".to_vec();
+        let encoded = anda_core::ByteBufB64(bytes.clone()).to_base64();
+        let msg = anda_core::Message {
+            role: "user".into(),
+            content: vec![
+                "look".to_string().into(),
+                anda_core::ContentPart::InlineData {
+                    mime_type: "image/png".into(),
+                    data: anda_core::ByteBufB64(bytes.clone()),
+                },
+                anda_core::ContentPart::InlineData {
+                    mime_type: "application/pdf".into(),
+                    data: anda_core::ByteBufB64(bytes),
+                },
+            ],
+            ..Default::default()
+        };
+        let mut raw = vec![serde_json::to_value(types::Content::from(msg)).unwrap()];
+        crate::model::raw::prune_inline_media(&mut raw);
+        let sent = serde_json::to_string(&raw).unwrap();
+        assert!(!sent.contains(&encoded), "{sent}");
+        assert!(sent.contains("[inline image/png data omitted]"), "{sent}");
+        assert!(
+            sent.contains("[inline application/pdf data omitted]"),
+            "{sent}"
+        );
+        assert!(sent.contains("look"), "{sent}");
+    }
 }
 
 #[cfg(test)]

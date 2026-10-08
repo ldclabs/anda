@@ -984,3 +984,95 @@ pub(crate) fn dynamic_remote_engines() -> RemoteEngines {
     );
     RemoteEngines { engines }
 }
+
+/// Mirrors a real adapter's history handling: the sent request content comes back in
+/// `chat_history`, and in Anthropic-shaped `raw_history` with base64 image blocks. A request
+/// that carries inline data calls `echo_tool` once before the model answers.
+#[derive(Clone, Debug)]
+pub(crate) struct InlineMediaCompleter {
+    pub(crate) requests: Arc<Mutex<Vec<CompletionRequest>>>,
+}
+
+impl CompletionFeaturesDyn for InlineMediaCompleter {
+    fn model_name(&self) -> String {
+        "inline_media".to_string()
+    }
+
+    fn completion(
+        &self,
+        req: CompletionRequest,
+    ) -> anda_core::BoxPinFut<Result<AgentOutput, BoxError>> {
+        self.requests.lock().unwrap().push(req.clone());
+        let role = req.role.clone().unwrap_or_else(|| "user".to_string());
+        let mut content = req.content;
+        if !req.prompt.is_empty() {
+            content.insert(0, req.prompt.into());
+        }
+        let raw_content = content
+            .iter()
+            .map(|part| match part {
+                ContentPart::InlineData { mime_type, data } => json!({
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": mime_type, "data": data.to_base64()}
+                }),
+                other => json!({"type": "text", "text": serde_json::to_string(other).unwrap()}),
+            })
+            .collect::<Vec<_>>();
+        let has_media = content
+            .iter()
+            .any(|part| matches!(part, ContentPart::InlineData { .. }));
+        let (reply, tool_calls) = if has_media {
+            let call = ToolCall {
+                name: "echo_tool".to_string(),
+                args: json!({"input": "inspect"}),
+                call_id: Some("media_call".into()),
+                result: None,
+                remote_id: None,
+            };
+            (
+                ContentPart::ToolCall {
+                    name: call.name.clone(),
+                    args: call.args.clone(),
+                    call_id: call.call_id.clone(),
+                },
+                vec![call],
+            )
+        } else {
+            ("done".to_string().into(), Vec::new())
+        };
+
+        Box::pin(futures::future::ready(Ok(AgentOutput {
+            content: if has_media {
+                String::new()
+            } else {
+                "done".to_string()
+            },
+            raw_history: vec![
+                json!({"role": role, "content": raw_content}),
+                json!({"role": "assistant", "content": [
+                    {"type": "text", "text": serde_json::to_string(&reply).unwrap()}
+                ]}),
+            ],
+            chat_history: vec![
+                Message {
+                    role,
+                    content,
+                    ..Default::default()
+                },
+                Message {
+                    role: "assistant".to_string(),
+                    content: vec![reply],
+                    ..Default::default()
+                },
+            ],
+            tool_calls,
+            usage: Usage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cached_tokens: 0,
+                requests: 1,
+            },
+            ..Default::default()
+        })))
+    }
+}

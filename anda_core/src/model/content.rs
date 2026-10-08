@@ -316,7 +316,13 @@ impl ContentPart {
             ContentPart::InlineData { mime_type, data } => {
                 // Base64 expands bytes by ~4/3 and ~4 base64 chars ≈ 1 token, so
                 // the encoded payload is roughly `len / 3` tokens.
-                estimate_tokens(mime_type).saturating_add(data.len().div_ceil(3))
+                let mut payload = data.len().div_ceil(3);
+                if mime_type.starts_with("image/") {
+                    // Providers bill an image by its resolution and downscale large ones,
+                    // so its encoded size overstates the cost by orders of magnitude.
+                    payload = payload.min(MAX_IMAGE_TOKENS);
+                }
+                estimate_tokens(mime_type).saturating_add(payload)
             }
             ContentPart::ToolCall {
                 name,
@@ -604,6 +610,10 @@ impl TryFrom<Resource> for ContentPart {
         }
     }
 }
+
+/// Upper bound on the tokens one inline image is estimated at: providers downscale large images,
+/// and even high-resolution ones cost a few thousand tokens.
+const MAX_IMAGE_TOKENS: usize = 5_000;
 
 /// Estimates token count using a small, provider-independent heuristic.
 pub fn estimate_tokens(text: &str) -> usize {
@@ -1401,5 +1411,25 @@ mod tests {
     fn test_estimate_tokens() {
         assert_eq!(estimate_tokens("abcdef"), 2);
         assert_eq!(estimate_tokens(""), 0);
+    }
+
+    #[test]
+    fn inline_image_estimates_stay_bounded() {
+        let inline = |mime_type: &str, len: usize| ContentPart::InlineData {
+            mime_type: mime_type.into(),
+            data: vec![0u8; len].into(),
+        };
+        // Small payloads keep the byte-based estimate.
+        assert_eq!(inline("image/png", 3_000).estimated_tokens(), 1_000 + 3);
+        // A multi-megabyte photo costs what a downscaled image does, not its encoded size.
+        assert_eq!(
+            inline("image/jpeg", 4 * 1024 * 1024).estimated_tokens(),
+            MAX_IMAGE_TOKENS + 3
+        );
+        // Other inline data is still sized by its bytes.
+        assert_eq!(
+            inline("application/pdf", 3_000_000).estimated_tokens(),
+            1_000_000 + 4
+        );
     }
 }

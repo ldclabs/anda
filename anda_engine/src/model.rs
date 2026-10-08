@@ -537,6 +537,19 @@ pub trait CompletionFeaturesDyn: Send + Sync + 'static {
     fn prune_tool_interactions(&self, raw_history: &mut Vec<Json>) {
         raw::prune_tool_interactions(raw_history);
     }
+
+    /// Replaces inline media payloads (base64 blocks, `data:` URLs, inline audio and file data)
+    /// in `raw_history` with a short text note in the provider's text shape.
+    ///
+    /// Callers that send attachment bytes for one task use this at an idle boundary, so the
+    /// bytes are not replayed on every later request. Media referenced by remote URL or
+    /// provider file id must stay, and no message may be left without content.
+    ///
+    /// The default implementation is a conservative union over the built-in provider wire
+    /// shapes; override it when your provider's raw items are not covered by it.
+    fn prune_inline_media(&self, raw_history: &mut Vec<Json>) {
+        raw::prune_inline_media(raw_history);
+    }
 }
 
 /// Placeholder implementation that returns errors for completion requests.
@@ -670,6 +683,14 @@ impl Model {
     /// See [`CompletionFeaturesDyn::prune_tool_interactions`].
     pub fn prune_tool_interactions(&self, raw_history: &mut Vec<Json>) {
         self.completer.prune_tool_interactions(raw_history);
+    }
+
+    /// Replaces inline media payloads in `raw_history` using the provider's own wire-format
+    /// knowledge.
+    ///
+    /// See [`CompletionFeaturesDyn::prune_inline_media`].
+    pub fn prune_inline_media(&self, raw_history: &mut Vec<Json>) {
+        self.completer.prune_inline_media(raw_history);
     }
 }
 

@@ -3821,4 +3821,41 @@ mod tests {
             assert_eq!(crate::model::is_retryable_box_error(&error), retryable);
         }
     }
+
+    #[test]
+    fn prune_inline_media_covers_openai_chat_and_responses_items() {
+        let bytes = b"inline attachment bytes".to_vec();
+        let encoded = anda_core::ByteBufB64(bytes.clone()).to_base64();
+        let msg = anda_core::Message {
+            role: "user".into(),
+            content: vec![
+                "look".to_string().into(),
+                ContentPart::InlineData {
+                    mime_type: "image/png".into(),
+                    data: anda_core::ByteBufB64(bytes.clone()),
+                },
+                ContentPart::InlineData {
+                    mime_type: "application/pdf".into(),
+                    data: anda_core::ByteBufB64(bytes),
+                },
+            ],
+            ..Default::default()
+        };
+        let chat = to_message_inputs(&msg).unwrap();
+        let responses = types::message_into(msg);
+        for mut raw in [
+            vec![serde_json::to_value(chat).unwrap()],
+            vec![serde_json::to_value(responses).unwrap()],
+        ] {
+            crate::model::raw::prune_inline_media(&mut raw);
+            let sent = serde_json::to_string(&raw).unwrap();
+            assert!(!sent.contains(&encoded), "{sent}");
+            assert!(sent.contains("[inline image/png data omitted]"), "{sent}");
+            assert!(
+                sent.contains("[inline application/pdf data omitted]"),
+                "{sent}"
+            );
+            assert!(sent.contains("look"), "{sent}");
+        }
+    }
 }

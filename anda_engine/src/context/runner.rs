@@ -88,6 +88,9 @@ pub struct CompletionRunner {
     allowed_callables: Option<BTreeSet<String>>,
     done: bool,
     unbound: bool,
+    /// Keeps inline attachment bytes out of the accumulated history; see
+    /// [`Self::set_transient_inline_data`].
+    transient_inline_data: bool,
     turns: usize,
 }
 
@@ -126,6 +129,7 @@ impl CompletionRunner {
             allowed_callables: None,
             done: false,
             unbound: false,
+            transient_inline_data: false,
             turns: 0,
         }
     }
@@ -292,6 +296,38 @@ impl CompletionRunner {
     /// contract.
     pub fn set_unbound(&mut self, unbound: bool) {
         self.unbound = unbound;
+    }
+
+    /// Keeps inline attachment bytes out of the accumulated history.
+    ///
+    /// When enabled, `InlineData` parts (and `FileData` parts with a `data:` URI) in request
+    /// content still reach the model, but the provider-neutral [`Self::chat_history`] never
+    /// records them, and the provider raw history drops them once the runner goes idle or its
+    /// task is stopped. The model therefore sees the bytes on every turn of the task that
+    /// introduced them and not afterwards; a caller that persists history should send a
+    /// reference alongside the bytes so the attachment can be found again. A message left with
+    /// no other content keeps a short text note. A runner created by [`Self::handoff`] inherits
+    /// the setting.
+    pub fn set_transient_inline_data(&mut self, transient: bool) {
+        self.transient_inline_data = transient;
+    }
+
+    /// Appends tool definitions to later requests, skipping names already offered.
+    ///
+    /// Unlike [`Self::set_tools`], this keeps tools the model discovered during the session, so
+    /// a long-lived caller can offer more tools when new input needs them.
+    pub fn add_tools(&mut self, tools: Vec<FunctionDefinition>) {
+        let mut names: BTreeSet<String> = self
+            .req
+            .tools
+            .iter()
+            .map(|tool| tool.name.to_ascii_lowercase())
+            .collect();
+        for tool in tools {
+            if names.insert(tool.name.to_ascii_lowercase()) {
+                self.req.tools.push(tool);
+            }
+        }
     }
 
     /// Sets the discovered-tool merge policy.
@@ -468,6 +504,7 @@ impl CompletionRunner {
         self.steering_message.clear();
         self.follow_up_message.clear();
         self.implicit_context = None;
+        self.prune_transient_inline_data();
 
         output.tool_calls = self.tool_calls.clone();
         output.artifacts = self.artifacts.clone();
@@ -478,6 +515,14 @@ impl CompletionRunner {
         self.last_output = Some(output.clone());
         output.chat_history = self.chat_history.clone();
         output
+    }
+
+    /// Drops inline attachment bytes from the provider raw history once the task that sent
+    /// them has ended; see [`Self::set_transient_inline_data`].
+    fn prune_transient_inline_data(&mut self) {
+        if self.transient_inline_data && !self.req.raw_history.is_empty() {
+            self.model.prune_inline_media(&mut self.req.raw_history);
+        }
     }
 
     fn append_interrupted_tool_outputs(&mut self, error: &str, reason: Option<&str>) {
@@ -822,7 +867,10 @@ impl CompletionRunner {
         let summary = output.content.trim().to_string();
         output.model = Some(self.model.model_name());
         output.raw_history.clear();
-        if let Some(message) = pending_message {
+        if let Some(mut message) = pending_message {
+            if self.transient_inline_data {
+                strip_inline_data(std::slice::from_mut(&mut message));
+            }
             self.chat_history.push(message);
         }
         let output = self.final_output(output);
@@ -865,6 +913,7 @@ impl CompletionRunner {
             .completion_iter(req, std::mem::take(&mut self.resources))
             .reserve_chat_history(restored_history);
         runner.set_unbound(unbound);
+        runner.transient_inline_data = self.transient_inline_data;
         // `self` is finalized above, so its remaining state moves into the replacement runner.
         runner.discovered = std::mem::take(&mut self.discovered);
         runner.follow_up_message = std::mem::take(&mut self.follow_up_message);
@@ -1237,6 +1286,9 @@ impl CompletionRunner {
 
         let mut output = self.model_request(req).await?;
         output.model = Some(self.model.model_name());
+        if self.transient_inline_data {
+            strip_inline_data(&mut output.chat_history);
+        }
 
         self.current_usage = output.usage.clone();
         self.accumulate(&output.usage);
@@ -1287,6 +1339,8 @@ impl CompletionRunner {
         }
 
         if self.unbound {
+            // Idle: the task that sent any inline attachment bytes is over.
+            self.prune_transient_inline_data();
             return Ok(Some(self.intermediate_output(output)));
         }
 
@@ -1327,6 +1381,36 @@ impl CompletionRunner {
         output.tools_usage = std::mem::take(&mut self.tools_usage);
 
         output
+    }
+}
+
+/// Drops inline payloads (`InlineData` parts and `FileData` parts with a `data:` URI) from
+/// provider-neutral messages. A message left without content keeps a short text note so its
+/// turn is not lost.
+fn strip_inline_data(messages: &mut [Message]) {
+    for message in messages {
+        let mut omitted: Option<Option<String>> = None;
+        message.content.retain(|part| match part {
+            ContentPart::InlineData { mime_type, .. } => {
+                omitted.get_or_insert(Some(mime_type.clone()));
+                false
+            }
+            ContentPart::FileData {
+                file_uri,
+                mime_type,
+            } if file_uri.starts_with("data:") => {
+                omitted.get_or_insert(mime_type.clone());
+                false
+            }
+            _ => true,
+        });
+        if let Some(mime) = omitted
+            && message.content.is_empty()
+        {
+            message.content.push(ContentPart::Text {
+                text: crate::model::raw::inline_media_text(mime.as_deref()),
+            });
+        }
     }
 }
 
@@ -4098,5 +4182,242 @@ mod tests {
         for tc in &final_out.tool_calls {
             assert!(tc.result.is_some());
         }
+    }
+
+    fn image_request(bytes: &[u8]) -> CompletionRequest {
+        CompletionRequest {
+            prompt: "look at this".to_string(),
+            content: vec![ContentPart::InlineData {
+                mime_type: "image/png".to_string(),
+                data: anda_core::ByteBufB64(bytes.to_vec()),
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn has_inline_data(messages: &[Message]) -> bool {
+        messages.iter().any(|message| {
+            message
+                .content
+                .iter()
+                .any(|part| matches!(part, ContentPart::InlineData { .. }))
+        })
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn transient_inline_data_lasts_for_its_task_only() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let model = Model::with_completer(Arc::new(InlineMediaCompleter {
+            requests: requests.clone(),
+        }));
+        let ctx = EngineBuilder::new()
+            .with_model(model)
+            .register_tool(Arc::new(EchoTool))
+            .unwrap()
+            .mock_ctx();
+        let bytes = b"transient image bytes";
+        let encoded = anda_core::ByteBufB64(bytes.to_vec()).to_base64();
+        let mut runner = ctx
+            .completion_iter(image_request(bytes), Vec::new())
+            .unbound();
+        runner.set_transient_inline_data(true);
+
+        // The image goes out, and the model's tool call keeps the task running.
+        let first = runner.next().await.unwrap().unwrap();
+        assert_eq!(first.tool_calls[0].name, "echo_tool");
+        assert!(!has_inline_data(runner.chat_history()));
+        assert_eq!(
+            runner.chat_history()[0].text().as_deref(),
+            Some("look at this")
+        );
+
+        // The next turn of the same task still replays the image.
+        let second = runner.next().await.unwrap().unwrap();
+        assert_eq!(second.content, "done");
+        assert!(runner.is_idle());
+        {
+            let requests = requests.lock().unwrap();
+            assert!(
+                serde_json::to_string(&requests[1].raw_history)
+                    .unwrap()
+                    .contains(&encoded)
+            );
+        }
+
+        // Idle ends the task: the bytes leave the raw history, a note stays in their place.
+        let raw = serde_json::to_string(&runner.req().raw_history).unwrap();
+        assert!(!raw.contains(&encoded), "{raw}");
+        assert!(raw.contains("[inline image/png data omitted]"), "{raw}");
+        assert!(!has_inline_data(&second.chat_history));
+
+        runner.follow_up("and now?".to_string());
+        runner.next().await.unwrap().unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(
+            !serde_json::to_string(&requests[2].raw_history)
+                .unwrap()
+                .contains(&encoded)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stopping_a_task_prunes_its_transient_inline_data() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let model = Model::with_completer(Arc::new(InlineMediaCompleter {
+            requests: requests.clone(),
+        }));
+        let ctx = EngineBuilder::new()
+            .with_model(model)
+            .register_tool(Arc::new(EchoTool))
+            .unwrap()
+            .mock_ctx();
+        let bytes = b"stopped image bytes";
+        let encoded = anda_core::ByteBufB64(bytes.to_vec()).to_base64();
+        let mut runner = ctx
+            .completion_iter(image_request(bytes), Vec::new())
+            .unbound();
+        runner.set_transient_inline_data(true);
+
+        runner.next().await.unwrap().unwrap();
+        assert!(
+            serde_json::to_string(&runner.req().raw_history)
+                .unwrap()
+                .contains(&encoded)
+        );
+
+        let output = runner.stop_current_task(AgentOutput::default());
+        assert!(
+            !serde_json::to_string(&runner.req().raw_history)
+                .unwrap()
+                .contains(&encoded)
+        );
+        assert!(!has_inline_data(&output.chat_history));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn inline_data_stays_in_history_unless_transient() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let model = Model::with_completer(Arc::new(InlineMediaCompleter {
+            requests: requests.clone(),
+        }));
+        let ctx = EngineBuilder::new()
+            .with_model(model)
+            .register_tool(Arc::new(EchoTool))
+            .unwrap()
+            .mock_ctx();
+        let bytes = b"kept image bytes";
+        let encoded = anda_core::ByteBufB64(bytes.to_vec()).to_base64();
+        let mut runner = ctx
+            .completion_iter(image_request(bytes), Vec::new())
+            .unbound();
+
+        runner.next().await.unwrap().unwrap();
+        runner.next().await.unwrap().unwrap();
+        assert!(runner.is_idle());
+        assert!(has_inline_data(runner.chat_history()));
+        assert!(
+            serde_json::to_string(&runner.req().raw_history)
+                .unwrap()
+                .contains(&encoded)
+        );
+    }
+
+    #[test]
+    fn strip_inline_data_keeps_other_parts_or_leaves_a_note() {
+        let inline = ContentPart::InlineData {
+            mime_type: "image/png".to_string(),
+            data: anda_core::ByteBufB64(vec![1, 2, 3]),
+        };
+        let data_uri = ContentPart::FileData {
+            file_uri: "data:application/pdf;base64,AAAA".to_string(),
+            mime_type: Some("application/pdf".to_string()),
+        };
+        let remote = ContentPart::FileData {
+            file_uri: "https://example.com/a.pdf".to_string(),
+            mime_type: Some("application/pdf".to_string()),
+        };
+        let mut messages = vec![
+            Message {
+                role: "user".to_string(),
+                content: vec!["caption".to_string().into(), inline.clone(), remote.clone()],
+                ..Default::default()
+            },
+            Message {
+                role: "user".to_string(),
+                content: vec![data_uri, inline],
+                ..Default::default()
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: Vec::new(),
+                ..Default::default()
+            },
+        ];
+
+        super::strip_inline_data(&mut messages);
+
+        assert_eq!(
+            messages[0].content,
+            vec!["caption".to_string().into(), remote]
+        );
+        assert_eq!(
+            messages[1].content,
+            vec![ContentPart::Text {
+                text: "[inline application/pdf data omitted]".to_string()
+            }]
+        );
+        assert!(messages[2].content.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handoff_keeps_transient_inline_data() {
+        let ctx = EngineBuilder::new()
+            .with_model(Model::with_completer(Arc::new(EchoCompleter)))
+            .mock_ctx();
+        let mut runner = ctx.completion_iter(CompletionRequest::default(), Vec::new());
+        runner.set_transient_inline_data(true);
+
+        let (new_runner, _output) = runner.handoff(None).await.unwrap();
+        assert!(new_runner.transient_inline_data);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn add_tools_appends_new_definitions_and_keeps_discovered_ones() {
+        let ctx = EngineBuilder::new().mock_ctx();
+        let tool = |name: &str| FunctionDefinition {
+            name: name.to_string(),
+            ..Default::default()
+        };
+        let req = CompletionRequest {
+            tools: vec![tool("first")],
+            ..Default::default()
+        };
+        let mut runner = ctx.completion_iter(req, Vec::new());
+        runner.set_merge_discovered_tools(Some(true));
+        runner.add_discovered_tools_from_output(
+            "tools_select",
+            &json!({"tools": [{
+                "name": "echo_tool",
+                "description": "Echoes input",
+                "parameters": {"type": "object"},
+                "strict": true
+            }]}),
+        );
+
+        runner.add_tools(vec![tool("First"), tool("second"), tool("second")]);
+
+        let names = runner
+            .req()
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["first", "second"]);
+        assert!(runner.discovered.contains("echo_tool"));
+
+        // `set_tools` replaces the offer and forgets what was discovered.
+        runner.set_tools(vec![tool("third")]);
+        assert!(!runner.discovered.contains("echo_tool"));
     }
 }

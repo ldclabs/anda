@@ -4,8 +4,36 @@ All notable changes to the Anda project will be documented in this file.
 
 ## [Unreleased]
 
+## [anda_core 0.16.3 / anda_engine 0.16.5] — 2026-10-08
+
+### Added — anda_engine
+
+- **Task-scoped inline attachments** — `CompletionRunner::set_transient_inline_data`
+  lets a long-lived runner send attachment bytes without keeping them: request
+  `InlineData` parts (and `FileData` with a `data:` URI) reach the model on every
+  turn of the task that introduced them, never enter the neutral `chat_history`
+  (a message left empty keeps a short note), and are replaced in `raw_history`
+  by a text note when the runner goes idle or `stop_current_task` runs. A runner
+  created by `handoff` inherits the setting.
+- **`CompletionFeaturesDyn::prune_inline_media`** — replaces inline media in
+  provider raw history (Anthropic base64/text image and document blocks, OpenAI
+  Chat `image_url`/`video_url` data URLs, `input_audio` and `file` data, OpenAI
+  Responses `input_image`/`input_file`/`input_audio`, Gemini `inlineData`) with a
+  note in the provider's text shape, keeping media referenced by URL or file id.
+  The default is a union over the built-in adapters; `Model::prune_inline_media`
+  forwards to it.
+- **`CompletionRunner::add_tools`** — appends tool definitions not already
+  offered without resetting the tools discovered through `tools_select`, which
+  `set_tools` forgets.
+
 ### Changed — anda_core
 
+- **Inline images are no longer sized by their bytes** —
+  `ContentPart::estimated_tokens` caps an `image/*` `InlineData` part at 5,000
+  tokens. Providers bill an image by its resolution and downscale large ones, so
+  the `len / 3` estimate made one phone photo look like a million tokens and
+  pushed callers into needless context compaction. Other inline data keeps the
+  byte-based estimate.
 - **Forced tool choice documented** — `CompletionRequest::tool_choice_required`
   now explains that adapters map it to the provider's forced tool choice, and
   that Claude Opus 5.5, Claude Sonnet 5.5, and Claude Fable 5.1 reject it with a

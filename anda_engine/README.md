@@ -116,6 +116,14 @@ model step is pending. Failed context compaction leaves the original runner
 usable. Stop/cancel controls interrupt pending subagent work; native shell
 cancellation cleans up the process tree and output readers.
 
+A long-lived runner can send attachment bytes for one task only:
+`set_transient_inline_data(true)` keeps `InlineData` (and `data:` `FileData`)
+out of the neutral `chat_history`, and the provider raw history replaces them
+with a short note once the runner goes idle or its task is stopped. Send a
+reference alongside the bytes so the attachment can be found later.
+`add_tools` offers more tool definitions mid-session without forgetting the
+tools the model discovered, unlike `set_tools`.
+
 Agent dependencies supplied by dynamic providers are verified after provider
 initialization during engine build. Exact `SA_`, `RA_`, and `RT_` callable names
 can be used when requesting definitions.

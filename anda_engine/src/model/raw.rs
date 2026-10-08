@@ -16,6 +16,7 @@
 //! provider-specific fields such as reasoning signatures.
 
 use anda_core::Json;
+use serde_json::json;
 
 /// Removes unanswered tool-call requests from `raw_history[start..]`.
 ///
@@ -38,6 +39,114 @@ pub(crate) fn prune_tool_interactions(raw_history: &mut Vec<Json>) {
     *raw_history = prune_items(items, |value| {
         is_tool_call_item(value) || is_tool_output_item(value)
     });
+}
+
+/// Replaces inline media payloads in provider raw history with a short text note.
+///
+/// Inline media is anything that carries its bytes in the request: base64 or text sources,
+/// `data:` URLs, and audio or file data fields. Media referenced by a remote URL or a provider
+/// file id is kept. The note takes the text shape of the provider the item belongs to, so the
+/// surrounding message keeps valid, non-empty content.
+pub(crate) fn prune_inline_media(raw_history: &mut [Json]) {
+    for item in raw_history {
+        replace_inline_media(item, false);
+    }
+}
+
+fn replace_inline_media(value: &mut Json, responses: bool) {
+    match value {
+        Json::Array(items) => {
+            // OpenAI Chat and Responses share the `input_audio` shape but not their text shape;
+            // a Responses item among the siblings settles which one this array uses.
+            let responses = responses || items.iter().any(is_responses_content_item);
+            for item in items {
+                match inline_media_note(item, responses) {
+                    Some(note) => *item = note,
+                    None => replace_inline_media(item, responses),
+                }
+            }
+        }
+        Json::Object(map) => {
+            let responses = responses
+                || matches!(
+                    map.get("type").and_then(Json::as_str),
+                    Some("message" | "function_call_output")
+                );
+            for value in map.values_mut() {
+                replace_inline_media(value, responses);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_responses_content_item(value: &Json) -> bool {
+    matches!(
+        value.get("type").and_then(Json::as_str),
+        Some("input_text" | "input_image" | "input_file" | "output_text" | "refusal")
+    )
+}
+
+/// Returns the replacement for `item` when it is an inline media block.
+fn inline_media_note(item: &Json, responses: bool) -> Option<Json> {
+    let map = item.as_object()?;
+
+    // Gemini parts carry no `type`; the payload sits under `inlineData`.
+    if let Some(data) = map.get("inlineData").or_else(|| map.get("inline_data")) {
+        let mime = str_at(data.get("mimeType").or_else(|| data.get("mime_type")));
+        return Some(json!({ "text": inline_media_text(mime) }));
+    }
+
+    let kind = str_at(map.get("type"))?;
+    let mime = match kind {
+        // Anthropic image and document blocks.
+        "image" | "document" => {
+            let source = map.get("source")?;
+            match str_at(source.get("type"))? {
+                "base64" | "text" => str_at(source.get("media_type")).map(str::to_string),
+                "url" => Some(data_url_mime(str_at(source.get("url"))?)?),
+                _ => return None,
+            }
+        }
+        // OpenAI Chat Completions.
+        "image_url" | "video_url" => Some(data_url_mime(str_at(map.get(kind)?.get("url"))?)?),
+        "file" => Some(data_url_mime(str_at(map.get("file")?.get("file_data"))?)?),
+        // OpenAI Responses (and Chat Completions for `input_audio`).
+        "input_image" => Some(data_url_mime(str_at(map.get("image_url"))?)?),
+        "input_file" => Some(data_url_mime(str_at(map.get("file_data"))?)?),
+        "input_audio" => {
+            let audio = map.get("input_audio")?;
+            str_at(audio.get("data"))?;
+            str_at(audio.get("format")).map(|format| format!("audio/{format}"))
+        }
+        _ => return None,
+    };
+
+    let text_kind = match kind {
+        "input_image" | "input_file" => "input_text",
+        "input_audio" if responses => "input_text",
+        _ => "text",
+    };
+    Some(json!({ "type": text_kind, "text": inline_media_text(mime.as_deref()) }))
+}
+
+fn str_at(value: Option<&Json>) -> Option<&str> {
+    value.and_then(Json::as_str)
+}
+
+/// Returns the MIME type of a `data:` URL, or `None` for any other URL.
+fn data_url_mime(url: &str) -> Option<String> {
+    let header = url.strip_prefix("data:")?;
+    let mime = header
+        .split([';', ','])
+        .next()
+        .filter(|mime| !mime.is_empty())
+        .unwrap_or("application/octet-stream");
+    Some(mime.to_string())
+}
+
+pub(crate) fn inline_media_text(mime: Option<&str>) -> String {
+    format!("[inline {} data omitted]", mime.unwrap_or("media"))
 }
 
 /// Drops every item `is_pruned` classifies, recursing into wrapper items so a
@@ -427,5 +536,88 @@ mod tests {
         assert!(pruned.contains("planning"));
         assert!(!pruned.contains("rs_orphan"));
         assert!(!pruned.contains("call_1"));
+    }
+
+    #[test]
+    fn replaces_inline_media_in_every_provider_shape() {
+        let note = |mime: &str| format!("[inline {mime} data omitted]");
+        let mut raw_history = vec![
+            // Anthropic: base64 image, text document, and an image inside a tool result.
+            json!({"role": "user", "content": [
+                {"type": "text", "text": "look"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}},
+                {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": "body"}},
+                {"type": "image", "source": {"type": "url", "url": "https://example.com/a.png"}},
+                {"type": "tool_result", "tool_use_id": "t1", "content": [
+                    {"type": "image", "source": {"type": "url", "url": "data:image/jpeg;base64,BBBB"}}
+                ]}
+            ]}),
+            // OpenAI Chat Completions.
+            json!({"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/webp;base64,CCCC"}},
+                {"type": "image_url", "image_url": {"url": "https://example.com/b.png"}},
+                {"type": "input_audio", "input_audio": {"data": "DDDD", "format": "wav"}},
+                {"type": "file", "file": {"file_data": "data:application/pdf;base64,EEEE", "filename": "a.pdf"}}
+            ]}),
+            // OpenAI Responses: `input_audio` takes the Responses text shape here.
+            json!({"type": "message", "role": "user", "content": [
+                {"type": "input_image", "image_url": "data:image/gif;base64,FFFF", "detail": "auto"},
+                {"type": "input_image", "file_id": "file_1", "detail": "auto"},
+                {"type": "input_file", "file_data": "data:text/csv;base64,GGGG"},
+                {"type": "input_audio", "input_audio": {"data": "HHHH", "format": "mp3"}}
+            ]}),
+            // Gemini.
+            json!({"role": "user", "parts": [
+                {"inlineData": {"mimeType": "video/mp4", "data": "IIII"}},
+                {"fileData": {"fileUri": "gs://bucket/v.mp4", "mimeType": "video/mp4"}},
+                {"text": "kept"}
+            ]}),
+        ];
+
+        prune_inline_media(&mut raw_history);
+
+        assert_eq!(
+            raw_history[0]["content"],
+            json!([
+                {"type": "text", "text": "look"},
+                {"type": "text", "text": note("image/png")},
+                {"type": "text", "text": note("text/plain")},
+                {"type": "image", "source": {"type": "url", "url": "https://example.com/a.png"}},
+                {"type": "tool_result", "tool_use_id": "t1", "content": [
+                    {"type": "text", "text": note("image/jpeg")}
+                ]}
+            ])
+        );
+        assert_eq!(
+            raw_history[1]["content"],
+            json!([
+                {"type": "text", "text": note("image/webp")},
+                {"type": "image_url", "image_url": {"url": "https://example.com/b.png"}},
+                {"type": "text", "text": note("audio/wav")},
+                {"type": "text", "text": note("application/pdf")}
+            ])
+        );
+        assert_eq!(
+            raw_history[2]["content"],
+            json!([
+                {"type": "input_text", "text": note("image/gif")},
+                {"type": "input_image", "file_id": "file_1", "detail": "auto"},
+                {"type": "input_text", "text": note("text/csv")},
+                {"type": "input_text", "text": note("audio/mp3")}
+            ])
+        );
+        assert_eq!(
+            raw_history[3]["parts"],
+            json!([
+                {"text": note("video/mp4")},
+                {"fileData": {"fileUri": "gs://bucket/v.mp4", "mimeType": "video/mp4"}},
+                {"text": "kept"}
+            ])
+        );
+
+        // Pruning again finds nothing left to replace.
+        let pruned = raw_history.clone();
+        prune_inline_media(&mut raw_history);
+        assert_eq!(raw_history, pruned);
     }
 }
