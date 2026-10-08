@@ -543,7 +543,9 @@ pub trait CompletionFeaturesDyn: Send + Sync + 'static {
     ///
     /// Callers that send attachment bytes for one task use this at an idle boundary, so the
     /// bytes are not replayed on every later request. Media referenced by remote URL or
-    /// provider file id must stay, and no message may be left without content.
+    /// provider file id must stay, messages the model wrote keep the media it generated, and
+    /// no message may be left without content. Where the provider accepts only media (Gemini
+    /// function-response parts), inline media is removed and the note joins the response text.
     ///
     /// The default implementation is a conservative union over the built-in provider wire
     /// shapes; override it when your provider's raw items are not covered by it.

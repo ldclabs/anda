@@ -45,11 +45,17 @@ pub(crate) fn prune_tool_interactions(raw_history: &mut Vec<Json>) {
 ///
 /// Inline media is anything that carries its bytes in the request: base64 or text sources,
 /// `data:` URLs, and audio or file data fields. Media referenced by a remote URL or a provider
-/// file id is kept. The note takes the text shape of the provider the item belongs to, so the
-/// surrounding message keeps valid, non-empty content.
+/// file id is kept, and so are messages the model wrote: media it generated is its answer, not
+/// an attachment, and Gemini signs it. The note takes the text shape of the provider the item
+/// belongs to, so the surrounding message keeps valid, non-empty content.
 pub(crate) fn prune_inline_media(raw_history: &mut [Json]) {
     for item in raw_history {
-        replace_inline_media(item, false);
+        if !matches!(
+            item.get("role").and_then(Json::as_str),
+            Some("assistant" | "model")
+        ) {
+            replace_inline_media(item, false);
+        }
     }
 }
 
@@ -72,11 +78,48 @@ fn replace_inline_media(value: &mut Json, responses: bool) {
                     map.get("type").and_then(Json::as_str),
                     Some("message" | "function_call_output")
                 );
-            for value in map.values_mut() {
+            for (key, value) in map.iter_mut() {
+                if matches!(key.as_str(), "functionResponse" | "function_response") {
+                    drop_function_response_media(value);
+                }
                 replace_inline_media(value, responses);
             }
         }
         _ => {}
+    }
+}
+
+/// Gemini `FunctionResponsePart`s accept media only, so a text note in their place would be
+/// rejected: inline media leaves `parts`, and its note joins the response text instead.
+fn drop_function_response_media(response: &mut Json) {
+    let Some(response) = response.as_object_mut() else {
+        return;
+    };
+    let Some(Json::Array(parts)) = response.get_mut("parts") else {
+        return;
+    };
+    let mut notes = String::new();
+    parts.retain(|part| match inline_media_note(part, false) {
+        Some(note) => {
+            notes.push('\n');
+            notes.push_str(note.get("text").and_then(Json::as_str).unwrap_or_default());
+            false
+        }
+        None => true,
+    });
+    if parts.is_empty() {
+        response.remove("parts");
+    }
+    // The adapter sends a tool's presentation text as the `output` (or `error`) string.
+    if let Some(Json::Object(result)) = response.get_mut("response") {
+        let key = if result.contains_key("output") {
+            "output"
+        } else {
+            "error"
+        };
+        if let Some(Json::String(text)) = result.get_mut(key) {
+            text.push_str(&notes);
+        }
     }
 }
 
@@ -91,10 +134,19 @@ fn is_responses_content_item(value: &Json) -> bool {
 fn inline_media_note(item: &Json, responses: bool) -> Option<Json> {
     let map = item.as_object()?;
 
-    // Gemini parts carry no `type`; the payload sits under `inlineData`.
+    // Gemini parts carry no `type`; the payload sits under `inlineData`, or under `fileData`
+    // as a `data:` URI. (A Responses `input_file` has a string `file_data` instead.)
     if let Some(data) = map.get("inlineData").or_else(|| map.get("inline_data")) {
         let mime = str_at(data.get("mimeType").or_else(|| data.get("mime_type")));
         return Some(json!({ "text": inline_media_text(mime) }));
+    }
+    if let Some(data) = map
+        .get("fileData")
+        .or_else(|| map.get("file_data"))
+        .filter(|data| data.is_object())
+    {
+        let uri = str_at(data.get("fileUri").or_else(|| data.get("file_uri")))?;
+        return Some(json!({ "text": inline_media_text(Some(&data_url_mime(uri)?)) }));
     }
 
     let kind = str_at(map.get("type"))?;
@@ -113,7 +165,12 @@ fn inline_media_note(item: &Json, responses: bool) -> Option<Json> {
         "file" => Some(data_url_mime(str_at(map.get("file")?.get("file_data"))?)?),
         // OpenAI Responses (and Chat Completions for `input_audio`).
         "input_image" => Some(data_url_mime(str_at(map.get("image_url"))?)?),
-        "input_file" => Some(data_url_mime(str_at(map.get("file_data"))?)?),
+        // The adapter sends a `data:` `FileData` as `file_url`.
+        "input_file" => Some(
+            ["file_data", "file_url"]
+                .into_iter()
+                .find_map(|key| data_url_mime(str_at(map.get(key))?))?,
+        ),
         "input_audio" => {
             let audio = map.get("input_audio")?;
             str_at(audio.get("data"))?;
@@ -619,5 +676,93 @@ mod tests {
         let pruned = raw_history.clone();
         prune_inline_media(&mut raw_history);
         assert_eq!(raw_history, pruned);
+    }
+
+    #[test]
+    fn replaces_data_uri_file_references() {
+        let note = |mime: &str| format!("[inline {mime} data omitted]");
+        let mut raw_history = vec![
+            // OpenAI Responses sends a `data:` `FileData` as `file_url`.
+            json!({"type": "message", "role": "user", "content": [
+                {"type": "input_file", "file_url": "data:application/pdf;base64,AAAA"},
+                {"type": "input_file", "file_url": "https://example.com/a.pdf"}
+            ]}),
+            // Gemini sends it as `fileData`.
+            json!({"role": "user", "parts": [
+                {"fileData": {"fileUri": "data:application/pdf;base64,BBBB", "mimeType": "application/pdf"}},
+                {"fileData": {"fileUri": "https://example.com/b.pdf", "mimeType": "application/pdf"}}
+            ]}),
+        ];
+
+        prune_inline_media(&mut raw_history);
+
+        assert_eq!(
+            raw_history[0]["content"],
+            json!([
+                {"type": "input_text", "text": note("application/pdf")},
+                {"type": "input_file", "file_url": "https://example.com/a.pdf"}
+            ])
+        );
+        assert_eq!(
+            raw_history[1]["parts"],
+            json!([
+                {"text": note("application/pdf")},
+                {"fileData": {"fileUri": "https://example.com/b.pdf", "mimeType": "application/pdf"}}
+            ])
+        );
+    }
+
+    #[test]
+    fn gemini_function_response_media_is_dropped_not_turned_into_text() {
+        let mut raw_history = vec![json!({"role": "user", "parts": [
+            {"functionResponse": {
+                "name": "screenshot",
+                "response": {"output": "captured"},
+                "parts": [{"inlineData": {"mimeType": "image/png", "data": "AAAA"}}]
+            }},
+            {"functionResponse": {
+                "name": "render",
+                "response": {"output": "rendered"},
+                "parts": [
+                    {"inlineData": {"mimeType": "image/jpeg", "data": "BBBB"}},
+                    {"fileData": {"fileUri": "gs://bucket/c.png", "mimeType": "image/png"}}
+                ]
+            }}
+        ]})];
+
+        prune_inline_media(&mut raw_history);
+
+        // `FunctionResponsePart` accepts media only, so a text note there would be rejected.
+        assert_eq!(
+            raw_history[0]["parts"],
+            json!([
+                {"functionResponse": {
+                    "name": "screenshot",
+                    "response": {"output": "captured\n[inline image/png data omitted]"}
+                }},
+                {"functionResponse": {
+                    "name": "render",
+                    "response": {"output": "rendered\n[inline image/jpeg data omitted]"},
+                    "parts": [{"fileData": {"fileUri": "gs://bucket/c.png", "mimeType": "image/png"}}]
+                }}
+            ])
+        );
+    }
+
+    #[test]
+    fn keeps_media_the_model_generated() {
+        let generated = vec![
+            json!({"role": "model", "parts": [
+                {"inlineData": {"mimeType": "image/png", "data": "AAAA"}, "thoughtSignature": "sig"}
+            ]}),
+            json!({"role": "assistant", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "BBBB"}}
+            ]}),
+        ];
+        let mut raw_history = generated.clone();
+
+        prune_inline_media(&mut raw_history);
+
+        assert_eq!(raw_history, generated);
     }
 }

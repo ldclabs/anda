@@ -4,6 +4,34 @@ All notable changes to the Anda project will be documented in this file.
 
 ## [Unreleased]
 
+## [anda_core 0.16.3 / anda_engine 0.16.5] — 2026-10-08
+
+### Added — anda_engine
+
+- **Task-scoped inline attachments** — `CompletionRunner::set_transient_inline_data`
+  lets a long-lived runner send attachment bytes without keeping them: request
+  `InlineData` parts (and `FileData` with a `data:` URI) reach the model on every
+  turn of the task that introduced them, never enter the neutral `chat_history`
+  (a message left empty keeps a short note), and are replaced in `raw_history`
+  by a text note when the runner goes idle, `stop_current_task` runs, or
+  `discard_in_flight_request` drops the task. Media the model generated stays in
+  its reply. A model switch or `handoff` in the middle of a task replays the
+  neutral history, so the bytes leave early. A runner created by `handoff`
+  inherits the setting.
+- **`CompletionFeaturesDyn::prune_inline_media`** — replaces inline media in
+  provider raw history (Anthropic base64/text image and document blocks, OpenAI
+  Chat `image_url`/`video_url` data URLs, `input_audio` and `file` data, OpenAI
+  Responses `input_image`/`input_file`/`input_audio` including `data:` file
+  URLs, Gemini `inlineData` and `data:` `fileData`) with a note in the
+  provider's text shape, keeping media referenced by URL or file id and the
+  messages the model wrote. Gemini function-response media, which
+  `FunctionResponsePart` accepts only as media, leaves `parts`, and its note
+  joins the response text. The default is a union over the built-in adapters;
+  `Model::prune_inline_media` forwards to it.
+- **`CompletionRunner::add_tools`** — appends tool definitions not already
+  offered without resetting the tools discovered through `tools_select`, which
+  `set_tools` forgets.
+
 ### Fixed — anda_engine
 
 - **Stopping a task keeps the conversation the runner replays** —
@@ -33,38 +61,14 @@ All notable changes to the Anda project will be documented in this file.
   poll, so collecting a stream against a persistently failing model (or no
   configured model) never finished. The runner keeps its state for callers that
   want to recover through `stream.runner`.
-
-### Changed — anda_engine
-
-- **Simpler completion runner internals** — Tool execution returns its outputs
-  without an infallible `Result` or optional results and shares one error
-  constructor, the unprefixed-subagent dispatch branch that could only fail is
-  gone, and `finalize`, `AgentCtx::completion`, history replay, idle snapshots,
-  queued-input draining, and the note index loader share helpers instead of
-  repeating them. Steps without a subagent scope no longer allocate a default
-  one.
-
-## [anda_core 0.16.3 / anda_engine 0.16.5] — 2026-10-08
-
-### Added — anda_engine
-
-- **Task-scoped inline attachments** — `CompletionRunner::set_transient_inline_data`
-  lets a long-lived runner send attachment bytes without keeping them: request
-  `InlineData` parts (and `FileData` with a `data:` URI) reach the model on every
-  turn of the task that introduced them, never enter the neutral `chat_history`
-  (a message left empty keeps a short note), and are replaced in `raw_history`
-  by a text note when the runner goes idle or `stop_current_task` runs. A runner
-  created by `handoff` inherits the setting.
-- **`CompletionFeaturesDyn::prune_inline_media`** — replaces inline media in
-  provider raw history (Anthropic base64/text image and document blocks, OpenAI
-  Chat `image_url`/`video_url` data URLs, `input_audio` and `file` data, OpenAI
-  Responses `input_image`/`input_file`/`input_audio`, Gemini `inlineData`) with a
-  note in the provider's text shape, keeping media referenced by URL or file id.
-  The default is a union over the built-in adapters; `Model::prune_inline_media`
-  forwards to it.
-- **`CompletionRunner::add_tools`** — appends tool definitions not already
-  offered without resetting the tools discovered through `tools_select`, which
-  `set_tools` forgets.
+- **Interrupted tool calls are answered in a replayed history** — After a live
+  model switch the request replays the neutral history, which holds the pending
+  tool calls; a stop or discard closed them only in `chat_history`, so the next
+  request sent a tool call without a result and the provider rejected it.
+- **Implicit context no longer splits tool calls from their outputs** — A step
+  that sends tool outputs left queued by a failed `handoff` or a failed request
+  inserted the implicit context as a user message between the calls and their
+  outputs. It now waits for the next user turn, like the note index.
 
 ### Changed — anda_core
 
@@ -80,6 +84,16 @@ All notable changes to the Anda project will be documented in this file.
   that Claude Opus 5.5, Claude Sonnet 5.5, and Claude Fable 5.1 reject it with a
   400: leave it unset for those models, name the tool in the prompt, and mark the
   tool `strict` when schema-valid arguments matter.
+
+### Changed — anda_engine
+
+- **Simpler completion runner internals** — Tool execution returns its outputs
+  without an infallible `Result` or optional results and shares one error
+  constructor, the unprefixed-subagent dispatch branch that could only fail is
+  gone, and `finalize`, `AgentCtx::completion`, history replay, idle snapshots,
+  queued-input draining, and the note index loader share helpers instead of
+  repeating them. Steps without a subagent scope no longer allocate a default
+  one.
 
 ## [anda_engine 0.16.4] — 2026-09-29
 

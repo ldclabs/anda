@@ -298,12 +298,14 @@ impl CompletionRunner {
     ///
     /// When enabled, `InlineData` parts (and `FileData` parts with a `data:` URI) in request
     /// content still reach the model, but the provider-neutral [`Self::chat_history`] never
-    /// records them, and the provider raw history drops them once the runner goes idle or its
-    /// task is stopped. The model therefore sees the bytes on every turn of the task that
-    /// introduced them and not afterwards; a caller that persists history should send a
-    /// reference alongside the bytes so the attachment can be found again. A message left with
-    /// no other content keeps a short text note. A runner created by [`Self::handoff`] inherits
-    /// the setting.
+    /// records them, and the provider raw history drops them once the runner goes idle, its
+    /// task is stopped, or its in-flight request is discarded. The model therefore sees the
+    /// bytes on every turn of the task that introduced them and not afterwards; a caller that
+    /// persists history should send a reference alongside the bytes so the attachment can be
+    /// found again. The bytes live only in the raw history, so a model switch or
+    /// [`Self::handoff`] in the middle of the task, which replays the neutral history, drops
+    /// them early. A message left with no other content keeps a short text note, and media the
+    /// model generated is kept. A runner created by [`Self::handoff`] inherits the setting.
     pub fn set_transient_inline_data(&mut self, transient: bool) {
         self.transient_inline_data = transient;
     }
@@ -437,6 +439,8 @@ impl CompletionRunner {
     /// history is pruned.
     pub fn discard_in_flight_request(&mut self) {
         self.discard_in_flight_request_with_interrupted_tool_outputs("tool call discarded", None);
+        // The discarded task is over; later input must not replay its attachment bytes.
+        self.prune_transient_inline_data();
     }
 
     /// Prunes completed tool interactions from the accumulated provider raw history.
@@ -537,11 +541,17 @@ impl CompletionRunner {
             })
             .collect::<Vec<_>>();
 
-        self.chat_history.push(Message {
+        let message = Message {
             role: "tool".to_string(),
             content,
             ..Default::default()
-        });
+        };
+        // After a model switch the request replays the neutral history, which holds the same
+        // calls; it survives the interruption, so it must be answered there too.
+        if !Self::unanswered_tool_calls(&self.req.chat_history).is_empty() {
+            self.req.chat_history.push(message.clone());
+        }
+        self.chat_history.push(message);
     }
 
     /// Set an implicit context message that is automatically included in the next request.
@@ -1129,7 +1139,7 @@ impl CompletionRunner {
     async fn load_note_context(&mut self) -> Result<(), BoxError> {
         use crate::extension::note::{NoteContextConfig, NoteTool, load_note_summary};
 
-        if self.note_context_loaded || self.req.role.as_deref() == Some("tool") {
+        if self.note_context_loaded {
             return Ok(());
         }
         // Child contexts inherit the config, so also require that this request offers the
@@ -1185,6 +1195,9 @@ impl CompletionRunner {
                 return Ok(None);
             }
         }
+        // Outputs left queued by a failed step or handoff answer calls too; a user message
+        // between those calls and their outputs would be rejected.
+        let tool_round = tool_round || self.req.role.as_deref() == Some("tool");
 
         self.sync_model_for_next_turn();
         if !tool_round {
@@ -1303,9 +1316,13 @@ fn tool_error(message: String) -> ToolOutput<Json> {
 
 /// Drops inline payloads (`InlineData` parts and `FileData` parts with a `data:` URI) from
 /// provider-neutral messages. A message left without content keeps a short text note so its
-/// turn is not lost.
+/// turn is not lost. Assistant messages are kept whole: media the model generated is its
+/// answer, not an attachment.
 fn strip_inline_data(messages: &mut [Message]) {
-    for message in messages {
+    for message in messages
+        .iter_mut()
+        .filter(|message| message.role != "assistant")
+    {
         let mut omitted: Option<Option<String>> = None;
         message.content.retain(|part| match part {
             ContentPart::InlineData { mime_type, .. } => {
@@ -4277,12 +4294,18 @@ mod tests {
             },
             Message {
                 role: "user".to_string(),
-                content: vec![data_uri, inline],
+                content: vec![data_uri, inline.clone()],
                 ..Default::default()
             },
             Message {
                 role: "assistant".to_string(),
                 content: Vec::new(),
+                ..Default::default()
+            },
+            // Media the model generated is its answer, not an attachment.
+            Message {
+                role: "assistant".to_string(),
+                content: vec![inline.clone()],
                 ..Default::default()
             },
         ];
@@ -4300,6 +4323,7 @@ mod tests {
             }]
         );
         assert!(messages[2].content.is_empty());
+        assert_eq!(messages[3].content, vec![inline]);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -4553,5 +4577,198 @@ mod tests {
             part,
             ContentPart::ToolOutput { call_id, .. } if call_id.as_deref() == Some("echo_call")
         )));
+    }
+
+    fn echo_call_message() -> Message {
+        Message {
+            role: "assistant".to_string(),
+            content: vec![ContentPart::ToolCall {
+                name: "echo_tool".to_string(),
+                args: json!({ "input": "hi" }),
+                call_id: Some("echo_call".into()),
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn transient_inline_data_keeps_media_the_model_generated() {
+        let generated = ContentPart::InlineData {
+            mime_type: "image/png".to_string(),
+            data: anda_core::ByteBufB64(b"generated image".to_vec()),
+        };
+        let encoded = anda_core::ByteBufB64(b"generated image".to_vec()).to_base64();
+        let completer = ScriptedCompleter::new("scripted")
+            .push_output(AgentOutput {
+                content: "here it is".to_string(),
+                chat_history: vec![
+                    text_message("user", "draw a cat"),
+                    Message {
+                        role: "assistant".to_string(),
+                        content: vec!["here it is".to_string().into(), generated.clone()],
+                        ..Default::default()
+                    },
+                ],
+                raw_history: vec![
+                    json!({"role": "user", "parts": [{"text": "draw a cat"}]}),
+                    json!({"role": "model", "parts": [
+                        {"text": "here it is"},
+                        {"inlineData": {"mimeType": "image/png", "data": encoded}, "thoughtSignature": "sig"}
+                    ]}),
+                ],
+                ..Default::default()
+            })
+            .into_arc();
+        let ctx = EngineBuilder::new()
+            .with_model(Model::with_completer(completer))
+            .mock_ctx();
+        let mut runner = ctx
+            .completion_iter(
+                CompletionRequest {
+                    prompt: "draw a cat".to_string(),
+                    ..Default::default()
+                },
+                Vec::new(),
+            )
+            .unbound();
+        runner.set_transient_inline_data(true);
+
+        // The generated image is the model's answer, not an attachment the caller sent.
+        let output = runner.next().await.unwrap().unwrap();
+        assert!(runner.is_idle());
+        assert_eq!(output.chat_history[1].content[1], generated);
+        let raw = serde_json::to_string(&runner.req().raw_history).unwrap();
+        assert!(raw.contains(&encoded), "{raw}");
+        assert!(raw.contains("thoughtSignature"), "{raw}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn discarding_a_failed_request_prunes_its_transient_inline_data() {
+        let encoded = anda_core::ByteBufB64(b"discarded image bytes".to_vec()).to_base64();
+        let completer = ScriptedCompleter::new("scripted")
+            .push_output(AgentOutput {
+                raw_history: vec![json!({"role": "user", "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": encoded}}
+                ]})],
+                tool_calls: vec![echo_call()],
+                ..Default::default()
+            })
+            .push_error("model error")
+            .into_arc();
+        let ctx = EngineBuilder::new()
+            .with_model(Model::with_completer(completer.clone()))
+            .register_tool(Arc::new(EchoTool))
+            .unwrap()
+            .mock_ctx();
+        let mut runner = ctx
+            .completion_iter(image_request(b"discarded image bytes"), Vec::new())
+            .unbound();
+        runner.set_transient_inline_data(true);
+
+        runner.next().await.unwrap().unwrap();
+        // The tool round's request fails, and the host drops it.
+        assert!(runner.next().await.is_err());
+        runner.discard_in_flight_request();
+        assert!(runner.is_idle());
+
+        // The failed task is over, so the next one must not replay its bytes.
+        runner.follow_up("next".to_string());
+        runner.next().await.unwrap().unwrap();
+        let requests = completer.requests();
+        let next = serde_json::to_string(&requests.last().unwrap().raw_history).unwrap();
+        assert!(!next.contains(&encoded), "{next}");
+        assert!(next.contains("[inline image/png data omitted]"), "{next}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stopping_a_tool_round_after_a_model_switch_answers_its_calls_in_the_replay() {
+        let first = ScriptedCompleter::new("provider_a")
+            .push_output(AgentOutput {
+                chat_history: vec![echo_call_message()],
+                raw_history: vec![json!({"provider": "provider_a"})],
+                tool_calls: vec![echo_call()],
+                ..Default::default()
+            })
+            .into_arc();
+        let second = ScriptedCompleter::new("provider_b")
+            .push_error("model error")
+            .into_arc();
+        let ctx = EngineBuilder::new()
+            .with_model(Model::with_completer(first))
+            .register_tool(Arc::new(EchoTool))
+            .unwrap()
+            .mock_ctx();
+        let mut runner = ctx
+            .clone()
+            .completion_iter(
+                CompletionRequest {
+                    prompt: "call tool".to_string(),
+                    ..Default::default()
+                },
+                Vec::new(),
+            )
+            .unbound();
+        runner.next().await.unwrap().unwrap();
+
+        // The model switches before the tool outputs are sent, so the request replays the
+        // neutral history, and that request fails.
+        ctx.models.set_model(Model::with_completer(second.clone()));
+        assert!(runner.next().await.is_err());
+        runner.stop_current_task(AgentOutput::default());
+
+        runner.follow_up("next".to_string());
+        assert_eq!(runner.next().await.unwrap().unwrap().content, "next");
+        let requests = second.requests();
+        let replay = &requests.last().unwrap().chat_history;
+        assert!(
+            CompletionRunner::unanswered_tool_calls(replay).is_empty(),
+            "{replay:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn implicit_context_does_not_split_tool_calls_from_their_outputs() {
+        let completer = ScriptedCompleter::new("scripted")
+            .push_output(AgentOutput {
+                tool_calls: vec![echo_call()],
+                ..Default::default()
+            })
+            .push_error("summary failed")
+            .into_arc();
+        let ctx = EngineBuilder::new()
+            .with_model(Model::with_completer(completer.clone()))
+            .register_tool(Arc::new(EchoTool))
+            .unwrap()
+            .mock_ctx();
+        let mut runner = ctx
+            .completion_iter(
+                CompletionRequest {
+                    prompt: "call tool".to_string(),
+                    ..Default::default()
+                },
+                Vec::new(),
+            )
+            .unbound();
+        runner.next().await.unwrap().unwrap();
+        runner.implicit_context(text_message("user", "implicit context"));
+        // The failed summary leaves the executed outputs as the next request.
+        assert!(runner.handoff(None).await.is_err());
+
+        let has_implicit_context = |req: &CompletionRequest| {
+            req.chat_history
+                .iter()
+                .any(|message| message.text().as_deref() == Some("implicit context"))
+        };
+        // A user message between the calls and their outputs is rejected by providers.
+        runner.next().await.unwrap().unwrap();
+        let requests = completer.requests();
+        let tool_turn = requests.last().unwrap();
+        assert_eq!(tool_turn.role.as_deref(), Some("tool"));
+        assert!(!has_implicit_context(tool_turn));
+
+        // It rides with the next user turn instead.
+        runner.follow_up("next".to_string());
+        runner.next().await.unwrap().unwrap();
+        assert!(has_implicit_context(completer.requests().last().unwrap()));
     }
 }

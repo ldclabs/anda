@@ -1095,6 +1095,7 @@ mod tests {
     fn prune_inline_media_covers_gemini_inline_parts() {
         let bytes = b"inline attachment bytes".to_vec();
         let encoded = anda_core::ByteBufB64(bytes.clone()).to_base64();
+        let file_encoded = anda_core::ByteBufB64(b"data uri attachment".to_vec()).to_base64();
         let msg = anda_core::Message {
             role: "user".into(),
             content: vec![
@@ -1107,6 +1108,10 @@ mod tests {
                     mime_type: "application/pdf".into(),
                     data: anda_core::ByteBufB64(bytes),
                 },
+                anda_core::ContentPart::FileData {
+                    file_uri: format!("data:application/pdf;base64,{file_encoded}"),
+                    mime_type: Some("application/pdf".into()),
+                },
             ],
             ..Default::default()
         };
@@ -1114,12 +1119,49 @@ mod tests {
         crate::model::raw::prune_inline_media(&mut raw);
         let sent = serde_json::to_string(&raw).unwrap();
         assert!(!sent.contains(&encoded), "{sent}");
+        assert!(!sent.contains(&file_encoded), "{sent}");
         assert!(sent.contains("[inline image/png data omitted]"), "{sent}");
         assert!(
             sent.contains("[inline application/pdf data omitted]"),
             "{sent}"
         );
         assert!(sent.contains("look"), "{sent}");
+    }
+
+    #[test]
+    fn prune_inline_media_keeps_gemini_function_responses_valid() {
+        let screenshot = anda_core::ByteBufB64(b"screenshot bytes".to_vec());
+        let encoded = screenshot.to_base64();
+        let msg = anda_core::Message {
+            role: "tool".into(),
+            content: vec![anda_core::ContentPart::ToolOutput {
+                name: "screenshot".into(),
+                output: anda_core::ToolPresentation {
+                    text: "captured".into(),
+                    media: vec![anda_core::ToolMedia {
+                        mime_type: "image/png".into(),
+                        data: screenshot,
+                    }],
+                }
+                .into_output(),
+                is_error: None,
+                call_id: Some("call_1".into()),
+                remote_id: None,
+            }],
+            ..Default::default()
+        };
+        let mut raw = vec![serde_json::to_value(types::Content::from(msg)).unwrap()];
+        assert!(serde_json::to_string(&raw).unwrap().contains(&encoded));
+
+        crate::model::raw::prune_inline_media(&mut raw);
+
+        // `FunctionResponsePart` accepts media only: the image leaves instead of becoming text.
+        let response = &raw[0]["parts"][0]["functionResponse"];
+        assert!(response.get("parts").is_none(), "{response}");
+        assert_eq!(
+            response["response"]["output"],
+            "captured\n[inline image/png data omitted]"
+        );
     }
 }
 

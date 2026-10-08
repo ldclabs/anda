@@ -3826,6 +3826,7 @@ mod tests {
     fn prune_inline_media_covers_openai_chat_and_responses_items() {
         let bytes = b"inline attachment bytes".to_vec();
         let encoded = anda_core::ByteBufB64(bytes.clone()).to_base64();
+        let file_encoded = anda_core::ByteBufB64(b"data uri attachment".to_vec()).to_base64();
         let msg = anda_core::Message {
             role: "user".into(),
             content: vec![
@@ -3837,6 +3838,10 @@ mod tests {
                 ContentPart::InlineData {
                     mime_type: "application/pdf".into(),
                     data: anda_core::ByteBufB64(bytes),
+                },
+                ContentPart::FileData {
+                    file_uri: format!("data:application/pdf;base64,{file_encoded}"),
+                    mime_type: Some("application/pdf".into()),
                 },
             ],
             ..Default::default()
@@ -3850,6 +3855,7 @@ mod tests {
             crate::model::raw::prune_inline_media(&mut raw);
             let sent = serde_json::to_string(&raw).unwrap();
             assert!(!sent.contains(&encoded), "{sent}");
+            assert!(!sent.contains(&file_encoded), "{sent}");
             assert!(sent.contains("[inline image/png data omitted]"), "{sent}");
             assert!(
                 sent.contains("[inline application/pdf data omitted]"),

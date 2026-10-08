@@ -222,7 +222,7 @@ Host --> Caller : response
 - `Engine` 是公开运行时边界。它对非 manager 调用者执行 exported agent/tool lists 检查，并自动导出 default agent。
 - `EngineBuilder` 默认使用 in-memory store、not-implemented Web3 client、无外部模型，并注册 discovery/subagent control agents。
 - `AgentCtx` 是主要调度面。它暴露本地 tools、动态 tool providers、本地 agents、subagents、已注册远程 engines，以及从 cache 动态加载的远程 engines。
-- `CompletionRunner` 是迭代式执行器。模型回合可以返回 tool calls；runner 执行它们，再把 tool outputs 回灌到下一轮模型请求。压缩摘要验证成功后才提交状态，失败时原 runner 仍可重试；stream 在正常终态提交前处理等待期间追加的输入。
+- `CompletionRunner` 是迭代式执行器。模型回合可以返回 tool calls；runner 执行它们，再把 tool outputs 回灌到下一轮模型请求。长任务 runner 可以把过长的历史压缩为 continuation handoff，并从摘要继续：待处理的 tool outputs 随历史一起被摘要；待处理的请求输入、排队的 follow-up/steering 以及 implicit context 则移交给替换 runner。压缩摘要验证成功后才提交状态，失败时原 runner 仍可重试；stream 在正常终态提交前处理等待期间追加的输入，某一步失败后即结束。
 - `tools_groups`、`tools_search` 和 `tools_select` 是 agents，不是旁路机制。`tools_groups` 返回当前可见 capability bundles 的紧凑目录；`tools_select` 可以把一个 group 展开成 schemas，发现到的 schemas 仍保留在 tool-output context 中，并压缩 conversation context 中重复的 schema payload。
 - `BaseCtx` 创建命名空间隔离的 child contexts。Agent 路径使用 `a_<agent>`，tool 路径使用 `t_<tool>`，store/cache 操作都在该 path 下解析。
 - `Models` 先按 label 路由，再回落到 primary/default model。provider 真实模型名留在 adapter 配置内部。
