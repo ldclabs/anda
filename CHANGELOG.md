@@ -4,6 +4,18 @@ All notable changes to the Anda project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed — anda_engine
+
+- **A session command reported as running always reports its exit** — The
+  session supervisor emitted the background start and end events only if it
+  moved the command to the background itself. When it first ran after the
+  process had already exited, which a busy runtime makes likely for
+  `background: true` commands, the starting call could still reply `Running`
+  while neither event came, so a host waiting for the end (such as a cron job)
+  waited forever. The reply now decides what it reports under the status lock
+  the supervisor publishes the exit through; a command reported as running
+  always gets its start and end events, and one reported finished gets none.
+
 ## [anda_core 0.16.3 / anda_engine 0.16.5] — 2026-10-08
 
 ### Added — anda_engine

@@ -853,6 +853,74 @@ async fn patch_deletes_binary_files() {
 }
 
 #[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn a_command_reported_running_always_gets_its_background_end() {
+    use anda_core::ToolOutput;
+    use anda_engine::{
+        extension::shell::{ExecArgs, ExecOutput, ShellToolHook},
+        hook::{BackgroundHandle, ToolHook},
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct Events {
+        start: AtomicUsize,
+        end: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl ToolHook<ExecArgs, ExecOutput> for Events {
+        async fn on_background_start(&self, _: &BaseCtx, _: BackgroundHandle, _: &ExecArgs) {
+            self.start.fetch_add(1, Ordering::SeqCst);
+        }
+        async fn on_background_end(&self, _: &BaseCtx, _: String, _: ToolOutput<ExecOutput>) {
+            self.end.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let dir = Directory::new();
+    let runtime = NativeRuntime::new(dir.0.clone());
+    // Each round holds the only worker, so the session supervisor first runs after
+    // the command has exited while the reply usually still reports it running.
+    for _ in 0..3 {
+        let ctx = context();
+        let events = Arc::new(Events::default());
+        ctx.set_state(ShellToolHook::new(events.clone()));
+        let (busy_tx, busy_rx) = std::sync::mpsc::channel();
+        tokio::spawn(async move {
+            busy_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+        });
+        busy_rx.recv().unwrap();
+        let output = runtime
+            .execute_session(
+                ctx.clone(),
+                CommandArgs {
+                    command: "exit 7".into(),
+                    background: true,
+                    ..Default::default()
+                },
+                Default::default(),
+            )
+            .await
+            .unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while events.end.load(Ordering::SeqCst) < events.start.load(Ordering::SeqCst)
+            || (output.state == CommandState::Running && events.end.load(Ordering::SeqCst) == 0)
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a command reported as running never got its background end"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let start = events.start.load(Ordering::SeqCst);
+        assert_eq!(start, events.end.load(Ordering::SeqCst));
+        assert_eq!(start, usize::from(output.state == CommandState::Running));
+    }
+}
+
+#[cfg(unix)]
 #[tokio::test]
 async fn foreground_wait_completes_commands_and_hooks_only_see_background_ones() {
     use anda_core::ToolOutput;

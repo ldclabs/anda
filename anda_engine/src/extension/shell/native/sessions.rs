@@ -47,6 +47,9 @@ struct Status {
     signal: Option<i32>,
     exit_status: Option<String>,
     finished: Option<Instant>,
+    /// The starting call returned this command as running, so its caller learns
+    /// the outcome only from the background end event.
+    reported_running: bool,
 }
 
 struct Log {
@@ -267,6 +270,7 @@ impl NativeRuntime {
                 signal: None,
                 exit_status: None,
                 finished: None,
+                reported_running: false,
             }),
             stdout: Arc::new(TokioMutex::new(StreamBuffer::bounded(1024 * 1024))),
             stderr: Arc::new(TokioMutex::new(StreamBuffer::bounded(1024 * 1024))),
@@ -307,6 +311,15 @@ impl NativeRuntime {
             let mut stdout_progress = ProgressStreamState::default();
             let mut stderr_progress = ProgressStreamState::default();
             let mut state = CommandState::Exited;
+            let start_with = (&json_hook, &hook, &ctx, &args, &legacy_args);
+            let start = move |handle: BackgroundHandle| async move {
+                let (json_hook, hook, ctx, args, legacy_args) = start_with;
+                if let Some(hook) = json_hook {
+                    hook.on_background_start(ctx, handle, json!(args)).await;
+                } else if let Some(hook) = hook {
+                    hook.on_background_start(ctx, handle, legacy_args).await;
+                }
+            };
             let status = loop {
                 tokio::select! {
                     biased;
@@ -316,15 +329,8 @@ impl NativeRuntime {
                         backgrounded = true;
                         interval.reset();
                         let handle = BackgroundHandle::new(&task.id, task.token.clone());
-                        let start = async {
-                            if let Some(hook) = &json_hook {
-                                hook.on_background_start(&ctx, handle, json!(&args)).await;
-                            } else if let Some(hook) = &hook {
-                                hook.on_background_start(&ctx, handle, &legacy_args).await;
-                            }
-                        };
                         // Hook latency cannot indefinitely delay supervision or cancellation.
-                        tokio::select! { biased; _ = tokio::time::timeout(Duration::from_secs(2), start) => (), _ = task.token.cancelled() => (), _ = tokio::time::sleep_until(deadline) => () }
+                        tokio::select! { biased; _ = tokio::time::timeout(Duration::from_secs(2), start(handle)) => (), _ = task.token.cancelled() => (), _ = tokio::time::sleep_until(deadline) => () }
                     }
                     _ = task.token.cancelled() => {
                         state = CommandState::Cancelled;
@@ -380,18 +386,30 @@ impl NativeRuntime {
                     (None, None, None)
                 }
             };
-            *task.status.lock() = Status {
-                state,
-                code,
-                signal,
-                exit_status,
-                finished: Some(Instant::now()),
+            let reported_running = {
+                let mut status = task.status.lock();
+                let reported_running = status.reported_running;
+                *status = Status {
+                    state,
+                    code,
+                    signal,
+                    exit_status,
+                    finished: Some(Instant::now()),
+                    reported_running,
+                };
+                reported_running
             };
             task.changed.notify_waiters();
             guard.disarm();
             if !backgrounded {
-                // The foreground call already returned this result to the caller.
-                return;
+                if !reported_running {
+                    // The foreground call already returned this result to the caller.
+                    return;
+                }
+                // The process exited before this task first ran, yet the foreground
+                // reported it running: its caller still needs the start and end events.
+                let handle = BackgroundHandle::new(&task.id, task.token.clone());
+                let _ = tokio::time::timeout(Duration::from_secs(2), start(handle)).await;
             }
             let final_output = snapshot(&task, &mut (0, 0), super::super::MAX_OUTPUT_BYTES).await;
             let end = async {
@@ -426,7 +444,16 @@ impl NativeRuntime {
         });
         let mut cursor = entry.interaction.lock().await;
         wait_output(&entry, &cursor, foreground_deadline, true, &cancellation).await?;
-        Ok(snapshot(&entry, &mut cursor, output_budget).await)
+        // Decide what this reply reports under the lock the supervisor publishes the
+        // exit through, so a command reported running always gets its end event.
+        let status = {
+            let mut status = entry.status.lock();
+            if status.state == CommandState::Running {
+                status.reported_running = true;
+            }
+            status.clone()
+        };
+        Ok(snapshot_of(&entry, status, &mut cursor, output_budget).await)
     }
 
     pub(super) async fn session_action(
@@ -648,6 +675,17 @@ async fn wait_output(
 }
 
 async fn snapshot(entry: &Entry, cursor: &mut (usize, usize), limit: usize) -> CommandOutput {
+    let status = entry.status.lock().clone();
+    snapshot_of(entry, status, cursor, limit).await
+}
+
+/// Renders `entry` as of `status`, so a caller can report the exact state it decided on.
+async fn snapshot_of(
+    entry: &Entry,
+    status: Status,
+    cursor: &mut (usize, usize),
+    limit: usize,
+) -> CommandOutput {
     async fn stream(buffer: &OutputBuffer, cursor: &mut usize, finished: bool) -> (String, usize) {
         let buffer = buffer.lock().await;
         let prefix = if *cursor < buffer.head.len() {
@@ -676,7 +714,6 @@ async fn snapshot(entry: &Entry, cursor: &mut (usize, usize), limit: usize) -> C
             lost,
         )
     }
-    let status = entry.status.lock().clone();
     let finished = status.state != CommandState::Running;
     let (stdout, lost_out) = stream(&entry.stdout, &mut cursor.0, finished).await;
     let (stderr, lost_err) = stream(&entry.stderr, &mut cursor.1, finished).await;
