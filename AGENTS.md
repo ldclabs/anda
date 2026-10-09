@@ -46,6 +46,20 @@ to change.
   provider names must satisfy the function-name rules: lowercase ASCII letters,
   digits, underscores, and hyphens, starting with a lowercase letter, max 64
   bytes.
+- Never use `oneOf`, `anyOf` or `allOf` in a model-facing schema: tool and
+  agent parameters, MCP-exposed tool schemas, and structured-output schemas.
+  Anthropic rejects them at the top level of a tool's `input_schema` and fails
+  the whole request with a 400 (KIP's top-level `oneOf` once broke every Brain
+  pass on Claude); strict modes reject them anywhere. Write a nullable field as
+  a type list (`"type": ["string", "null"]`), alternatives of distinct types as
+  one schema with a type list, and tagged variants as one object with an `enum`
+  discriminator and the variant-only fields nullable or optional (see
+  `memory_tool_schema`). Enforce cross-field rules such as "exactly one of
+  `command` or `operations`" when parsing the arguments, and state them in the
+  descriptions. schemars derives these keywords from `Option<Struct>` and enums,
+  so check the generated JSON (`extension_tool_definitions_are_strict_and_union_free`).
+  The Anthropic adapter drops top-level combinators only as a safety net for
+  external MCP schemas; it is not a way to keep them in our own.
 - When changing model/provider conversion code, preserve raw-history and
   tool/user message boundaries. Do not merge tool outputs into user messages or
   lose provider-specific content unless the existing code explicitly does so.

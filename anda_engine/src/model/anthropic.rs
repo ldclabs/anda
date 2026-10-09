@@ -606,6 +606,18 @@ fn normalize_schema_node(schema: &mut Value, cost: &mut StrictCost) -> Result<()
     Ok(())
 }
 
+/// Anthropic rejects `oneOf`, `allOf` and `anyOf` at the top level of every
+/// tool's input schema, strict or not, and fails the whole request with a 400.
+/// Tools state cross-field rules there, such as KIP's `command` xor
+/// `operations`, which their argument parsing enforces again.
+fn drop_top_level_combinators(schema: &mut Value) {
+    if let Some(map) = schema.as_object_mut() {
+        for key in ["oneOf", "allOf", "anyOf"] {
+            map.remove(key);
+        }
+    }
+}
+
 impl WireFormat for CompletionModel {
     type Request = types::CreateMessageParams;
     type Response = types::CreateMessageResponse;
@@ -669,6 +681,14 @@ impl WireFormat for CompletionModel {
             .and_then(|config| config.format.as_mut())
         {
             spent = normalize_output_schema(&mut format.schema)?;
+        }
+        for schema in r
+            .tools
+            .iter_mut()
+            .flatten()
+            .filter_map(|tool| tool.input_schema.as_mut())
+        {
+            drop_top_level_combinators(schema);
         }
         let mut strict_tools = 0;
         for tool in r
@@ -855,6 +875,51 @@ mod tests {
         expected.extend((0..19).map(|i| i < 18));
         assert_eq!(strict, expected);
         assert_eq!(tools[1].input_schema.as_ref(), Some(&schemas[1]));
+    }
+
+    #[test]
+    fn tool_schemas_drop_top_level_combinators() {
+        // KIP 0.14.1's `execute_kip` required exactly one of `command` and
+        // `operations` through a top-level `oneOf`, which Anthropic rejects.
+        let properties = json!({
+            "command":{"type":"string"},
+            "operations":{"type":"array", "items":{"oneOf":[{"type":"string"},
+                {"type":"object", "properties":{"command":{"type":"string"}}}]}}
+        });
+        let kip = json!({"type":"object", "properties":properties,
+            "oneOf":[{"required":["command"]},{"required":["operations"]}],
+            "additionalProperties":false});
+        let union = json!({"type":"object", "properties":{"id":{"type":"string"}},
+            "anyOf":[{"required":["id"]}], "allOf":[{"required":["id"]}]});
+        let mut request = types::CreateMessageParams::default();
+        <CompletionModel as WireFormat>::apply_tools(
+            &mut request,
+            vec![
+                FunctionDefinition {
+                    name: "execute_kip".into(),
+                    parameters: kip,
+                    ..Default::default()
+                },
+                FunctionDefinition {
+                    name: "union".into(),
+                    parameters: union,
+                    strict: Some(true),
+                    ..Default::default()
+                },
+            ],
+            false,
+        );
+        <CompletionModel as WireFormat>::finalize_request(&mut request).unwrap();
+        let tools = request.tools.unwrap();
+        let schema = tools[0].input_schema.as_ref().unwrap();
+        for key in ["oneOf", "allOf", "anyOf"] {
+            assert!(schema.get(key).is_none(), "{key}");
+            assert!(tools[1].input_schema.as_ref().unwrap().get(key).is_none());
+        }
+        assert_eq!(schema["properties"], properties);
+        // Nested combinators are supported and stay.
+        assert!(schema["properties"]["operations"]["items"]["oneOf"].is_array());
+        assert_eq!(tools[1].strict, Some(true));
     }
 
     #[test]

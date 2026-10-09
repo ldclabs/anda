@@ -3148,9 +3148,9 @@ mod tests {
         let readonly = MemoryReadonly::new(memory.clone());
         assert_eq!(readonly.name(), MemoryReadonly::NAME);
         assert!(readonly.description().contains("read-only"));
-        // The KIP 2.0 schemas gate `command` against `operations` with `oneOf`,
-        // which strict structured-output mode does not accept, so neither KIP tool
-        // claims to be strict.
+        // The KIP 2.0 schemas leave `command` and `operations` optional and
+        // `parameters` open, which strict structured-output mode does not
+        // accept, so neither KIP tool claims to be strict.
         assert_eq!(readonly.definition().strict, None);
 
         let get_content = GetResourceContentTool::new(memory.clone());

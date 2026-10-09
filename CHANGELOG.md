@@ -4,6 +4,18 @@ All notable changes to the Anda project will be documented in this file.
 
 ## [Unreleased]
 
+## [anda_engine 0.16.8] — 2026-10-09
+
+### Fixed — anda_engine
+
+- **Tools with top-level schema combinators work on Claude** — Anthropic
+  rejects `oneOf`, `allOf` and `anyOf` at the top level of any tool's input
+  schema and fails the whole request with a 400. KIP's `execute_kip` and
+  `execute_kip_readonly` state `command` xor `operations` that way, so every
+  Brain Formation, Maintenance and Recall pass on a Claude model failed. The
+  adapter now drops those top-level keywords; tools enforce such cross-field
+  rules when parsing their arguments, and MCP servers' schemas are covered too.
+
 ## [anda_engine 0.16.7] — 2026-10-08
 
 ### Fixed — anda_engine
