@@ -19,6 +19,7 @@ use anda_core::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, json};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 
 pub mod types;
@@ -1888,6 +1889,34 @@ impl CompletionFeaturesDyn for CompletionModelV2 {
     }
 }
 
+/// The OpenAI API routes a request to a prompt cache by `prompt_cache_key`, and
+/// ChatGPT's Codex backend by the `session-id` header; the Codex CLI sends its
+/// session id as both. Without them, the rounds of one conversation land on
+/// unrelated caches and most of a stable prefix is billed again. The
+/// instructions and the first input item stay fixed for a conversation, so
+/// their digest keeps every round on one cache without a conversation id in the
+/// completion request. It is shaped as a UUID, as the Codex CLI's header is.
+fn prompt_cache_key(r: &types::CompletionRequest) -> Option<String> {
+    let first = serde_json::to_vec(r.input.first()?).ok()?;
+    let mut hasher = Sha256::new();
+    hasher.update(r.instructions.as_deref().unwrap_or_default());
+    hasher.update([0]);
+    hasher.update(first);
+    let mut bytes: [u8; 16] = hasher.finalize()[..16].try_into().ok()?;
+    // Version 8 (custom) with the RFC 9562 variant.
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex = hex::encode(bytes);
+    Some(format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    ))
+}
+
 impl WireFormat for CompletionModelV2 {
     type Request = types::CompletionRequest;
     type Response = types::CompletionResponse;
@@ -1973,7 +2002,18 @@ impl WireFormat for CompletionModelV2 {
         // regardless of `with_stream` or `with_default_request` overrides.
         r.stream = Some(true);
         r.additional_parameters.store = Some(false);
+        if r.additional_parameters.prompt_cache_key.is_none() {
+            r.additional_parameters.prompt_cache_key = prompt_cache_key(r);
+        }
         Ok(())
+    }
+
+    fn request_headers(r: &Self::Request) -> Vec<(&'static str, String)> {
+        r.additional_parameters
+            .prompt_cache_key
+            .iter()
+            .map(|key| ("session-id", key.clone()))
+            .collect()
     }
 
     fn is_stream(r: &Self::Request) -> bool {
@@ -2825,6 +2865,70 @@ mod tests {
         assert_eq!(sent["tools"][0]["name"], "lookup");
         assert_eq!(sent["tool_choice"], "auto");
         assert_eq!(sent["text"]["format"]["name"], "structured_output");
+        let key = sent["prompt_cache_key"].as_str().unwrap();
+        assert_eq!(
+            req.headers.get("session-id").and_then(|v| v.to_str().ok()),
+            Some(key)
+        );
+    }
+
+    #[test]
+    fn responses_prompt_cache_key_holds_across_rounds_of_one_conversation() {
+        type V2 = CompletionModelV2;
+        let user = |text: &str| Message {
+            role: "user".into(),
+            content: vec![text.to_string().into()],
+            ..Default::default()
+        };
+        let mut first = types::CompletionRequest::default();
+        V2::set_instructions(&mut first, "rules".into());
+        V2::push_message(&mut first, user("find it"), "gpt-5.5").unwrap();
+        V2::finalize_request(&mut first).unwrap();
+        let key = first
+            .additional_parameters
+            .prompt_cache_key
+            .clone()
+            .unwrap();
+        // A UUID (version 8) for the Codex backend's session-id header.
+        let parts: Vec<_> = key.split('-').map(str::len).collect();
+        assert_eq!(parts, [8, 4, 4, 4, 12]);
+        assert_eq!(&key[14..15], "8");
+        assert_eq!(V2::request_headers(&first), [("session-id", key.clone())]);
+
+        // The next round replays this round's raw history and adds a tool result.
+        let mut raw_history = V2::sent_messages(first, 0);
+        raw_history.push(json!({
+            "type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"
+        }));
+        let mut next = types::CompletionRequest::default();
+        V2::set_instructions(&mut next, "rules".into());
+        V2::append_raw_history(&mut next, raw_history);
+        V2::push_message(&mut next, user("and then?"), "gpt-5.5").unwrap();
+        V2::finalize_request(&mut next).unwrap();
+        assert_eq!(
+            next.additional_parameters.prompt_cache_key,
+            Some(key.clone())
+        );
+
+        // Another conversation gets another key; a caller-chosen key is kept.
+        let mut other = types::CompletionRequest::default();
+        V2::set_instructions(&mut other, "rules".into());
+        V2::push_message(&mut other, user("something else"), "gpt-5.5").unwrap();
+        V2::finalize_request(&mut other).unwrap();
+        assert_ne!(other.additional_parameters.prompt_cache_key, Some(key));
+        let mut chosen = types::CompletionRequest::default();
+        chosen.additional_parameters.prompt_cache_key = Some("mine".into());
+        V2::push_message(&mut chosen, user("find it"), "gpt-5.5").unwrap();
+        V2::finalize_request(&mut chosen).unwrap();
+        assert_eq!(
+            chosen.additional_parameters.prompt_cache_key.as_deref(),
+            Some("mine")
+        );
+
+        // Nothing to key on: no header.
+        let mut empty = types::CompletionRequest::default();
+        V2::finalize_request(&mut empty).unwrap();
+        assert!(V2::request_headers(&empty).is_empty());
     }
 
     #[tokio::test]

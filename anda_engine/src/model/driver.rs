@@ -91,6 +91,11 @@ pub(crate) trait WireFormat {
         Ok(())
     }
 
+    /// HTTP headers derived from the finalized request, sent on every attempt.
+    fn request_headers(_r: &Self::Request) -> Vec<(&'static str, String)> {
+        Vec::new()
+    }
+
     /// Whether this request executes as a stream.
     fn is_stream(r: &Self::Request) -> bool;
 
@@ -196,10 +201,14 @@ pub(crate) async fn drive_completion<W: WireFormat>(
 
     let stream = W::is_stream(&r);
     let path = W::endpoint(&r, &model);
+    let headers = W::request_headers(&r);
     let (res, assistant_raw_message) = execute_completion_request_with_retry(
         &model,
         || {
             let mut request = post(&path).json(&r);
+            for (name, value) in &headers {
+                request = request.header(*name, value);
+            }
             if stream {
                 request = streaming_completion_request(request);
             }

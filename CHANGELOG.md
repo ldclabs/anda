@@ -14,6 +14,12 @@ All notable changes to the Anda project will be documented in this file.
   raw history so replayed rounds never exceed Anthropic's four breakpoints.
   Markers go on blocks, not in the top-level field, which Anthropic-compatible
   endpoints do not document; DeepSeek and MiniMax accept them.
+- **Responses requests keep one prompt cache per conversation** — the OpenAI
+  API routes a request to a prompt cache by `prompt_cache_key`, and ChatGPT's
+  Codex backend by the `session-id` header. The Responses adapter sent
+  neither, so the rounds of one conversation landed on unrelated caches. It
+  now sends a key derived from the instructions and the first input item as
+  both; a `prompt_cache_key` set in the default request is kept.
 
 ## [anda_engine 0.16.8] — 2026-10-09
 
