@@ -8,7 +8,7 @@
 use anda_core::{
     AgentOutput, BoxError, BoxPinFut, CompletionRequest, FunctionDefinition, Json, Message,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
 use super::driver::{SamplingOptions, WireFormat, assign_tool_call_ids, drive_completion};
@@ -618,6 +618,87 @@ fn drop_top_level_combinators(schema: &mut Value) {
     }
 }
 
+/// Anthropic caches a prompt only up to a `cache_control` breakpoint, so a
+/// request without one bills its whole prefix again on every round. One marker
+/// closes the system prompt, which covers the tools and system a session
+/// shares, and one closes the last message, so the next round of the
+/// conversation reads everything before its new tail from the cache. Markers go
+/// on blocks rather than in the top-level `cache_control` field because the
+/// Anthropic-compatible endpoints document block markers (honored or ignored)
+/// but not the top-level field.
+///
+/// A system prompt already given as blocks keeps the markers its author chose.
+fn mark_cache_breakpoints(r: &mut types::CreateMessageParams) {
+    if let Some(types::SystemPrompt::Text(text)) = &mut r.system
+        && !text.is_empty()
+    {
+        r.system = Some(types::SystemPrompt::Blocks(vec![
+            types::ContentBlock::Text {
+                text: std::mem::take(text),
+                cache_control: Some(ephemeral_cache_control()),
+                citations: None,
+            },
+        ]));
+    }
+
+    let Some(content) = r
+        .messages
+        .last_mut()
+        .and_then(|message| message.get_mut("content"))
+    else {
+        return;
+    };
+    if let Json::String(text) = content {
+        if text.is_empty() {
+            return;
+        }
+        // A string cannot carry a marker. The text block that replaces it
+        // renders the same prompt, and it is what the raw history keeps, so the
+        // next round replays the exact prefix this round wrote.
+        *content = json!([{"type": "text", "text": std::mem::take(text)}]);
+    }
+    // Thinking blocks and empty text blocks cannot carry a marker; the one
+    // before them closes the prefix instead.
+    if let Some(block) = content
+        .as_array_mut()
+        .into_iter()
+        .flatten()
+        .rev()
+        .filter_map(Json::as_object_mut)
+        .find(|block| match block.get("type").and_then(Json::as_str) {
+            Some("thinking" | "redacted_thinking") => false,
+            Some("text") => block
+                .get("text")
+                .and_then(Json::as_str)
+                .is_some_and(|text| !text.is_empty()),
+            _ => true,
+        })
+    {
+        block.insert(
+            "cache_control".to_string(),
+            serde_json::to_value(ephemeral_cache_control()).unwrap_or_default(),
+        );
+    }
+}
+
+/// Removes the breakpoint [`mark_cache_breakpoints`] put on the last message.
+/// Raw history is replayed on every later round, and markers left in it would
+/// pile up past Anthropic's four breakpoints per request.
+fn unmark_cache_breakpoint(message: &mut Json) {
+    if let Some(blocks) = message.get_mut("content").and_then(Json::as_array_mut) {
+        for block in blocks.iter_mut().filter_map(Json::as_object_mut) {
+            block.remove("cache_control");
+        }
+    }
+}
+
+fn ephemeral_cache_control() -> types::CacheControlEphemeral {
+    types::CacheControlEphemeral {
+        r#type: types::CacheControlType::Ephemeral,
+        ttl: None,
+    }
+}
+
 impl WireFormat for CompletionModel {
     type Request = types::CreateMessageParams;
     type Response = types::CreateMessageResponse;
@@ -714,6 +795,7 @@ impl WireFormat for CompletionModel {
                 _ => tool.strict = None,
             }
         }
+        mark_cache_breakpoints(r);
         Ok(())
     }
 
@@ -770,6 +852,9 @@ impl WireFormat for CompletionModel {
         if skip_raw > 0 {
             r.messages.drain(0..skip_raw);
         }
+        if let Some(last) = r.messages.last_mut() {
+            unmark_cache_breakpoint(last);
+        }
         r.messages
     }
 
@@ -791,6 +876,63 @@ mod tests {
     use http::{HeaderMap, Method, StatusCode};
     use reqwest::header::ACCEPT;
     use serde_json::{Map, json};
+
+    #[test]
+    fn cache_breakpoints_close_the_system_prompt_and_the_last_message() {
+        let marker = json!({"type": "ephemeral"});
+        let tool_round = vec![
+            json!({"role": "user", "content": "find it"}),
+            json!({"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "", "signature": "sig"},
+                {"type": "tool_use", "id": "call_1", "name": "lookup", "input": {}}
+            ]}),
+            json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "call_1", "content": "found"}
+            ]}),
+        ];
+        let mut r = types::CreateMessageParams {
+            system: Some("rules".into()),
+            messages: tool_round.clone(),
+            ..Default::default()
+        };
+        mark_cache_breakpoints(&mut r);
+        let sent = serde_json::to_value(&r).unwrap();
+        assert_eq!(sent["system"][0]["cache_control"], marker);
+        // Only the newest block is marked; earlier rounds were marked by the
+        // requests that sent them.
+        assert_eq!(sent["messages"][0]["content"], "find it");
+        assert_eq!(sent["messages"][2]["content"][0]["cache_control"], marker);
+        unmark_cache_breakpoint(r.messages.last_mut().unwrap());
+        assert_eq!(r.messages, tool_round);
+
+        // Thinking and empty text cannot be marked, so the block before them
+        // closes the prefix; an author's system blocks are left as given.
+        let mut r = types::CreateMessageParams {
+            system: Some(vec![types::ContentBlock::text("rules")].into()),
+            messages: vec![json!({"role": "assistant", "content": [
+                {"type": "text", "text": "partial"},
+                {"type": "thinking", "thinking": "", "signature": "sig"},
+                {"type": "text", "text": ""}
+            ]})],
+            ..Default::default()
+        };
+        mark_cache_breakpoints(&mut r);
+        let sent = serde_json::to_value(&r).unwrap();
+        assert_eq!(sent["system"], json!([{"type": "text", "text": "rules"}]));
+        let blocks = &sent["messages"][0]["content"];
+        assert_eq!(blocks[0]["cache_control"], marker);
+        assert!(blocks[1].get("cache_control").is_none());
+        assert!(blocks[2].get("cache_control").is_none());
+
+        // Nothing to mark: no system prompt, empty last message.
+        let mut r = types::CreateMessageParams {
+            messages: vec![json!({"role": "user", "content": ""})],
+            ..Default::default()
+        };
+        mark_cache_breakpoints(&mut r);
+        assert!(r.system.is_none());
+        assert_eq!(r.messages[0]["content"], "");
+    }
 
     #[test]
     fn strict_schemas_drop_type_arrays_beside_enums_and_count_their_cost() {
@@ -1383,8 +1525,29 @@ mod tests {
         );
         let sent: Value = serde_json::from_slice(&req.body).unwrap();
         assert_eq!(sent["model"], "claude-test");
-        assert_eq!(sent["system"], "system rules");
+        assert_eq!(
+            sent["system"],
+            json!([{
+                "type": "text",
+                "text": "system rules",
+                "cache_control": {"type": "ephemeral"}
+            }])
+        );
         assert_eq!(sent["messages"][0]["role"], "user");
+        assert_eq!(
+            sent["messages"][0]["content"],
+            json!([{
+                "type": "text",
+                "text": "say hello",
+                "cache_control": {"type": "ephemeral"}
+            }])
+        );
+        // The marker belongs to this request only: replayed history must not
+        // carry it into later rounds.
+        assert_eq!(
+            output.raw_history[0],
+            json!({"role": "user", "content": [{"type": "text", "text": "say hello"}]})
+        );
         assert_eq!(sent["max_tokens"], 256);
         assert_eq!(sent["temperature"], 0.3);
         assert_eq!(sent["stop_sequences"], json!(["END"]));

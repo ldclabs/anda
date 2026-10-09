@@ -4,6 +4,17 @@ All notable changes to the Anda project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed — anda_engine
+
+- **Claude requests use the prompt cache** — Anthropic caches a prompt only up
+  to a `cache_control` breakpoint, and the adapter never sent one, so every
+  round of an agent loop billed its whole prefix at the full input price and
+  reported `cached_tokens: 0`. The adapter now marks the end of the system
+  prompt and the last message, and strips the message marker from the returned
+  raw history so replayed rounds never exceed Anthropic's four breakpoints.
+  Markers go on blocks, not in the top-level field, which Anthropic-compatible
+  endpoints do not document; DeepSeek and MiniMax accept them.
+
 ## [anda_engine 0.16.8] — 2026-10-09
 
 ### Fixed — anda_engine
