@@ -1890,31 +1890,19 @@ impl CompletionFeaturesDyn for CompletionModelV2 {
 }
 
 /// The OpenAI API routes a request to a prompt cache by `prompt_cache_key`, and
-/// ChatGPT's Codex backend by the `session-id` header; the Codex CLI sends its
-/// session id as both. Without them, the rounds of one conversation land on
+/// ChatGPT's Codex backend by the `session-id` header; the Codex CLI sends the
+/// same key as both. Without them, the rounds of one conversation land on
 /// unrelated caches and most of a stable prefix is billed again. The
 /// instructions and the first input item stay fixed for a conversation, so
 /// their digest keeps every round on one cache without a conversation id in the
-/// completion request. It is shaped as a UUID, as the Codex CLI's header is.
+/// completion request. Neither needs a UUID; the Codex CLI sends other keys too.
 fn prompt_cache_key(r: &types::CompletionRequest) -> Option<String> {
     let first = serde_json::to_vec(r.input.first()?).ok()?;
     let mut hasher = Sha256::new();
     hasher.update(r.instructions.as_deref().unwrap_or_default());
     hasher.update([0]);
     hasher.update(first);
-    let mut bytes: [u8; 16] = hasher.finalize()[..16].try_into().ok()?;
-    // Version 8 (custom) with the RFC 9562 variant.
-    bytes[6] = (bytes[6] & 0x0f) | 0x80;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    let hex = hex::encode(bytes);
-    Some(format!(
-        "{}-{}-{}-{}-{}",
-        &hex[..8],
-        &hex[8..12],
-        &hex[12..16],
-        &hex[16..20],
-        &hex[20..]
-    ))
+    Some(hex::encode(&hasher.finalize()[..16]))
 }
 
 impl WireFormat for CompletionModelV2 {
@@ -2889,10 +2877,8 @@ mod tests {
             .prompt_cache_key
             .clone()
             .unwrap();
-        // A UUID (version 8) for the Codex backend's session-id header.
-        let parts: Vec<_> = key.split('-').map(str::len).collect();
-        assert_eq!(parts, [8, 4, 4, 4, 12]);
-        assert_eq!(&key[14..15], "8");
+        assert_eq!(key.len(), 32);
+        assert!(key.bytes().all(|b| b.is_ascii_hexdigit()));
         assert_eq!(V2::request_headers(&first), [("session-id", key.clone())]);
 
         // The next round replays this round's raw history and adds a tool result.

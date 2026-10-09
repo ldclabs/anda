@@ -4,22 +4,27 @@ All notable changes to the Anda project will be documented in this file.
 
 ## [Unreleased]
 
+## [anda_engine 0.16.9] — 2026-10-10
+
 ### Fixed — anda_engine
 
 - **Claude requests use the prompt cache** — Anthropic caches a prompt only up
   to a `cache_control` breakpoint, and the adapter never sent one, so every
   round of an agent loop billed its whole prefix at the full input price and
-  reported `cached_tokens: 0`. The adapter now marks the end of the system
-  prompt and the last message, and strips the message marker from the returned
-  raw history so replayed rounds never exceed Anthropic's four breakpoints.
-  Markers go on blocks, not in the top-level field, which Anthropic-compatible
-  endpoints do not document; DeepSeek and MiniMax accept them.
+  reported `cached_tokens: 0`. Requests now turn on Anthropic's automatic
+  caching with the top-level `cache_control` field, which moves the breakpoint
+  forward as the conversation grows, and mark the end of the system prompt,
+  which caches the tools and system for conversations that share them. The
+  messages, and the raw history replayed from them, are sent as given. A
+  top-level `cache_control` set in the default request is kept, and its TTL
+  applies to the system marker too. Anthropic-compatible endpoints that honor
+  only block markers, such as MiniMax, cache just the tools and system.
 - **Responses requests keep one prompt cache per conversation** — the OpenAI
   API routes a request to a prompt cache by `prompt_cache_key`, and ChatGPT's
   Codex backend by the `session-id` header. The Responses adapter sent
   neither, so the rounds of one conversation landed on unrelated caches. It
-  now sends a key derived from the instructions and the first input item as
-  both; a `prompt_cache_key` set in the default request is kept.
+  now sends a hex digest of the instructions and the first input item as both;
+  a `prompt_cache_key` set in the default request is kept.
 
 ## [anda_engine 0.16.8] — 2026-10-09
 
