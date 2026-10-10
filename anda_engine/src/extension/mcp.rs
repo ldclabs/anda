@@ -110,7 +110,9 @@ use rmcp::{
     model::{CallToolRequestParams, ServerPeerInfo, Tool as McpTool},
     serve_client_with_lifecycle,
     service::ClientLifecycleMode,
-    transport::{AuthClient, AuthorizationManager, StreamableHttpClientTransport},
+    transport::{
+        AuthClient, AuthorizationManager, StreamableHttpClientTransport, async_rw::AsyncRwTransport,
+    },
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Map;
@@ -134,6 +136,7 @@ use crate::context::BaseCtx;
 mod auth;
 mod bounded;
 mod catalog;
+mod events;
 mod http_client;
 mod interaction;
 mod policy;
@@ -150,10 +153,16 @@ pub use auth::{
     InMemoryMcpCredentialStore, McpAuthorizationRequired, McpCredentialStore, McpOAuthConfig,
     McpOAuthMetadata, OAuthAuthorizationCodeConfig, OAuthClientCredentialsConfig,
 };
+pub use events::{
+    MAX_EVENT_BYTES, McpEvent, McpEventDefinition, McpEventDeliveryMode, McpEventError,
+    McpEventErrorKind, McpEventSignal, McpEventSink, McpEventSubscribeRequest,
+    McpEventSubscription, McpWebhookSubscribeRequest, McpWebhookSubscription,
+};
 pub use router::McpToolRoute;
 pub use session::{McpStdioTransport, McpStreamableHttpTransport, McpTransportConfig};
 
 use auth::{ScopedCredentialStore, authorization_required_hint, is_authorization_error};
+use events::{EventRouter, EventTap};
 use router::{
     DEFAULT_TASK_MAX_WAIT_SECS, MAX_LOCAL_NAME_ATTEMPTS, MAX_TASK_MAX_WAIT_SECS, call_tool_rounds,
     mcp_result_to_tool_output, sanitize_name_part, shorten_with_hash,
@@ -630,6 +639,7 @@ impl McpToolProvider {
         };
         let handler = AndaMcpClient::new(dirty.clone(), config.tasks.is_some())
             .with_elicitation(elicitation.clone());
+        let events = EventRouter::new();
         // Only a discovery opener can go unanswered by a server that does not know
         // it; the legacy handshake is answered or refused by every MCP server.
         let probe_timeout = (!matches!(lifecycle, ClientLifecycleMode::Initialize))
@@ -638,9 +648,11 @@ impl McpToolProvider {
         let mut process = None;
         let service = match &config.transport {
             McpTransportConfig::Stdio(stdio) => {
-                let (child, transport) =
+                let (child, (read, write)) =
                     bounded::spawn(stdio.command(), config.limits.message_bytes)?;
                 process = Some(child);
+                let transport =
+                    EventTap::new(AsyncRwTransport::new_client(read, write), events.clone());
                 serve_bounded(
                     serve_client_with_lifecycle(handler, transport, lifecycle),
                     probe_timeout,
@@ -649,10 +661,13 @@ impl McpToolProvider {
             }
             McpTransportConfig::StreamableHttp(http) => match &http.auth {
                 None => {
-                    let transport = StreamableHttpClientTransport::with_client(
-                        http_client::McpHttpClient::new(config.limits.message_bytes)?,
-                        http.transport_config()?
-                            .max_sse_event_size(config.limits.message_bytes),
+                    let transport = EventTap::new(
+                        StreamableHttpClientTransport::with_client(
+                            http_client::McpHttpClient::new(config.limits.message_bytes)?,
+                            http.transport_config()?
+                                .max_sse_event_size(config.limits.message_bytes),
+                        ),
+                        events.clone(),
                     );
                     serve_bounded(
                         serve_client_with_lifecycle(handler, transport, lifecycle),
@@ -667,13 +682,16 @@ impl McpToolProvider {
                     let (manager, deadline) =
                         auth::authorize_client_credentials(http.url.as_str(), cc).await?;
                     expires_at = deadline;
-                    let transport = StreamableHttpClientTransport::with_client(
-                        AuthClient::new(
-                            http_client::McpHttpClient::new(config.limits.message_bytes)?,
-                            manager,
+                    let transport = EventTap::new(
+                        StreamableHttpClientTransport::with_client(
+                            AuthClient::new(
+                                http_client::McpHttpClient::new(config.limits.message_bytes)?,
+                                manager,
+                            ),
+                            http.base_transport_config()?
+                                .max_sse_event_size(config.limits.message_bytes),
                         ),
-                        http.base_transport_config()?
-                            .max_sse_event_size(config.limits.message_bytes),
+                        events.clone(),
                     );
                     serve_bounded(
                         serve_client_with_lifecycle(handler, transport, lifecycle),
@@ -690,13 +708,16 @@ impl McpToolProvider {
                         self.scoped_store(&config.id),
                     )
                     .await?;
-                    let transport = StreamableHttpClientTransport::with_client(
-                        AuthClient::new(
-                            http_client::McpHttpClient::new(config.limits.message_bytes)?,
-                            manager,
+                    let transport = EventTap::new(
+                        StreamableHttpClientTransport::with_client(
+                            AuthClient::new(
+                                http_client::McpHttpClient::new(config.limits.message_bytes)?,
+                                manager,
+                            ),
+                            http.base_transport_config()?
+                                .max_sse_event_size(config.limits.message_bytes),
                         ),
-                        http.base_transport_config()?
-                            .max_sse_event_size(config.limits.message_bytes),
+                        events.clone(),
                     );
                     serve_bounded(
                         serve_client_with_lifecycle(handler, transport, lifecycle),
@@ -712,6 +733,7 @@ impl McpToolProvider {
             .await;
         Ok(Arc::new(McpSession {
             retired: AtomicBool::new(false),
+            events,
             _process: process,
             session_cancelled,
             elicitation,
@@ -940,6 +962,48 @@ impl McpToolProvider {
         drop(_guard);
         self.disconnect_server(server_id).await;
         Ok(())
+    }
+
+    /// Calls one of a server's tools for the application, not the model: the
+    /// tool is named by its remote name, it does not have to be visible to
+    /// the model, and the result is returned as the server sent it. The call
+    /// follows the server's concurrency policy and deadlines. A result that
+    /// asks for more input is an error.
+    pub async fn call_server_tool(
+        &self,
+        server_id: &str,
+        name: &str,
+        arguments: Map<String, Json>,
+        cancellation: CancellationToken,
+    ) -> Result<rmcp::model::CallToolResult, BoxError> {
+        let config = self.server_config(server_id)?;
+        let call = async {
+            let session = self.ensure_session(&config).await?;
+            let _calls = if config.concurrency == McpConcurrency::Parallel {
+                (Some(config.calls.read().await), None)
+            } else {
+                (None, Some(config.calls.write().await))
+            };
+            let peer = session.service.lock().await.peer().clone();
+            let params = CallToolRequestParams::new(name.to_string()).with_arguments(arguments);
+            match tokio::time::timeout(
+                Duration::from_secs(config.timeouts.request_secs),
+                peer.call_tool_once(params),
+            )
+            .await
+            .map_err(|_| format!("MCP tool {name} request timed out"))??
+            {
+                rmcp::model::CallToolResponse::Complete(result) => Ok(result),
+                _ => Err(format!("MCP tool {name} asked for input").into()),
+            }
+        };
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err("MCP tool call cancelled".into()),
+            _ = config.cancelled.cancelled() => Err("MCP server removed".into()),
+            result = tokio::time::timeout(config.timeouts.call(), call) =>
+                result.map_err(|_| "MCP logical tool call timed out")?,
+        }
     }
 
     fn scoped_store(&self, server_id: &str) -> ScopedCredentialStore {
@@ -2694,7 +2758,7 @@ done
     }
 
     #[cfg(unix)]
-    fn write_fake_server(name: &str, script: &str) -> PathBuf {
+    pub(super) fn write_fake_server(name: &str, script: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
 
         let path = std::env::temp_dir().join(format!(

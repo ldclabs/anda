@@ -81,6 +81,8 @@ pub(crate) fn legacy_protocol_version() -> ProtocolVersion {
 
 pub(crate) struct McpSession {
     pub(crate) retired: AtomicBool,
+    /// Routes `notifications/events/*` of this session to event streams.
+    pub(crate) events: Arc<super::events::EventRouter>,
     pub(crate) session_cancelled: anda_core::CancellationToken,
     pub(crate) elicitation: Option<super::interaction::ElicitationDispatcher>,
     pub(crate) _process: Option<super::bounded::StdioProcess>,

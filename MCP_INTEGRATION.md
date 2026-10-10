@@ -406,6 +406,53 @@ cancellation token. These methods share the authenticated session and byte/time
 budgets. They do not register new model tools or fetch returned resource URIs
 from the local filesystem or an unrelated HTTP origin.
 
+## Events
+
+`list_events`, `subscribe_events`, `subscribe_webhook` and `unsubscribe_webhook`
+implement the client side of the experimental MCP Events extension
+(`events/list`, `events/poll`, `events/stream`, `events/subscribe`,
+`events/unsubscribe`). They share the server's session, credentials and budgets.
+
+- **Detection.** rmcp 3.5 drops `capabilities.events`, so `list_events` sends
+  `events/list` and returns `None` on "method not found". A server that ignores
+  unknown methods is given 10 seconds. Event types over the description or schema
+  limits are skipped.
+- **Poll and push.** `subscribe_events` runs one subscription on a background
+  task and reports `McpEventSignal`s to an application `McpEventSink`: `Active`
+  (with `truncated` when events were lost), `Events` with the cursor to resume
+  after them, recoverable `Error`s, `ListChanged`, and a final `Terminated`.
+  Poll follows `hasMore` and `nextPollMs` (clamped to 1 s – 5 min, 100 events a
+  page). Push keeps one `events/stream` request open per subscription, outside the
+  tool concurrency queue and without a request timeout; a stream silent for 60 s,
+  a closed or retired session, or a full 256-notification buffer reopens it from
+  the last accepted cursor. Cancelling sends `notifications/cancelled` (rmcp also
+  aborts the response stream over HTTP).
+- **Ordering.** rmcp dispatches each notification on its own task, which can
+  reorder a burst. `EventTap` wraps every transport and hands
+  `notifications/events/*` to the session's router as they are read, keyed by
+  `_meta["io.modelcontextprotocol/subscriptionId"]`; notifications that beat the
+  stream's registration are held briefly.
+- **Delivery guarantee.** The provider keeps no event state. A cursor is used for
+  the next request only after the sink accepted the signal carrying it, so delivery
+  is at least once; the application persists cursors and deduplicates by `eventId`.
+  A sink error restarts the subscription from the last accepted cursor after a
+  backoff (2 s doubling to 5 min). Events over 256 KiB are skipped with an `Error`.
+- **Webhooks.** The provider subscribes, refreshes (subscribe again before
+  `refreshBefore`) and unsubscribes; the application supplies the callback URL and
+  `whsec_` secret and receives and verifies the deliveries itself. A host that
+  relays webhooks through another MCP server (such as dMsg) drives that server's
+  endpoint tools with `call_server_tool`, which calls a tool by its remote name
+  for the application rather than the model, whether or not the model sees it.
+- **Errors.** `McpEventError` classifies both generations of the draft's codes
+  (-32023..-32027 and the earlier -32011..-32015 that OpenAI documents), keeps
+  `data.reason`/`data.kind`, and maps authorization failures to
+  `AuthorizationRequired`. Not found, forbidden, unsupported, invalid arguments,
+  authorization and a removed or re-registered server end a subscription; other
+  failures are retried.
+
+Event payloads, descriptions and schemas are untrusted server data, like tool
+results. Receiving an event does not authorize any action.
+
 ## Credential Transactions
 
 `McpCredentialStore::acquire_refresh_guard` is an optional extension with a

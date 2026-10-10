@@ -4,6 +4,23 @@ All notable changes to the Anda project will be documented in this file.
 
 ## [Unreleased]
 
+## [anda_engine 0.16.10] — 2026-10-10
+
+### Added — anda_engine
+
+- **MCP Events client** — `McpToolProvider` implements the client side of the
+  experimental MCP Events extension. `list_events` reads a server's event types
+  (and returns `None` when the server does not support them);
+  `subscribe_events` runs a poll or push subscription and reports events, cursors,
+  errors and termination to an application `McpEventSink`, using a cursor only
+  after the sink accepted it; `subscribe_webhook` and `unsubscribe_webhook`
+  manage webhook subscriptions whose deliveries the application receives itself;
+  `call_server_tool` lets the application call a server's tool by its remote
+  name, outside the model's catalog.
+  Event notifications are taken off the transport in arrival order, since rmcp
+  hands each notification to its own task. Both generations of the draft's error
+  codes are recognized. See `MCP_INTEGRATION.md`.
+
 ## [anda_engine 0.16.9] — 2026-10-10
 
 ### Fixed — anda_engine
