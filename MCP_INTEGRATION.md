@@ -425,13 +425,15 @@ implement the client side of the experimental MCP Events extension
   page). Push keeps one `events/stream` request open per subscription, outside the
   tool concurrency queue and without a request timeout; a stream silent for 60 s,
   a closed or retired session, or a full 256-notification buffer reopens it from
-  the last accepted cursor. Cancelling sends `notifications/cancelled` (rmcp also
-  aborts the response stream over HTTP).
+  the last accepted cursor. Cancelling sends `notifications/cancelled` on stdio and
+  legacy HTTP; on `2026-07-28` HTTP, rmcp closes the request's response stream
+  instead.
 - **Ordering.** rmcp dispatches each notification on its own task, which can
   reorder a burst. `EventTap` wraps every transport and hands
   `notifications/events/*` to the session's router as they are read, keyed by
-  `_meta["io.modelcontextprotocol/subscriptionId"]`; notifications that beat the
-  stream's registration are held briefly.
+  `_meta["io.modelcontextprotocol/subscriptionId"]` (a pushed event keeps the
+  rest of its `_meta`); notifications that beat the stream's registration are
+  held briefly.
 - **Delivery guarantee.** The provider keeps no event state. A cursor is used for
   the next request only after the sink accepted the signal carrying it, so delivery
   is at least once; the application persists cursors and deduplicates by `eventId`.

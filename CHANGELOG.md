@@ -12,14 +12,16 @@ All notable changes to the Anda project will be documented in this file.
   experimental MCP Events extension. `list_events` reads a server's event types
   (and returns `None` when the server does not support them);
   `subscribe_events` runs a poll or push subscription and reports events, cursors,
-  errors and termination to an application `McpEventSink`, using a cursor only
-  after the sink accepted it; `subscribe_webhook` and `unsubscribe_webhook`
-  manage webhook subscriptions whose deliveries the application receives itself;
-  `call_server_tool` lets the application call a server's tool by its remote
-  name, outside the model's catalog.
+  list changes, errors and termination to an application `McpEventSink`, using a
+  cursor only after the sink accepted it; `McpEventSubscription::cancel` does not
+  wait for a busy sink. `subscribe_webhook` and `unsubscribe_webhook` manage
+  webhook subscriptions whose deliveries the application receives itself, and
+  report failures as `McpEventError`s; `call_server_tool` lets the application
+  call a server's tool by its remote name, outside the model's catalog.
   Event notifications are taken off the transport in arrival order, since rmcp
-  hands each notification to its own task. Both generations of the draft's error
-  codes are recognized. See `MCP_INTEGRATION.md`.
+  hands each notification to its own task, and a pushed event keeps its `_meta`
+  (without the stream's subscription id) as a polled one does. Both generations
+  of the draft's error codes are recognized. See `MCP_INTEGRATION.md`.
 
 ## [anda_engine 0.16.9] — 2026-10-10
 

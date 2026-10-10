@@ -28,8 +28,8 @@ use parking_lot::Mutex as SyncMutex;
 use rmcp::{
     RoleClient,
     model::{
-        ClientRequest, CustomRequest, JsonRpcMessage, JsonRpcNotification, RequestId,
-        ServerNotification, ServerResult,
+        ClientRequest, CustomRequest, JsonRpcMessage, JsonRpcNotification, NotificationMetaObject,
+        RequestId, ServerNotification, ServerResult,
     },
     service::{PeerRequestOptions, RxJsonRpcMessage, ServiceError},
     transport::Transport,
@@ -76,6 +76,8 @@ const LIST_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_ID_BYTES: usize = 1024;
 
 const NOTIFICATION_PREFIX: &str = "notifications/events/";
+/// `_meta` key naming the stream a push notification belongs to.
+const SUBSCRIPTION_ID_META: &str = "io.modelcontextprotocol/subscriptionId";
 
 /// How a server can deliver an event type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -90,6 +92,7 @@ pub enum McpEventDeliveryMode {
 }
 
 impl McpEventDeliveryMode {
+    /// The mode's name on the wire.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Poll => "poll",
@@ -103,7 +106,9 @@ impl McpEventDeliveryMode {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct McpEventDefinition {
+    /// Event type name, used to subscribe.
     pub name: String,
+    /// What the event type reports.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// Supported delivery modes; unknown modes are dropped.
@@ -115,6 +120,7 @@ pub struct McpEventDefinition {
     /// JSON Schema of an event's `data`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload_schema: Option<Json>,
+    /// Server metadata (`_meta`).
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<Json>,
 }
@@ -155,14 +161,18 @@ where
 pub struct McpEvent {
     /// Deduplication key; stays the same when the server delivers again.
     pub event_id: String,
+    /// Event type name.
     pub name: String,
     /// ISO 8601 time the event happened.
     #[serde(default)]
     pub timestamp: String,
+    /// Payload, described by the event type's `payload_schema`.
     #[serde(default)]
     pub data: Json,
+    /// Position just after this event.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
+    /// Server metadata (`_meta`), without a push stream's subscription id.
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<Json>,
 }
@@ -202,7 +212,9 @@ pub trait McpEventSink: Send + Sync {
 /// Starts a poll or push subscription.
 #[derive(Debug, Clone)]
 pub struct McpEventSubscribeRequest {
+    /// Event type name.
     pub name: String,
+    /// Subscription arguments, matching the event type's `input_schema`.
     pub arguments: Map<String, Json>,
     /// [`McpEventDeliveryMode::Poll`] or [`McpEventDeliveryMode::Push`].
     pub mode: McpEventDeliveryMode,
@@ -221,6 +233,7 @@ pub struct McpEventSubscription {
 }
 
 impl McpEventSubscription {
+    /// The delivery mode the subscription runs.
     pub fn mode(&self) -> McpEventDeliveryMode {
         self.mode
     }
@@ -250,13 +263,17 @@ impl Drop for McpEventSubscription {
 /// same name, arguments and URL before `refresh_before` refreshes it.
 #[derive(Clone)]
 pub struct McpWebhookSubscribeRequest {
+    /// Event type name.
     pub name: String,
+    /// Subscription arguments, matching the event type's `input_schema`.
     pub arguments: Map<String, Json>,
     /// HTTPS callback URL.
     pub url: String,
     /// `whsec_` followed by base64 of 24 to 64 random bytes.
     pub secret: String,
+    /// Where to resume; `None` starts from now.
     pub cursor: Option<String>,
+    /// Replay floor: nothing older than this is replayed.
     pub max_age_ms: Option<u64>,
     /// `None` leaves the lifetime to the server; `Some(None)` asks for no expiry.
     pub ttl_ms: Option<Option<u64>>,
@@ -286,10 +303,13 @@ pub struct McpWebhookSubscription {
     /// ISO 8601 time to subscribe again by; `None` means no expiry.
     #[serde(default)]
     pub refresh_before: Option<String>,
+    /// Where deliveries start.
     #[serde(default)]
     pub cursor: Option<String>,
+    /// The server could not replay everything since the requested cursor.
     #[serde(default)]
     pub truncated: bool,
+    /// The server's report on recent deliveries, untrusted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivery_status: Option<Json>,
 }
@@ -332,9 +352,11 @@ pub enum McpEventErrorKind {
 /// Error of an events request, or the reason a subscription ended.
 #[derive(Debug, Clone, PartialEq)]
 pub struct McpEventError {
+    /// What failed.
     pub kind: McpEventErrorKind,
     /// JSON-RPC error code, when the server sent one.
     pub code: Option<i64>,
+    /// Error message, followed by `data.reason` (or `data.kind`) when present.
     pub message: String,
     /// JSON-RPC error data (`reason`, `kind`, ...), untrusted.
     pub data: Option<Json>,
@@ -451,11 +473,7 @@ fn truncate(text: &str, max: usize) -> String {
     if text.len() <= max {
         return text.to_string();
     }
-    let mut end = max;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…", &text[..end])
+    format!("{}…", &text[..text.floor_char_boundary(max)])
 }
 
 impl McpToolProvider {
@@ -567,6 +585,9 @@ impl McpToolProvider {
         request: McpWebhookSubscribeRequest,
         cancellation: CancellationToken,
     ) -> Result<McpWebhookSubscription, BoxError> {
+        let config = self
+            .server_config(server_id)
+            .map_err(McpEventError::from_box)?;
         let mut params = json!({
             "name": request.name,
             "arguments": request.arguments,
@@ -580,18 +601,17 @@ impl McpToolProvider {
             params["ttlMs"] = ttl_ms.map_or(Json::Null, Json::from);
         }
         let result = self
-            .events_request(server_id, "events/subscribe", params, cancellation)
+            .events_request(&config, "events/subscribe", params, cancellation)
             .await?;
         let subscription: McpWebhookSubscription =
             serde_json::from_value(result).map_err(|err| {
                 McpEventError::other(format!("invalid events/subscribe result: {err}"))
             })?;
-        let limits = &self.server_config(server_id)?.limits;
         if subscription.id.len() > MAX_ID_BYTES
             || subscription
                 .cursor
                 .as_ref()
-                .is_some_and(|cursor| cursor.len() > limits.cursor_bytes)
+                .is_some_and(|cursor| cursor.len() > config.limits.cursor_bytes)
         {
             return Err(McpEventError::other("events/subscribe result exceeds limits").into());
         }
@@ -608,31 +628,31 @@ impl McpToolProvider {
         url: &str,
         cancellation: CancellationToken,
     ) -> Result<(), BoxError> {
+        let config = self
+            .server_config(server_id)
+            .map_err(McpEventError::from_box)?;
         let params = json!({
             "name": name,
             "arguments": arguments,
             "delivery": {"mode": "webhook", "url": url},
         });
-        self.events_request(server_id, "events/unsubscribe", params, cancellation)
+        self.events_request(&config, "events/unsubscribe", params, cancellation)
             .await?;
         Ok(())
     }
 
     async fn events_request(
         &self,
-        server_id: &str,
+        config: &Arc<Registration>,
         method: &'static str,
         params: Json,
         cancellation: CancellationToken,
     ) -> Result<Json, McpEventError> {
-        let config = self
-            .server_config(server_id)
-            .map_err(McpEventError::from_box)?;
         let limit = Duration::from_secs(config.timeouts.setup_secs)
             + Duration::from_secs(config.timeouts.request_secs);
         let request = async {
             let session = self
-                .ensure_session(&config)
+                .ensure_session(config)
                 .await
                 .map_err(McpEventError::from_box)?;
             let peer = session.service.lock().await.peer().clone();
@@ -806,7 +826,7 @@ impl Subscriber {
                 Round::Cancelled => return,
                 Round::Closed => REOPEN_DELAY,
                 Round::Failed(err) if err.is_terminal() => {
-                    let _ = self.sink.deliver(McpEventSignal::Terminated(err)).await;
+                    self.notify(McpEventSignal::Terminated(err)).await;
                     return;
                 }
                 Round::Failed(err) => {
@@ -815,18 +835,16 @@ impl Subscriber {
                         self.config.id,
                         self.request.name
                     );
-                    let _ = self
-                        .sink
-                        .deliver(McpEventSignal::Error {
-                            message: err.to_string(),
-                        })
-                        .await;
+                    self.notify(McpEventSignal::Error {
+                        message: err.to_string(),
+                    })
+                    .await;
                     backoff.next()
                 }
             };
             if let Some(round) = self.sleep(delay).await {
                 if let Round::Failed(err) = round {
-                    let _ = self.sink.deliver(McpEventSignal::Terminated(err)).await;
+                    self.notify(McpEventSignal::Terminated(err)).await;
                 }
                 return;
             }
@@ -856,6 +874,17 @@ impl Subscriber {
                 Ok(Err(err)) => Err(Round::Failed(McpEventError::from_box(err))),
                 Err(_) => Err(Round::Failed(McpEventError::other("MCP session setup timed out"))),
             },
+        }
+    }
+
+    /// Delivers a signal that carries no progress; the sink's answer is ignored.
+    /// Like [`Self::deliver`], it gives way to cancellation, so a slow sink
+    /// cannot hold up [`McpEventSubscription::cancel`].
+    async fn notify(&self, signal: McpEventSignal) {
+        tokio::select! {
+            biased;
+            _ = self.cancel.cancelled() => {}
+            _ = self.sink.deliver(signal) => {}
         }
     }
 
@@ -898,7 +927,7 @@ impl Subscriber {
                 Ok(event) => events.push(event),
                 Err(message) => {
                     log::warn!("MCP server {}: {message}", self.config.id);
-                    let _ = self.sink.deliver(McpEventSignal::Error { message }).await;
+                    self.notify(McpEventSignal::Error { message }).await;
                 }
             }
         }
@@ -907,12 +936,21 @@ impl Subscriber {
 
     async fn poll(&mut self, backoff: &mut Backoff) -> Round {
         let mut started = false;
+        // Kept across polls of one session: a change announced while waiting
+        // for the next poll is reported after it.
+        let mut list_changed: Option<watch::Receiver<u64>> = None;
         loop {
             let session = match self.session().await {
                 Ok(session) => session,
                 Err(round) => return round,
             };
-            let mut list_changed = session.events.list_changed();
+            let current = session.events.list_changed();
+            if !list_changed
+                .as_ref()
+                .is_some_and(|known| known.same_channel(&current))
+            {
+                list_changed = Some(current);
+            }
             let mut params = json!({
                 "name": self.request.name,
                 "arguments": self.request.arguments,
@@ -933,6 +971,8 @@ impl Subscriber {
                 _ = self.config.cancelled.cancelled() => return removed(),
                 result = request => result,
             };
+            // Do not keep a retired session alive until the next poll.
+            drop(session);
             let page = match result {
                 Err(_) => return Round::Failed(McpEventError::other("MCP events/poll timed out")),
                 Ok(Err(err)) => return Round::Failed(McpEventError::from_service(err)),
@@ -971,9 +1011,11 @@ impl Subscriber {
             if let Err(round) = self.deliver_events(events, page.cursor).await {
                 return round;
             }
-            if list_changed.has_changed().unwrap_or(false) {
+            if let Some(list_changed) = &mut list_changed
+                && list_changed.has_changed().unwrap_or(false)
+            {
                 list_changed.mark_unchanged();
-                let _ = self.sink.deliver(McpEventSignal::ListChanged).await;
+                self.notify(McpEventSignal::ListChanged).await;
             }
             let delay = if page.has_more {
                 Duration::ZERO
@@ -1047,7 +1089,7 @@ impl Subscriber {
                     };
                 }
                 Ok(()) = list_changed.changed() => {
-                    let _ = self.sink.deliver(McpEventSignal::ListChanged).await;
+                    self.notify(McpEventSignal::ListChanged).await;
                 }
                 _ = checks.tick() => {
                     if session.is_closed().await {
@@ -1063,8 +1105,9 @@ impl Subscriber {
             }
         };
         router.unregister(&id);
-        // Tell the server to end the stream: on stdio a cancellation
-        // notification, on HTTP rmcp also aborts the request's response stream.
+        // Tell the server to end the stream: a cancellation notification on
+        // stdio and legacy HTTP; on `2026-07-28` HTTP rmcp closes the
+        // request's response stream instead.
         let _ = tokio::time::timeout(
             Duration::from_secs(5),
             handle.cancel(Some("subscription ended".to_string())),
@@ -1086,13 +1129,9 @@ impl Subscriber {
                 self.position(position.cursor).await
             }
             "event" => {
-                let mut params = notice.params;
-                if let Some(params) = params.as_object_mut() {
-                    params.remove("_meta");
-                }
-                let events = self.accept(vec![params]).await;
+                // `event()` already rejects an oversized cursor.
+                let events = self.accept(vec![notice.params]).await;
                 let cursor = events.last().and_then(|event| event.cursor.clone());
-                let cursor = self.checked(cursor)?;
                 self.deliver_events(events, cursor).await
             }
             "heartbeat" => {
@@ -1101,12 +1140,10 @@ impl Subscriber {
             }
             "error" => {
                 let error = McpEventError::from_notice(&notice.params);
-                let _ = self
-                    .sink
-                    .deliver(McpEventSignal::Error {
-                        message: error.to_string(),
-                    })
-                    .await;
+                self.notify(McpEventSignal::Error {
+                    message: error.to_string(),
+                })
+                .await;
                 Ok(())
             }
             "terminated" => Err(Round::Failed(McpEventError::from_notice(&notice.params))),
@@ -1179,7 +1216,7 @@ impl EventRouter {
     fn tap(&self, message: RxJsonRpcMessage<RoleClient>) -> Option<RxJsonRpcMessage<RoleClient>> {
         match message {
             JsonRpcMessage::Notification(JsonRpcNotification {
-                notification: ServerNotification::CustomNotification(notification),
+                notification: ServerNotification::CustomNotification(mut notification),
                 ..
             }) if notification.method.starts_with(NOTIFICATION_PREFIX) => {
                 let kind = &notification.method[NOTIFICATION_PREFIX.len()..];
@@ -1195,9 +1232,20 @@ impl EventRouter {
                     );
                     return None;
                 };
+                let mut params = notification.params.take().unwrap_or(Json::Null);
+                // rmcp moves `_meta` out of the params; an event keeps the
+                // rest of it, as it does when polled.
+                if let Some(mut meta) = notification.extensions.remove::<NotificationMetaObject>() {
+                    meta.remove(SUBSCRIPTION_ID_META);
+                    if !meta.is_empty()
+                        && let Some(params) = params.as_object_mut()
+                    {
+                        params.insert("_meta".to_string(), Json::Object(meta.0.0));
+                    }
+                }
                 let notice = StreamNotice {
                     kind: kind.to_string(),
-                    params: notification.params.unwrap_or(Json::Null),
+                    params,
                 };
                 self.route(id, notice);
                 None
@@ -1451,6 +1499,33 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn push_events_keep_their_own_meta() {
+        let router = EventRouter::new();
+        let mut stream = router.register(RequestId::Number(9));
+        let event = serde_json::from_value(json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/events/event",
+            "params": {
+                "eventId": "m1",
+                "name": "x",
+                "_meta": {"io.modelcontextprotocol/subscriptionId": 9, "trace": "t1"},
+            },
+        }))
+        .unwrap();
+        assert!(router.tap(event).is_none());
+        let notice = stream.try_recv().unwrap();
+        assert_eq!(notice.params["eventId"], "m1");
+        assert_eq!(notice.params["_meta"], json!({"trace": "t1"}));
+        // A `_meta` that only names the stream is not passed on.
+        router.tap(notification(
+            "notifications/events/heartbeat",
+            Some(9),
+            json!({"cursor": "c1"}),
+        ));
+        assert!(stream.try_recv().unwrap().params.get("_meta").is_none());
+    }
+
     /// Sink that forwards signals to the test, failing the first `fail_events`
     /// non-empty event deliveries.
     struct TestSink {
@@ -1515,8 +1590,9 @@ mod tests {
     }
 
     /// A stateless `2026-07-28` server with MCP Events: poll pages chained by
-    /// cursor, a push stream that sends a burst and stays open, a stream that is
-    /// terminated at once, and a marker file touched when a stream is cancelled.
+    /// cursor, a poll whose event types change between two polls, a push stream
+    /// that sends a burst and stays open, a stream that is terminated at once,
+    /// and a marker file touched when a stream is cancelled.
     #[cfg(unix)]
     const EVENTS_SERVER: &str = r#"#!/bin/sh
 marker="$1"
@@ -1538,6 +1614,15 @@ while IFS= read -r line; do
       ;;
     *'"method":"events/poll"'*)
       case "$line" in
+        *'"name":"catalog.changed"'*)
+          printf '{"jsonrpc":"2.0","id":%s,"result":{"events":[],"cursor":"k1","truncated":false,"hasMore":false,"nextPollMs":1000}}\n' "$id"
+          case "$line" in
+            *'"cursor":null'*)
+              sleep 0.3
+              printf '{"jsonrpc":"2.0","method":"notifications/events/list_changed","params":{}}\n'
+              ;;
+          esac
+          ;;
         *'"cursor":null'*)
           printf '{"jsonrpc":"2.0","id":%s,"result":{"events":[{"eventId":"e1","name":"issue.opened","timestamp":"2026-10-10T00:00:00Z","data":{"n":1},"cursor":"c1"}],"cursor":"c1","truncated":false,"hasMore":true}}\n' "$id"
           ;;
@@ -1714,6 +1799,30 @@ done
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn polls_report_a_list_change_announced_between_polls() {
+        let (provider, script, _) = events_server("poll_list_changed");
+        let (sink, mut signals) = sink(0);
+        let subscription = provider
+            .subscribe_events(
+                "events",
+                request("catalog.changed", McpEventDeliveryMode::Poll),
+                sink,
+            )
+            .unwrap();
+        assert!(matches!(
+            next(&mut signals).await,
+            McpEventSignal::Active { .. }
+        ));
+        assert_eq!(ids(&next(&mut signals).await), (vec![], Some("k1".into())));
+        // The server announces the change while the subscription waits for its
+        // next poll, which then reports it.
+        assert_eq!(next(&mut signals).await, McpEventSignal::ListChanged);
+        subscription.cancel().await;
+        let _ = std::fs::remove_file(script);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn streams_a_burst_in_order_and_cancels_the_stream_on_the_server() {
         let (provider, script, marker) = events_server("push");
         let (sink, mut signals) = sink(0);
@@ -1797,6 +1906,39 @@ done
         let _ = std::fs::remove_file(script);
     }
 
+    /// Sink that records each signal and never returns.
+    struct StuckSink(mpsc::UnboundedSender<McpEventSignal>);
+
+    impl McpEventSink for StuckSink {
+        fn deliver(&self, signal: McpEventSignal) -> BoxFut<'_, Result<(), BoxError>> {
+            let _ = self.0.send(signal);
+            Box::pin(std::future::pending())
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_does_not_wait_for_a_stuck_sink() {
+        let (provider, script, _) = events_server("stuck_sink");
+        let (signals, mut received) = mpsc::unbounded_channel();
+        let subscription = provider
+            .subscribe_events(
+                "events",
+                request("doomed", McpEventDeliveryMode::Push),
+                Arc::new(StuckSink(signals)),
+            )
+            .unwrap();
+        // The sink never returns from the final signal.
+        assert!(matches!(
+            next(&mut received).await,
+            McpEventSignal::Terminated(_)
+        ));
+        tokio::time::timeout(Duration::from_secs(5), subscription.cancel())
+            .await
+            .expect("cancel does not wait for the sink");
+        let _ = std::fs::remove_file(script);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn removing_the_server_terminates_its_subscriptions() {
@@ -1858,9 +2000,11 @@ done
                 "events/unsubscribe" => json!({}),
                 "events/stream" => {
                     let meta = json!({"io.modelcontextprotocol/subscriptionId": id});
+                    let event_meta =
+                        json!({"io.modelcontextprotocol/subscriptionId": id, "trace": "t1"});
                     let frames = [
                         json!({"jsonrpc":"2.0","method":"notifications/events/active","params":{"cursor":"h0","truncated":true,"_meta":meta}}),
-                        json!({"jsonrpc":"2.0","method":"notifications/events/event","params":{"eventId":"h1","name":"push.http","timestamp":"2026-10-10T00:00:00Z","data":{"ok":true},"cursor":"h1","_meta":meta}}),
+                        json!({"jsonrpc":"2.0","method":"notifications/events/event","params":{"eventId":"h1","name":"push.http","timestamp":"2026-10-10T00:00:00Z","data":{"ok":true},"cursor":"h1","_meta":event_meta}}),
                     ];
                     let body = futures::stream::iter(
                         frames.map(|frame| Ok::<_, std::io::Error>(format!("data: {frame}\n\n"))),
@@ -1983,10 +2127,14 @@ done
             }
         );
         assert_eq!(ids(&next(&mut signals).await), (vec![], Some("h0".into())));
-        assert_eq!(
-            ids(&next(&mut signals).await),
-            (vec!["h1".into()], Some("h1".into()))
-        );
+        let McpEventSignal::Events { events, cursor } = next(&mut signals).await else {
+            panic!("expected events");
+        };
+        assert_eq!(cursor.as_deref(), Some("h1"));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_id, "h1");
+        // The event keeps its own metadata, but not the stream's id.
+        assert_eq!(events[0].meta, Some(json!({"trace": "t1"})));
         subscription.cancel().await;
         task.abort();
     }
