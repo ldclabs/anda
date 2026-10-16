@@ -18,7 +18,7 @@ async fn main() -> Result<(), BoxError> {
         .mock_ctx();
     // Production hosts create one scope per conversation and reuse it across turns.
     ctx.base.set_state(ShellSessionScope::new());
-    let (mut result, _) = ctx
+    let mut result = ctx
         .tool_call(ToolInput {
             name: "shell".into(),
             args: json!({"command": "echo workspace tools ready"}),
@@ -28,7 +28,7 @@ async fn main() -> Result<(), BoxError> {
     println!("{}", result.output);
     while result.output.get("state").and_then(|state| state.as_str()) == Some("running") {
         let task_id = result.output["task_id"].clone();
-        let (reply, _) = ctx
+        let reply = ctx
             .tool_call(ToolInput {
                 name: "shell_session".into(),
                 args: json!({"action": "poll", "task_id": task_id}),

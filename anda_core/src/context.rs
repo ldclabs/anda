@@ -36,9 +36,9 @@ use crate::{BoxError, path_lowercase};
 /// Execution environment available to agents.
 ///
 /// `AgentContext` combines the base runtime capabilities with model completion
-/// and orchestration methods for calling local or remote agents and tools.
+/// and orchestration methods for calling agents and tools.
 pub trait AgentContext: BaseContext + CompletionFeatures {
-    /// Returns definitions for available local tools.
+    /// Returns definitions for available tools.
     ///
     /// # Arguments
     /// * `names` - Optional filter for specific tool names.
@@ -47,20 +47,6 @@ pub trait AgentContext: BaseContext + CompletionFeatures {
     /// Vector of function definitions for the requested tools.
     fn tool_definitions(&self, names: Option<&[String]>) -> Vec<FunctionDefinition>;
 
-    /// Returns definitions for tools exposed by remote engines.
-    ///
-    /// # Arguments
-    /// * `endpoint` - Optional filter for specific remote engine endpoint;
-    /// * `names` - Optional filter for specific tool names.
-    ///
-    /// # Returns
-    /// Vector of function definitions for the requested tools.
-    fn remote_tool_definitions(
-        &self,
-        endpoint: Option<&str>,
-        names: Option<&[String]>,
-    ) -> impl Future<Output = Result<Vec<FunctionDefinition>, BoxError>> + Send;
-
     /// Removes and returns resources supported by the named tool.
     fn select_tool_resources(
         &self,
@@ -68,7 +54,7 @@ pub trait AgentContext: BaseContext + CompletionFeatures {
         resources: &mut Vec<Resource>,
     ) -> impl Future<Output = Vec<Resource>> + Send;
 
-    /// Returns definitions for available local agents.
+    /// Returns definitions for available agents.
     ///
     /// # Arguments
     /// * `names` - Optional filter for specific agent names;
@@ -77,20 +63,6 @@ pub trait AgentContext: BaseContext + CompletionFeatures {
     /// Vector of function definitions for the requested agents.
     fn agent_definitions(&self, names: Option<&[String]>) -> Vec<FunctionDefinition>;
 
-    /// Returns definitions for agents exposed by remote engines.
-    ///
-    /// # Arguments
-    /// * `endpoint` - Optional filter for specific remote engine endpoint;
-    /// * `names` - Optional filter for specific agent names.
-    ///
-    /// # Returns
-    /// Vector of function definitions for the requested agents.
-    fn remote_agent_definitions(
-        &self,
-        endpoint: Option<&str>,
-        names: Option<&[String]>,
-    ) -> impl Future<Output = Result<Vec<FunctionDefinition>, BoxError>> + Send;
-
     /// Removes and returns resources supported by the named agent.
     fn select_agent_resources(
         &self,
@@ -98,7 +70,7 @@ pub trait AgentContext: BaseContext + CompletionFeatures {
         resources: &mut Vec<Resource>,
     ) -> impl Future<Output = Vec<Resource>> + Send;
 
-    /// Returns definitions for all available tools and agents, including remote ones.
+    /// Returns definitions for all available tools and agents.
     ///
     /// # Arguments
     /// * `names` - Optional filter for specific tool or agent names;
@@ -110,7 +82,7 @@ pub trait AgentContext: BaseContext + CompletionFeatures {
         names: Option<&[String]>,
     ) -> impl Future<Output = Vec<FunctionDefinition>> + Send;
 
-    /// Executes a local tool call.
+    /// Executes a tool call.
     ///
     /// # Arguments
     /// * `args` - Tool input arguments, [`ToolInput`].
@@ -120,9 +92,9 @@ pub trait AgentContext: BaseContext + CompletionFeatures {
     fn tool_call(
         &self,
         args: ToolInput<Json>,
-    ) -> impl Future<Output = Result<(ToolOutput<Json>, Option<Principal>), BoxError>> + Send;
+    ) -> impl Future<Output = Result<ToolOutput<Json>, BoxError>> + Send;
 
-    /// Runs a local agent.
+    /// Runs an agent.
     ///
     /// # Arguments
     /// * `args` - Agent input arguments, [`AgentInput`].
@@ -131,20 +103,6 @@ pub trait AgentContext: BaseContext + CompletionFeatures {
     /// [`AgentOutput`] containing the result of the agent execution.
     fn agent_run(
         self,
-        args: AgentInput,
-    ) -> impl Future<Output = Result<(AgentOutput, Option<Principal>), BoxError>> + Send;
-
-    /// Runs a remote agent via HTTP RPC.
-    ///
-    /// # Arguments
-    /// * `endpoint` - Remote endpoint URL;
-    /// * `args` - Agent input arguments, [`AgentInput`]. The `meta` field will be set by the runtime.
-    ///
-    /// # Returns
-    /// [`AgentOutput`] containing the result of the agent execution.
-    fn remote_agent_run(
-        &self,
-        endpoint: &str,
         args: AgentInput,
     ) -> impl Future<Output = Result<AgentOutput, BoxError>> + Send;
 }
@@ -159,19 +117,6 @@ pub trait AgentContext: BaseContext + CompletionFeatures {
 pub trait BaseContext:
     Sized + StateFeatures + KeysFeatures + StoreFeatures + CacheFeatures + HttpFeatures
 {
-    /// Executes a remote tool call via HTTP RPC.
-    ///
-    /// # Arguments
-    /// * `endpoint` - Remote endpoint URL
-    /// * `args` - Tool input arguments, [`ToolInput`].
-    ///
-    /// # Returns
-    /// [`ToolOutput`] containing the final result.
-    fn remote_tool_call(
-        &self,
-        endpoint: &str,
-        args: ToolInput<Json>,
-    ) -> impl Future<Output = Result<ToolOutput<Json>, BoxError>> + Send;
 }
 
 /// Context metadata available during an agent or tool call.

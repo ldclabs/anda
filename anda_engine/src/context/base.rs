@@ -24,8 +24,8 @@
 
 use anda_core::{
     BaseContext, BoxError, CacheExpiry, CacheFeatures, CacheStoreFeatures, CancellationToken,
-    HttpFeatures, Json, KeysFeatures, ObjectMeta, Path, PutMode, PutResult, RequestMeta,
-    StateFeatures, StoreFeatures, ToolInput, ToolOutput, derivation_path_with,
+    HttpFeatures, KeysFeatures, ObjectMeta, Path, PutMode, PutResult, RequestMeta, StateFeatures,
+    StoreFeatures, derivation_path_with,
 };
 use candid::Principal;
 use http::Extensions;
@@ -42,14 +42,13 @@ use std::{
 const CONTEXT_MAX_DEPTH: u8 = 42;
 const CACHE_MAX_CAPACITY: u64 = 1000000;
 
-use super::{RemoteEngines, cache::CacheService, web3::Web3SDK};
+use super::{cache::CacheService, web3::Web3SDK};
 use crate::store::Store;
 
 /// Runtime context shared by engine tools and nested agent calls.
 ///
 /// `BaseCtx` owns the current agent namespace and request metadata while
-/// sharing storage, cache, Web3, remote-engine, and cancellation services with
-/// child contexts.
+/// sharing storage, cache, Web3, and cancellation services with child contexts.
 #[derive(Clone)]
 pub struct BaseCtx {
     /// Agent namespace that owns this context's storage and cache view.
@@ -63,8 +62,6 @@ pub struct BaseCtx {
     pub(crate) start_at: Instant,
     pub(crate) depth: u8,
     pub(crate) web3: Arc<Web3SDK>,
-    /// Registered remote engines for tool and agent execution.
-    pub(crate) remote: Arc<RemoteEngines>,
     pub(crate) state: Arc<RwLock<Extensions>>,
     pub(crate) meta: RequestMeta,
 
@@ -95,7 +92,6 @@ impl BaseCtx {
         names: BTreeSet<Path>,
         web3: Arc<Web3SDK>,
         store: Store,
-        remote: Arc<RemoteEngines>,
     ) -> Self {
         let caller = Principal::anonymous();
         Self {
@@ -110,7 +106,6 @@ impl BaseCtx {
             store,
             web3,
             depth: 0,
-            remote,
             state: Arc::new(RwLock::new(Extensions::default())),
             meta: RequestMeta::default(),
         }
@@ -173,7 +168,6 @@ impl BaseCtx {
             store: self.store.clone(),
             web3: self.web3.clone(),
             depth: self.depth + 1,
-            remote: self.remote.clone(),
             state: Arc::new(RwLock::new(state)),
             meta,
         };
@@ -182,42 +176,6 @@ impl BaseCtx {
             return Err("Context depth limit exceeded".into());
         }
         Ok(child)
-    }
-
-    // Helper function to create RequestMeta for self calls to remote engines.
-    pub(crate) fn self_meta(&self, target: Principal) -> RequestMeta {
-        RequestMeta {
-            engine: Some(target),
-            user: Some(self.name.clone()),
-            ..Default::default()
-        }
-    }
-
-    pub(crate) async fn remote_target(&self, endpoint: &str) -> Result<Principal, BoxError> {
-        if let Some(id) = self.remote.get_id_by_endpoint(endpoint) {
-            return Ok(id);
-        }
-        if let Ok((data, _)) = self
-            .store
-            .store_get(&Path::default(), &Path::from(super::DYNAMIC_REMOTE_ENGINES))
-            .await
-            && let Ok(engines) = cbor2::from_slice::<RemoteEngines>(&data)
-            && let Some(id) = engines.get_id_by_endpoint(endpoint)
-        {
-            return Ok(id);
-        }
-        Err(format!("remote engine endpoint {endpoint} not found").into())
-    }
-
-    pub(crate) async fn call_remote_tool(
-        &self,
-        target: Principal,
-        endpoint: &str,
-        mut args: ToolInput<Json>,
-    ) -> Result<ToolOutput<Json>, BoxError> {
-        args.meta = Some(self.self_meta(target));
-        self.https_signed_rpc(endpoint, "tool_call", &(&args,))
-            .await
     }
 
     /// Clones the context with a new caller principal.
@@ -268,24 +226,7 @@ impl BaseCtx {
     }
 }
 
-impl BaseContext for BaseCtx {
-    /// Executes a remote tool call via HTTP RPC.
-    ///
-    /// # Arguments
-    /// * `endpoint` - Remote endpoint URL;
-    /// * `args` - Tool input arguments, [`ToolInput`].
-    ///
-    /// # Returns
-    /// [`ToolOutput`] containing the final result.
-    async fn remote_tool_call(
-        &self,
-        endpoint: &str,
-        args: ToolInput<Json>,
-    ) -> Result<ToolOutput<Json>, BoxError> {
-        let target = self.remote_target(endpoint).await?;
-        self.call_remote_tool(target, endpoint, args).await
-    }
-}
+impl BaseContext for BaseCtx {}
 
 impl CacheStoreFeatures for BaseCtx {}
 
@@ -646,7 +587,7 @@ impl HttpFeatures for BaseCtx {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anda_core::{AgentOutput, ToolInput};
+    use anda_core::AgentOutput;
     use bytes::Bytes;
 
     use crate::store::{InMemory, Store};
@@ -660,7 +601,6 @@ mod tests {
             BTreeSet::from([Path::default()]),
             Arc::new(Web3SDK::not_implemented()),
             Store::new(Arc::new(InMemory::new())),
-            Arc::new(RemoteEngines::new()),
         )
     }
 
@@ -747,11 +687,6 @@ mod tests {
         assert_eq!(cloned.caller, caller);
         assert_eq!(cloned.get_state::<String>().as_deref(), Some("root-state"));
 
-        let target = Principal::self_authenticating([3; 32]);
-        let self_meta = ctx.self_meta(target);
-        assert_eq!(self_meta.engine, Some(target));
-        assert_eq!(self_meta.user.as_deref(), Some("EngineName"));
-
         let mut deep = ctx;
         for _ in 0..41 {
             deep = deep
@@ -765,7 +700,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn base_ctx_store_cache_and_remote_feature_forwarding() {
+    async fn base_ctx_store_cache_and_feature_forwarding() {
         let ctx = test_ctx();
         let file = Path::from("File.TXT");
         let renamed = Path::from("Renamed.TXT");
@@ -811,17 +746,6 @@ mod tests {
         assert!(ctx.cache.iter(&ctx.path).count() >= 3);
         assert!(ctx.cache_delete("c").await);
         assert!(!ctx.cache_delete("c").await);
-
-        assert!(
-            ctx.remote_tool_call(
-                "https://missing.example",
-                ToolInput::new("x".to_string(), Json::Null)
-            )
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("not found")
-        );
 
         assert!(ctx.a256gcm_key(Vec::new()).await.is_err());
         assert!(ctx.ed25519_sign_message(Vec::new(), b"m").await.is_err());

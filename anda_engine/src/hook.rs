@@ -539,7 +539,7 @@ mod tests {
     use parking_lot::Mutex;
 
     use crate::{
-        context::{RemoteEngines, Web3SDK},
+        context::Web3SDK,
         model::Models,
         store::{InMemory, Store},
         subagent::SubAgentSetManager,
@@ -554,7 +554,6 @@ mod tests {
             std::collections::BTreeSet::from([anda_core::Path::default()]),
             Arc::new(Web3SDK::not_implemented()),
             Store::new(Arc::new(InMemory::new())),
-            Arc::new(RemoteEngines::new()),
         )
     }
 

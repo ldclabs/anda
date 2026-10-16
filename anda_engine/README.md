@@ -8,7 +8,7 @@
 
 Runtime engine for [Anda](https://github.com/ldclabs/anda), a Rust framework for building autonomous AI agents powered by ICP identities and Trusted Execution Environments (TEEs).
 
-`anda_engine` implements the runtime behind the traits and data contracts in [`anda_core`](https://github.com/ldclabs/anda/tree/main/anda_core). It wires together agent execution, tool dispatch, model providers, persistent storage, hooks, remote engines, and built-in extensions.
+`anda_engine` implements the runtime behind the traits and data contracts in [`anda_core`](https://github.com/ldclabs/anda/tree/main/anda_core). It wires together agent execution, tool dispatch, model providers, persistent storage, hooks, and built-in extensions.
 
 Full API documentation is available on [docs.rs][docs].
 
@@ -22,7 +22,6 @@ Full API documentation is available on [docs.rs][docs].
 - Built-in model adapters for OpenAI-compatible APIs, Anthropic, and Gemini.
 - Object storage backed by the `object_store` ecosystem.
 - Persistent memory tools built on AndaDB, Cognitive Nexus, and KIP.
-- Remote engine discovery and cross-engine tool or agent calls.
 - Hook APIs for observing and transforming agent and tool execution.
 - Workspace tools for filesystem access, shell execution, web fetch, notes, skills, todos, and search.
 - MCP client support with versioned catalogs, stable routes, input/output budgets, configurable concurrency/deadlines, OAuth refresh coordination, and opt-in elicitation/resources.
@@ -90,13 +89,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 ### Engine
 
-`Engine` is the top-level runtime. It owns registered agents, tools, models, hooks, storage, management policy, Web3 or TEE identity, and remote engine metadata.
+`Engine` is the top-level runtime. It owns registered agents, tools, models, hooks, storage, management policy, and Web3 or TEE identity.
 
 Use `EngineBuilder` to configure an engine, then call `build(default_agent)` to initialize tools and agents. The selected default agent is automatically exported.
 
 ### Contexts
 
-Agents receive `AgentCtx`; tools receive `BaseCtx`. Contexts carry caller identity, request metadata, cancellation tokens, scoped cache and storage, shared state, HTTP and canister features, Web3 signing, and remote engine access.
+Agents receive `AgentCtx`; tools receive `BaseCtx`. Contexts carry caller identity, request metadata, cancellation tokens, scoped cache and storage, shared state, HTTP and canister features, and Web3 signing.
 
 Context namespaces are derived from agent and tool names so cache and object storage remain isolated between components.
 
@@ -127,8 +126,8 @@ reference alongside the bytes so the attachment can be found later.
 tools the model discovered, unlike `set_tools`.
 
 Agent dependencies supplied by dynamic providers are verified after provider
-initialization during engine build. Exact `SA_`, `RA_`, and `RT_` callable names
-can be used when requesting definitions.
+initialization during engine build. Exact `SA_` callable names can be used when
+requesting definitions.
 
 
 ### Models
@@ -309,15 +308,6 @@ subagents are not cancelled by removing their catalog entries; hosts own session
 ### Memory
 
 The `memory` module stores conversations, resources, artifacts, usage, steering messages, and follow-up messages. It uses AndaDB collections and exposes KIP-backed tools for persistent agent memory through the Cognitive Nexus.
-
-### Remote Engines
-
-Engines can register other engines by endpoint. Remote metadata is fetched through signed RPC, and exported remote functions are exposed with prefixed names:
-
-- Tools: `RT_{handle}_{tool}`
-- Agents: `RA_{handle}_{agent}`
-
-This lets agents discover and call capabilities hosted by other engines without linking them into the same process.
 
 ### Hooks
 

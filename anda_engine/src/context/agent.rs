@@ -40,7 +40,6 @@ use std::{
 
 use super::{
     base::BaseCtx,
-    engine::RemoteEngines,
     runner::{CompletionRunner, CompletionStream},
 };
 use crate::{
@@ -49,18 +48,11 @@ use crate::{
     subagent::{SubAgentSet, SubAgentSetManager},
 };
 
-/// Reserved dynamic-configuration key for remote engine registrations.
-pub static DYNAMIC_REMOTE_ENGINES: &str = "_engines";
-/// Prefix used for routed remote-agent calls in model-facing tool names.
-pub static REMOTE_AGENT_PREFIX: &str = "RA_";
-/// Prefix used for routed remote-tool calls in model-facing tool names.
-pub static REMOTE_TOOL_PREFIX: &str = "RT_";
 /// Prefix used for routed subagent calls in model-facing tool names.
 pub static SUB_AGENT_PREFIX: &str = "SA_";
 
-/// Strips a routing prefix such as `RT_`, `RA_`, or `SA_` without case
-/// sensitivity, since models occasionally echo prefixed callable names in a
-/// different case.
+/// Strips a routing prefix such as `SA_` without case sensitivity, since models
+/// occasionally echo prefixed callable names in a different case.
 pub(crate) fn strip_prefix_ignore_ascii_case<'a>(name: &'a str, prefix: &str) -> Option<&'a str> {
     let (head, tail) = name.split_at_checked(prefix.len())?;
     head.eq_ignore_ascii_case(prefix).then_some(tail)
@@ -72,9 +64,7 @@ pub(crate) fn strip_prefix_ignore_ascii_case<'a>(name: &'a str, prefix: &str) ->
 /// dispatched, so any check that compares a model-emitted name against a registered name must
 /// normalize through here first.
 pub(crate) fn strip_routing_prefix(name: &str) -> Option<&str> {
-    [SUB_AGENT_PREFIX, REMOTE_TOOL_PREFIX, REMOTE_AGENT_PREFIX]
-        .into_iter()
-        .find_map(|prefix| strip_prefix_ignore_ascii_case(name, prefix))
+    strip_prefix_ignore_ascii_case(name, SUB_AGENT_PREFIX)
 }
 
 pub(crate) fn agent_context_path(agent_name: &str) -> String {
@@ -246,17 +236,6 @@ impl AgentCtx {
         }
     }
 
-    async fn call_remote_agent(
-        &self,
-        target: Principal,
-        endpoint: &str,
-        mut args: AgentInput,
-    ) -> Result<AgentOutput, BoxError> {
-        args.meta = Some(self.base.self_meta(target));
-        self.https_signed_rpc(endpoint, "agent_run", &(&args,))
-            .await
-    }
-
     pub(crate) fn has_tool_lowercase(&self, lowercase_name: &str) -> bool {
         self.tools.contains_lowercase(lowercase_name)
             || self.tool_providers.contains_lowercase(lowercase_name)
@@ -310,43 +289,6 @@ impl AgentCtx {
         groups.into_values().collect()
     }
 
-    /// Loads the dynamically registered remote engines, if any are configured.
-    async fn dynamic_remote_engines(&self) -> Option<RemoteEngines> {
-        self.root
-            .cache_store_get::<RemoteEngines>(DYNAMIC_REMOTE_ENGINES)
-            .await
-            .ok()
-            .map(|(engines, _)| engines)
-    }
-
-    /// Remote tool definitions from static and dynamic engines, routed with `RT_`.
-    fn remote_tool_definitions_with(
-        &self,
-        dynamic: Option<&RemoteEngines>,
-        endpoint: Option<&str>,
-        names: Option<&[String]>,
-    ) -> Vec<FunctionDefinition> {
-        merge_remote_definitions(
-            self.base.remote.tool_definitions(endpoint, names),
-            dynamic.map(|engines| engines.tool_definitions(endpoint, names)),
-            REMOTE_TOOL_PREFIX,
-        )
-    }
-
-    /// Remote agent definitions from static and dynamic engines, routed with `RA_`.
-    fn remote_agent_definitions_with(
-        &self,
-        dynamic: Option<&RemoteEngines>,
-        endpoint: Option<&str>,
-        names: Option<&[String]>,
-    ) -> Vec<FunctionDefinition> {
-        merge_remote_definitions(
-            self.base.remote.agent_definitions(endpoint, names),
-            dynamic.map(|engines| engines.agent_definitions(endpoint, names)),
-            REMOTE_AGENT_PREFIX,
-        )
-    }
-
     /// Creates a completion runner for iterative processing of completion requests.
     pub fn completion_iter(
         self,
@@ -398,46 +340,12 @@ impl AgentContext for AgentCtx {
         definitions
     }
 
-    /// Retrieves definitions for available tools in the remote engines.
-    ///
-    /// # Arguments
-    /// * `endpoint` - Optional filter for specific remote engine endpoint;
-    /// * `names` - Optional filter for specific tool names.
-    ///
-    /// # Returns
-    /// Vector of function definitions for the requested tools.
-    async fn remote_tool_definitions(
-        &self,
-        endpoint: Option<&str>,
-        names: Option<&[String]>,
-    ) -> Result<Vec<FunctionDefinition>, BoxError> {
-        if let Some(names) = names
-            && names.is_empty()
-        {
-            return Ok(Vec::new());
-        }
-
-        let dynamic = self.dynamic_remote_engines().await;
-        Ok(self.remote_tool_definitions_with(dynamic.as_ref(), endpoint, names))
-    }
-
     /// Extracts resources from the provided list based on the tool's supported tags.
     async fn select_tool_resources(
         &self,
         prefixed_name: &str,
         resources: &mut Vec<Resource>,
     ) -> Vec<Resource> {
-        if let Some(name) = strip_prefix_ignore_ascii_case(prefixed_name, REMOTE_TOOL_PREFIX) {
-            let res = self.base.remote.select_tool_resources(name, resources);
-            if !res.is_empty() {
-                return res;
-            }
-
-            if let Some(engines) = self.dynamic_remote_engines().await {
-                return engines.select_tool_resources(name, resources);
-            }
-        }
-
         if self.tools.contains(prefixed_name) {
             return self.tools.select_resources(prefixed_name, resources);
         }
@@ -480,46 +388,12 @@ impl AgentContext for AgentCtx {
         defs
     }
 
-    /// Retrieves definitions for available agents in the remote engines.
-    ///
-    /// # Arguments
-    /// * `endpoint` - Optional filter for specific remote engine endpoint;
-    /// * `names` - Optional filter for specific agent names.
-    ///
-    /// # Returns
-    /// Vector of function definitions for the requested agents.
-    async fn remote_agent_definitions(
-        &self,
-        endpoint: Option<&str>,
-        names: Option<&[String]>,
-    ) -> Result<Vec<FunctionDefinition>, BoxError> {
-        if let Some(names) = names
-            && names.is_empty()
-        {
-            return Ok(Vec::new());
-        }
-
-        let dynamic = self.dynamic_remote_engines().await;
-        Ok(self.remote_agent_definitions_with(dynamic.as_ref(), endpoint, names))
-    }
-
     /// Extracts resources from the provided list based on the agent's supported tags.
     async fn select_agent_resources(
         &self,
         prefixed_name: &str,
         resources: &mut Vec<Resource>,
     ) -> Vec<Resource> {
-        if let Some(name) = strip_prefix_ignore_ascii_case(prefixed_name, REMOTE_AGENT_PREFIX) {
-            let res = self.base.remote.select_agent_resources(name, resources);
-            if !res.is_empty() {
-                return res;
-            }
-
-            if let Some(engines) = self.dynamic_remote_engines().await {
-                return engines.select_agent_resources(name, resources);
-            }
-        }
-
         if let Some(prefix) = strip_prefix_ignore_ascii_case(prefixed_name, SUB_AGENT_PREFIX) {
             let res = self.subagents.select_resources(prefix, resources);
             if !res.is_empty() {
@@ -530,7 +404,7 @@ impl AgentContext for AgentCtx {
         self.agents.select_resources(prefixed_name, resources)
     }
 
-    /// Retrieves definitions for available tools and agents, including those from remote engines.
+    /// Retrieves definitions for available tools, agents, and subagents.
     async fn definitions(&self, names: Option<&[String]>) -> Vec<FunctionDefinition> {
         if let Some(names) = names
             && names.is_empty()
@@ -538,8 +412,8 @@ impl AgentContext for AgentCtx {
             return Vec::new();
         }
 
-        // Deduplicate across every source, not just within each one. Tools, agents,
-        // subagents, and remote engines are independent registries, so nothing prevents one
+        // Deduplicate across every source, not just within each one. Tools, tool providers,
+        // agents, and subagents are independent registries, so nothing prevents one
         // name from being registered in two of them (e.g. a tool and an agent both named
         // `search`, or an MCP tool colliding with an agent). Emitting the name twice makes
         // providers reject the entire request with a duplicate-function-name error, taking
@@ -556,16 +430,6 @@ impl AgentContext for AgentCtx {
 
         extend_unique(self.tool_definitions(names), &mut definitions);
         extend_unique(self.agent_definitions(names), &mut definitions);
-        // Load the dynamic engine registry once for both remote tools and remote agents.
-        let dynamic = self.dynamic_remote_engines().await;
-        extend_unique(
-            self.remote_tool_definitions_with(dynamic.as_ref(), None, names),
-            &mut definitions,
-        );
-        extend_unique(
-            self.remote_agent_definitions_with(dynamic.as_ref(), None, names),
-            &mut definitions,
-        );
 
         definitions
     }
@@ -578,46 +442,13 @@ impl AgentContext for AgentCtx {
     ///
     /// # Returns
     /// Tuple containing the result string and a boolean indicating if further processing is needed
-    async fn tool_call(
-        &self,
-        mut input: ToolInput<Json>,
-    ) -> Result<(ToolOutput<Json>, Option<Principal>), BoxError> {
-        if let Some(name) = strip_prefix_ignore_ascii_case(&input.name, REMOTE_TOOL_PREFIX) {
-            // find registered remote tool and call it
-            if let Some((id, endpoint, tool_name)) = self.base.remote.get_tool_endpoint(name) {
-                input.name = tool_name;
-                return self
-                    .base
-                    .call_remote_tool(id, &endpoint, input)
-                    .await
-                    .map(|output| (output, Some(id)));
-            }
-
-            // find dynamic remote tool and call it
-            if let Some(engines) = self.dynamic_remote_engines().await
-                && let Some((id, endpoint, tool_name)) = engines.get_tool_endpoint(name)
-            {
-                input.name = tool_name;
-                return self
-                    .base
-                    .call_remote_tool(id, &endpoint, input)
-                    .await
-                    .map(|output| (output, Some(id)));
-            }
-        }
-
+    async fn tool_call(&self, input: ToolInput<Json>) -> Result<ToolOutput<Json>, BoxError> {
         let ctx = self.child_base(&input.name)?;
         if let Some(tool) = self.tools.get(&input.name) {
-            return tool
-                .call(ctx, input.args, input.resources)
-                .await
-                .map(|output| (output, None));
+            return tool.call(ctx, input.args, input.resources).await;
         }
 
-        self.tool_providers
-            .call(ctx, input)
-            .await
-            .map(|output| (output, None))
+        self.tool_providers.call(ctx, input).await
     }
 
     /// Runs a local agent.
@@ -629,73 +460,29 @@ impl AgentContext for AgentCtx {
     /// [`AgentOutput`] containing the result of the agent execution.
     fn agent_run(
         self,
-        mut input: AgentInput,
-    ) -> impl Future<Output = Result<(AgentOutput, Option<Principal>), BoxError>> + Send {
+        input: AgentInput,
+    ) -> impl Future<Output = Result<AgentOutput, BoxError>> + Send {
         let ctx = self;
         Box::pin(async move {
-            // Prefixed names route to remote engines or subagents first; on a
-            // miss they fall through to the local agent lookup so that local
-            // agents whose names happen to start with a routing prefix stay
-            // reachable.
-            if let Some(name) = strip_prefix_ignore_ascii_case(&input.name, REMOTE_AGENT_PREFIX) {
-                if let Some((id, endpoint, agent_name)) = ctx.base.remote.get_agent_endpoint(name) {
-                    input.name = agent_name;
-                    return ctx
-                        .call_remote_agent(id, &endpoint, input)
-                        .await
-                        .map(|output| (output, Some(id)));
-                }
-
-                if let Some(engines) = ctx.dynamic_remote_engines().await
-                    && let Some((id, endpoint, agent_name)) = engines.get_agent_endpoint(name)
-                {
-                    input.name = agent_name;
-                    return ctx
-                        .call_remote_agent(id, &endpoint, input)
-                        .await
-                        .map(|output| (output, Some(id)));
-                }
-            }
-
+            // Prefixed names route to subagents first; on a miss they fall
+            // through to the local agent lookup so that local agents whose
+            // names happen to start with the routing prefix stay reachable.
             if let Some(name) = strip_prefix_ignore_ascii_case(&input.name, SUB_AGENT_PREFIX) {
                 let name = name.to_ascii_lowercase();
                 if let Some(agent) = ctx.subagents.get_lowercase(&name) {
                     let child = ctx.child(&name, &name)?;
-                    return agent
-                        .run(child, input.prompt, input.resources)
-                        .await
-                        .map(|output| (output, None));
+                    return agent.run(child, input.prompt, input.resources).await;
                 }
             }
 
             let name = input.name.to_ascii_lowercase();
             if let Some(agent) = ctx.agents.get(&name) {
                 let child = ctx.child(&name, agent.label())?;
-                agent
-                    .run(child, input.prompt, input.resources)
-                    .await
-                    .map(|output| (output, None))
+                agent.run(child, input.prompt, input.resources).await
             } else {
                 Err(format!("agent {} not found", name).into())
             }
         })
-    }
-
-    /// Runs a remote agent via HTTP RPC.
-    ///
-    /// # Arguments
-    /// * `endpoint` - Remote endpoint URL;
-    /// * `args` - Tool input arguments, [`AgentInput`]. The `meta` field will be set to the current agent's metadata.
-    ///
-    /// # Returns
-    /// [`AgentOutput`] containing the result of the agent execution.
-    async fn remote_agent_run(
-        &self,
-        endpoint: &str,
-        args: AgentInput,
-    ) -> Result<AgentOutput, BoxError> {
-        let target = self.base.remote_target(endpoint).await?;
-        self.call_remote_agent(target, endpoint, args).await
     }
 }
 
@@ -737,23 +524,7 @@ impl CompletionFeatures for AgentCtx {
     }
 }
 
-impl BaseContext for AgentCtx {
-    /// Executes a remote tool call via HTTP RPC.
-    ///
-    /// # Arguments
-    /// * `endpoint` - Remote endpoint URL;
-    /// * `args` - Tool input arguments, [`ToolInput`].
-    ///
-    /// # Returns
-    /// [`ToolOutput`] containing the final result.
-    async fn remote_tool_call(
-        &self,
-        endpoint: &str,
-        args: ToolInput<Json>,
-    ) -> Result<ToolOutput<Json>, BoxError> {
-        self.base.remote_tool_call(endpoint, args).await
-    }
-}
+impl BaseContext for AgentCtx {}
 
 impl StateFeatures for AgentCtx {
     fn engine_id(&self) -> &Principal {
@@ -1042,31 +813,6 @@ impl HttpFeatures for AgentCtx {
     }
 }
 
-/// Merges static and dynamic remote definitions, keeping the first of any
-/// case-insensitively repeated name, and applies the model-facing routing prefix.
-fn merge_remote_definitions(
-    mut definitions: Vec<FunctionDefinition>,
-    dynamic: Option<Vec<FunctionDefinition>>,
-    routing_prefix: &str,
-) -> Vec<FunctionDefinition> {
-    if let Some(dynamic) = dynamic {
-        let mut seen: BTreeSet<String> = definitions
-            .iter()
-            .map(|definition| definition.name.to_ascii_lowercase())
-            .collect();
-        definitions.extend(
-            dynamic
-                .into_iter()
-                .filter(|definition| seen.insert(definition.name.to_ascii_lowercase())),
-        );
-    }
-
-    definitions
-        .into_iter()
-        .map(|definition| definition.name_with_prefix(routing_prefix))
-        .collect()
-}
-
 /// Merges one source's capability group into `groups`, keeping only members
 /// visible to the model and deduplicating them case-insensitively.
 fn merge_visible_group(
@@ -1124,9 +870,9 @@ fn merge_visible_group(
 #[cfg(test)]
 mod tests {
     use anda_core::{
-        AgentContext as _, AgentInput, BaseContext as _, BoxError, CacheFeatures as _,
-        CacheStoreFeatures as _, CompletionFeatures as _, HttpFeatures as _, Json,
-        KeysFeatures as _, Path, PutMode, StateFeatures as _, StoreFeatures as _, ToolInput,
+        AgentContext as _, AgentInput, BoxError, CacheFeatures as _, CompletionFeatures as _,
+        HttpFeatures as _, Json, KeysFeatures as _, Path, PutMode, StateFeatures as _,
+        StoreFeatures as _, ToolInput,
     };
     use bytes::Bytes;
     use candid::Principal;
@@ -1135,9 +881,7 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
 
-    use super::{
-        DYNAMIC_REMOTE_ENGINES, REMOTE_AGENT_PREFIX, REMOTE_TOOL_PREFIX, SUB_AGENT_PREFIX,
-    };
+    use super::SUB_AGENT_PREFIX;
     use crate::context::test_fixtures::*;
     use crate::{engine::EngineBuilder, model::Model};
 
@@ -1194,7 +938,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn agent_context_definitions_dynamic_resources_and_missing_runs() {
+    async fn agent_context_definitions_calls_and_missing_runs() {
         let model = Model::with_completer(Arc::new(EchoCompleter));
         let ctx = EngineBuilder::new()
             .with_model(model)
@@ -1207,102 +951,59 @@ mod tests {
         let empty: Vec<String> = Vec::new();
         assert!(ctx.tool_definitions(Some(&empty)).is_empty());
         assert!(ctx.agent_definitions(Some(&empty)).is_empty());
-        assert!(
-            ctx.remote_tool_definitions(None, Some(&empty))
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            ctx.remote_agent_definitions(None, Some(&empty))
-                .await
-                .unwrap()
-                .is_empty()
-        );
         assert!(ctx.definitions(Some(&empty)).await.is_empty());
-
-        ctx.root
-            .cache_store_set(DYNAMIC_REMOTE_ENGINES, dynamic_remote_engines(), None)
-            .await
-            .unwrap();
 
         let definitions = ctx.definitions(None).await;
         assert!(definitions.iter().any(|d| d.name == "echo_tool"));
         assert!(definitions.iter().any(|d| d.name == "echo_agent"));
-        assert!(
-            definitions
-                .iter()
-                .any(|d| d.name == format!("{REMOTE_TOOL_PREFIX}dyn_lookup"))
-        );
-        assert!(
-            definitions
-                .iter()
-                .any(|d| d.name == format!("{REMOTE_AGENT_PREFIX}dyn_chat"))
-        );
 
-        let mut resources = vec![resource(1, &["text"]), resource(2, &["md"])];
-        let selected = ctx
-            .select_tool_resources(&format!("{REMOTE_TOOL_PREFIX}dyn_lookup"), &mut resources)
-            .await;
-        assert_eq!(
-            selected
-                .iter()
-                .map(|resource| resource._id)
-                .collect::<Vec<_>>(),
-            vec![1]
-        );
-        assert_eq!(
-            resources
-                .iter()
-                .map(|resource| resource._id)
-                .collect::<Vec<_>>(),
-            vec![2]
-        );
-
-        let selected = ctx
-            .select_agent_resources(&format!("{REMOTE_AGENT_PREFIX}dyn_chat"), &mut resources)
-            .await;
-        assert_eq!(
-            selected
-                .iter()
-                .map(|resource| resource._id)
-                .collect::<Vec<_>>(),
-            vec![2]
-        );
-        assert!(resources.is_empty());
-
-        let tool_err = ctx
+        let output = ctx
             .tool_call(ToolInput {
-                name: format!("{REMOTE_TOOL_PREFIX}dyn_lookup"),
-                args: json!({}),
+                name: "echo_tool".to_string(),
+                args: json!({"input": "hi"}),
                 resources: Vec::new(),
                 meta: None,
             })
             .await
-            .unwrap_err();
-        assert!(tool_err.to_string().contains("not implemented"));
+            .unwrap();
+        assert_eq!(output.output, json!("echoed:hi"));
 
+        let output = ctx
+            .clone()
+            .agent_run(AgentInput {
+                name: "echo_agent".to_string(),
+                prompt: "hello".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.content, "agent_echoed:hello");
+
+        // The retired remote routing prefixes are plain names now.
+        assert!(
+            ctx.tool_call(ToolInput {
+                name: "RT_echo_tool".to_string(),
+                args: json!({"input": "hi"}),
+                resources: Vec::new(),
+                meta: None,
+            })
+            .await
+            .is_err()
+        );
         let agent_err = ctx
             .clone()
             .agent_run(AgentInput {
-                name: format!("{REMOTE_AGENT_PREFIX}dyn_chat"),
+                name: "RA_echo_agent".to_string(),
                 prompt: "hello".to_string(),
                 ..Default::default()
             })
             .await
             .unwrap_err();
-        assert!(agent_err.to_string().contains("not implemented"));
-
-        let agent_err = ctx
-            .clone()
-            .agent_run(AgentInput {
-                name: format!("{REMOTE_AGENT_PREFIX}missing"),
-                prompt: "hello".to_string(),
-                ..Default::default()
-            })
-            .await
-            .unwrap_err();
-        assert!(agent_err.to_string().contains("agent ra_missing not found"));
+        assert!(
+            agent_err
+                .to_string()
+                .contains("agent ra_echo_agent not found")
+        );
 
         let agent_err = ctx
             .clone()
@@ -1331,7 +1032,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn agent_context_trait_forwarders_cover_base_store_cache_keys_and_http() {
+    async fn agent_context_trait_forwarders_cover_store_cache_keys_and_http() {
         let model = Model::with_completer(Arc::new(EchoCompleter));
         let ctx = EngineBuilder::new().with_model(model).mock_ctx();
 
@@ -1444,22 +1145,5 @@ mod tests {
             .https_signed_rpc("https://example.test", "method", &())
             .await;
         assert!(rpc.is_err());
-
-        let err = ctx
-            .remote_tool_call(
-                "https://missing.example",
-                ToolInput {
-                    name: "lookup".to_string(),
-                    args: json!({}),
-                    resources: Vec::new(),
-                    meta: None,
-                },
-            )
-            .await
-            .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("remote engine endpoint https://missing.example not found")
-        );
     }
 }

@@ -24,8 +24,7 @@ use std::{
 
 use super::tool::DiscoveredTools;
 use crate::context::{
-    AgentCtx, REMOTE_AGENT_PREFIX, REMOTE_TOOL_PREFIX, SUB_AGENT_PREFIX,
-    strip_prefix_ignore_ascii_case, strip_routing_prefix,
+    AgentCtx, SUB_AGENT_PREFIX, strip_prefix_ignore_ascii_case, strip_routing_prefix,
 };
 use crate::{model::Model, unix_ms};
 
@@ -364,7 +363,7 @@ impl CompletionRunner {
     /// Returns whether the runner may execute the lowercased callable `name`.
     ///
     /// The name arrives as the model emitted it, so it still carries any routing prefix
-    /// (`SA_`, `RT_`, `RA_`) that [`Self::definitions`] added. Allowlists are written in terms
+    /// (`SA_`) that [`Self::definitions`] added. Allowlists are written in terms
     /// of the unprefixed names the caller registered — the same names `definitions(Some(..))`
     /// filters on — so the prefix is stripped before matching. Both spellings are accepted,
     /// since a caller may reasonably whitelist either.
@@ -931,7 +930,7 @@ impl CompletionRunner {
 
         let mut tool_call_futs: Vec<BoxPinFut<(ToolCall, ToolOutput<Json>)>> =
             Vec::with_capacity(tool_calls.len());
-        for mut tool in tool_calls {
+        for tool in tool_calls {
             let tool_name = tool.name.to_ascii_lowercase();
 
             // Enforce the execution-time allowlist before dispatching. The model
@@ -947,9 +946,7 @@ impl CompletionRunner {
                 continue;
             }
 
-            if self.ctx.has_tool_lowercase(&tool_name)
-                || strip_prefix_ignore_ascii_case(&tool_name, REMOTE_TOOL_PREFIX).is_some()
-            {
+            if self.ctx.has_tool_lowercase(&tool_name) {
                 let ctx = self.ctx.clone();
                 let input = ToolInput {
                     name: tool.name.clone(),
@@ -962,10 +959,7 @@ impl CompletionRunner {
                 };
                 tool_call_futs.push(Box::pin(async move {
                     let output = match ctx.tool_call(input).await {
-                        Ok((output, remote_id)) => {
-                            tool.remote_id = remote_id;
-                            output
-                        }
+                        Ok(output) => output,
                         // The tool call failed, but we must not abort the whole conversation:
                         // surface the error so the LLM can try to correct it and continue.
                         Err(err) => tool_error(format!("tool call failed: {err}")),
@@ -974,7 +968,6 @@ impl CompletionRunner {
                 }));
             } else if self.ctx.agents.contains_lowercase(&tool_name)
                 || strip_prefix_ignore_ascii_case(&tool_name, SUB_AGENT_PREFIX).is_some()
-                || strip_prefix_ignore_ascii_case(&tool_name, REMOTE_AGENT_PREFIX).is_some()
             {
                 // Subagents consume structured controls such as `session`, `model`, and
                 // `effort`, so preserve their full argument object. Plain string args and
@@ -1002,10 +995,7 @@ impl CompletionRunner {
                 };
                 tool_call_futs.push(Box::pin(async move {
                     let output = match ctx.agent_run(input).await {
-                        Ok((output, remote_id)) => {
-                            tool.remote_id = remote_id;
-                            output.into_tool_output()
-                        }
+                        Ok(output) => output.into_tool_output(),
                         // The agent run failed, but we must not abort the whole conversation:
                         // surface the error so the LLM can try to correct it and continue.
                         Err(err) => tool_error(format!("agent run failed: {err}")),
@@ -2363,9 +2353,9 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn allowlist_matches_callables_through_their_routing_prefix() {
         // Allowlists are written with the unprefixed names the caller registered, but the
-        // model calls the prefixed name that `definitions` advertises (`SA_helper`,
-        // `RT_...`, `RA_...`). Matching the raw name against the allowlist would reject
-        // every whitelisted subagent and remote callable, permanently.
+        // model calls the prefixed name that `definitions` advertises (`SA_helper`).
+        // Matching the raw name against the allowlist would reject every whitelisted
+        // subagent, permanently.
         let model = Model::with_completer(Arc::new(EchoCompleter));
         let ctx = EngineBuilder::new().with_model(model).mock_ctx();
 
@@ -2374,18 +2364,18 @@ mod tests {
             .with_allowed_callables(Some(BTreeSet::from([
                 "helper".to_string(),
                 "lookup".to_string(),
-                "chat".to_string(),
             ])));
 
-        for name in ["helper", "sa_helper", "rt_lookup", "ra_chat"] {
+        for name in ["helper", "sa_helper", "lookup"] {
             assert!(
                 runner.is_callable_allowed(name),
                 "{name} must be permitted for a runner whitelisting its unprefixed name"
             );
         }
 
-        // Stripping a prefix must not turn an unrelated callable into an allowed one.
-        for name in ["other", "sa_other", "rt_helperx"] {
+        // Stripping a prefix must not turn an unrelated callable into an allowed one, and
+        // the retired remote prefixes are ordinary name characters now.
+        for name in ["other", "sa_other", "rt_lookup", "ra_helper"] {
             assert!(
                 !runner.is_callable_allowed(name),
                 "{name} must stay blocked"

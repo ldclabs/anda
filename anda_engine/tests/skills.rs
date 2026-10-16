@@ -31,11 +31,11 @@ async fn skill_resource_dispatch_rechecks_filter_and_validates_schema() -> Resul
             resources: vec![],
             ..Default::default()
         };
-        let (listed, _) = ctx
+        let listed = ctx
             .tool_call(call("skills_list", json!({"query":null,"cursor":null})))
             .await?;
         let id = listed.output["skills"][0]["id"].as_str().unwrap();
-        let (read, _) = ctx
+        let read = ctx
             .tool_call(call(
                 "skills_read",
                 json!({"skill":id,"resource":"references/guide.md","cursor":null}),

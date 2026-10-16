@@ -13,10 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::context::{
-    AgentCtx, REMOTE_AGENT_PREFIX, REMOTE_TOOL_PREFIX, SUB_AGENT_PREFIX,
-    strip_prefix_ignore_ascii_case,
-};
+use crate::context::{AgentCtx, strip_routing_prefix};
 
 /// Built-in name for keyword search across available callables.
 pub const TOOLS_SEARCH_NAME: &str = "tools_search";
@@ -941,10 +938,7 @@ fn rank_search_items(
         // Returned names must stay the full callable names so that definition
         // lookups succeed; the routing prefix is only ignored for matching.
         let normalized_name = item.name.to_lowercase();
-        let stripped_name = strip_prefix_ignore_ascii_case(&normalized_name, SUB_AGENT_PREFIX)
-            .or_else(|| strip_prefix_ignore_ascii_case(&normalized_name, REMOTE_AGENT_PREFIX))
-            .or_else(|| strip_prefix_ignore_ascii_case(&normalized_name, REMOTE_TOOL_PREFIX))
-            .unwrap_or(&normalized_name);
+        let stripped_name = strip_routing_prefix(&normalized_name).unwrap_or(&normalized_name);
         let normalized_description = item.description.to_lowercase();
         let mut score = 0usize;
 
@@ -2216,18 +2210,13 @@ mod tests {
     fn rank_search_items_keeps_prefixed_names_resolvable() {
         let definitions = vec![
             FunctionDefinition {
-                name: "RT_remote_lookup".to_string(),
-                description: "Remote lookup tool".to_string(),
+                name: "lookup".to_string(),
+                description: "Lookup tool".to_string(),
                 ..Default::default()
             },
             FunctionDefinition {
                 name: "SA_researcher".to_string(),
                 description: "Research subagent".to_string(),
-                ..Default::default()
-            },
-            FunctionDefinition {
-                name: "RA_remote_chat".to_string(),
-                description: "Remote chat agent".to_string(),
                 ..Default::default()
             },
         ];
@@ -2236,14 +2225,12 @@ mod tests {
         // resolvable through select_requested_definitions.
         let ranked = rank_search_items(&definitions, "researcher", &[], false);
         assert_eq!(ranked, vec!["sa_researcher"]);
-        let ranked = rank_search_items(&definitions, "remote_lookup", &[], false);
-        assert_eq!(ranked.first().map(String::as_str), Some("rt_remote_lookup"));
-        let ranked = rank_search_items(&definitions, "remote_chat", &[], false);
-        assert_eq!(ranked.first().map(String::as_str), Some("ra_remote_chat"));
+        let ranked = rank_search_items(&definitions, "lookup", &[], false);
+        assert_eq!(ranked.first().map(String::as_str), Some("lookup"));
 
-        let ranked = rank_search_items(&definitions, "remote_lookup", &[], false);
+        let ranked = rank_search_items(&definitions, "researcher", &[], false);
         let selected = select_requested_definitions(definitions, &ranked);
-        assert_eq!(selected[0].name, "RT_remote_lookup");
+        assert_eq!(selected[0].name, "SA_researcher");
     }
 }
 

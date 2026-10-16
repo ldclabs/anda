@@ -2295,7 +2295,7 @@ impl Tool<BaseCtx> for MemoryTool {
 mod tests {
     use super::*;
     use crate::{
-        context::{RemoteEngines, Web3SDK},
+        context::Web3SDK,
         store::{InMemory, Store},
     };
     use anda_core::CancellationToken;
@@ -2434,7 +2434,6 @@ mod tests {
             BTreeSet::new(),
             Arc::new(Web3SDK::not_implemented()),
             Store::new(Arc::new(InMemory::new())),
-            Arc::new(RemoteEngines::new()),
         )
         .with_caller(caller)
     }

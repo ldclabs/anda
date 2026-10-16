@@ -4,6 +4,29 @@ All notable changes to the Anda project will be documented in this file.
 
 ## [Unreleased]
 
+### Removed — anda_core
+
+- **Remote calls in the context traits** — `AgentContext` no longer has
+  `remote_tool_definitions`, `remote_agent_definitions` or `remote_agent_run`,
+  and `BaseContext` no longer has `remote_tool_call`; it is now a pure bound
+  over the capability traits, implemented with an empty `impl`.
+  `AgentContext::tool_call` and `agent_run` return the output alone instead of
+  pairing it with the principal of the remote engine that ran it. The
+  `remote_id` fields of `ToolCall` and `ContentPart::ToolOutput` stay so stored
+  histories keep decoding.
+
+### Removed — anda_engine
+
+- **Remote engines, remote agents and remote tools** — `RemoteEngines`,
+  `RemoteEngineArgs`, `RemoteTool`, `RemoteAgent`,
+  `EngineBuilder::register_remote_engine`, the `DYNAMIC_REMOTE_ENGINES`
+  (`_engines`) registry, and the `RT_` / `RA_` routing prefixes
+  (`REMOTE_TOOL_PREFIX`, `REMOTE_AGENT_PREFIX`) are gone. `AgentCtx` routes only
+  to local tools, tool providers, local agents and `SA_` subagents; `RT_` and
+  `RA_` names are now ordinary names, and the completion runner and tool search
+  no longer treat them specially. `EngineCard` and `AgentInfo` remain for
+  `Engine::information`.
+
 ## [anda_engine 0.16.10] — 2026-10-10
 
 ### Added — anda_engine

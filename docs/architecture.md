@@ -2,14 +2,14 @@
 
 This document describes the current `anda_engine` runtime architecture from the source code. It replaces the older deployment-first narrative that treated ICP, TEE, and IC-TEE as mandatory runtime blocks.
 
-In the current engine, those integrations are optional backing capabilities. The practical center of the system is the `Engine` runtime: it validates callers, creates scoped contexts, dispatches agents and tools, routes model calls, handles tool-call loops, and exposes selected local or remote functions.
+In the current engine, those integrations are optional backing capabilities. The practical center of the system is the `Engine` runtime: it validates callers, creates scoped contexts, dispatches agents and tools, routes model calls, handles tool-call loops, and exposes selected functions to callers.
 
 Preview note: use [markdown-viewer/markdown-viewer-extension](https://github.com/markdown-viewer/markdown-viewer-extension) to preview this document with the embedded HTML architecture diagram and PlantUML sequence diagram rendered.
 
 Source map:
 
 - [`engine.rs`](../anda_engine/src/engine.rs): top-level `Engine`, `EngineBuilder`, exported APIs, management checks, hooks, challenge signing.
-- [`context/agent.rs`](../anda_engine/src/context/agent.rs): `AgentCtx`, local/remote/subagent routing.
+- [`context/agent.rs`](../anda_engine/src/context/agent.rs): `AgentCtx`, local and subagent routing.
 - [`context/runner.rs`](../anda_engine/src/context/runner.rs): `CompletionRunner`, `CompletionStream`, queued input and compaction.
 - [`context/base.rs`](../anda_engine/src/context/base.rs): `BaseCtx`, scoped state, cache, store, keys, HTTP, signed RPC, cancellation.
 - [`context/tool.rs`](../anda_engine/src/context/tool.rs): built-in discovery agents: `tools_groups`, `tools_search`, and `tools_select`.
@@ -68,7 +68,7 @@ See [notes and tasks](note-todo.md).
 <div class="anda-side-list">
 <div class="anda-side-item"><strong>Host apps</strong><br>CLI, HTTP server, bot runtime, or embedded Rust application call the engine API.</div>
 <div class="anda-side-item"><strong>Public API</strong><br><span class="anda-pill">agent_run</span><span class="anda-pill">tool_call</span><span class="anda-pill">information</span><span class="anda-pill">challenge</span></div>
-<div class="anda-side-item"><strong>Remote peers</strong><br>Other engines can discover exported functions and call them through signed RPC.</div>
+<div class="anda-side-item"><strong>Remote callers</strong><br>Clients can discover exported functions and call them through signed RPC.</div>
 </div>
 </div>
 <div class="anda-main">
@@ -76,8 +76,8 @@ See [notes and tasks](note-todo.md).
 <div class="anda-layer-title">Engine Boundary</div>
 <div class="anda-grid three">
 <div class="anda-box"><strong>Engine</strong><small>Owns runtime state, default agent, export lists, hooks, management policy.</small></div>
-<div class="anda-box"><strong>EngineBuilder</strong><small>Registers tools, agents, models, store, remote engines, subagents, and hooks.</small></div>
-<div class="anda-box"><strong>EngineCard</strong><small>Publishes exported agent/tool definitions for remote discovery.</small></div>
+<div class="anda-box"><strong>EngineBuilder</strong><small>Registers tools, agents, models, store, subagents, and hooks.</small></div>
+<div class="anda-box"><strong>EngineCard</strong><small>Publishes exported agent/tool definitions for discovery clients.</small></div>
 </div>
 </div>
 <div class="anda-layer control">
@@ -93,7 +93,7 @@ See [notes and tasks](note-todo.md).
 <div class="anda-grid three">
 <div class="anda-box"><strong>AgentSet</strong><small>Local agents, including built-in `tools_groups`, `tools_search`, `tools_select`, and `subagents_manager`.</small></div>
 <div class="anda-box"><strong>ToolSet / ToolProviderSet</strong><small>Static tools and runtime-discovered providers with function definitions, resource tags, and capability groups.</small></div>
-<div class="anda-box"><strong>RemoteEngines</strong><small>Remote function metadata routed with `RA_` and `RT_` prefixes.</small></div>
+<div class="anda-box"><strong>SubAgentSet</strong><small>Subagents routed with the `SA_` prefix, run inline or as background sessions.</small></div>
 </div>
 </div>
 <div class="anda-layer runner">
@@ -134,7 +134,7 @@ See [notes and tasks](note-todo.md).
 <div class="anda-side-list">
 <div class="anda-side-item"><strong>Model providers</strong><br>Completion APIs are reached only through registered model adapters.</div>
 <div class="anda-side-item"><strong>Web3SDK</strong><br>Can be a TEE client, a Web3 client, or a not-implemented placeholder.</div>
-<div class="anda-side-item"><strong>HTTP resources</strong><br>Fetch and remote-engine calls use the context HTTP/signed-RPC traits.</div>
+<div class="anda-side-item"><strong>HTTP resources</strong><br>Fetch and other outbound calls use the context HTTP/signed-RPC traits.</div>
 <div class="anda-side-item"><strong>Databases</strong><br>AndaDB and Cognitive Nexus are used when memory tools are registered.</div>
 </div>
 </div>
@@ -167,7 +167,6 @@ participant "Models\nlabel router" as Models
 participant "Model adapter\nOpenAI / Anthropic / Gemini" as Model
 participant "Tool / Agent\nregistries" as Registry
 participant "Local Tool\nor Agent" as Local
-participant "Remote Engine" as Remote
 participant "SubAgent\nsession runner" as SubSession
 Caller -> Host : submit AgentInput
 Host -> Engine : agent_run(caller, input)
@@ -185,7 +184,7 @@ Models --> Runner : Model
 Runner -> Model : completion(CompletionRequest)
 Model --> Runner : AgentOutput\ncontent, usage, raw_history, tool_calls
 alt model returned tool_calls
-Runner -> Registry : resolve each tool_call name\nlocal, RA_, RT_, or SA_
+Runner -> Registry : resolve each tool_call name\nlocal or SA_
 par each resolved call
 alt local tool
 Runner -> Ctx : child_base(tool)
@@ -195,10 +194,6 @@ else local agent or subagent without session
 Runner -> Ctx : child(agent)
 Ctx -> Local : Agent::run(AgentCtx, prompt, resources)
 Local --> Runner : AgentOutput as ToolOutput
-else remote callable
-Runner -> Ctx : remote_tool_call or remote_agent_run
-Ctx -> Remote : https_signed_rpc(tool_call / agent_run)
-Remote --> Runner : ToolOutput or AgentOutput
 else subagent session mode
 Runner -> Local : SubAgent::run(session args)
 Local -> SubSession : claim session and spawn background runner
@@ -231,7 +226,7 @@ Host --> Caller : response
 - `Engine` is the public runtime boundary. It enforces exported agent/tool lists for non-manager callers and always exports the default agent.
 - `anda_engine_server` validates registry keys against engine identities, authenticates RPC bodies, and releases encoded parameters before awaiting execution. Discovery negotiates JSON/CBOR through `Accept`; caller-bearing responses are not cached. Public engine cards include current exported tool definitions. See the [HTTP and authentication contracts](../anda_engine_server/README.md#http-contract).
 - `EngineBuilder` starts with in-memory storage, no implemented Web3 client, no external model, and built-in discovery/subagent control agents.
-- `AgentCtx` is the main scheduling surface. It exposes local tools, dynamic tool providers, local agents, subagents, registered remote engines, and dynamic remote engines from cache.
+- `AgentCtx` is the main scheduling surface. It exposes local tools, dynamic tool providers, local agents, and subagents.
 - `CompletionRunner` is iterative. A model turn can return tool calls; the runner executes them and feeds tool outputs into the next model turn. Long-running runners can compact oversized history into a continuation handoff and resume from that summary. Pending tool outputs are summarized with the history; pending request input, queued follow-up/steering, and the implicit context move to the replacement runner instead. A summary is committed only after validation, so failure leaves the original runner available for retry. Streams deliver queued input before committing normal completion and end after a failed step.
 - `tools_groups`, `tools_search`, and `tools_select` are agents, not side channels. `tools_groups` returns a compact directory of visible capability bundles; `tools_select` can expand one group into schemas, and discovered schemas stay in tool-output context while repeated payloads are compacted from conversation context.
 - `BaseCtx` creates namespace-scoped child contexts. Agent paths use `a_<agent>`, tool paths use `t_<tool>`, and all store/cache operations are resolved under that path.

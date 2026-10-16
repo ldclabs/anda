@@ -1,11 +1,9 @@
 use anda_core::{
-    Agent, AgentContext, AgentInput, AgentOutput, BoxError, BoxPinFut, CacheStoreFeatures,
-    CompletionRequest, Function, FunctionDefinition, Json, Path, PutMode, StateFeatures, ToolInput,
+    Agent, AgentContext, AgentInput, AgentOutput, BoxError, BoxPinFut, CompletionRequest,
+    FunctionDefinition, Json, Path, PutMode, StateFeatures, ToolInput,
 };
 use anda_engine::{
-    context::{
-        AgentCtx, AgentInfo, DYNAMIC_REMOTE_ENGINES, DiscoveredTools, EngineCard, RemoteEngines,
-    },
+    context::{AgentCtx, DiscoveredTools},
     engine::Engine,
     hook::{Hook, Hooks, SingleThreadHook},
     model::{CompletionFeaturesDyn, Model, testing::ScriptedCompleter},
@@ -74,56 +72,6 @@ fn discovery_retains_schemas_beyond_the_request_merge_budget() {
     assert_eq!(output["tools"].as_array().unwrap().len(), 17);
     assert!(output["tools"][16].get("parameters").is_some());
     assert!(discovered.contains("tool_16"));
-}
-
-#[tokio::test]
-async fn dynamic_remote_routes_reach_the_transport() {
-    let ctx = Engine::builder().mock_ctx();
-    let remotes = RemoteEngines {
-        engines: BTreeMap::from([(
-            "remote".into(),
-            EngineCard {
-                id: candid::Principal::self_authenticating([3]),
-                info: AgentInfo {
-                    endpoint: "https://example.invalid/engine".into(),
-                    ..Default::default()
-                },
-                agents: vec![Function {
-                    definition: definition("work"),
-                    ..Default::default()
-                }],
-                tools: vec![Function {
-                    definition: definition("echo"),
-                    ..Default::default()
-                }],
-            },
-        )]),
-    };
-    ctx.base
-        .cache_store_set(DYNAMIC_REMOTE_ENGINES, remotes, None)
-        .await
-        .unwrap();
-    assert_eq!(
-        ctx.remote_tool_definitions(None, None).await.unwrap()[0].name,
-        "RT_remote_echo"
-    );
-    let err = ctx
-        .tool_call(ToolInput {
-            name: "RT_remote_echo".into(),
-            args: json!({}),
-            ..Default::default()
-        })
-        .await
-        .unwrap_err();
-    assert!(err.to_string().contains("not implemented"));
-    let err = ctx
-        .agent_run(AgentInput {
-            name: "RA_remote_work".into(),
-            ..Default::default()
-        })
-        .await
-        .unwrap_err();
-    assert!(err.to_string().contains("not implemented"));
 }
 
 #[tokio::test]

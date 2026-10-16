@@ -254,15 +254,7 @@ impl HttpFeatures for MockContext {
     }
 }
 
-impl BaseContext for MockContext {
-    async fn remote_tool_call(
-        &self,
-        _endpoint: &str,
-        _args: ToolInput<Json>,
-    ) -> Result<ToolOutput<Json>, BoxError> {
-        Err("not implemented".into())
-    }
-}
+impl BaseContext for MockContext {}
 
 impl CompletionFeatures for MockContext {
     async fn completion(
@@ -283,14 +275,6 @@ impl AgentContext for MockContext {
         Vec::new()
     }
 
-    async fn remote_tool_definitions(
-        &self,
-        _endpoint: Option<&str>,
-        _names: Option<&[String]>,
-    ) -> Result<Vec<FunctionDefinition>, BoxError> {
-        Ok(Vec::new())
-    }
-
     async fn select_tool_resources(
         &self,
         _name: &str,
@@ -301,14 +285,6 @@ impl AgentContext for MockContext {
 
     fn agent_definitions(&self, _names: Option<&[String]>) -> Vec<FunctionDefinition> {
         Vec::new()
-    }
-
-    async fn remote_agent_definitions(
-        &self,
-        _endpoint: Option<&str>,
-        _names: Option<&[String]>,
-    ) -> Result<Vec<FunctionDefinition>, BoxError> {
-        Ok(Vec::new())
     }
 
     async fn select_agent_resources(
@@ -323,25 +299,11 @@ impl AgentContext for MockContext {
         Vec::new()
     }
 
-    async fn tool_call(
-        &self,
-        _args: ToolInput<Json>,
-    ) -> Result<(ToolOutput<Json>, Option<Principal>), BoxError> {
-        Ok((ToolOutput::new(Json::Null), None))
+    async fn tool_call(&self, _args: ToolInput<Json>) -> Result<ToolOutput<Json>, BoxError> {
+        Ok(ToolOutput::new(Json::Null))
     }
 
-    async fn agent_run(
-        self,
-        _args: AgentInput,
-    ) -> Result<(AgentOutput, Option<Principal>), BoxError> {
-        Ok((AgentOutput::default(), None))
-    }
-
-    async fn remote_agent_run(
-        &self,
-        _endpoint: &str,
-        _args: AgentInput,
-    ) -> Result<AgentOutput, BoxError> {
+    async fn agent_run(self, _args: AgentInput) -> Result<AgentOutput, BoxError> {
         Ok(AgentOutput::default())
     }
 }

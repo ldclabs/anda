@@ -1,11 +1,11 @@
 //! Engine construction and top-level execution APIs.
 //!
 //! [`Engine`] is the runtime boundary for a group of agents, tools, model
-//! providers, storage backends, hooks, and remote engines. It is responsible for:
+//! providers, storage backends, and hooks. It is responsible for:
 //! - validating callers and request metadata;
 //! - creating scoped [`AgentCtx`] and [`BaseCtx`] values;
 //! - dispatching local agent runs and direct tool calls;
-//! - exporting selected agents and tools to other engines;
+//! - exporting selected agents and tools to non-manager callers;
 //! - signing challenge responses when Web3 or TEE clients are configured.
 //!
 //! Engines are created with [`EngineBuilder`]. A built engine is private by
@@ -13,7 +13,7 @@
 //!
 //! # Usage
 //! 1. Start from [`Engine::builder`].
-//! 2. Register models, tools, agents, hooks, storage, and remote engines.
+//! 2. Register models, tools, agents, hooks, and storage.
 //! 3. Select the default agent with [`EngineBuilder::build`].
 //! 4. Execute agents with [`Engine::agent_run`] or direct tools with
 //!    [`Engine::tool_call`].
@@ -60,13 +60,12 @@ use anda_cloud_cdk::{ChallengeEnvelope, ChallengeRequest};
 use anda_core::{
     Agent, AgentContext, AgentInput, AgentOutput, AgentSet, BoxError, Function, Json, Path,
     RequestMeta, Resource, Tool, ToolInput, ToolOutput, ToolProvider, ToolProviderSet, ToolSet,
-    validate_function_name,
 };
 use candid::Principal;
 use ic_auth_types::deterministic_cbor_into_vec;
 use object_store::memory::InMemory;
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::BTreeSet,
     sync::{Arc, OnceLock, Weak},
 };
 use structured_logger::unix_ms;
@@ -85,7 +84,7 @@ use crate::{
     subagent::{SubAgentConversationRecorder, SubAgentManager, SubAgentSetManager},
 };
 
-pub use crate::context::{AgentInfo, EngineCard, RemoteEngineArgs, RemoteEngines};
+pub use crate::context::{AgentInfo, EngineCard};
 
 /// Top-level runtime for a configured set of Anda agents and tools.
 ///
@@ -448,7 +447,7 @@ impl Engine {
         })
     }
 
-    /// Returns the public engine card used by remote engines for discovery.
+    /// Returns the public engine card served to discovery clients.
     ///
     /// Only exported agents and tools are included.
     pub fn information(&self) -> EngineCard {
@@ -485,7 +484,6 @@ pub struct EngineBuilder {
     tool_providers: ToolProviderSet<BaseCtx>,
     agents: AgentSet<AgentCtx>,
     subagents: SubAgentSetManager,
-    remote: HashMap<String, RemoteEngineArgs>,
     models: Arc<Models>,
     store: Store,
     web3: Arc<Web3SDK>,
@@ -535,7 +533,6 @@ impl EngineBuilder {
             tool_providers: ToolProviderSet::new(),
             agents,
             subagents,
-            remote: HashMap::new(),
             models: Arc::new(Models::default()),
             store: Store::new(mstore),
             web3: Arc::new(Web3SDK::not_implemented()),
@@ -676,25 +673,7 @@ impl EngineBuilder {
         Ok(self)
     }
 
-    /// Registers a remote engine for cross-engine agent and tool calls.
-    ///
-    /// Remote metadata is fetched during [`EngineBuilder::build`]. Optional
-    /// agent and tool filters in [`RemoteEngineArgs`] limit which remote
-    /// functions are exposed through this engine.
-    pub fn register_remote_engine(mut self, engine: RemoteEngineArgs) -> Result<Self, BoxError> {
-        if self.remote.contains_key(&engine.endpoint) {
-            return Err(format!("remote engine {} already exists", engine.endpoint).into());
-        }
-        if let Some(handle) = &engine.handle {
-            validate_function_name(handle)
-                .map_err(|err| format!("invalid engine handle {}: {}", handle, err))?;
-        }
-
-        self.remote.insert(engine.endpoint.clone(), engine);
-        Ok(self)
-    }
-
-    /// Exports agents by name for non-manager callers and remote discovery.
+    /// Exports agents by name for non-manager callers and discovery.
     pub fn export_agents(mut self, agents: Vec<String>) -> Self {
         for mut agent in agents {
             agent.make_ascii_lowercase();
@@ -703,7 +682,7 @@ impl EngineBuilder {
         self
     }
 
-    /// Exports tools by name for non-manager callers and remote discovery.
+    /// Exports tools by name for non-manager callers and discovery.
     pub fn export_tools(mut self, tools: Vec<String>) -> Self {
         for mut tool in tools {
             tool.make_ascii_lowercase();
@@ -787,14 +766,6 @@ impl EngineBuilder {
         let id = self.web3.as_ref().get_principal();
         let names = self.context_names();
 
-        // Register remote engines on every assembly path. Dropping them would silently
-        // discard every `register_remote_engine` call, so remote tools and agents would go
-        // missing with no error at build time.
-        let mut remote = RemoteEngines::new();
-        for (_, engine) in self.remote {
-            remote.register(self.web3.as_ref(), engine).await?;
-        }
-
         let ctx = BaseCtx::new(
             id,
             self.info.name.clone(),
@@ -803,7 +774,6 @@ impl EngineBuilder {
             names,
             self.web3,
             self.store,
-            Arc::new(remote),
         );
 
         let tools = Arc::new(self.tools);
@@ -880,8 +850,8 @@ impl EngineBuilder {
             .collect();
         names.insert(Path::from(SYSTEM_PATH));
         // The root `BaseCtx` uses the empty path; register it so root-level
-        // cache lookups (e.g. dynamic remote-engine resolution) can hit memory
-        // instead of always falling through to the store backend.
+        // cache lookups can hit memory instead of always falling through to the
+        // store backend.
         names.insert(Path::default());
         names
     }
@@ -890,8 +860,8 @@ impl EngineBuilder {
     ///
     /// This is the supported way for agent and tool authors to obtain an
     /// execution context in their own test suites without standing up a full
-    /// engine: anonymous identity, in-memory store, no remote engines. Not
-    /// intended for production paths.
+    /// engine: anonymous identity and in-memory store. Not intended for
+    /// production paths.
     pub fn mock_ctx(self) -> AgentCtx {
         let names = self.context_names();
         let ctx = BaseCtx::new(
@@ -902,7 +872,6 @@ impl EngineBuilder {
             names,
             self.web3,
             self.store,
-            Arc::new(RemoteEngines::new()),
         );
 
         let ctx = AgentCtx::new(
@@ -1519,36 +1488,6 @@ mod tests {
             "duplicate agents registration",
         );
         assert!(err.to_string().contains("agent echo_agent already exists"));
-
-        let err = expect_box_err(
-            Engine::builder()
-                .register_remote_engine(RemoteEngineArgs {
-                    endpoint: "https://remote.example".to_string(),
-                    agents: Vec::new(),
-                    tools: Vec::new(),
-                    handle: Some("remote".to_string()),
-                })
-                .unwrap()
-                .register_remote_engine(RemoteEngineArgs {
-                    endpoint: "https://remote.example".to_string(),
-                    agents: Vec::new(),
-                    tools: Vec::new(),
-                    handle: Some("remote2".to_string()),
-                }),
-            "duplicate remote engine registration",
-        );
-        assert!(err.to_string().contains("remote engine"));
-
-        let err = expect_box_err(
-            Engine::builder().register_remote_engine(RemoteEngineArgs {
-                endpoint: "https://remote.example".to_string(),
-                agents: Vec::new(),
-                tools: Vec::new(),
-                handle: Some("bad handle".to_string()),
-            }),
-            "invalid remote engine handle",
-        );
-        assert!(err.to_string().contains("invalid engine handle"));
 
         let err = expect_box_err(
             Engine::builder().build("missing".to_string()).await,

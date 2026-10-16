@@ -2,12 +2,11 @@
 //!
 //! `anda_engine` turns the traits and data contracts from `anda_core` into a
 //! runnable agent engine. It provides the execution context, model routing,
-//! storage, hooks, memory tools, remote engine integration, and built-in
-//! extensions used by Anda agents.
+//! storage, hooks, memory tools, and built-in extensions used by Anda agents.
 //!
 //! # Main modules
-//! - [`engine`]: engine construction, agent execution, tool calls, and remote
-//!   engine metadata.
+//! - [`engine`]: engine construction, agent execution, tool calls, and the
+//!   public engine card.
 //! - [`context`]: runtime contexts passed to agents and tools, including cache,
 //!   storage, HTTP, Web3, cancellation, and state features.
 //! - [`model`]: model provider adapters and label-based model routing.

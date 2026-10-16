@@ -67,7 +67,7 @@ the default implementation selects by the declared tags.
 `BaseContext` deliberately excludes canister access: runtimes that need it implement
 `CanisterCaller` separately on their own context type.
 
-[`AgentContext`][agent-context] extends `BaseContext` with LLM completion and orchestration methods for local or remote agents and tools.
+[`AgentContext`][agent-context] extends `BaseContext` with LLM completion and orchestration methods for agents and tools.
 
 `CacheStoreFeatures` takes namespace-relative keys and uses one ASCII-lowercased
 object-store path for both the storage path and cache key. Direct cache access

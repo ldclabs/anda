@@ -79,15 +79,14 @@ to change.
 - `ToolProvider` and `ToolProviderSet` are for runtime-discovered tools, such as
   MCP servers.
 - `AgentCtx` is the scheduling surface for local tools, dynamic providers,
-  local agents, subagents, and remote engines.
+  local agents, and subagents.
 - `BaseCtx` is the capability surface for tools and agents. Use scoped child
   contexts so cache, store, metadata, and cancellation behavior remain isolated.
 - `tools_search` and `tools_select` are normal agents, not side channels. If a
   change affects discovery, verify schema selection, request tool merging, and
   repeated-selection compaction.
-- Remote engine prefixes and subagent prefixes are part of the runtime contract.
-  Do not rename or reinterpret them without updating all call and discovery
-  paths.
+- The subagent prefix (`SA_`) is part of the runtime contract. Do not rename or
+  reinterpret it without updating all call and discovery paths.
 
 ## MCP Rules
 

@@ -4,20 +4,15 @@
 //! and small builders used by `context::agent` and `context::runner` tests.
 
 use anda_core::{
-    Agent, AgentOutput, BoxError, CompletionRequest, ContentPart, Function, FunctionDefinition,
-    Message, Resource, Tool, ToolCall, ToolOutput, Usage,
+    Agent, AgentOutput, BoxError, CompletionRequest, ContentPart, FunctionDefinition, Message,
+    Resource, Tool, ToolCall, ToolOutput, Usage,
 };
-use candid::Principal;
 use serde::Deserialize;
 use serde_json::json;
-use std::{
-    collections::BTreeMap,
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
 
 use crate::context::AgentCtx;
 use crate::context::base::BaseCtx;
-use crate::context::engine::{AgentInfo, EngineCard, RemoteEngines};
 use crate::model::CompletionFeaturesDyn;
 
 #[derive(Clone, Debug)]
@@ -944,45 +939,6 @@ impl Agent<AgentCtx> for FailAgent {
     ) -> Result<AgentOutput, BoxError> {
         Err("agent execution failed".into())
     }
-}
-
-pub(crate) fn function(name: &str, description: &str, tags: &[&str]) -> Function {
-    Function {
-        definition: FunctionDefinition {
-            name: name.to_string(),
-            description: description.to_string(),
-            parameters: json!({"type": "object"}),
-            ..Default::default()
-        },
-        supported_resource_tags: tags.iter().map(|tag| tag.to_string()).collect(),
-    }
-}
-
-pub(crate) fn resource(id: u64, tags: &[&str]) -> Resource {
-    Resource {
-        _id: id,
-        name: format!("resource-{id}"),
-        tags: tags.iter().map(|tag| tag.to_string()).collect(),
-        ..Default::default()
-    }
-}
-
-pub(crate) fn dynamic_remote_engines() -> RemoteEngines {
-    let mut engines = BTreeMap::new();
-    engines.insert(
-        "dyn".to_string(),
-        EngineCard {
-            id: Principal::self_authenticating([9; 32]),
-            info: AgentInfo {
-                handle: "Dynamic".to_string(),
-                endpoint: "https://dynamic.example".to_string(),
-                ..Default::default()
-            },
-            agents: vec![function("chat", "Chat remotely", &["md"])],
-            tools: vec![function("lookup", "Lookup remotely", &["text"])],
-        },
-    );
-    RemoteEngines { engines }
 }
 
 /// Mirrors a real adapter's history handling: the sent request content comes back in
