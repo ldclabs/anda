@@ -69,7 +69,7 @@ anda_cloud_cdk = "0.7"
 object_store = { version = "0.14" }
 parking_lot = "0.12"
 tokio-util = "0.7"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1.53.3", features = ["full"] }
 structured-logger = "1"
 rand = "0.10"
 reqwest = { version = "0.13", features = [
@@ -101,7 +101,7 @@ windows-sys = "0.52"
 hex = "0.4"
 tower-http = { version = "0.7", features = ["compression-gzip"] }
 glob = "0.3"
-serde-saphyr = "1"
+serde-saphyr = "2"
 unicode-segmentation = "1"
 libc = "0.2"
 sha2 = "0.11"

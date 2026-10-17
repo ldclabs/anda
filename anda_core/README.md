@@ -16,7 +16,7 @@ Full API documentation is available on [docs.rs][docs].
 
 ```toml
 [dependencies]
-anda_core = "0.16"
+anda_core = "0.17"
 ```
 
 ## What It Provides

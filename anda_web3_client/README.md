@@ -27,7 +27,7 @@ Endpoints passed to the signed HTTP/RPC calls must be trusted: requests are sign
 Enable `client` in your dependency:
 
 ```toml
-anda_web3_client = { version = "0.16", features = ["client"] }
+anda_web3_client = { version = "0.17", features = ["client"] }
 ```
 
 Provide a persistent, securely generated 48-byte root secret when using key

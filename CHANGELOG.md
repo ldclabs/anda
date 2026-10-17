@@ -2,7 +2,25 @@
 
 All notable changes to the Anda project will be documented in this file.
 
-## [Unreleased]
+## [0.17.0] — 2026-10-17
+
+This release removes remote engines, agents and tools, which changes the
+`anda_core` context traits, and adds agent-initiated context compaction to
+`anda_engine`. Because the trait change is breaking, every workspace crate
+moves to `0.17.0` instead of taking a patch release.
+
+### Changed — workspace
+
+- **Workspace release alignment** — `anda_core`, `anda_engine`,
+  `anda_engine_server`, `anda_web3_client`, and `anda_cli` now share version
+  `0.17.0`; internal crate requirements have been raised to `0.17`. The server,
+  web3 client and CLI sources are unchanged.
+
+- **tokio 1.53.3 minimum** — the workspace `tokio` requirement rises from `1` to
+  `1.53.3`, the first 1.53 release with `AsyncFd::register`.
+
+- **serde-saphyr 2** — the YAML library `anda_engine` uses for skill frontmatter
+  and skill metadata sidecars moves from 1 to 2. No code changes were needed.
 
 ### Removed — anda_core
 
@@ -59,6 +77,12 @@ All notable changes to the Anda project will be documented in this file.
   mid-task. The replacement runner now resumes with `COMPACTION_CONTINUE_PROMPT`.
   Hosts that queue their own continuation prompt after a handoff should do so
   only when the runner is idle, or the two prompts share one user turn.
+
+- **PTY sessions register their terminal with `AsyncFd::register`** — tokio
+  1.53.3 deprecates `AsyncFd::new` as unsound, since it cannot know the
+  descriptor stays open for the registration's lifetime. The PTY master is now
+  registered through the `unsafe` replacement; the `File` that owns it moves
+  into the `AsyncFd`, which upholds that requirement.
 
 ## [anda_engine 0.16.10] — 2026-10-10
 

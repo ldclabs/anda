@@ -122,7 +122,10 @@ pub(super) fn spawn(
     command.kill_on_drop(true);
     let child = command.spawn()?;
     drop(command);
-    let fd = Arc::new(AsyncFd::new(master)?);
+    // SAFETY: `master` owns the descriptor `openpty` opened and moves into the `AsyncFd`; a
+    // `File` returns that same descriptor until it is dropped, which is also when it closes it.
+    let fd = unsafe { AsyncFd::register(master) }.map_err(std::io::Error::from)?;
+    let fd = Arc::new(fd);
     Ok((
         child,
         Box::new(Terminal(fd.clone())),

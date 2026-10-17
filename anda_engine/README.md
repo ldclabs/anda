@@ -37,7 +37,7 @@ The crate has no default optional features.
 
 ```toml
 [dependencies]
-anda_engine = "0.16"
+anda_engine = "0.17"
 ```
 
 ## Quick Start
