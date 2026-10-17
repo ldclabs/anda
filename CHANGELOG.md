@@ -2,6 +2,24 @@
 
 All notable changes to the Anda project will be documented in this file.
 
+## [anda_engine 0.17.1] — 2026-10-17
+
+### Fixed — anda_engine
+
+- **Follow-ups after a Claude tool turn no longer fail** — at an idle boundary
+  the runner prunes completed tool calls and results from the provider raw
+  history, but it kept each tool round's signed thinking, so a
+  `[thinking, tool_use]` message became a thinking-only message. With the tool
+  results between them gone, Anthropic merged it into the turn's final answer
+  and rejected the next request with "`thinking` or `redacted_thinking` blocks
+  in the latest assistant message cannot be modified". Models that think by
+  default, such as Claude Opus 5.5, failed on every message after a tool-using
+  turn. A message that lost a tool call is no longer the response its thinking
+  was signed for, so its `thinking` and `redacted_thinking` blocks now leave
+  with the call, after an interrupt as well as at the idle boundary. Thinking
+  is optional in request input; the final answer is unchanged and keeps its
+  thinking.
+
 ## [0.17.0] — 2026-10-17
 
 This release removes remote engines, agents and tools, which changes the

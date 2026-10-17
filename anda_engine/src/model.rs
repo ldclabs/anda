@@ -514,7 +514,8 @@ pub trait CompletionFeaturesDyn: Send + Sync + 'static {
     /// provider can classify its items reliably. The runner calls this after an
     /// interrupt (steering, discard, stop) so the next request does not inherit
     /// a tool-call requirement the provider would reject as unanswered. Visible
-    /// text and reasoning must stay untouched.
+    /// text and reasoning must stay untouched, except reasoning that is valid
+    /// only together with the pruned call.
     ///
     /// The default implementation is a conservative union over the built-in
     /// provider wire shapes; override it when your provider's raw items are not
@@ -528,8 +529,9 @@ pub trait CompletionFeaturesDyn: Send + Sync + 'static {
     /// Long-lived callers invoke this at an idle boundary to reclaim
     /// context-window budget from tool payloads the model has already consumed.
     /// Visible text and reasoning must stay untouched, and provider ordering
-    /// constraints (for example a reasoning item that must precede its sibling)
-    /// must be preserved.
+    /// constraints must be preserved: a reasoning item that must precede its
+    /// sibling, or Anthropic thinking that is valid only in its unchanged
+    /// message, leaves together with the pruned call.
     ///
     /// The default implementation is a conservative union over the built-in
     /// provider wire shapes; override it when your provider's raw items are not

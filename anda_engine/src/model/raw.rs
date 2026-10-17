@@ -22,8 +22,9 @@ use serde_json::json;
 ///
 /// Used after an interrupt (steering, discard, stop) so the next request does
 /// not inherit a tool-call requirement the provider would reject as unanswered.
-/// Visible text and reasoning stay untouched; wrapper items left without
-/// meaningful content are removed entirely.
+/// Visible text and reasoning stay untouched, except reasoning tied to a pruned
+/// call (an OpenAI Responses `reasoning` item, Anthropic thinking in the same
+/// message); wrapper items left without meaningful content are removed entirely.
 pub(crate) fn prune_unanswered_tool_calls(raw_history: &mut Vec<Json>, start: usize) {
     if start >= raw_history.len() {
         return;
@@ -248,6 +249,23 @@ fn prune_item(mut value: Json, is_pruned: impl Fn(&Json) -> bool + Copy) -> Opti
 fn prune_nested(value: &mut Json, is_pruned: impl Fn(&Json) -> bool + Copy) {
     match value {
         Json::Array(items) => {
+            let len = items.len();
+            items.retain(|item| !is_pruned(item));
+            // Anthropic accepts thinking blocks only as they were in the response that
+            // produced them, and a message that lost a tool call is no longer that response.
+            // A leftover thinking-only message also merges into the next assistant message
+            // once the tool results between them are gone, and the API rejects the merged
+            // message ("`thinking` or `redacted_thinking` blocks in the latest assistant
+            // message cannot be modified"). Thinking is optional in request input, so it
+            // follows the pruned call out.
+            if items.len() < len {
+                items.retain(|item| {
+                    !matches!(
+                        item.get("type").and_then(Json::as_str),
+                        Some("thinking" | "redacted_thinking")
+                    )
+                });
+            }
             let retained: Vec<Json> = items
                 .drain(..)
                 .filter_map(|item| prune_item(item, is_pruned))
@@ -477,11 +495,11 @@ mod tests {
             json!({"type": "reasoning", "id": "rs_orphan", "encrypted_content": "opaque"}),
             json!({"type": "function_call", "call_id": "call_2", "name": "lookup", "arguments": "{}"}),
             json!({"type": "function_call_output", "call_id": "call_2", "output": "ok"}),
-            // Anthropic shapes.
+            // Anthropic shapes: thinking leaves with the pruned call, the text stays.
             json!({
                 "role": "assistant",
                 "content": [
-                    {"type": "thinking", "thinking": "kept thinking", "signature": "sig"},
+                    {"type": "thinking", "thinking": "tool round thinking", "signature": "sig"},
                     {"type": "text", "text": "anthropic text"},
                     {"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}}
                 ]
@@ -518,7 +536,7 @@ mod tests {
         let pruned = serde_json::to_string(&raw_history).unwrap();
         assert_eq!(raw_history.len(), 5);
         assert_eq!(raw_history[0]["content"], json!("question"));
-        assert!(pruned.contains("kept thinking"));
+        assert!(!pruned.contains("tool round thinking"));
         assert!(pruned.contains("anthropic text"));
         assert!(pruned.contains("gemini text"));
         assert!(pruned.contains("rs_kept"));
@@ -534,6 +552,57 @@ mod tests {
     }
 
     #[test]
+    fn pruned_anthropic_tool_rounds_leave_no_thinking_behind() {
+        // A Claude turn with two tool rounds. Pruning the calls and results used to keep each
+        // round's signed thinking, so the API merged the leftover thinking-only messages into
+        // the final answer and rejected the next request with "`thinking` or
+        // `redacted_thinking` blocks in the latest assistant message cannot be modified".
+        let question = json!({"role": "user", "content": [{"type": "text", "text": "question"}]});
+        let answer = json!({
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "", "signature": "sig_answer"},
+                {"type": "text", "text": "final answer"}
+            ]
+        });
+        let mut raw_history = vec![
+            question.clone(),
+            json!({
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "", "signature": "sig_1"},
+                    {"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}},
+                    {"type": "tool_use", "id": "toolu_2", "name": "lookup", "input": {}}
+                ]
+            }),
+            json!({
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "one"},
+                    {"type": "tool_result", "tool_use_id": "toolu_2", "content": "two"}
+                ]
+            }),
+            json!({
+                "role": "assistant",
+                "content": [
+                    {"type": "redacted_thinking", "data": "cipher"},
+                    {"type": "tool_use", "id": "toolu_3", "name": "lookup", "input": {}}
+                ]
+            }),
+            json!({
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "toolu_3", "content": "three"}]
+            }),
+            answer.clone(),
+        ];
+
+        prune_tool_interactions(&mut raw_history);
+
+        // The final answer was never modified, so its thinking stays valid and is kept.
+        assert_eq!(raw_history, vec![question, answer]);
+    }
+
+    #[test]
     fn prunes_only_unanswered_raw_tool_call_items() {
         let sentinel = json!({"role": "user", "content": "prior"});
         let mut raw_history = vec![
@@ -541,6 +610,7 @@ mod tests {
             json!({
                 "role": "assistant",
                 "content": [
+                    {"type": "thinking", "thinking": "plan", "signature": "sig"},
                     {"type": "text", "text": "anthropic text"},
                     {"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}}
                 ]

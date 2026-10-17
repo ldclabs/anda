@@ -507,7 +507,7 @@ impl CompletionRunner {
     /// [`CompletionFeaturesDyn::prune_tool_interactions`](crate::model::CompletionFeaturesDyn::prune_tool_interactions):
     /// only the provider knows its own wire shapes. Tool-call requests, their results,
     /// and items left without meaningful content are removed; visible text and reasoning
-    /// stay untouched.
+    /// stay untouched, except reasoning that is valid only together with a pruned call.
     ///
     /// Long-lived callers (for example subagent sessions) can invoke this at an idle
     /// boundary to reclaim context-window budget from tool payloads the model has already
