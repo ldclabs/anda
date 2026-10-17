@@ -1,13 +1,14 @@
 //! Shared completion driver for provider adapters.
 //!
 //! Every provider adapter answers a [`CompletionRequest`] with the same
-//! fifteen-step algorithm — instructions, replayed raw history (recording the
-//! skip point), converted chat history, documents message, prompt/content
-//! message, sampling options, tools, execute with a stream/non-stream branch,
-//! failure logging, drain of the replayed prefix, and conversion into
-//! [`AgentOutput`]. Only the wire format differs. [`drive_completion`] owns
-//! that algorithm once; a provider contributes a [`WireFormat`] implementation
-//! that maps each step onto its own request and response types.
+//! algorithm — instructions, replayed raw history (recording the skip point),
+//! converted chat history, documents message, prompt/content message, sampling
+//! options, tools and their mid-conversation additions, execute with a
+//! stream/non-stream branch, failure logging, drain of the replayed prefix, and
+//! conversion into [`AgentOutput`]. Only the wire format differs.
+//! [`drive_completion`] owns that algorithm once; a provider contributes a
+//! [`WireFormat`] implementation that maps each step onto its own request and
+//! response types.
 //!
 //! The driver makes the seam's most fragile invariants structural instead of
 //! copied prose:
@@ -84,6 +85,12 @@ pub(crate) trait WireFormat {
     /// Maps a non-empty tool list (and the required-choice flag) onto the
     /// request.
     fn apply_tools(r: &mut Self::Request, tools: Vec<FunctionDefinition>, required: bool);
+
+    /// Activates `names`, tools that joined the conversation after the replayed
+    /// raw history, after this request's input. Called once every message and
+    /// the tools are applied. The default sends them as ordinary tools, which is
+    /// all a provider without mid-conversation tool changes can do.
+    fn push_tool_additions(_r: &mut Self::Request, _names: Vec<String>) {}
 
     /// Final request adjustments after all content is applied (for example
     /// forcing stream flags or stream usage options).
@@ -195,6 +202,9 @@ pub(crate) async fn drive_completion<W: WireFormat>(
 
     if !req.tools.is_empty() {
         W::apply_tools(&mut r, req.tools, req.tool_choice_required);
+        if !req.tool_additions.is_empty() {
+            W::push_tool_additions(&mut r, req.tool_additions);
+        }
     }
 
     W::finalize_request(&mut r)?;

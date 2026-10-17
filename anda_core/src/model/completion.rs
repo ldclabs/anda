@@ -116,6 +116,15 @@ pub struct CompletionRequest {
     /// The tools to be sent to the completion model provider.
     pub tools: Vec<FunctionDefinition>,
 
+    /// Names of `tools` that joined the conversation after the request that produced the
+    /// replayed `raw_history`.
+    ///
+    /// A model that activates tools mid-conversation declares them deferred and activates them
+    /// after this request's input, so the cached request prefix before that point survives the
+    /// change. Other models receive `tools` as given. The engine's completion runner fills this
+    /// in for each request it sends.
+    pub tool_additions: Vec<String>,
+
     /// Whether the model must call a tool this turn.
     ///
     /// Adapters map this to the provider's forced tool choice (Anthropic `tool_choice: any`).

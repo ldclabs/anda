@@ -8,8 +8,8 @@
 use anda_core::{
     AgentOutput, BoxError, BoxPinFut, CompletionRequest, FunctionDefinition, Json, Message,
 };
-use serde_json::Value;
-use std::collections::BTreeMap;
+use serde_json::{Value, json};
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::driver::{SamplingOptions, WireFormat, assign_tool_call_ids, drive_completion};
 use super::{CompletionFeaturesDyn, ModelEffort, ModelError, request_client_builder};
@@ -130,6 +130,9 @@ pub struct CompletionModel {
     default_request: types::CreateMessageParams,
     /// Model identifier
     pub model: String,
+    /// Whether the endpoint activates tools mid-conversation; see
+    /// [`Self::with_tool_additions`].
+    tool_additions: bool,
 }
 
 impl CompletionModel {
@@ -147,6 +150,7 @@ impl CompletionModel {
             client,
             default_request,
             model: model.to_string(),
+            tool_additions: known_tool_additions(model),
         }
     }
 
@@ -159,11 +163,24 @@ impl CompletionModel {
     /// Sets the default reasoning effort for compatible models
     pub fn with_effort(mut self, effort: Option<ModelEffort>) -> Self {
         if let Some(effort) = effort {
-            self.default_request
-                .output_config
-                .get_or_insert_default()
-                .effort = Some(effort.into());
+            apply_effort(&mut self.default_request, &self.model, effort);
         }
+        self
+    }
+
+    /// Sets whether the endpoint activates tools that join a conversation where
+    /// they join it.
+    ///
+    /// Tools come first in the prompt a provider caches, so adding one to a
+    /// conversation usually invalidates the whole cached prefix. An endpoint
+    /// that supports mid-conversation tool changes takes the new tool as a
+    /// deferred declaration and activates it from a system `tool_addition`
+    /// message after the input that brought it, which keeps the prefix before
+    /// that point cached. It is on by default only for the models known to
+    /// support it, DeepSeek's `deepseek-flash`; Anthropic's own API accepts no
+    /// system messages.
+    pub fn with_tool_additions(mut self, enabled: bool) -> Self {
+        self.tool_additions = enabled;
         self
     }
 
@@ -459,9 +476,11 @@ impl CompletionFeaturesDyn for CompletionModel {
         let client = self.client.clone();
         let mut r = self.default_request.clone();
         r.model = model.clone();
+        let tool_additions = self.tool_additions;
 
         Box::pin(async move {
             assign_tool_call_ids(&mut req);
+            prepare_tool_additions(&mut req, tool_additions);
             drive_completion::<CompletionModel>(model, move |path| client.post(path), r, req).await
         })
     }
@@ -651,6 +670,126 @@ fn mark_cache_breakpoints(r: &mut types::CreateMessageParams) {
     }
 }
 
+/// The opt-in for system `tool_addition` messages and deferred tool declarations.
+const TOOL_CHANGES_BETA: &str = "mid-conversation-tool-changes-2026-07-01";
+
+/// Models known to activate tools that join a conversation where they join it;
+/// see [`CompletionModel::with_tool_additions`]. The capability belongs to the
+/// exact model, not to its family or provider.
+fn known_tool_additions(model: &str) -> bool {
+    model.eq_ignore_ascii_case("deepseek-flash")
+}
+
+/// The tools a system message's `tool_addition` blocks activate.
+fn tool_addition_names(message: &Value) -> impl Iterator<Item = &str> {
+    let blocks = (message.get("role").and_then(Value::as_str) == Some("system"))
+        .then(|| message.get("content").and_then(Value::as_array))
+        .flatten();
+    blocks
+        .into_iter()
+        .flatten()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_addition"))
+        .filter_map(|block| block.get("tool")?.get("name")?.as_str())
+}
+
+/// Readies `req` for the endpoint's support of mid-conversation tool changes.
+///
+/// Without that support the request adds no tool and the replayed history loses
+/// its activations, which the endpoint would reject. With it, an activation
+/// stays only while its tool is still offered: the endpoint resolves each one
+/// against the request's declarations.
+fn prepare_tool_additions(req: &mut CompletionRequest, enabled: bool) {
+    if !enabled {
+        req.tool_additions.clear();
+    }
+    let offered: BTreeSet<&str> = if enabled {
+        req.tools.iter().map(|tool| tool.name.as_str()).collect()
+    } else {
+        BTreeSet::new()
+    };
+    req.raw_history.retain_mut(|message| {
+        if tool_addition_names(message).all(|name| offered.contains(name)) {
+            return true;
+        }
+        let Some(blocks) = message.get_mut("content").and_then(Value::as_array_mut) else {
+            return true;
+        };
+        blocks.retain(|block| {
+            block.get("type").and_then(Value::as_str) != Some("tool_addition")
+                || block
+                    .get("tool")
+                    .and_then(|tool| tool.get("name"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| offered.contains(name))
+        });
+        !blocks.is_empty()
+    });
+}
+
+/// Declares the tools the conversation activates as deferred, after the tools
+/// offered from its start and in the order it activates them, so the
+/// declarations a provider caches stay the same when a tool joins.
+fn defer_activated_tools(r: &mut types::CreateMessageParams) {
+    let mut activated: Vec<&str> = Vec::new();
+    for name in r.messages.iter().flat_map(tool_addition_names) {
+        if !activated.contains(&name) {
+            activated.push(name);
+        }
+    }
+    let Some(tools) = r.tools.as_mut().filter(|_| !activated.is_empty()) else {
+        return;
+    };
+    let position = |tool: &types::Tool| activated.iter().position(|name| *name == tool.name);
+    let (mut deferred, offered): (Vec<_>, Vec<_>) = std::mem::take(tools)
+        .into_iter()
+        .partition(|tool| position(tool).is_some());
+    deferred.sort_by_key(|tool| position(tool));
+    for tool in &mut deferred {
+        tool.defer_loading = Some(true);
+    }
+    *tools = offered;
+    tools.append(&mut deferred);
+}
+
+/// DeepSeek's Anthropic-compatible API thinks unless thinking is disabled.
+fn is_deepseek(model: &str) -> bool {
+    model.to_ascii_lowercase().contains("deepseek")
+}
+
+/// Sets `effort` on a request for `model`. On DeepSeek `minimal` turns thinking
+/// off.
+fn apply_effort(r: &mut types::CreateMessageParams, model: &str, effort: ModelEffort) {
+    if !is_deepseek(model) {
+        r.output_config.get_or_insert_default().effort = Some(effort.into());
+        return;
+    }
+    if effort == ModelEffort::Minimal {
+        r.thinking = Some(types::Thinking {
+            budget_tokens: 0,
+            r#type: types::ThinkingType::Disabled,
+            display: None,
+        });
+        if let Some(config) = r.output_config.as_mut() {
+            config.effort = None;
+            if config.format.is_none() {
+                r.output_config = None;
+            }
+        }
+        return;
+    }
+    // A request effort overrides a default that turned thinking off.
+    if matches!(
+        r.thinking,
+        Some(types::Thinking {
+            r#type: types::ThinkingType::Disabled,
+            ..
+        })
+    ) {
+        r.thinking = None;
+    }
+    r.output_config.get_or_insert_default().effort = Some(effort.into());
+}
+
 impl WireFormat for CompletionModel {
     type Request = types::CreateMessageParams;
     type Response = types::CreateMessageResponse;
@@ -674,7 +813,7 @@ impl WireFormat for CompletionModel {
     fn apply_sampling(
         r: &mut Self::Request,
         options: SamplingOptions,
-        _model: &str,
+        model: &str,
     ) -> Result<(), BoxError> {
         if let Some(temperature) = options.temperature {
             r.temperature = Some(temperature as f32);
@@ -683,7 +822,7 @@ impl WireFormat for CompletionModel {
             r.max_tokens = max_tokens as u32;
         }
         if let Some(effort) = options.effort {
-            r.output_config.get_or_insert_default().effort = Some(effort.into());
+            apply_effort(r, model, effort);
         }
         if let Some(output_schema) = options.output_schema {
             r.output_config.get_or_insert_default().format = Some(types::JsonOutputFormat {
@@ -704,6 +843,40 @@ impl WireFormat for CompletionModel {
         } else {
             types::ToolChoice::auto()
         });
+    }
+
+    fn push_tool_additions(r: &mut Self::Request, names: Vec<String>) {
+        // A tool is activated after the turn that brought it, never between a
+        // tool call and its result, so it waits for a request ending in input.
+        if r.messages
+            .last()
+            .and_then(|m| m.get("role"))
+            .and_then(Value::as_str)
+            != Some("user")
+        {
+            return;
+        }
+        let active: BTreeSet<&str> = r.messages.iter().flat_map(tool_addition_names).collect();
+        let declared: BTreeSet<&str> = r
+            .tools
+            .iter()
+            .flatten()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        let blocks: Vec<Value> = names
+            .iter()
+            .filter(|name| declared.contains(name.as_str()) && !active.contains(name.as_str()))
+            .map(|name| {
+                json!({
+                    "type": "tool_addition",
+                    "tool": {"type": "tool_reference", "name": name},
+                })
+            })
+            .collect();
+        if !blocks.is_empty() {
+            r.messages
+                .push(json!({"role": "system", "content": blocks}));
+        }
     }
 
     fn finalize_request(r: &mut Self::Request) -> Result<(), BoxError> {
@@ -747,8 +920,20 @@ impl WireFormat for CompletionModel {
                 _ => tool.strict = None,
             }
         }
+        defer_activated_tools(r);
         mark_cache_breakpoints(r);
         Ok(())
+    }
+
+    fn request_headers(r: &Self::Request) -> Vec<(&'static str, String)> {
+        if r.messages
+            .iter()
+            .any(|message| tool_addition_names(message).next().is_some())
+        {
+            vec![("anthropic-beta", TOOL_CHANGES_BETA.to_string())]
+        } else {
+            Vec::new()
+        }
     }
 
     fn is_stream(r: &Self::Request) -> bool {
@@ -820,7 +1005,9 @@ impl WireFormat for CompletionModel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::test_support::{no_proxy_client, recorded, spawn_mock_server, sse_headers};
+    use crate::model::test_support::{
+        MockState, no_proxy_client, recorded, spawn_mock_server, sse_headers,
+    };
     use anda_core::{ContentPart, FunctionDefinition};
     use http::{HeaderMap, Method, StatusCode};
     use reqwest::header::ACCEPT;
@@ -1825,5 +2012,328 @@ mod tests {
             "{sent}"
         );
         assert!(sent.contains("look"), "{sent}");
+    }
+
+    fn tool(name: &str) -> FunctionDefinition {
+        FunctionDefinition {
+            name: name.into(),
+            description: format!("{name} tool"),
+            parameters: json!({"type": "object"}),
+            strict: None,
+        }
+    }
+
+    fn tool_addition(names: &[&str]) -> Value {
+        let blocks: Vec<Value> = names
+            .iter()
+            .map(|name| {
+                json!({"type": "tool_addition", "tool": {"type": "tool_reference", "name": name}})
+            })
+            .collect();
+        json!({"role": "system", "content": blocks})
+    }
+
+    async fn deepseek_model() -> (CompletionModel, MockState) {
+        let body = serde_json::to_vec(&json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "model": "deepseek-flash",
+            "content": [{"type": "text", "text": "done"}],
+            "stop_reason": "end_turn",
+            "stop_sequence": null,
+            "usage": {"input_tokens": 4, "output_tokens": 1}
+        }))
+        .unwrap();
+        let (endpoint, state) = spawn_mock_server(StatusCode::OK, HeaderMap::new(), body).await;
+        let model = Client::new("test-key", Some(endpoint))
+            .with_client(no_proxy_client())
+            .completion_model("deepseek-flash")
+            .with_stream(false);
+        (model, state)
+    }
+
+    #[tokio::test]
+    async fn a_tool_joining_the_conversation_is_deferred_and_activated_after_the_input() {
+        let (model, state) = deepseek_model().await;
+        let raw_history = vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "assistant", "content": [{"type": "text", "text": "hello"}]}),
+        ];
+        let output = complete(
+            &model,
+            CompletionRequest {
+                raw_history: raw_history.clone(),
+                prompt: "read this image".into(),
+                tools: vec![tool("shell"), tool("image_reader"), tool("compact_context")],
+                tool_additions: vec!["image_reader".into()],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let req = recorded(&state);
+        assert_eq!(
+            req.headers.get("anthropic-beta").unwrap(),
+            "mid-conversation-tool-changes-2026-07-01"
+        );
+        let sent: Value = serde_json::from_slice(&req.body).unwrap();
+        assert_eq!(sent["messages"][0], raw_history[0]);
+        assert_eq!(sent["messages"][1], raw_history[1]);
+        assert_eq!(sent["messages"][2]["role"], "user");
+        assert_eq!(sent["messages"][3], tool_addition(&["image_reader"]));
+        let tools: Vec<(&str, bool)> = sent["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| {
+                (
+                    tool["name"].as_str().unwrap(),
+                    tool["defer_loading"] == json!(true),
+                )
+            })
+            .collect();
+        // The tools offered from the start keep their order; the new one follows them.
+        assert_eq!(
+            tools,
+            vec![
+                ("shell", false),
+                ("compact_context", false),
+                ("image_reader", true)
+            ]
+        );
+        // The activation joins the raw history at its place, so later rounds replay it.
+        assert_eq!(output.raw_history[0], sent["messages"][2]);
+        assert_eq!(output.raw_history[1], tool_addition(&["image_reader"]));
+        assert_eq!(output.raw_history[2]["role"], "assistant");
+    }
+
+    #[tokio::test]
+    async fn a_replayed_activation_keeps_its_tool_deferred_without_activating_it_again() {
+        let (model, state) = deepseek_model().await;
+        let raw_history = vec![
+            json!({"role": "user", "content": "read this image"}),
+            tool_addition(&["image_reader"]),
+            json!({"role": "assistant", "content": [{"type": "text", "text": "a cat"}]}),
+        ];
+        complete(
+            &model,
+            CompletionRequest {
+                raw_history: raw_history.clone(),
+                prompt: "and this one".into(),
+                tools: vec![tool("image_reader"), tool("shell")],
+                tool_additions: vec!["image_reader".into()],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let req = recorded(&state);
+        assert!(req.headers.contains_key("anthropic-beta"));
+        let sent: Value = serde_json::from_slice(&req.body).unwrap();
+        assert_eq!(sent["messages"][1], raw_history[1]);
+        assert_eq!(sent["messages"].as_array().unwrap().len(), 4);
+        assert_eq!(sent["messages"][3]["role"], "user");
+        assert_eq!(sent["tools"][0]["name"], "shell");
+        assert!(sent["tools"][0].get("defer_loading").is_none());
+        assert_eq!(sent["tools"][1]["name"], "image_reader");
+        assert_eq!(sent["tools"][1]["defer_loading"], true);
+    }
+
+    #[tokio::test]
+    async fn activations_of_tools_no_longer_offered_are_dropped() {
+        let (model, state) = deepseek_model().await;
+        complete(
+            &model,
+            CompletionRequest {
+                raw_history: vec![
+                    json!({"role": "user", "content": "go"}),
+                    tool_addition(&["gone", "kept"]),
+                    tool_addition(&["gone"]),
+                    json!({"role": "assistant", "content": [{"type": "text", "text": "ok"}]}),
+                ],
+                prompt: "next".into(),
+                tools: vec![tool("kept")],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let sent: Value = serde_json::from_slice(&recorded(&state).body).unwrap();
+        let roles: Vec<&str> = sent["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| message["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, vec!["user", "system", "assistant", "user"]);
+        assert_eq!(sent["messages"][1], tool_addition(&["kept"]));
+        assert_eq!(sent["tools"][0]["defer_loading"], true);
+    }
+
+    #[tokio::test]
+    async fn an_addition_waits_for_a_request_that_ends_in_input() {
+        let (model, state) = deepseek_model().await;
+        complete(
+            &model,
+            CompletionRequest {
+                raw_history: vec![
+                    json!({"role": "user", "content": "go"}),
+                    json!({"role": "assistant", "content": [{"type": "text", "text": "ok"}]}),
+                ],
+                tools: vec![tool("shell")],
+                tool_additions: vec!["shell".into(), "unknown".into()],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let req = recorded(&state);
+        assert!(!req.headers.contains_key("anthropic-beta"));
+        let sent: Value = serde_json::from_slice(&req.body).unwrap();
+        assert_eq!(sent["messages"].as_array().unwrap().len(), 2);
+        assert!(sent["tools"][0].get("defer_loading").is_none());
+    }
+
+    #[tokio::test]
+    async fn without_tool_changes_additions_are_ordinary_tools_and_activations_are_dropped() {
+        let body = serde_json::to_vec(&json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-test",
+            "content": [{"type": "text", "text": "done"}],
+            "stop_reason": "end_turn",
+            "stop_sequence": null,
+            "usage": {"input_tokens": 4, "output_tokens": 1}
+        }))
+        .unwrap();
+        let (endpoint, state) = spawn_mock_server(StatusCode::OK, HeaderMap::new(), body).await;
+        let model = Client::new("test-key", Some(endpoint))
+            .with_client(no_proxy_client())
+            .completion_model("claude-test")
+            .with_stream(false);
+        let output = complete(
+            &model,
+            CompletionRequest {
+                raw_history: vec![
+                    json!({"role": "user", "content": "go"}),
+                    tool_addition(&["shell"]),
+                    json!({"role": "assistant", "content": [{"type": "text", "text": "ok"}]}),
+                ],
+                prompt: "next".into(),
+                tools: vec![tool("shell"), tool("lookup")],
+                tool_additions: vec!["lookup".into()],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let req = recorded(&state);
+        assert!(!req.headers.contains_key("anthropic-beta"));
+        let sent: Value = serde_json::from_slice(&req.body).unwrap();
+        let roles: Vec<&str> = sent["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| message["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, vec!["user", "assistant", "user"]);
+        assert!(
+            sent["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|tool| tool.get("defer_loading").is_none())
+        );
+        assert_eq!(output.raw_history.len(), 2);
+    }
+
+    #[test]
+    fn tool_additions_are_on_for_known_models_only() {
+        let client = Client::new("test-key", Some("http://localhost".into()));
+        assert!(client.completion_model("deepseek-flash").tool_additions);
+        assert!(client.completion_model("DeepSeek-Flash").tool_additions);
+        assert!(!client.completion_model("deepseek-v4-pro").tool_additions);
+        assert!(!client.completion_model("claude-opus-5-5").tool_additions);
+        assert!(
+            !client
+                .completion_model("deepseek-flash")
+                .with_tool_additions(false)
+                .tool_additions
+        );
+    }
+
+    #[test]
+    fn pruning_keeps_tool_activations() {
+        let mut raw_history = vec![
+            json!({"role": "user", "content": "read this"}),
+            tool_addition(&["image_reader"]),
+            json!({"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_1", "name": "image_reader", "input": {}}
+            ]}),
+            json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1", "content": "a cat"}
+            ]}),
+            json!({"role": "assistant", "content": [{"type": "text", "text": "a cat"}]}),
+        ];
+        crate::model::raw::prune_tool_interactions(&mut raw_history);
+        assert_eq!(raw_history.len(), 3);
+        assert_eq!(raw_history[1], tool_addition(&["image_reader"]));
+    }
+
+    #[test]
+    fn deepseek_minimal_effort_turns_thinking_off() {
+        let client = Client::new("test-key", Some("http://localhost".into()));
+        let minimal = client
+            .completion_model("deepseek-flash")
+            .with_effort(Some(ModelEffort::Minimal));
+        let value = serde_json::to_value(&minimal.default_request).unwrap();
+        assert_eq!(value["thinking"], json!({"type": "disabled"}));
+        assert!(value.get("output_config").is_none());
+
+        // A request effort turns thinking back on.
+        let mut r = minimal.default_request.clone();
+        apply_effort(&mut r, "deepseek-flash", ModelEffort::Medium);
+        let value = serde_json::to_value(&r).unwrap();
+        assert!(value.get("thinking").is_none());
+        assert_eq!(value["output_config"]["effort"], "medium");
+
+        // Turning thinking off keeps a structured-output format.
+        r.output_config.as_mut().unwrap().format = Some(types::JsonOutputFormat {
+            schema: json!({"type": "object"}),
+            r#type: types::JsonOutputFormatType::JsonSchema,
+        });
+        apply_effort(&mut r, "DeepSeek-V4-Pro", ModelEffort::Minimal);
+        let value = serde_json::to_value(&r).unwrap();
+        assert_eq!(value["thinking"]["type"], "disabled");
+        assert!(value["output_config"].get("effort").is_none());
+        assert_eq!(value["output_config"]["format"]["type"], "json_schema");
+
+        for (effort, wire) in [
+            (ModelEffort::Low, "low"),
+            (ModelEffort::High, "high"),
+            (ModelEffort::Max, "max"),
+        ] {
+            let model = client
+                .completion_model("deepseek-flash")
+                .with_effort(Some(effort));
+            let value = serde_json::to_value(&model.default_request).unwrap();
+            assert_eq!(value["output_config"]["effort"], wire);
+            assert!(value.get("thinking").is_none());
+        }
+
+        // Other models keep their own mapping.
+        let claude = client
+            .completion_model("claude-sonnet-5-5")
+            .with_effort(Some(ModelEffort::Minimal));
+        let value = serde_json::to_value(&claude.default_request).unwrap();
+        assert_eq!(value["output_config"]["effort"], "low");
+        assert!(value.get("thinking").is_none());
     }
 }

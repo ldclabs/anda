@@ -2,6 +2,49 @@
 
 All notable changes to the Anda project will be documented in this file.
 
+## [anda_core 0.17.1, anda_engine 0.17.2] — 2026-10-17
+
+anda_engine 0.17.2 requires anda_core 0.17.1.
+
+### Added — anda_core
+
+- **`CompletionRequest::tool_additions`** — the names of `tools` that joined
+  the conversation after the request that produced the replayed
+  `raw_history`. The completion runner fills it in for every request; a caller
+  that builds requests itself can leave it empty. Code that builds a
+  `CompletionRequest` with a struct literal needs `..Default::default()`.
+
+### Added — anda_engine
+
+- **A tool that joins a DeepSeek conversation keeps the prompt cache** — tools
+  come first in the prompt a provider caches, so a tool added in the middle of
+  a conversation (an attachment's reader, a skill's callable, a merged
+  discovered tool) made the provider re-read the whole conversation at the
+  uncached price. DeepSeek's Anthropic-compatible API can activate a tool
+  where it joins: the runner now reports each request's new tools, and for
+  `deepseek-flash` the Anthropic adapter declares them with
+  `defer_loading: true` after the tools offered from the start, activates them
+  from a system `tool_addition` message after the input that brought them, and
+  sends `anthropic-beta: mid-conversation-tool-changes-2026-07-01`. The
+  activation joins the raw history at its place, so later requests replay the
+  same prefix; pruning tool rounds keeps it, and an activation whose tool is
+  no longer offered is dropped. `CompletionModel::with_tool_additions`
+  switches the capability for other models; it is off for every model but
+  `deepseek-flash`, including Anthropic's own, which accepts no system
+  messages. Other adapters send new tools as before. Against the live API,
+  the request that added a tool read 2,560 of the previous request's ~2,690
+  input tokens from the cache, against 128 without the extension; the
+  ignored `tests/deepseek_live.rs` repeats the check with `DEEPSEEK_API_KEY`.
+
+### Changed — anda_engine
+
+- **`minimal` turns DeepSeek's thinking off** — DeepSeek thinks unless thinking
+  is disabled, so `minimal`, sent as `low`, still thought. On a DeepSeek model
+  the Anthropic adapter now sends `thinking: {"type": "disabled"}` for
+  `minimal` instead; live, the answer took one output token and no thinking.
+  The other efforts pass through as before, and a request effort turns
+  thinking back on over a `minimal` default. Other models keep their mapping.
+
 ## [anda_engine 0.17.1] — 2026-10-17
 
 ### Fixed — anda_engine

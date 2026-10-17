@@ -372,6 +372,11 @@ fn item_has_context(value: &Json) -> bool {
         Json::Bool(_) | Json::Number(_) => true,
         Json::String(text) => !text.is_empty(),
         Json::Array(items) => items.iter().any(item_has_context),
+        // An Anthropic-compatible `tool_addition` block names its tool only, yet the tool
+        // stays deferred and unusable without it.
+        Json::Object(map) if map.get("type").and_then(Json::as_str) == Some("tool_addition") => {
+            true
+        }
         Json::Object(map) => map.iter().any(|(key, value)| {
             !matches!(
                 key.as_str(),

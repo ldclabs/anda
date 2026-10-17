@@ -95,6 +95,9 @@ pub struct CompletionRunner {
     transient_inline_data: bool,
     /// Agent-initiated compaction; see [`Self::set_self_compaction`].
     self_compaction: Option<CompactionState>,
+    /// Tools the request that last extended `req.raw_history` declared. A tool missing from them
+    /// joins the conversation with the next request; see [`CompletionRequest::tool_additions`].
+    history_tools: Option<BTreeSet<String>>,
     turns: usize,
 }
 
@@ -135,6 +138,7 @@ impl CompletionRunner {
             unbound: false,
             transient_inline_data: false,
             self_compaction: None,
+            history_tools: None,
             turns: 0,
         }
     }
@@ -1445,6 +1449,17 @@ impl CompletionRunner {
             // After the request's own and discovered tools, where it stays put.
             req.tools.push(state.definition.clone());
         }
+        let request_tools: BTreeSet<String> =
+            req.tools.iter().map(|tool| tool.name.clone()).collect();
+        req.tool_additions = match &self.history_tools {
+            Some(history_tools) if !req.raw_history.is_empty() => req
+                .tools
+                .iter()
+                .filter(|tool| !history_tools.contains(&tool.name))
+                .map(|tool| tool.name.clone())
+                .collect(),
+            _ => Vec::new(),
+        };
 
         let mut output = self.model_request(req).await?;
         output.model = Some(self.model.model_name());
@@ -1473,6 +1488,7 @@ impl CompletionRunner {
         // Accumulate all raw history, including the original request history.
         let raw_history_start = self.req.raw_history.len();
         self.req.raw_history.append(&mut output.raw_history);
+        self.history_tools = Some(request_tools);
         self.pending_tool_call_raw_history_start = None;
         // Accumulate all generated chat history, excluding the original request history.
         self.chat_history.append(&mut output.chat_history);
@@ -4917,6 +4933,62 @@ mod tests {
         let next = serde_json::to_string(&requests.last().unwrap().raw_history).unwrap();
         assert!(!next.contains(&encoded), "{next}");
         assert!(next.contains("[inline image/png data omitted]"), "{next}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_tool_joins_the_request_after_the_raw_history_it_missed() {
+        let raw = |provider: &str| AgentOutput {
+            raw_history: vec![json!({"provider": provider})],
+            ..Default::default()
+        };
+        let first = ScriptedCompleter::new("provider_a")
+            .push_output(raw("provider_a"))
+            .push_output(raw("provider_a"))
+            .push_output(raw("provider_a"))
+            .into_arc();
+        let ctx = EngineBuilder::new()
+            .with_model(Model::with_completer(first.clone()))
+            .mock_ctx();
+        let tool = |name: &str| FunctionDefinition {
+            name: name.to_string(),
+            ..Default::default()
+        };
+        let mut runner = ctx
+            .clone()
+            .completion_iter(
+                CompletionRequest {
+                    prompt: "hi".to_string(),
+                    tools: vec![tool("shell")],
+                    ..Default::default()
+                },
+                Vec::new(),
+            )
+            .unbound();
+        runner.next().await.unwrap().unwrap();
+
+        runner.add_tools(vec![tool("image_reader")]);
+        runner.follow_up("look".to_string());
+        runner.next().await.unwrap().unwrap();
+        runner.follow_up("again".to_string());
+        runner.next().await.unwrap().unwrap();
+
+        let additions: Vec<Vec<String>> = first
+            .requests()
+            .into_iter()
+            .map(|req| req.tool_additions)
+            .collect();
+        assert_eq!(
+            additions,
+            vec![vec![], vec!["image_reader".to_string()], vec![]]
+        );
+
+        // A model switch replays the neutral history, so every tool is offered from the start.
+        let second = ScriptedCompleter::new("provider_b").into_arc();
+        ctx.models.set_model(Model::with_completer(second.clone()));
+        runner.add_tools(vec![tool("lookup")]);
+        runner.follow_up("switch".to_string());
+        runner.next().await.unwrap().unwrap();
+        assert!(second.requests()[0].tool_additions.is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]
