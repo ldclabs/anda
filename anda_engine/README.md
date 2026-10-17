@@ -189,9 +189,11 @@ Completion adapter behavior:
   `defer_loading: true` after the tools offered from the start and activates
   them from a system `tool_addition` message after the input that brought them
   (beta `mid-conversation-tool-changes-2026-07-01`), so the cached prompt
-  prefix survives. `CompletionModel::with_tool_additions` switches this for
-  other models; Anthropic's own API accepts no system messages. Other adapters
-  send new tools as ordinary tools.
+  prefix survives. Only requests at max effort do this: below max the model
+  often answers that an activated tool does not exist, so those requests
+  declare every tool as usual. `CompletionModel::with_tool_additions` switches
+  this for other models; Anthropic's own API accepts no system messages. Other
+  adapters send new tools as ordinary tools.
 - Chat audio inputs must contain inline WAV/MP3 data. Remote audio/file URLs
   return errors; use Responses for remote file inputs. Video is sent as a
   `video_url` part for compatible providers; OpenAI itself rejects it.

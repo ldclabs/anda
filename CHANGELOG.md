@@ -4,6 +4,23 @@ All notable changes to the Anda project will be documented in this file.
 
 ## [Unreleased]
 
+## [anda_engine 0.17.3] — 2026-10-18
+
+### Fixed — anda_engine
+
+- **A tool that joins a DeepSeek conversation below max effort is usable
+  again** — 0.17.2 activated every tool that joined a `deepseek-flash`
+  conversation from a system `tool_addition` message, and below max effort the
+  model often answered that the tool did not exist: asked to call a tool it had
+  just been given, it said so in 16 of 20 requests at `low` and 12 of 20 at
+  `high`, against none of 50 when the tool was declared as usual. The
+  Anthropic adapter now uses mid-conversation tool additions only for requests
+  that run at max effort, by their own effort or the model's default, which
+  missed once in 46 requests. Other requests declare every tool as usual and
+  replay the conversation without its activations, so they read nothing from
+  the cache after a tool joins. Anda Bot's default `deepseek-flash` runs at
+  max and keeps the cached prefix.
+
 ## [anda_core 0.17.1, anda_engine 0.17.2] — 2026-10-17
 
 anda_engine 0.17.2 requires anda_core 0.17.1.

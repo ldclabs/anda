@@ -179,6 +179,12 @@ impl CompletionModel {
     /// that point cached. It is on by default only for the models known to
     /// support it, DeepSeek's `deepseek-flash`; Anthropic's own API accepts no
     /// system messages.
+    ///
+    /// Only requests at max effort use it. Below max, `deepseek-flash` often
+    /// answers that an activated tool does not exist (16 of 20 probes at low,
+    /// 12 of 20 at high, 1 of 46 at max, none of 50 with ordinary
+    /// declarations), so those requests declare every tool as usual and leave
+    /// the conversation's activations out.
     pub fn with_tool_additions(mut self, enabled: bool) -> Self {
         self.tool_additions = enabled;
         self
@@ -476,7 +482,7 @@ impl CompletionFeaturesDyn for CompletionModel {
         let client = self.client.clone();
         let mut r = self.default_request.clone();
         r.model = model.clone();
-        let tool_additions = self.tool_additions;
+        let tool_additions = self.tool_additions && runs_at_max_effort(&r, req.effort);
 
         Box::pin(async move {
             assign_tool_call_ids(&mut req);
@@ -692,12 +698,23 @@ fn tool_addition_names(message: &Value) -> impl Iterator<Item = &str> {
         .filter_map(|block| block.get("tool")?.get("name")?.as_str())
 }
 
-/// Readies `req` for the endpoint's support of mid-conversation tool changes.
+/// Whether a request runs at max effort: its own effort, else the model's default.
+fn runs_at_max_effort(r: &types::CreateMessageParams, effort: Option<ModelEffort>) -> bool {
+    match effort {
+        Some(effort) => effort == ModelEffort::Max,
+        None => {
+            r.output_config.as_ref().and_then(|config| config.effort)
+                == Some(types::OutputEffort::Max)
+        }
+    }
+}
+
+/// Readies `req` for mid-conversation tool changes.
 ///
-/// Without that support the request adds no tool and the replayed history loses
-/// its activations, which the endpoint would reject. With it, an activation
-/// stays only while its tool is still offered: the endpoint resolves each one
-/// against the request's declarations.
+/// A request that does not use them adds no tool and replays the history
+/// without its activations, so every tool is an ordinary declaration. One that
+/// does keeps an activation only while its tool is still offered: the endpoint
+/// resolves each one against the request's declarations.
 fn prepare_tool_additions(req: &mut CompletionRequest, enabled: bool) {
     if !enabled {
         req.tool_additions.clear();
@@ -2037,6 +2054,10 @@ mod tests {
     }
 
     async fn deepseek_model() -> (CompletionModel, MockState) {
+        deepseek_model_with(ModelEffort::Max).await
+    }
+
+    async fn deepseek_model_with(effort: ModelEffort) -> (CompletionModel, MockState) {
         let body = serde_json::to_vec(&json!({
             "id": "msg_1",
             "type": "message",
@@ -2052,7 +2073,8 @@ mod tests {
         let model = Client::new("test-key", Some(endpoint))
             .with_client(no_proxy_client())
             .completion_model("deepseek-flash")
-            .with_stream(false);
+            .with_stream(false)
+            .with_effort(Some(effort));
         (model, state)
     }
 
@@ -2286,6 +2308,62 @@ mod tests {
                 .all(|tool| tool.get("defer_loading").is_none())
         );
         assert_eq!(output.raw_history.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn below_max_effort_every_tool_is_an_ordinary_declaration() {
+        let raw_history = vec![
+            json!({"role": "user", "content": "read this image"}),
+            tool_addition(&["image_reader"]),
+            json!({"role": "assistant", "content": [{"type": "text", "text": "a cat"}]}),
+        ];
+        let request = |effort: Option<ModelEffort>| CompletionRequest {
+            raw_history: raw_history.clone(),
+            prompt: "look this up".into(),
+            tools: vec![tool("image_reader"), tool("lookup")],
+            tool_additions: vec!["lookup".into()],
+            effort,
+            ..Default::default()
+        };
+
+        // A max-effort model asked for less, and a model below max by default.
+        for (default, effort) in [
+            (ModelEffort::Max, Some(ModelEffort::High)),
+            (ModelEffort::Low, None),
+        ] {
+            let (model, state) = deepseek_model_with(default).await;
+            complete(&model, request(effort)).await.unwrap();
+            let req = recorded(&state);
+            assert!(!req.headers.contains_key("anthropic-beta"));
+            let sent: Value = serde_json::from_slice(&req.body).unwrap();
+            let roles: Vec<&str> = sent["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|message| message["role"].as_str().unwrap())
+                .collect();
+            assert_eq!(roles, vec!["user", "assistant", "user"]);
+            assert!(
+                sent["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|tool| tool.get("defer_loading").is_none())
+            );
+        }
+
+        // A request that asks for max on a lower default uses them.
+        let (model, state) = deepseek_model_with(ModelEffort::Low).await;
+        complete(&model, request(Some(ModelEffort::Max)))
+            .await
+            .unwrap();
+        let req = recorded(&state);
+        assert!(req.headers.contains_key("anthropic-beta"));
+        let sent: Value = serde_json::from_slice(&req.body).unwrap();
+        assert_eq!(sent["messages"][1], tool_addition(&["image_reader"]));
+        assert_eq!(sent["messages"][4], tool_addition(&["lookup"]));
+        assert_eq!(sent["tools"][0]["defer_loading"], true);
+        assert_eq!(sent["tools"][1]["defer_loading"], true);
     }
 
     #[test]

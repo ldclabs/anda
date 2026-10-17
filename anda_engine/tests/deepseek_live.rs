@@ -29,7 +29,7 @@ fn deepseek(effort: ModelEffort) -> anthropic::CompletionModel {
         .completion_model(MODEL)
         .with_stream(true)
         .with_effort(Some(effort))
-        .with_max_output(2048)
+        .with_max_output(8192)
 }
 
 /// What one request carried and what it cost.
@@ -40,7 +40,6 @@ struct Round {
     input_tokens: u64,
     cached_tokens: u64,
     tool_calls: Vec<String>,
-    thoughts: bool,
     raw_history: Vec<Json>,
 }
 
@@ -68,7 +67,6 @@ impl CompletionFeaturesDyn for Recorder {
                 input_tokens: output.usage.input_tokens,
                 cached_tokens: output.usage.cached_tokens,
                 tool_calls: output.tool_calls.iter().map(|c| c.name.clone()).collect(),
-                thoughts: output.thoughts.is_some(),
                 raw_history: output.raw_history.clone(),
             });
             Ok(output)
@@ -154,11 +152,14 @@ impl Tool<BaseCtx> for CacheSample {
 
 /// Runs four turns: a long unique history, a warm-up, then a turn that adds
 /// `cache_sample` and asks for it. Returns every request and the last reply.
-async fn add_a_tool_mid_conversation(tool_additions: bool) -> (Vec<Round>, String, String) {
+async fn add_a_tool_mid_conversation(
+    effort: ModelEffort,
+    tool_additions: bool,
+) -> (Vec<Round>, String, String) {
     let label = format!("CACHE_SAMPLE_{:032x}", rand::random::<u128>());
     let rounds = Arc::new(Mutex::new(Vec::new()));
     let recorder = Recorder {
-        inner: deepseek(ModelEffort::Minimal).with_tool_additions(tool_additions),
+        inner: deepseek(effort).with_tool_additions(tool_additions),
         rounds: rounds.clone(),
     };
     let sample = Arc::new(CacheSample {
@@ -220,7 +221,7 @@ async fn add_a_tool_mid_conversation(tool_additions: bool) -> (Vec<Round>, Strin
 #[tokio::test]
 #[ignore = "calls the DeepSeek API; set DEEPSEEK_API_KEY and run with --ignored"]
 async fn a_tool_added_mid_conversation_keeps_the_cached_prefix() {
-    let (rounds, reply, label) = add_a_tool_mid_conversation(true).await;
+    let (rounds, reply, label) = add_a_tool_mid_conversation(ModelEffort::Max, true).await;
     for (i, round) in rounds.iter().enumerate() {
         println!(
             "request {i}: input {} cached {} additions {:?} activations replayed {} calls {:?}",
@@ -249,7 +250,8 @@ async fn a_tool_added_mid_conversation_keeps_the_cached_prefix() {
         rounds[added].cached_tokens,
         before.input_tokens
     );
-    // Without thinking the model now and then answers without the tool (1 run in 10);
+    // Below max effort the model often answers that the activated tool does not exist, which
+    // is why only max-effort requests activate tools. At max it still did once in 46 runs;
     // rerun before suspecting the activation.
     assert!(
         rounds[added]
@@ -268,14 +270,42 @@ async fn a_tool_added_mid_conversation_keeps_the_cached_prefix() {
         after.cached_tokens,
         rounds[added].input_tokens
     );
-    // `minimal` turned thinking off.
-    assert!(rounds.iter().all(|round| !round.thoughts));
+}
+
+#[tokio::test]
+#[ignore = "calls the DeepSeek API; set DEEPSEEK_API_KEY and run with --ignored"]
+async fn below_max_effort_an_added_tool_is_declared_as_usual() {
+    let (rounds, reply, label) = add_a_tool_mid_conversation(ModelEffort::High, true).await;
+    for (i, round) in rounds.iter().enumerate() {
+        println!(
+            "request {i}: input {} cached {} additions {:?} calls {:?}",
+            round.input_tokens, round.cached_tokens, round.tool_additions, round.tool_calls
+        );
+    }
+    let added = rounds
+        .iter()
+        .position(|round| !round.tool_additions.is_empty())
+        .expect("one request adds cache_sample");
+    assert!(rounds.iter().all(|round| round.activations_replayed == 0));
+    assert!(
+        rounds[added]
+            .raw_history
+            .iter()
+            .all(|message| message["role"] != "system")
+    );
+    assert!(
+        rounds[added]
+            .tool_calls
+            .contains(&"cache_sample".to_string()),
+        "the model did not call the added tool; reply {reply:?}"
+    );
+    assert!(reply.contains(&label), "reply {reply:?} lacks {label}");
 }
 
 #[tokio::test]
 #[ignore = "calls the DeepSeek API; set DEEPSEEK_API_KEY and run with --ignored"]
 async fn without_tool_additions_an_added_tool_misses_the_cache() {
-    let (rounds, reply, label) = add_a_tool_mid_conversation(false).await;
+    let (rounds, reply, label) = add_a_tool_mid_conversation(ModelEffort::Max, false).await;
     for (i, round) in rounds.iter().enumerate() {
         println!(
             "request {i}: input {} cached {} additions {:?} calls {:?}",
