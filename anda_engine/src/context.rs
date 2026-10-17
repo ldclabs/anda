@@ -9,6 +9,7 @@
 mod agent;
 mod base;
 mod cache;
+mod compaction;
 mod engine;
 mod runner;
 mod tool;
@@ -19,6 +20,9 @@ pub(crate) mod test_fixtures;
 
 pub use agent::*;
 pub use base::*;
+pub use compaction::{
+    COMPACT_CONTEXT_TOOL, COMPACTION_CONTINUE_PROMPT, CompactContextArgs, SelfCompaction,
+};
 pub use engine::*;
 pub use runner::*;
 pub use tool::*;

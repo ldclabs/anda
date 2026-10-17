@@ -102,6 +102,13 @@ An optional absolute `deadline_ms` also interrupts pending runner/tool work.
 It is separate from the per-definition idle timeout. Message/control queue bounds
 and event retention apply independently of context compaction.
 
+Session runners compact when usage reaches 80% of the window, and they also
+enable agent-initiated compaction (`SelfCompaction::default()`). A worker can call
+`compact_context` at a task or phase boundary with its own handoff, and the
+session runs that compaction before its next step. A compaction that interrupts a
+tool round resumes the task with `COMPACTION_CONTINUE_PROMPT` instead of leaving
+the session idle. Blocking runs do not compact.
+
 ## Idle checkpoints and handoffs
 
 `SubAgentConversationRecorder` remains an audit log. `SubAgentCheckpoints` is a

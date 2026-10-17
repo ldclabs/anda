@@ -113,7 +113,17 @@ See [subagent lifecycle and migration](../docs/subagents.md) and the runnable
 `CompletionStream` preserves follow-up and steering input submitted while a
 model step is pending, and ends after it yields an error. Context compaction
 moves pending and queued input to the replacement runner; a failed compaction
-leaves the original runner usable. Stop/cancel controls interrupt pending
+leaves the original runner usable, and a compaction that interrupted unfinished
+tool work resumes it with `COMPACTION_CONTINUE_PROMPT`.
+
+`set_self_compaction(Some(SelfCompaction::default()))` lets the model compact its
+own context. It is meant for runners whose host checks `needs_compaction_with`
+before every step, as subagent sessions do. The runner offers an intrinsic
+`compact_context` call and reports usage in short request-only notes from
+`notice_percent` (default 50%). The model calls it at a task or phase boundary
+with a handoff it writes itself. Accepted requests (sole call, usage at least
+`min_percent`, default 30%) make `needs_compaction_with` return `true`, and
+`handoff` then uses the model's text instead of a summary turn. Stop/cancel controls interrupt pending
 subagent work; native shell cancellation cleans up the process tree and output
 readers.
 

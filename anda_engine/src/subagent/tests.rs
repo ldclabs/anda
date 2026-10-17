@@ -1,5 +1,7 @@
 use super::*;
-use crate::context::COMPACTION_PROMPT;
+use crate::context::{
+    COMPACT_CONTEXT_TOOL, COMPACTION_CONTINUE_PROMPT, COMPACTION_PROMPT, SelfCompaction,
+};
 use crate::engine::EngineBuilder;
 use crate::management::{BaseManagement, Visibility};
 use crate::memory::Conversations;
@@ -1556,8 +1558,10 @@ async fn subsession_runner_compaction_executes_pending_tool_calls_first() {
 
     assert!(runner.run(Vec::new()).await.unwrap());
 
+    // The tool result was folded into the summary before the model saw it, so the replacement
+    // runner resumes the task in the same step instead of going idle.
     let recorded = requests.lock().clone();
-    assert_eq!(recorded.len(), 2);
+    assert_eq!(recorded.len(), 3);
     assert_eq!(request_text(&recorded[0]), "seed task");
     assert_eq!(request_text(&recorded[1]).trim(), COMPACTION_PROMPT.trim());
     assert!(recorded[1].tools.is_empty());
@@ -1577,7 +1581,14 @@ async fn subsession_runner_compaction_executes_pending_tool_calls_first() {
         })
     }));
 
-    assert!(runner.runner.no_pending_tool_calls());
+    assert_eq!(request_text(&recorded[2]), COMPACTION_CONTINUE_PROMPT);
+    assert_eq!(
+        recorded[2].chat_history[0].text().as_deref(),
+        Some("compacted handoff")
+    );
+
+    // The scripted model calls the tool again on the resumed turn.
+    assert!(!runner.runner.no_pending_tool_calls());
     assert_eq!(
         runner.runner.chat_history()[0].text().as_deref(),
         Some("compacted handoff")
@@ -1590,6 +1601,78 @@ async fn subsession_runner_compaction_executes_pending_tool_calls_first() {
             .map(|usage| usage.requests),
         Some(1)
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn subsession_runner_runs_the_compaction_the_model_requests() {
+    use crate::model::testing::ScriptedCompleter;
+
+    let handoff = "Objective: answer the seed task; nothing earlier is needed. ".repeat(4);
+    let completer = ScriptedCompleter::new("self-compactor")
+        .push_output(AgentOutput {
+            tool_calls: vec![anda_core::ToolCall {
+                name: COMPACT_CONTEXT_TOOL.to_string(),
+                args: json!({"reason": "new topic", "handoff": handoff}),
+                call_id: Some("call-self-compact".to_string()),
+                result: None,
+                remote_id: None,
+            }],
+            usage: Usage {
+                input_tokens: 50_000,
+                output_tokens: 100,
+                cached_tokens: 0,
+                requests: 1,
+            },
+            ..Default::default()
+        })
+        .into_arc();
+    let mut model = Model::with_completer(completer.clone());
+    model.context_window = 100_000;
+    let ctx = EngineBuilder::new().with_model(model).mock_ctx();
+
+    let (sender, _rx) = tokio::sync::mpsc::channel(4);
+    let session = Arc::new(SubSession::new(
+        "session-self-compact".to_string(),
+        "compactor".to_string(),
+        sender,
+        0,
+    ));
+    let mut runner = SubSessionRunner {
+        session,
+        agent_hook: None,
+        runner: ctx
+            .completion_iter(
+                CompletionRequest {
+                    prompt: "seed task".to_string(),
+                    ..Default::default()
+                },
+                Vec::new(),
+            )
+            .unbound()
+            .with_self_compaction(Some(SelfCompaction::default()))
+            .unwrap(),
+        conversation: None,
+        last_output: None,
+        carried_artifacts: Vec::new(),
+        closing: false,
+        raw_history_pruned: false,
+    };
+
+    assert!(runner.run(Vec::new()).await.unwrap());
+    assert!(!runner.runner.no_pending_tool_calls());
+    assert!(runner.run(Vec::new()).await.unwrap());
+
+    // No summary turn: the model's handoff seeds the replacement runner, which answers the
+    // input the model compacted before acting on.
+    let recorded = completer.requests();
+    assert_eq!(recorded.len(), 2);
+    assert_eq!(
+        recorded[1].chat_history[0].text().as_deref(),
+        Some(handoff.trim())
+    );
+    assert_eq!(request_text(&recorded[1]), "seed task");
+    assert_eq!(runner.last_output.as_ref().unwrap().content, "seed task");
+    assert!(runner.runner.self_compaction().is_some());
 }
 
 #[tokio::test(flavor = "current_thread")]

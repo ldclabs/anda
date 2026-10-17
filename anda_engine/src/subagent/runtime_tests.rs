@@ -803,3 +803,21 @@ async fn nested_turn_result_reaches_the_parent_once() {
     );
     child.close();
 }
+
+#[tokio::test]
+async fn session_runners_offer_self_compaction() {
+    let completer = crate::model::testing::ScriptedCompleter::new("recorder").into_arc();
+    let ctx = EngineBuilder::new()
+        .with_model(Model::with_completer(completer.clone()))
+        .mock_ctx();
+    let worker = worker();
+    invoke(&worker, &ctx, "task", "compacting").await.unwrap();
+    let s = session(&worker, &ctx, "compacting");
+    completed(&scope(&ctx), &s.execution.id, 0).await;
+    let requests = completer.requests();
+    assert_eq!(
+        requests[0].tools.last().map(|tool| tool.name.as_str()),
+        Some(crate::context::COMPACT_CONTEXT_TOOL)
+    );
+    s.close();
+}

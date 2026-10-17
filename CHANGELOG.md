@@ -27,6 +27,39 @@ All notable changes to the Anda project will be documented in this file.
   no longer treat them specially. `EngineCard` and `AgentInfo` remain for
   `Engine::information`.
 
+### Added — anda_engine
+
+- **Agent-initiated context compaction** — `CompletionRunner::set_self_compaction`
+  (`SelfCompaction`) offers the model a runner-intrinsic `compact_context` call
+  (`COMPACT_CONTEXT_TOOL`, a reserved name). The model calls it at a task or phase
+  boundary with a handoff it writes itself, so `handoff` seeds the replacement
+  runner with that text and sends no summary turn, which would otherwise replay
+  the whole context without the prompt cache. The runner accepts a request only
+  when it is the sole call in its response, carries a 200 B–64 KiB handoff, and
+  context usage is at least `min_percent` (default 30%) of the window, and it is
+  not the first turn after a compaction; otherwise the model gets the reason as a
+  tool error and carries on. An accepted request makes `needs_compaction_with`
+  return `true`, so hosts that check it before every step run it through their
+  existing `handoff` path; elsewhere it is answered as unavailable. If the model
+  asks before acting on its latest user input, that input is delivered again
+  verbatim after the handoff, ahead of any queued steering. From `notice_percent`
+  (default 50%) the runner reports context usage in a short request-only
+  `$system` note: on every user turn, and once per 10% band during tool rounds.
+  The note follows the tool outputs and is never written to `chat_history`.
+  Before the first turn of a runner seeded with a conversation, usage is
+  estimated from that history. The definition is appended after the request's own
+  and discovered tools. Subagent session runners enable it by default.
+
+### Fixed — anda_engine
+
+- **Compaction no longer stalls an unfinished task** — when `handoff` folded tool
+  outputs the model had not seen into the summary (compaction during a tool
+  round, or outputs left by a failed step) and nothing else was queued, the
+  replacement runner had no input and went idle, so a subagent session stopped
+  mid-task. The replacement runner now resumes with `COMPACTION_CONTINUE_PROMPT`.
+  Hosts that queue their own continuation prompt after a handoff should do so
+  only when the runner is idle, or the two prompts share one user turn.
+
 ## [anda_engine 0.16.10] — 2026-10-10
 
 ### Added — anda_engine

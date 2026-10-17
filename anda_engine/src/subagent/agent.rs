@@ -664,6 +664,11 @@ impl Agent<AgentCtx> for SubAgent {
             .completion_iter(req, vec![])
             .unbound()
             .with_allowed_callables(Some(self.allowed_callables()));
+        // The session runner checks `needs_compaction_with` before every step, so the model may
+        // also compact on its own judgment.
+        if let Err(err) = runner.set_self_compaction(Some(SelfCompaction::default())) {
+            log::warn!("subagent {} runs without self-compaction: {err}", self.name);
+        }
         if let Some(saved) = checkpoint.take() {
             runner.accumulate(&saved.usage);
             runner.accumulate_tools_usage(&saved.tools_usage);

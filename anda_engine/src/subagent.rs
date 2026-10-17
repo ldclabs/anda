@@ -27,7 +27,7 @@ use std::{
 };
 
 use crate::{
-    context::{AgentCtx, BaseCtx, CompletionRunner},
+    context::{AgentCtx, BaseCtx, CompletionRunner, SelfCompaction},
     hook::{
         AgentHook, BackgroundHandle, BackgroundTaskControls, DynAgentHook, DynToolJsonHook,
         PrefixedId, ToolBackgroundHook,

@@ -22,11 +22,15 @@ use std::{
     task::{Context, Poll},
 };
 
+use super::compaction::{
+    self, COMPACT_CONTEXT_TOOL, COMPACTION_CONTINUE_PROMPT, CompactContextArgs, CompactionState,
+    SelfCompaction, TurnInput,
+};
 use super::tool::DiscoveredTools;
 use crate::context::{
     AgentCtx, SUB_AGENT_PREFIX, strip_prefix_ignore_ascii_case, strip_routing_prefix,
 };
-use crate::{model::Model, unix_ms};
+use crate::{model::Model, rfc3339_datetime, unix_ms};
 
 // The number of turns after which conversation history is compacted. This prevents unbounded
 // history growth even when provider usage metadata stays below the token threshold. The value
@@ -89,6 +93,8 @@ pub struct CompletionRunner {
     /// Keeps inline attachment bytes out of the accumulated history; see
     /// [`Self::set_transient_inline_data`].
     transient_inline_data: bool,
+    /// Agent-initiated compaction; see [`Self::set_self_compaction`].
+    self_compaction: Option<CompactionState>,
     turns: usize,
 }
 
@@ -128,6 +134,7 @@ impl CompletionRunner {
             done: false,
             unbound: false,
             transient_inline_data: false,
+            self_compaction: None,
             turns: 0,
         }
     }
@@ -360,6 +367,57 @@ impl CompletionRunner {
         self
     }
 
+    /// Lets the model compact its own context; `None` (the default) disables it.
+    ///
+    /// The runner offers the intrinsic [`COMPACT_CONTEXT_TOOL`] call, whose arguments carry a
+    /// handoff the model writes itself, and reports context usage to the model through short
+    /// runtime notes (see [`SelfCompaction`]). The call is answered by the runner, never
+    /// dispatched to the engine, and is not subject to [`Self::set_allowed_callables`]: enabling
+    /// it is the authorization.
+    ///
+    /// An admitted request makes [`Self::needs_compaction_with`] return `true`, and
+    /// [`Self::handoff`] then compacts with the model's handoff instead of a summary turn. Only
+    /// enable this on a runner whose host checks `needs_compaction_with` before every step; on
+    /// any other runner the request is answered as unavailable and the model carries on. The
+    /// setting survives handoffs.
+    ///
+    /// Fails when a registered tool or agent already uses the reserved name, or a percentage
+    /// exceeds 100.
+    pub fn set_self_compaction(
+        &mut self,
+        compaction: Option<SelfCompaction>,
+    ) -> Result<(), BoxError> {
+        let Some(compaction) = compaction else {
+            self.self_compaction = None;
+            return Ok(());
+        };
+        compaction.validate()?;
+        if self.ctx.has_tool_lowercase(COMPACT_CONTEXT_TOOL)
+            || self.ctx.agents.contains_lowercase(COMPACT_CONTEXT_TOOL)
+        {
+            return Err(format!(
+                "{COMPACT_CONTEXT_TOOL} is reserved for context compaction, but a registered tool or agent uses it"
+            )
+            .into());
+        }
+        self.self_compaction = Some(CompactionState::new(compaction));
+        Ok(())
+    }
+
+    /// Builder variant of [`Self::set_self_compaction`].
+    pub fn with_self_compaction(
+        mut self,
+        compaction: Option<SelfCompaction>,
+    ) -> Result<Self, BoxError> {
+        self.set_self_compaction(compaction)?;
+        Ok(self)
+    }
+
+    /// Returns the agent-initiated compaction settings, when enabled.
+    pub fn self_compaction(&self) -> Option<&SelfCompaction> {
+        self.self_compaction.as_ref().map(|state| &state.config)
+    }
+
     /// Returns whether the runner may execute the lowercased callable `name`.
     ///
     /// The name arrives as the model emitted it, so it still carries any routing prefix
@@ -590,28 +648,109 @@ impl CompletionRunner {
     }
 
     /// Returns whether the current runner should be compacted based on usage and turn count.
+    ///
+    /// Also returns `true` while an admitted [`COMPACT_CONTEXT_TOOL`] request is pending (see
+    /// [`Self::set_self_compaction`]), so a host compacting on this signal runs the compaction
+    /// the model asked for.
     pub fn needs_compaction_with<F>(&self, pending_tokens: F) -> bool
     where
         F: FnOnce() -> u64,
     {
-        if self.turns >= MAX_TURNS_TO_COMPACT {
+        if self.turns >= MAX_TURNS_TO_COMPACT || matches!(self.pending_compaction(), Some(Ok(_))) {
             return true;
         }
-        let context_window = self.model.context_window as u64;
         // Compact at 80% of the model's context window, leaving headroom for the
         // compaction round itself plus the next turn's output. An unknown window
-        // (0) falls back to a conservative 100k input tokens — small enough for
+        // falls back to a conservative 100k input tokens — small enough for
         // every current provider default.
-        let threshold = if context_window == 0 {
-            100_000
-        } else {
-            context_window.saturating_mul(8).saturating_div(10).max(1)
-        };
-
         self.current_usage
             .input_tokens
             .saturating_add(pending_tokens())
-            >= threshold
+            >= compaction::forced_threshold(self.context_window())
+    }
+
+    /// The model's context window, when it reports one.
+    fn context_window(&self) -> Option<u64> {
+        (self.model.context_window > 0).then_some(self.model.context_window as u64)
+    }
+
+    /// Context the latest turn ended with: its input plus the output now in the history.
+    ///
+    /// Before the first turn (a runner seeded with a long conversation), or when the provider
+    /// reports no usage, the conversation to be replayed is estimated instead.
+    fn context_tokens(&self) -> u64 {
+        let reported = self
+            .current_usage
+            .input_tokens
+            .saturating_add(self.current_usage.output_tokens);
+        if reported > 0 {
+            return reported;
+        }
+        self.neutral_history()
+            .iter()
+            .flat_map(|message| &message.content)
+            .map(|part| part.estimated_tokens() as u64)
+            .sum::<u64>()
+            .saturating_add(anda_core::estimate_tokens(&self.req.instructions) as u64)
+    }
+
+    /// Validates a pending [`COMPACT_CONTEXT_TOOL`] request; `None` when self-compaction is off
+    /// or no such call is pending.
+    fn pending_compaction(&self) -> Option<Result<CompactContextArgs, String>> {
+        let state = self.self_compaction.as_ref()?;
+        compaction::admit(
+            &state.config,
+            &self.pending_tool_calls,
+            self.context_tokens(),
+            self.context_window(),
+            state.after_handoff && self.turns <= 1,
+        )
+    }
+
+    /// Records the user input the upcoming request carries, so a compaction the model asks for
+    /// before acting on it can deliver it again, and returns the context note due for it.
+    fn prepare_self_compaction(&mut self) -> Option<Message> {
+        self.self_compaction.as_ref()?;
+        let user_turn = self.req.role.as_deref() != Some("tool");
+        let input = if user_turn {
+            let mut parts = Vec::new();
+            if let Some(datetime) = rfc3339_datetime(unix_ms())
+                && let Some(message) = self.req.documents.to_message(&datetime)
+            {
+                parts.extend(message.content);
+            }
+            if !self.req.prompt.is_empty() {
+                parts.push(self.req.prompt.clone().into());
+            }
+            parts.extend(self.req.content.iter().cloned());
+            parts
+        } else {
+            Vec::new()
+        };
+        // New to this request: its input or tool outputs, plus outputs committed ahead of a
+        // follow-up.
+        let incoming = self
+            .req
+            .chat_history
+            .iter()
+            .filter(|message| message.role == "tool")
+            .flat_map(|message| &message.content)
+            .chain(if user_turn {
+                input.iter()
+            } else {
+                self.req.content.iter()
+            })
+            .map(|part| part.estimated_tokens() as u64)
+            .sum::<u64>();
+        let used = self.context_tokens();
+        let window = self.context_window();
+
+        let state = self.self_compaction.as_mut()?;
+        state.turn_input = user_turn.then_some(TurnInput {
+            content: input,
+            implicit_context: None,
+        });
+        state.context_note(!user_turn, used, incoming, window)
     }
 
     fn add_discovered_tools_from_output(&mut self, tool_name: &str, output: &Json) {
@@ -756,6 +895,15 @@ impl CompletionRunner {
     /// and the implicit context move to the replacement runner, so user intent is delivered after
     /// the handoff instead of being folded into the summary. A failed summary leaves this runner
     /// usable; outputs of tool calls it already executed stay queued for its next step.
+    ///
+    /// When the model requested the compaction through [`COMPACT_CONTEXT_TOOL`] (see
+    /// [`Self::set_self_compaction`]), its own handoff becomes the summary and no summary turn
+    /// is sent; `compaction_prompt` is then unused. If it asked before acting on its latest user
+    /// input, that input is delivered again verbatim after the summary.
+    ///
+    /// When the compaction interrupts work the model has not finished, such as a tool round
+    /// whose outputs were folded into the summary, and nothing else is queued, the replacement
+    /// runner is given [`COMPACTION_CONTINUE_PROMPT`] so the task resumes instead of stalling.
     pub async fn handoff(
         &mut self,
         compaction_prompt: Option<String>,
@@ -763,10 +911,15 @@ impl CompletionRunner {
         if self.done {
             return Err("completion already finalized".into());
         }
-        let prompt = compaction_prompt.unwrap_or_else(|| COMPACTION_PROMPT.to_string());
+        // A request the model made carries its handoff, so it needs no summary turn.
+        let requested = self.pending_compaction().and_then(Result::ok);
+        // Tool calls or outputs the model has not answered yet: the task is mid-flight.
+        let interrupted = !self.pending_tool_calls.is_empty()
+            || (self.req.role.as_deref() == Some("tool") && !self.req.content.is_empty());
 
         if !self.pending_tool_calls.is_empty() {
-            if self.steering_message.is_empty() {
+            // Answering the model's own request runs no tool, so steering need not interrupt it.
+            if self.steering_message.is_empty() || requested.is_some() {
                 if self.has_request_input() {
                     return Err(
                         "cannot compact while pending tool calls and request input are both queued"
@@ -774,7 +927,8 @@ impl CompletionRunner {
                     );
                 }
 
-                self.execute_pending_tool_calls_into_request().await;
+                self.execute_pending_tool_calls_into_request(requested.is_some())
+                    .await;
             } else {
                 self.discard_in_flight_request_with_interrupted_tool_outputs(
                     "tool call interrupted by steering",
@@ -783,18 +937,13 @@ impl CompletionRunner {
             }
         }
 
+        // Input the model asked to compact before acting on. Nothing below fails once the
+        // model wrote the handoff, so taking it cannot strand it.
+        let redeliver = match (&requested, &mut self.self_compaction) {
+            (Some(_), Some(state)) => state.turn_input.take(),
+            _ => None,
+        };
         self.sync_model_for_next_turn();
-        // Clone once for the speculative summary turn; on failure `self.req` stays intact so the
-        // runner can continue, and on success it is moved into the replacement runner.
-        let mut summary_req = self.req.clone();
-        // The summary turn drops `tools`. Replayed provider thinking blocks are bound to the
-        // tool set they were produced with (Claude's preserved-thinking check rejects them once
-        // it changes), and a summary does not need that reasoning, so this one request replays
-        // the provider-neutral history instead, as a model switch does.
-        if !summary_req.raw_history.is_empty() {
-            summary_req.raw_history.clear();
-            summary_req.chat_history = self.neutral_history();
-        }
         // Pending tool outputs answer calls already in the history, so they are summarized with
         // it. Pending user input is not: it becomes the replacement runner's next request.
         let tool_outputs = (self.req.role.as_deref() == Some("tool")
@@ -804,34 +953,16 @@ impl CompletionRunner {
             content: self.req.content.clone(),
             ..Default::default()
         });
-        if let Some(message) = &tool_outputs {
-            summary_req.chat_history.push(message.clone());
-        }
-        summary_req.role = Some("user".into());
-        summary_req.prompt.clear();
-        summary_req.documents.clear();
-        summary_req.content = vec![prompt.into()];
-        summary_req.tools.clear();
-        summary_req.tool_choice_required = false;
-        summary_req.output_schema = None;
-
-        // Summarization is speculative: a failed response must not finalize or drain this runner.
-        self.turns += 1;
-        let token = self.ctx.cancellation_token();
-        let mut output = tokio::select! {
-            _ = token.cancelled() => return Err("operation cancelled".into()),
-            result = self.model_request(summary_req) => result?,
+        let mut output = match requested {
+            Some(args) => AgentOutput {
+                content: args.handoff,
+                ..Default::default()
+            },
+            None => {
+                let prompt = compaction_prompt.unwrap_or_else(|| COMPACTION_PROMPT.to_string());
+                self.summarize(prompt, tool_outputs.clone()).await?
+            }
         };
-        self.accumulate(&output.usage);
-        if let Some(reason) = &output.failed_reason {
-            return Err(reason.clone().into());
-        }
-        if output.content.trim().is_empty() {
-            return Err("context compaction produced an empty summary".into());
-        }
-        if !output.tool_calls.is_empty() {
-            return Err("context compaction attempted a tool call".into());
-        }
         let summary = output.content.trim().to_string();
         output.model = Some(self.model.model_name());
         output.raw_history.clear();
@@ -881,7 +1012,71 @@ impl CompletionRunner {
         runner.steering_message = std::mem::take(&mut self.steering_message);
         runner.implicit_context = self.implicit_context.take();
         runner.allowed_callables = self.allowed_callables.take();
+        runner.self_compaction = self.self_compaction.take().map(CompactionState::renew);
+
+        if let Some(input) = redeliver {
+            // Ahead of anything queued later, as the model received it. Queued steering still
+            // follows in the same turn, as it does after any follow-up.
+            let queued = std::mem::take(&mut runner.follow_up_message);
+            runner.follow_up_message = input.content.into();
+            runner.follow_up_message.extend(queued);
+            if runner.implicit_context.is_none() {
+                runner.implicit_context = input.implicit_context;
+            }
+        } else if interrupted && runner.is_idle() {
+            // Queued input, including steering, already moves the task on.
+            runner.follow_up(COMPACTION_CONTINUE_PROMPT.to_string());
+        }
         Ok((runner, output))
+    }
+
+    /// Runs the summary turn of [`Self::handoff`] and validates its output.
+    ///
+    /// Summarization is speculative: a failed response must not finalize or drain this runner.
+    async fn summarize(
+        &mut self,
+        prompt: String,
+        tool_outputs: Option<Message>,
+    ) -> Result<AgentOutput, BoxError> {
+        // Clone once for the speculative summary turn; on failure `self.req` stays intact so the
+        // runner can continue, and on success it is moved into the replacement runner.
+        let mut summary_req = self.req.clone();
+        // The summary turn drops `tools`. Replayed provider thinking blocks are bound to the
+        // tool set they were produced with (Claude's preserved-thinking check rejects them once
+        // it changes), and a summary does not need that reasoning, so this one request replays
+        // the provider-neutral history instead, as a model switch does.
+        if !summary_req.raw_history.is_empty() {
+            summary_req.raw_history.clear();
+            summary_req.chat_history = self.neutral_history();
+        }
+        if let Some(message) = tool_outputs {
+            summary_req.chat_history.push(message);
+        }
+        summary_req.role = Some("user".into());
+        summary_req.prompt.clear();
+        summary_req.documents.clear();
+        summary_req.content = vec![prompt.into()];
+        summary_req.tools.clear();
+        summary_req.tool_choice_required = false;
+        summary_req.output_schema = None;
+
+        self.turns += 1;
+        let token = self.ctx.cancellation_token();
+        let output = tokio::select! {
+            _ = token.cancelled() => return Err("operation cancelled".into()),
+            result = self.model_request(summary_req) => result?,
+        };
+        self.accumulate(&output.usage);
+        if let Some(reason) = &output.failed_reason {
+            return Err(reason.clone().into());
+        }
+        if output.content.trim().is_empty() {
+            return Err("context compaction produced an empty summary".into());
+        }
+        if !output.tool_calls.is_empty() {
+            return Err("context compaction attempted a tool call".into());
+        }
+        Ok(output)
     }
 
     /// Finalize the completion with an optional prompt.
@@ -922,7 +1117,12 @@ impl CompletionRunner {
 
     /// Executes the pending tool and agent calls, leaving their outputs as the request content
     /// for the next turn. Returns `false` when no call was pending.
-    async fn execute_pending_tool_calls_into_request(&mut self) -> bool {
+    ///
+    /// `compaction_accepted` is set by [`Self::handoff`] when it is performing the pending
+    /// [`COMPACT_CONTEXT_TOOL`] request; the runner answers that call itself either way.
+    async fn execute_pending_tool_calls_into_request(&mut self, compaction_accepted: bool) -> bool {
+        // Judged against the whole batch, so before it is drained.
+        let compaction = self.pending_compaction();
         let tool_calls = std::mem::take(&mut self.pending_tool_calls);
         if tool_calls.is_empty() {
             return false;
@@ -932,6 +1132,19 @@ impl CompletionRunner {
             Vec::with_capacity(tool_calls.len());
         for tool in tool_calls {
             let tool_name = tool.name.to_ascii_lowercase();
+
+            if self.self_compaction.is_some() && tool_name == COMPACT_CONTEXT_TOOL {
+                let output = match &compaction {
+                    _ if compaction_accepted => ToolOutput::new(json!({ "status": "accepted" })),
+                    Some(Err(err)) => tool_error(err.clone()),
+                    // Admitted, yet the host stepped on instead of compacting.
+                    _ => tool_error(format!(
+                        "{COMPACT_CONTEXT_TOOL} is unavailable in this session; continue without it"
+                    )),
+                };
+                tool_call_futs.push(Box::pin(async move { (tool, output) }));
+                continue;
+            }
 
             // Enforce the execution-time allowlist before dispatching. The model
             // can emit any name (including one injected via untrusted tool
@@ -1171,7 +1384,7 @@ impl CompletionRunner {
             self.set_next_user_content(content);
         } else if !self.has_request_input() {
             // Automatically execute the pending tool/agent calls.
-            if self.execute_pending_tool_calls_into_request().await {
+            if self.execute_pending_tool_calls_into_request(false).await {
                 tool_round = true;
                 // Queued follow-up rides along as its own user turn after the tool outputs.
                 let follow_up: Vec<ContentPart> = self.follow_up_message.drain(..).collect();
@@ -1194,16 +1407,52 @@ impl CompletionRunner {
             self.load_note_context().await?;
         }
         self.turns += 1;
+        let note = self.prepare_self_compaction();
         let mut req = self.req.clone();
         if !tool_round && let Some(implicit_context) = self.implicit_context.take() {
+            if let Some(input) = self
+                .self_compaction
+                .as_mut()
+                .and_then(|state| state.turn_input.as_mut())
+            {
+                input.implicit_context = Some(implicit_context.clone());
+            }
             req.chat_history.push(implicit_context);
         }
+        // The note is request-only: `chat_history` entries are not echoed into the turn's output
+        // history. It must follow tool outputs, so pending ones move into the request history
+        // ahead of it and are committed once the turn succeeds.
+        let mut deferred_tool_outputs = false;
+        if let Some(note) = note {
+            if req.role.as_deref() == Some("tool") && !req.content.is_empty() {
+                req.chat_history.push(Message {
+                    role: "tool".into(),
+                    content: std::mem::take(&mut req.content),
+                    ..Default::default()
+                });
+                req.role = None;
+                deferred_tool_outputs = true;
+            }
+            req.chat_history.push(note);
+        }
         self.merge_discovered_tools_into_request(&mut req);
+        if let Some(state) = &self.self_compaction
+            && !req
+                .tools
+                .iter()
+                .any(|tool| tool.name.eq_ignore_ascii_case(COMPACT_CONTEXT_TOOL))
+        {
+            // After the request's own and discovered tools, where it stays put.
+            req.tools.push(state.definition.clone());
+        }
 
         let mut output = self.model_request(req).await?;
         output.model = Some(self.model.model_name());
         if self.transient_inline_data {
             strip_inline_data(&mut output.chat_history);
+        }
+        if deferred_tool_outputs {
+            self.commit_tool_outputs_to_history();
         }
 
         self.current_usage = output.usage.clone();
