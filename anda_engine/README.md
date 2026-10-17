@@ -166,12 +166,14 @@ Completion adapter behavior:
   requires a finish reason or prompt blocking; Anthropic requires both a stop
   reason and `message_stop`.
 - Anthropic maps minimal/low effort to `low`, and medium/high/max to their
-  corresponding API values. Gemini 2.5 maps minimal/low/medium/high/max to
-  budgets of 0/1024/4096/16384/24576 tokens; Pro uses 128 for minimal and 32768
-  for max. Gemini 3 uses thinking levels, mapping minimal to low on Pro and
-  medium to high on the original Gemini 3 Pro. Use a default request template
-  for other provider-specific settings. `ThinkingConfig::thinking_budget` is
-  signed so `-1` can request dynamic thinking.
+  corresponding API values; on a DeepSeek model, which thinks unless told not
+  to, minimal sends `thinking: {"type": "disabled"}` instead. Gemini 2.5 maps
+  minimal/low/medium/high/max to budgets of 0/1024/4096/16384/24576 tokens; Pro
+  uses 128 for minimal and 32768 for max. Gemini 3 uses thinking levels,
+  mapping minimal to low on Pro and medium to high on the original Gemini 3
+  Pro. Use a default request template for other provider-specific settings.
+  `ThinkingConfig::thinking_budget` is signed so `-1` can request dynamic
+  thinking.
 - Anthropic maps `tool_choice_required` to `tool_choice: any`. Claude Opus 5.5,
   Claude Sonnet 5.5, and Claude Fable 5.1 reject forced tool choice with a 400,
   so leave it unset for those models and name the tool in the prompt instead.
@@ -181,6 +183,15 @@ Completion adapter behavior:
   string lengths, such as `minimum: 0` on unsigned integers) is sent as a
   regular tool with its schema unchanged. In an output schema, such
   constraints return a local error rather than being discarded.
+- The runner reports the tools that joined a conversation since the request
+  behind its raw history in `CompletionRequest::tool_additions`. For
+  `deepseek-flash` the Anthropic adapter declares them with
+  `defer_loading: true` after the tools offered from the start and activates
+  them from a system `tool_addition` message after the input that brought them
+  (beta `mid-conversation-tool-changes-2026-07-01`), so the cached prompt
+  prefix survives. `CompletionModel::with_tool_additions` switches this for
+  other models; Anthropic's own API accepts no system messages. Other adapters
+  send new tools as ordinary tools.
 - Chat audio inputs must contain inline WAV/MP3 data. Remote audio/file URLs
   return errors; use Responses for remote file inputs. Video is sent as a
   `video_url` part for compatible providers; OpenAI itself rejects it.

@@ -2,6 +2,8 @@
 
 All notable changes to the Anda project will be documented in this file.
 
+## [Unreleased]
+
 ## [anda_core 0.17.1, anda_engine 0.17.2] — 2026-10-17
 
 anda_engine 0.17.2 requires anda_core 0.17.1.
@@ -44,6 +46,22 @@ anda_engine 0.17.2 requires anda_core 0.17.1.
   `minimal` instead; live, the answer took one output token and no thinking.
   The other efforts pass through as before, and a request effort turns
   thinking back on over a `minimal` default. Other models keep their mapping.
+
+### Fixed — anda_engine
+
+- **A strict tool that joins a DeepSeek conversation no longer costs the
+  cache** — Anthropic caps the strict tools of one request, and the adapter
+  spent that budget in request order before it moved the joining tool behind
+  the tools offered from the start. A strict tool added once the caps were
+  reached (an extension tool, or one appended ahead of the discovered tools
+  and `compact_context`) took a strict slot from a tool declared before, whose
+  declaration then changed and invalidated the prefix the deferred
+  declaration exists to keep. The joining tool is now moved first, so it gets
+  only the budget the tools offered before it leave.
+- **The README describes the DeepSeek mappings** — `anda_engine`'s README
+  still said `minimal` effort maps to `low` on every Anthropic model, and it
+  did not mention `CompletionRequest::tool_additions` or
+  `CompletionModel::with_tool_additions`.
 
 ## [anda_engine 0.17.1] — 2026-10-17
 

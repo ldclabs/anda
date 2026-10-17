@@ -896,6 +896,10 @@ impl WireFormat for CompletionModel {
         {
             drop_top_level_combinators(schema);
         }
+        // Joining tools move behind the tools offered from the start before the
+        // strict caps are spent, so they take only the budget those leave and
+        // the cached declarations stay the same.
+        defer_activated_tools(r);
         let mut strict_tools = 0;
         for tool in r
             .tools
@@ -920,7 +924,6 @@ impl WireFormat for CompletionModel {
                 _ => tool.strict = None,
             }
         }
-        defer_activated_tools(r);
         mark_cache_breakpoints(r);
         Ok(())
     }
@@ -2197,6 +2200,37 @@ mod tests {
         let sent: Value = serde_json::from_slice(&req.body).unwrap();
         assert_eq!(sent["messages"].as_array().unwrap().len(), 2);
         assert!(sent["tools"][0].get("defer_loading").is_none());
+    }
+
+    #[test]
+    fn a_joining_tool_leaves_the_strict_budget_of_the_tools_offered_before_it() {
+        let strict_tool = |name: String| FunctionDefinition {
+            name,
+            parameters: json!({"type": "object", "properties": {}}),
+            strict: Some(true),
+            ..Default::default()
+        };
+        // Twenty strict tools fill the cap. The runner appends a tool added to the
+        // conversation ahead of the discovered tools and `compact_context`.
+        let mut tools: Vec<FunctionDefinition> =
+            (0..20).map(|i| strict_tool(format!("tool{i}"))).collect();
+        tools.insert(19, strict_tool("joined".into()));
+        let mut request = types::CreateMessageParams {
+            messages: vec![
+                json!({"role": "user", "content": "go"}),
+                tool_addition(&["joined"]),
+            ],
+            ..Default::default()
+        };
+        <CompletionModel as WireFormat>::apply_tools(&mut request, tools, false);
+        <CompletionModel as WireFormat>::finalize_request(&mut request).unwrap();
+
+        // The tools offered before keep the declarations the provider cached.
+        let tools = request.tools.unwrap();
+        assert!(tools[..20].iter().all(|tool| tool.strict == Some(true)));
+        assert_eq!(tools[20].name, "joined");
+        assert_eq!(tools[20].defer_loading, Some(true));
+        assert_eq!(tools[20].strict, None);
     }
 
     #[tokio::test]
