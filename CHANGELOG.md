@@ -4,6 +4,23 @@ All notable changes to the Anda project will be documented in this file.
 
 ## [Unreleased]
 
+## [anda_engine 0.17.4] — 2026-10-20
+
+### Changed — anda_engine
+
+- **Runners no longer compact after a fixed number of turns** —
+  `CompletionRunner::needs_compaction_with` returned `true` once a runner had
+  run 81 turns, whatever its context usage, so a long tool-heavy task on a
+  large-window model could lose its context to a lossy handoff, and the
+  provider's cached prefix with it, long before the window filled. It now
+  reports compaction only when the latest turn's reported input plus the
+  input still to be sent reaches 80% of the model's context window, or when
+  an admitted `compact_context` request is pending. The turn cap was also the
+  backstop for providers that report no usage; with them, compaction now
+  comes from the model's own `compact_context`, whose usage notes estimate
+  the conversation, or from the host's recovery when the provider rejects an
+  oversized request.
+
 ## [anda_engine 0.17.3] — 2026-10-18
 
 ### Fixed — anda_engine

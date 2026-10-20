@@ -32,13 +32,6 @@ use crate::context::{
 };
 use crate::{model::Model, rfc3339_datetime, unix_ms};
 
-// The number of turns after which conversation history is compacted. This prevents unbounded
-// history growth even when provider usage metadata stays below the token threshold. The value
-// is deliberately generous — compaction is lossy, so it should only fire as a backstop when
-// the token-ratio check in `needs_compaction_with` never triggers (for example when a provider
-// reports no usage metadata); ~80 tool-heavy turns comfortably exceeds any normal single task.
-const MAX_TURNS_TO_COMPACT: usize = 81;
-
 pub static COMPACTION_PROMPT: &str = r#"
 Compress the current conversation into a concise continuation handoff. This is not a final answer to the user. Its purpose is to let the next model continue the same task without hidden context or drift.
 
@@ -651,7 +644,7 @@ impl CompletionRunner {
         }
     }
 
-    /// Returns whether the current runner should be compacted based on usage and turn count.
+    /// Returns whether the current runner should be compacted based on its context usage.
     ///
     /// Also returns `true` while an admitted [`COMPACT_CONTEXT_TOOL`] request is pending (see
     /// [`Self::set_self_compaction`]), so a host compacting on this signal runs the compaction
@@ -660,7 +653,7 @@ impl CompletionRunner {
     where
         F: FnOnce() -> u64,
     {
-        if self.turns >= MAX_TURNS_TO_COMPACT || matches!(self.pending_compaction(), Some(Ok(_))) {
+        if matches!(self.pending_compaction(), Some(Ok(_))) {
             return true;
         }
         // Compact at 80% of the model's context window, leaving headroom for the

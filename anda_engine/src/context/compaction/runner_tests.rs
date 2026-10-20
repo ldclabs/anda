@@ -414,6 +414,30 @@ async fn host_compaction_mid_task_resumes_the_task() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn long_tasks_compact_on_usage_not_on_turn_count() {
+    let mut completer = ScriptedCompleter::new("worker");
+    for _ in 0..100 {
+        completer = completer.push_with(|req| Ok(driver_reply(req, "", vec![echo_call()], 1_000)));
+    }
+    let completer = completer
+        .push_with(|req| Ok(driver_reply(req, "", vec![echo_call()], 80_000)))
+        .into_arc();
+    let ctx = ctx_with(completer, 100_000);
+    let mut runner = ctx.completion_iter(prompt_req("long task"), Vec::new());
+
+    // However many turns a task takes, little context in use asks for no compaction.
+    for _ in 0..100 {
+        runner.next().await.unwrap().unwrap();
+    }
+    assert_eq!(runner.turns(), 100);
+    assert!(!runner.needs_compaction_with(|| 0));
+
+    // Usage at 80% of the window does.
+    runner.next().await.unwrap().unwrap();
+    assert!(runner.needs_compaction_with(|| 0));
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn context_notes_follow_tool_outputs_and_stay_out_of_the_history() {
     let completer = ScriptedCompleter::new("noted")
         .push_with(|req| Ok(driver_reply(req, "", vec![echo_call()], 55_000)))
