@@ -867,7 +867,7 @@ impl Conversations {
         cursor: Option<String>,
         limit: Option<usize>,
     ) -> Result<(Vec<Conversation>, Option<String>), BoxError> {
-        // 0 means "no limit" to the database, and an empty page would panic below; clamp instead.
+        // The database treats a zero limit as unbounded.
         let limit = limit.unwrap_or(10).clamp(1, 100);
         let cursor = match BTree::from_cursor::<u64>(&cursor)? {
             Some(cursor) => cursor,
@@ -884,24 +884,20 @@ impl Conversations {
             ))),
         ]);
 
-        // `query_last_ids` returns the newest page for any filter shape; the IDs
-        // come back ascending, so reverse them for newest-first output.
+        // Fetch one extra ID to detect another page without loading its document.
         let mut ids = self
             .conversations
-            .query_last_ids(filter, Some(limit))
+            .query_last_ids(filter, Some(limit + 1))
             .await?;
         ids.reverse();
-        let rt = materialize_conversation_ids(&self.conversations, ids).await?;
-        // The page holds the newest matching conversations; the next cursor is the smallest ID,
-        // so the following page fetches strictly older ones.
-        let cursor = if rt.len() >= limit {
-            rt.iter()
-                .map(|conversation| conversation._id)
-                .min()
-                .and_then(|id| BTree::to_cursor(&id))
+        let cursor = if ids.len() > limit {
+            ids.truncate(limit);
+            ids.last().and_then(BTree::to_cursor)
         } else {
             None
         };
+        // Use the index page for the cursor even if a document was just deleted.
+        let rt = materialize_conversation_ids(&self.conversations, ids).await?;
         Ok((rt, cursor))
     }
 
@@ -931,7 +927,8 @@ impl Conversations {
         Ok(rt)
     }
 
-    /// Deletes all conversations created before `timestamp` (in milliseconds).
+    /// Deletes conversations in hour buckets preceding the one containing
+    /// `timestamp` (Unix milliseconds). Returns the number removed.
     pub async fn delete_expired_conversations(&self, timestamp: u64) -> Result<u64, BoxError> {
         let period = timestamp / 3600 / 1000;
         let mut count = 0u64;
@@ -943,13 +940,13 @@ impl Conversations {
 
             let mut removed = 0u64;
             for id in ids {
-                if matches!(self.conversations.remove(id).await, Ok(Some(_))) {
+                if self.conversations.remove(id).await?.is_some() {
                     removed += 1;
                 }
             }
             count += removed;
             if removed == 0 {
-                // Nothing was removable; stop instead of spinning on undeletable documents.
+                // A concurrent cleanup may have already removed this batch.
                 break;
             }
         }
@@ -1545,7 +1542,8 @@ impl MemoryManagement {
             .await
     }
 
-    /// Deletes all conversations created before `timestamp` (in milliseconds).
+    /// Deletes conversations in hour buckets preceding the one containing
+    /// `timestamp` (Unix milliseconds). Returns the number removed.
     ///
     /// Referenced resources are intentionally **not** deleted here. Resources are
     /// content-deduplicated (see [`MemoryManagement::try_add_resources`]): a single
@@ -2300,7 +2298,6 @@ mod tests {
     };
     use anda_core::CancellationToken;
     use anda_db::database::DBConfig;
-    use std::collections::BTreeSet;
 
     fn principal(seed: u8) -> Principal {
         Principal::self_authenticating([seed; 32])
@@ -2431,7 +2428,6 @@ mod tests {
             "engine".to_string(),
             "agent".to_string(),
             CancellationToken::new(),
-            BTreeSet::new(),
             Arc::new(Web3SDK::not_implemented()),
             Store::new(Arc::new(InMemory::new())),
         )
@@ -2806,10 +2802,11 @@ mod tests {
             .unwrap();
         assert_eq!(page.len(), 1);
         assert!(cursor.is_some());
-        let (next_page, _) = conversations
-            .list_conversations_by_user(&user, cursor, Some(10))
+        let (next_page, cursor) = conversations
+            .list_conversations_by_user(&user, cursor, Some(1))
             .await
             .unwrap();
+        assert!(cursor.is_none(), "the last full page has no continuation");
         assert_eq!(next_page.len(), 1);
 
         let search = conversations
@@ -2820,6 +2817,13 @@ mod tests {
 
         assert!(!conversations.delete_conversation(999_999).await.unwrap());
         assert!(conversations.delete_conversation(other_id).await.unwrap());
+        conversations.conversations.set_read_only(true);
+        let err = conversations
+            .delete_expired_conversations(2 * 3600 * 1000)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("read-only"), "{err}");
+        conversations.conversations.set_read_only(false);
         let deleted = conversations
             .delete_expired_conversations(2 * 3600 * 1000)
             .await

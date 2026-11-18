@@ -13,12 +13,15 @@ Command-line interface for interacting with the Anda engine server.
 ```sh
 git clone https://github.com/ldclabs/anda.git
 cd anda
-cp example.env .env
-# Update .env with your configuration
 cargo build -p anda_cli
 ```
 
 ## Usage
+
+The CLI defaults to anonymous RPC. For signed calls, pass `--id` or set
+`ID_SECRET` in the environment or in a local `.env` file (see
+[`example.env`](../example.env)). Plain HTTP is enabled for loopback endpoints.
+Other HTTP hosts require `--allow-http`.
 
 ```sh
 # Show help

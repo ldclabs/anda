@@ -33,7 +33,6 @@ use parking_lot::RwLock;
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
     borrow::Cow,
-    collections::BTreeSet,
     future::Future,
     sync::Arc,
     time::{Duration, Instant},
@@ -83,26 +82,24 @@ pub struct BaseCtx {
 /// maintaining its own state while sharing underlying resources.
 impl BaseCtx {
     /// Creates a new BaseCtx instance.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         id: Principal,
         name: String,
         agent: String,
         cancellation_token: CancellationToken,
-        names: BTreeSet<Path>,
         web3: Arc<Web3SDK>,
         store: Store,
     ) -> Self {
         let caller = Principal::anonymous();
         Self {
             id,
-            name: name.clone(),
+            name,
             agent,
             caller,
             path: Path::default(),
             cancellation_token,
             start_at: Instant::now(),
-            cache: Arc::new(CacheService::new(CACHE_MAX_CAPACITY, names)),
+            cache: Arc::new(CacheService::new(CACHE_MAX_CAPACITY)),
             store,
             web3,
             depth: 0,
@@ -598,7 +595,6 @@ mod tests {
             "EngineName".to_string(),
             "root_agent".to_string(),
             CancellationToken::new(),
-            BTreeSet::from([Path::default()]),
             Arc::new(Web3SDK::not_implemented()),
             Store::new(Arc::new(InMemory::new())),
         )
@@ -743,7 +739,7 @@ mod tests {
         );
         assert!(!ctx.cache_set_if_not_exists("b", (3_u32, None)).await);
         assert!(ctx.cache_set_if_not_exists("c", (4_u32, None)).await);
-        assert!(ctx.cache.iter(&ctx.path).count() >= 3);
+        assert!(ctx.cache.entry_count(&ctx.path) >= 3);
         assert!(ctx.cache_delete("c").await);
         assert!(!ctx.cache_delete("c").await);
 

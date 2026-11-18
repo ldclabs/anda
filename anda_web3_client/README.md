@@ -30,6 +30,10 @@ Enable `client` in your dependency:
 anda_web3_client = { version = "0.17", features = ["client"] }
 ```
 
+Applications that import `CoseSDK` or `CanisterCaller` directly need matching
+versions of `ic_cose` and `ic_cose_types`. This checkout implements the traits
+from version 0.12 of both crates.
+
 Provide a persistent, securely generated 48-byte root secret when using key
 operations. Generate it once, keep it in your secret store, and reuse it across
 restarts; changing it changes every derived key. The following complete example
@@ -57,6 +61,9 @@ with `ANDA_ROOT_SECRET_HEX` supplied by your environment or secret manager.
 
 - `build()` requires an identity or a root secret and rejects all-zero root
   secrets. There is no implicit default identity or derivation secret.
+- `Client::rpc` sends anonymous requests for an anonymous identity and signs
+  requests for any other identity. Use `HttpFeatures::https_signed_rpc` when a
+  signature is required.
 - `with_identity(...)` alone supports canister calls, envelope signing, and
   signed HTTP/RPC. Key derivation and path-based signing/verification return an
   error until `with_root_secret(...)` is configured. The identity does not change

@@ -10,13 +10,26 @@
 //!
 //! ## Examples
 //! Basic usage:
-//! ```rust,ignore
+//! ```rust
+//! use anda_core::{Path, PutMode};
+//! use anda_engine::store::{InMemory, Store};
+//! use std::sync::Arc;
+//!
+//! # #[tokio::main(flavor = "current_thread")]
+//! # async fn main() -> Result<(), anda_core::BoxError> {
 //! let store = Store::new(Arc::new(InMemory::new()));
-//! store.store_put(&namespace, &path, PutMode::Create, data).await?;
-//! let (content, meta) = store.store_get(&namespace, &path).await?;
+//! let namespace = Path::from("notes");
+//! let path = Path::from("first");
+//! store.store_put(&namespace, &path, PutMode::Create, "hello".into()).await?;
+//! let (content, _) = store.store_get(&namespace, &path).await?;
+//! assert_eq!(&content[..], b"hello");
+//! # Ok(())
+//! # }
 //! ```
 
-use anda_core::{BoxError, BoxPinFut, ObjectMeta, Path, PutMode, PutResult, path_join};
+use anda_core::{
+    BoxError, BoxPinFut, ObjectMeta, Path, PutMode, PutResult, path_join, path_lowercase,
+};
 use futures::TryStreamExt;
 use object_store::PutOptions;
 use std::sync::Arc;
@@ -181,13 +194,12 @@ impl Store {
         prefix: Option<&Path>,
         offset: &Path,
     ) -> Result<Vec<ObjectMeta>, BoxError> {
-        let prefix = prefix.map_or_else(|| namespace.clone(), |p| path_join(namespace, p));
-        let offset = path_join(namespace, offset);
-
+        let prefix = prefix.map_or_else(|| path_lowercase(namespace), |p| path_join(namespace, p));
         let mut res = if offset.is_root() {
             self.store.list(Some(&prefix))
         } else {
-            self.store.list_with_offset(Some(&prefix), &offset)
+            self.store
+                .list_with_offset(Some(&prefix), &path_join(namespace, offset))
         };
         let mut metas = Vec::new();
         while let Some(meta) = res.try_next().await? {
@@ -309,7 +321,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn store_applies_namespace_to_crud_list_and_rename_operations() {
         let store = Store::new(Arc::new(InMemory::new()));
-        let namespace = Path::from("agent/root");
+        let namespace = Path::from("Agent/Root");
         let docs = Path::from("docs");
         let first = Path::from("docs/first.txt");
         let second = Path::from("docs/second.txt");
@@ -337,6 +349,11 @@ mod tests {
         let (data, meta) = store.store_get(&namespace, &first).await.unwrap();
         assert_eq!(data, Bytes::from_static(b"first"));
         assert_eq!(meta.location, Path::from("agent/root/docs/first.txt"));
+        let all = store
+            .store_list(&namespace, None, &Path::default())
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 2);
 
         let listed = store
             .store_list(&namespace, Some(&docs), &Path::default())

@@ -2,7 +2,7 @@
 //! All protocol messages use rmcp types; this adapter only handles HTTP responses.
 
 use anda_core::BoxError;
-use futures::{StreamExt, stream};
+use futures::{StreamExt, TryStreamExt};
 use http::{HeaderName, HeaderValue};
 use reqwest::{Client, Response, StatusCode};
 use rmcp::{
@@ -78,24 +78,28 @@ impl McpHttpClient {
     }
 
     fn check_auth(response: &Response) -> Result<(), Error> {
-        if let Some(header) = response.headers().get("www-authenticate") {
-            let header = header.to_str().map_err(|_| {
-                StreamableHttpError::UnexpectedServerResponse(
-                    "invalid authentication challenge".into(),
-                )
-            })?;
-            if response.status() == StatusCode::UNAUTHORIZED {
-                return Err(StreamableHttpError::AuthRequired(AuthRequiredError::new(
-                    header.to_string(),
-                )));
-            }
-            if response.status() == StatusCode::FORBIDDEN {
-                return Err(StreamableHttpError::InsufficientScope(
-                    InsufficientScopeError::new(header.to_string(), None),
-                ));
-            }
+        let status = response.status();
+        if !matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+            return Ok(());
         }
-        Ok(())
+        let Some(header) = response
+            .headers()
+            .get("www-authenticate")
+            .and_then(|h| h.to_str().ok())
+        else {
+            return Err(StreamableHttpError::Client(HttpError::Status(
+                status.as_u16(),
+            )));
+        };
+        if status == StatusCode::UNAUTHORIZED {
+            Err(StreamableHttpError::AuthRequired(AuthRequiredError::new(
+                header.to_string(),
+            )))
+        } else {
+            Err(StreamableHttpError::InsufficientScope(
+                InsufficientScopeError::new(header.to_string(), None),
+            ))
+        }
     }
 
     async fn body(&self, response: Response) -> Result<Vec<u8>, Error> {
@@ -120,19 +124,34 @@ impl McpHttpClient {
 
     fn events(&self, response: Response) -> BoxedSseResponse {
         let limit = self.limit;
-        let bounded = stream::try_unfold(
-            (response.bytes_stream().boxed(), EventBudget::default()),
-            move |(mut source, mut budget)| async move {
-                let Some(chunk) = source.next().await else {
-                    return Ok(None);
-                };
-                let chunk = chunk.map_err(HttpError::Request)?;
-                budget.observe(&chunk, limit)?;
-                Ok::<_, HttpError>(Some((chunk, (source, budget))))
-            },
-        );
-        sse_stream::SseStream::from_bytes_stream(bounded).boxed()
+        let mut budget = EventBudget::default();
+        let bounded = response.bytes_stream().map(move |chunk| {
+            let chunk = chunk.map_err(HttpError::Request)?;
+            budget.observe(&chunk, limit)?;
+            Ok::<_, HttpError>(chunk)
+        });
+        // Move the decoded fields into rmcp's public SSE type at the transport boundary.
+        sse_stream::SseByteStream::new(bounded)
+            .map_ok(|event| rmcp_sse_stream::Sse {
+                event: event.event,
+                data: event.data,
+                id: event.id,
+                retry: event.retry,
+            })
+            .map_err(|err| match err {
+                sse_stream::Error::Body(source) => rmcp_sse_stream::Error::Body(source),
+                sse_stream::Error::Utf8Parse(source) => rmcp_sse_stream::Error::Utf8Parse(source),
+                _ => rmcp_sse_stream::Error::InvalidLine,
+            })
+            .boxed()
     }
+}
+
+fn media_type_is(header: &str, expected: &str) -> bool {
+    header
+        .split(';')
+        .next()
+        .is_some_and(|ty| ty.trim().eq_ignore_ascii_case(expected))
 }
 
 /// Count raw event bytes before the SSE parser can accumulate them. CR, LF and
@@ -213,7 +232,7 @@ impl StreamableHttpClient for McpHttpClient {
             .get("mcp-session-id")
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
-        if status.is_success() && content_type.starts_with("text/event-stream") {
+        if status.is_success() && media_type_is(&content_type, "text/event-stream") {
             return Ok(StreamableHttpPostResponse::Sse(
                 self.events(response),
                 returned_session,
@@ -225,7 +244,6 @@ impl StreamableHttpClient for McpHttpClient {
             // that uses a different id. Authorization and 5xx never trigger this path.
             if session.is_none()
                 && status.is_client_error()
-                && !matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
                 && let ClientJsonRpcMessage::Request(request) = &message
                 && matches!(request.request, ClientRequest::DiscoverRequest(_))
             {
@@ -241,7 +259,7 @@ impl StreamableHttpClient for McpHttpClient {
                     None,
                 ));
             }
-            if content_type.starts_with("application/json")
+            if media_type_is(&content_type, "application/json")
                 && let Ok(error @ ServerJsonRpcMessage::Error(_)) = serde_json::from_slice(&body)
             {
                 return Ok(StreamableHttpPostResponse::Json(error, returned_session));
@@ -253,7 +271,7 @@ impl StreamableHttpClient for McpHttpClient {
         if !matches!(message, ClientJsonRpcMessage::Request(_)) && body.is_empty() {
             return Ok(StreamableHttpPostResponse::Accepted);
         }
-        if !content_type.starts_with("application/json") {
+        if !media_type_is(&content_type, "application/json") {
             return Err(StreamableHttpError::UnexpectedContentType(Some(
                 content_type,
             )));
@@ -303,7 +321,7 @@ impl StreamableHttpClient for McpHttpClient {
             .get("content-type")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        if !content_type.starts_with("text/event-stream") {
+        if !media_type_is(content_type, "text/event-stream") {
             return Err(StreamableHttpError::UnexpectedContentType(Some(
                 content_type.into(),
             )));
@@ -382,5 +400,52 @@ pub(super) fn is_transient(error: &(dyn std::error::Error + 'static)) -> bool {
             error.is_connect() || error.is_timeout()
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn media_types_match_case_insensitively_and_in_full() {
+        assert!(media_type_is(
+            "Application/JSON; charset=utf-8",
+            "application/json"
+        ));
+        assert!(media_type_is("TEXT/EVENT-STREAM", "text/event-stream"));
+        assert!(!media_type_is("application/json-seq", "application/json"));
+    }
+
+    #[tokio::test]
+    async fn sdk_receives_complete_decoded_events_and_budget_errors() {
+        let client = McpHttpClient::new(64).unwrap();
+        let chunks = [
+            b"id: 42\r".as_slice(),
+            b"\nevent: message\nretry: 250\ndata: first\ndata: second\n\n",
+        ];
+        let body = reqwest::Body::wrap_stream(futures::stream::iter(
+            chunks.into_iter().map(Ok::<_, std::io::Error>),
+        ));
+        let mut events = client.events(Response::from(http::Response::new(body)));
+        let event = events.next().await.unwrap().unwrap();
+        assert_eq!(event.event.as_deref(), Some("message"));
+        assert_eq!(event.data.as_deref(), Some("first\nsecond"));
+        assert_eq!(event.id.as_deref(), Some("42"));
+        assert_eq!(event.retry, Some(250));
+        assert!(events.next().await.is_none());
+
+        let comments = ":a keep-alive comment\n".repeat(4);
+        let mut events = client.events(Response::from(http::Response::new(comments)));
+        assert!(
+            events
+                .next()
+                .await
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("byte budget")
+        );
+        assert!(events.next().await.is_none());
     }
 }

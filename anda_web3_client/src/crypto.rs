@@ -1,4 +1,4 @@
-//! Deterministic key derivation for the non-TEE Web3 [`Client`](crate::client::Client).
+//! Deterministic key derivation for the non-TEE Web3 [`crate::client::Client`].
 //!
 //! These helpers mirror the derivation scheme of the TEE gateway
 //! (`ic_tee_gateway_sdk::crypto`) exactly, so a key derived here from a given

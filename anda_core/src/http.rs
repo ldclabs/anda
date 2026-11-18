@@ -354,12 +354,10 @@ async fn read_body_capped(mut res: reqwest::Response) -> Result<Vec<u8>, String>
 /// diagnostics so a large error payload cannot exhaust memory either.
 async fn read_error_body(mut res: reqwest::Response) -> String {
     let mut data: Vec<u8> = Vec::new();
-    while let Ok(Some(chunk)) = res.chunk().await {
-        let remaining = MAX_RPC_ERROR_BYTES.saturating_sub(data.len());
-        if remaining == 0 {
-            break;
-        }
-        let take = chunk.len().min(remaining);
+    while data.len() < MAX_RPC_ERROR_BYTES
+        && let Ok(Some(chunk)) = res.chunk().await
+    {
+        let take = chunk.len().min(MAX_RPC_ERROR_BYTES - data.len());
         data.extend_from_slice(&chunk[..take]);
     }
     String::from_utf8_lossy(&data).into_owned()
@@ -566,6 +564,20 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, HttpRPCError::ResultError { .. }));
+    }
+
+    #[tokio::test]
+    async fn error_body_returns_as_soon_as_the_excerpt_is_full() {
+        use futures::{StreamExt, stream};
+        let chunks = stream::iter([Ok::<_, std::io::Error>(vec![b'x'; MAX_RPC_ERROR_BYTES])])
+            .chain(stream::pending());
+        let response =
+            reqwest::Response::from(::http::Response::new(reqwest::Body::wrap_stream(chunks)));
+        let excerpt =
+            tokio::time::timeout(std::time::Duration::from_secs(1), read_error_body(response))
+                .await
+                .unwrap();
+        assert_eq!(excerpt.len(), MAX_RPC_ERROR_BYTES);
     }
 
     #[tokio::test]

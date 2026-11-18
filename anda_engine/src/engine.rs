@@ -58,7 +58,7 @@
 
 use anda_cloud_cdk::{ChallengeEnvelope, ChallengeRequest};
 use anda_core::{
-    Agent, AgentContext, AgentInput, AgentOutput, AgentSet, BoxError, Function, Json, Path,
+    Agent, AgentContext, AgentInput, AgentOutput, AgentSet, BoxError, DynAgent, Function, Json,
     RequestMeta, Resource, Tool, ToolInput, ToolOutput, ToolProvider, ToolProviderSet, ToolSet,
 };
 use candid::Principal;
@@ -72,12 +72,9 @@ use structured_logger::unix_ms;
 use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
 
 use crate::{
-    context::{
-        AgentCtx, BaseCtx, ToolsGroups, ToolsSearch, ToolsSelect, Web3SDK, agent_context_path,
-        tool_context_path,
-    },
+    context::{AgentCtx, BaseCtx, ToolsGroups, ToolsSearch, ToolsSelect, Web3SDK},
     hook::{Hook, Hooks},
-    management::{BaseManagement, Management, SYSTEM_PATH, Visibility},
+    management::{BaseManagement, Management, Visibility},
     memory::Conversations,
     model::{Model, Models},
     store::Store,
@@ -129,10 +126,8 @@ impl Engine {
         self.default_agent.clone()
     }
 
-    /// Validates request metadata shared by every execution entry point:
-    /// the engine id must match this engine when present, and a user name
-    /// must be trimmed, non-empty, and at most 96 bytes.
-    fn validate_request_meta(&self, meta: &RequestMeta) -> Result<(), BoxError> {
+    /// Checks request metadata and engine visibility before looking up a callable.
+    fn check_request(&self, caller: &Principal, meta: &RequestMeta) -> Result<(), BoxError> {
         if meta.engine.is_some() && meta.engine != Some(self.id) {
             return Err(format!(
                 "invalid engine ID, expected {}, got {:?}",
@@ -147,7 +142,26 @@ impl Engine {
                 return Err(format!("invalid user name {:?}", user).into());
             }
         }
+        if self.management.check_visibility(caller)? == Visibility::Protected
+            && !self.management.is_manager(caller)
+        {
+            return Err("caller does not have permission".into());
+        }
         Ok(())
+    }
+
+    fn agent_for_request(
+        &self,
+        caller: &Principal,
+        name: &str,
+        meta: &RequestMeta,
+    ) -> Result<Arc<dyn DynAgent<AgentCtx>>, BoxError> {
+        self.check_request(caller, meta)?;
+        self.ctx
+            .agents
+            .get_lowercase(name)
+            .filter(|_| self.export_agents.contains(name) || self.management.is_manager(caller))
+            .ok_or_else(|| format!("agent {name} not found").into())
     }
 
     /// Cancels all tasks in the engine by triggering the cancellation token.
@@ -196,22 +210,7 @@ impl Engine {
         meta: RequestMeta,
     ) -> Result<AgentCtx, BoxError> {
         let name = agent_name.to_ascii_lowercase();
-
-        // Enforce the same visibility rules as `agent_run`; this public entry
-        // point must not let a caller bypass the anonymous/private/protected
-        // checks and obtain a caller-scoped context.
-        let visibility = self.management.check_visibility(&caller)?;
-        if visibility == Visibility::Protected && !self.management.is_manager(&caller) {
-            return Err("caller does not have permission".into());
-        }
-
-        // manager can access any agent
-        if (!self.export_agents.contains(&name) && !self.management.is_manager(&caller))
-            || !self.ctx.agents.contains(&name)
-        {
-            return Err(format!("agent {} not found", name).into());
-        }
-
+        self.agent_for_request(&caller, &name, &meta)?;
         self.ctx.child_with(caller, &name, agent_label, meta)
     }
 
@@ -230,13 +229,7 @@ impl Engine {
         let name = tool_name.to_ascii_lowercase();
         let agent = agent_name.to_ascii_lowercase();
 
-        // Enforce the same visibility rules as `tool_call`; this public entry
-        // point must not let a caller bypass the anonymous/private/protected
-        // checks and obtain a caller-scoped context.
-        let visibility = self.management.check_visibility(&caller)?;
-        if visibility == Visibility::Protected && !self.management.is_manager(&caller) {
-            return Err("caller does not have permission".into());
-        }
+        self.check_request(&caller, &meta)?;
 
         // The agent name scopes per-agent storage (e.g. notes/todos). Reject an
         // unregistered name so a caller cannot forge a namespace and read or
@@ -267,7 +260,6 @@ impl Engine {
         mut input: AgentInput,
     ) -> Result<AgentOutput, BoxError> {
         let meta = input.meta.unwrap_or_default();
-        self.validate_request_meta(&meta)?;
 
         input.name = if input.name.is_empty() {
             self.default_agent.clone()
@@ -275,21 +267,10 @@ impl Engine {
             input.name.to_ascii_lowercase()
         };
 
-        // Run the caller/visibility checks before looking up the agent so an
-        // unauthorized caller cannot tell a registered-but-not-exported agent
-        // apart from a non-existent one via differing error messages.
-        let visibility = self.management.check_visibility(&caller)?;
-        if visibility == Visibility::Protected && !self.management.is_manager(&caller) {
-            return Err("caller does not have permission".into());
-        }
-
-        let agent = self
+        let agent = self.agent_for_request(&caller, &input.name, &meta)?;
+        let ctx = self
             .ctx
-            .agents
-            .get(&input.name)
-            .ok_or_else(|| format!("agent {} not found", input.name))?;
-
-        let ctx = self.ctx_with(caller, &input.name, agent.label(), meta)?;
+            .child_with(caller, &input.name, agent.label(), meta)?;
         self.hooks.on_agent_start(&ctx, &input.name).await?;
 
         // Always run `on_agent_end` so start/end-paired hooks (e.g. the
@@ -329,14 +310,7 @@ impl Engine {
     ) -> Result<ToolOutput<Json>, BoxError> {
         input.name.make_ascii_lowercase();
         let meta = input.meta.take().unwrap_or_default();
-        self.validate_request_meta(&meta)?;
-
-        // As in `agent_run`, check the caller before looking up the tool so an
-        // unauthorized caller cannot probe which tools are registered.
-        let visibility = self.management.check_visibility(&caller)?;
-        if visibility == Visibility::Protected && !self.management.is_manager(&caller) {
-            return Err("caller does not have permission".into());
-        }
+        self.check_request(&caller, &meta)?;
 
         // manager can call any tool
         if (!self.export_tools.contains(&input.name) && !self.management.is_manager(&caller))
@@ -764,14 +738,12 @@ impl EngineBuilder {
     async fn assemble(self, default_agent: String) -> Result<Engine, BoxError> {
         self.check_exports()?;
         let id = self.web3.as_ref().get_principal();
-        let names = self.context_names();
 
         let ctx = BaseCtx::new(
             id,
             self.info.name.clone(),
             default_agent.clone(),
             self.cancellation_token,
-            names,
             self.web3,
             self.store,
         );
@@ -835,27 +807,6 @@ impl EngineBuilder {
         })
     }
 
-    /// Context namespaces registered for the engine's cache service: one per
-    /// tool, one per agent, the system namespace, and the root namespace.
-    fn context_names(&self) -> BTreeSet<Path> {
-        let mut names: BTreeSet<Path> = self
-            .tools
-            .iter()
-            .map(|(p, _)| Path::from(tool_context_path(p)))
-            .chain(
-                self.agents
-                    .iter()
-                    .map(|(p, _)| Path::from(agent_context_path(p))),
-            )
-            .collect();
-        names.insert(Path::from(SYSTEM_PATH));
-        // The root `BaseCtx` uses the empty path; register it so root-level
-        // cache lookups can hit memory instead of always falling through to the
-        // store backend.
-        names.insert(Path::default());
-        names
-    }
-
     /// Creates a fully in-process [`AgentCtx`] for tests and examples.
     ///
     /// This is the supported way for agent and tool authors to obtain an
@@ -863,13 +814,11 @@ impl EngineBuilder {
     /// engine: anonymous identity and in-memory store. Not intended for
     /// production paths.
     pub fn mock_ctx(self) -> AgentCtx {
-        let names = self.context_names();
         let ctx = BaseCtx::new(
             Principal::anonymous(),
             "Mocker".to_string(),
             "Mocker".to_string(),
             self.cancellation_token,
-            names,
             self.web3,
             self.store,
         );
@@ -1071,23 +1020,21 @@ mod tests {
             "dynamic_provider".to_string()
         }
 
-        fn definitions(&self, names: Option<&[String]>) -> Vec<FunctionDefinition> {
+        fn definitions(&self, _names: Option<&[String]>) -> Vec<FunctionDefinition> {
             let definition = FunctionDefinition {
                 name: "dynamic_echo".to_string(),
                 description: "Echoes dynamic provider args".to_string(),
                 parameters: json!({"type": "object"}),
                 strict: Some(false),
             };
-            match names {
-                Some(names)
-                    if !names
-                        .iter()
-                        .any(|name| name.eq_ignore_ascii_case(&definition.name)) =>
-                {
-                    Vec::new()
-                }
-                _ => vec![definition],
-            }
+            // This provider always returns a complete catalog.
+            vec![
+                FunctionDefinition {
+                    name: "internal_lookup".into(),
+                    ..definition.clone()
+                },
+                definition,
+            ]
         }
 
         fn call(
@@ -1191,6 +1138,27 @@ mod tests {
             .base_ctx_with(ANONYMOUS, "echo_agent", "echo_tool", RequestMeta::default())
             .unwrap();
         assert_eq!(tool_ctx.path.as_ref(), "t_echo_tool");
+        for invalid in [
+            RequestMeta {
+                engine: Some(Principal::self_authenticating([42])),
+                ..Default::default()
+            },
+            RequestMeta {
+                user: Some(" spaced ".into()),
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                engine
+                    .ctx_with(ANONYMOUS, "echo_agent", "pro", invalid.clone())
+                    .is_err()
+            );
+            assert!(
+                engine
+                    .base_ctx_with(ANONYMOUS, "echo_agent", "echo_tool", invalid)
+                    .is_err()
+            );
+        }
         assert!(
             engine
                 .base_ctx_with(ANONYMOUS, "echo_agent", "missing", RequestMeta::default())
@@ -1331,6 +1299,14 @@ mod tests {
             .unwrap();
 
         let tools = engine.tools(None);
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool.definition.name == "internal_lookup")
+        );
+        let exported = engine.information().tools;
+        assert_eq!(exported.len(), 1);
+        assert_eq!(exported[0].definition.name, "dynamic_echo");
         assert!(
             tools
                 .iter()

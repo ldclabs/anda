@@ -339,6 +339,10 @@ async fn http_guards_local_calls_and_signed_rpc_paths_are_exercised() {
             err.contains("Invalid url"),
             "expected {bad:?} to be rejected, got: {err}"
         );
+        assert!(
+            !err.contains(bad),
+            "URL validation exposed the input: {err}"
+        );
     }
 
     assert!(
@@ -436,6 +440,11 @@ async fn http_guards_local_calls_and_signed_rpc_paths_are_exercised() {
         HttpFeatures::https_signed_rpc(&client, &format!("{endpoint}/rpc"), "ping", &("arg",))
             .await
             .unwrap();
+    assert_eq!(rpc, "pong");
+    let rpc: String = client
+        .rpc(&format!("{endpoint}/rpc"), "ping", ("arg",))
+        .await
+        .unwrap();
     assert_eq!(rpc, "pong");
 
     let raw = Web3ClientFeatures::https_signed_rpc_raw(

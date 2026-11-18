@@ -551,7 +551,6 @@ mod tests {
             "engine".to_string(),
             "agent".to_string(),
             CancellationToken::new(),
-            std::collections::BTreeSet::from([anda_core::Path::default()]),
             Arc::new(Web3SDK::not_implemented()),
             Store::new(Arc::new(InMemory::new())),
         )

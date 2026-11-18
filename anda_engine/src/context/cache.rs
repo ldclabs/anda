@@ -33,7 +33,6 @@ use moka::{future::Cache, policy::Expiry};
 use object_store::path::Path;
 use parking_lot::RwLock;
 use serde::{Serialize, de::DeserializeOwned};
-use std::collections::BTreeSet;
 use std::{
     collections::HashMap,
     future::Future,
@@ -58,20 +57,14 @@ pub(crate) struct CacheService {
 /// Note: Data is cached only in memory and will be lost upon system restart.
 /// For persistent storage, use `StoreFeatures`.
 impl CacheService {
-    /// Returns the namespace cache for `path`, creating it on first use.
-    ///
-    /// Namespaces cannot be fully enumerated up front: provider-backed tools (MCP) are
-    /// discovered after the engine is built, and subagents can be registered at runtime.
-    /// Requiring pre-registration made every cache operation in those contexts fail silently
-    /// — `get_with` returned an error *without running the initializer*, and
-    /// `set_if_not_exists` returned `false`, which lease-style callers read as "already
-    /// held". Creating on demand keeps the per-agent/per-tool isolation while removing that
-    /// whole failure class.
-    fn cache(&self, path: &Path) -> NamespaceCache {
-        // `moka::future::Cache` is a cheap handle over shared state, so cloning it out of
-        // the lock lets callers await without holding the lock.
-        if let Some(cache) = self.cache_store.read().get(path) {
-            return cache.clone();
+    fn existing_cache(&self, path: &Path) -> Option<NamespaceCache> {
+        self.cache_store.read().get(path).cloned()
+    }
+
+    /// Allocates a namespace only when an operation can insert a value.
+    fn cache_or_create(&self, path: &Path) -> NamespaceCache {
+        if let Some(cache) = self.existing_cache(path) {
+            return cache;
         }
 
         let mut store = self.cache_store.write();
@@ -90,24 +83,11 @@ impl CacheService {
             .build()
     }
 
-    /// Creates a new CacheService instance with specified maximum capacity.
-    ///
-    /// # Arguments
-    /// * `max_capacity` - Maximum number of items the cache can hold (u64);
-    /// * `names` - Base paths to pre-create. Any other namespace is created on first use.
-    ///
-    /// # Default Behavior
-    /// - Maximum time-to-idle (TTI): 7 days;
-    /// - Uses custom expiration policy based on CacheExpiry.
-    pub fn new(max_capacity: u64, names: BTreeSet<Path>) -> Self {
+    /// Creates an empty cache service with a maximum entry count per namespace.
+    pub fn new(max_capacity: u64) -> Self {
         Self {
             max_capacity,
-            cache_store: RwLock::new(
-                names
-                    .into_iter()
-                    .map(|k| (k, Self::new_namespace(max_capacity)))
-                    .collect(),
-            ),
+            cache_store: RwLock::default(),
         }
     }
 }
@@ -122,7 +102,8 @@ impl CacheService {
     /// # Returns
     /// `true` if key exists, `false` otherwise, including when the cache namespace is missing.
     pub fn contains(&self, path: &Path, key: &str) -> bool {
-        self.cache(path).contains_key(key)
+        self.existing_cache(path)
+            .is_some_and(|cache| cache.contains_key(key))
     }
 
     /// Retrieves a cached value by key.
@@ -137,10 +118,10 @@ impl CacheService {
     where
         T: DeserializeOwned,
     {
-        match self.cache(path).get(key).await {
-            Some(val) => from_slice(&val.0[..]).map_err(|err| err.into()),
-            None => Err(format!("key {} not found", key).into()),
-        }
+        let missing = || format!("key {key} not found");
+        let cache = self.existing_cache(path).ok_or_else(missing)?;
+        let val = cache.get(key).await.ok_or_else(missing)?;
+        Ok(from_slice(&val.0)?)
     }
 
     /// Gets a cached value or initializes it if missing.
@@ -159,17 +140,12 @@ impl CacheService {
         T: Sized + DeserializeOwned + Serialize + Send,
         F: Future<Output = Result<(T, Option<CacheExpiry>), BoxError>> + Send + 'static,
     {
-        let cache = self.cache(path);
-        futures_util::pin_mut!(init);
+        let cache = self.cache_or_create(path);
         match cache
             .try_get_with_by_ref(key, async move {
-                match init.await {
-                    Ok((val, expiry)) => {
-                        let data = to_canonical_vec(&val)?;
-                        Ok(Arc::new((data.into(), expiry)))
-                    }
-                    Err(e) => Err(e),
-                }
+                let (val, expiry) = init.await?;
+                let data = to_canonical_vec(&val)?;
+                Ok::<_, BoxError>(Arc::new((data.into(), expiry)))
             })
             .await
         {
@@ -193,7 +169,6 @@ impl CacheService {
     where
         T: Sized + Serialize + Send,
     {
-        let cache = self.cache(path);
         let data = match to_canonical_vec(&value.0) {
             Ok(data) => data,
             Err(err) => {
@@ -201,7 +176,7 @@ impl CacheService {
                 return;
             }
         };
-        cache
+        self.cache_or_create(path)
             .insert(key.to_string(), Arc::new((data.into(), value.1)))
             .await;
     }
@@ -221,7 +196,6 @@ impl CacheService {
     where
         T: Sized + Serialize + Send,
     {
-        let cache = self.cache(path);
         let data = match to_canonical_vec(&value.0) {
             Ok(data) => data,
             Err(err) => {
@@ -229,7 +203,8 @@ impl CacheService {
                 return false;
             }
         };
-        let entry = cache
+        let entry = self
+            .cache_or_create(path)
             .entry_by_ref(key)
             .or_optionally_insert_with(async { Some(Arc::new((data.into(), value.1))) })
             .await;
@@ -245,23 +220,17 @@ impl CacheService {
     /// # Returns
     /// `true` if key existed and was deleted, `false` otherwise.
     pub async fn delete(&self, path: &Path, key: &str) -> bool {
-        self.cache(path).remove(key).await.is_some()
+        let Some(cache) = self.existing_cache(path) else {
+            return false;
+        };
+        cache.remove(key).await.is_some()
     }
 
-    /// Returns an iterator over the cache entries for a given path.
-    ///
-    /// Test-only observability seam: production code interacts with the cache
-    /// through the keyed operations above.
-    ///
-    /// Moka's iterator borrows the namespace handle, which is created on demand and owned by
-    /// this call, so entries are collected eagerly. Namespaces are per-agent/per-tool and
-    /// capacity-bounded, so the snapshot stays small.
+    /// Counts the entries currently visible to readers in a namespace.
     #[cfg(test)]
-    pub fn iter(
-        &self,
-        path: &Path,
-    ) -> impl Iterator<Item = (Arc<String>, Arc<(Bytes, Option<CacheExpiry>)>)> {
-        self.cache(path).iter().collect::<Vec<_>>().into_iter()
+    pub fn entry_count(&self, path: &Path) -> usize {
+        self.existing_cache(path)
+            .map_or(0, |cache| cache.iter().count())
     }
 }
 
@@ -348,7 +317,7 @@ mod tests {
     async fn test_cache_service() {
         let path1 = Path::from("path1");
         let path2 = Path::from("path2");
-        let cache = CacheService::new(100, BTreeSet::from([path1.clone(), path2.clone()]));
+        let cache = CacheService::new(100);
         assert!(!cache.contains(&path1, "key"));
         assert!(cache.get::<Profile>(&path2, "key").await.is_err());
 
@@ -399,7 +368,7 @@ mod tests {
         // report `true` on the first insert (lease callers read `false` as "already held").
         let path1 = Path::from("path1");
         let path2 = Path::from("path2");
-        let cache = CacheService::new(100, BTreeSet::from([path1.clone()]));
+        let cache = CacheService::new(100);
         let profile = Profile {
             name: "Anda".to_string(),
             age: Some(18),
@@ -407,6 +376,8 @@ mod tests {
 
         assert!(!cache.contains(&path2, "key"));
         assert!(cache.get::<Profile>(&path2, "key").await.is_err());
+        assert!(!cache.delete(&path2, "key").await);
+        assert!(cache.cache_store.read().is_empty());
 
         let p1 = profile.clone();
         let initialized = cache
@@ -429,7 +400,7 @@ mod tests {
                 .await,
             "a second insert must observe the existing key"
         );
-        assert_eq!(cache.iter(&path2).count(), 1);
+        assert_eq!(cache.entry_count(&path2), 1);
 
         // Namespaces stay isolated: writing to `path2` does not populate `path1`.
         assert!(cache.get::<Profile>(&path1, "key").await.is_err());

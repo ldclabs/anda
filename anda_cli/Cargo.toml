@@ -23,5 +23,7 @@ tokio = { workspace = true }
 hex = { workspace = true }
 rand = { workspace = true }
 cbor2 = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
+axum = { workspace = true }

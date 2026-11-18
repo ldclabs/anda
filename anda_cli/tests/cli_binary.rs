@@ -20,9 +20,9 @@ fn binary_runs_no_command_and_rand_bytes_modes() {
     assert!(text.contains("no command"));
 
     let output = anda_cli(&[
-        "--id",
-        "Anonymous",
         "rand-bytes",
+        "--id",
+        "no-identity-needed",
         "--len",
         "4",
         "--format",
@@ -33,7 +33,8 @@ fn binary_runs_no_command_and_rand_bytes_modes() {
         .lines()
         .map(str::to_string)
         .collect::<Vec<_>>();
-    assert_eq!(lines.last().unwrap().len(), 8);
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0].len(), 8);
 
     let output = anda_cli(&[
         "--id",
@@ -47,6 +48,54 @@ fn binary_runs_no_command_and_rand_bytes_modes() {
     let text = stdout(&output);
     assert!(text.contains("Secret Key:"));
     assert!(text.contains("Public Key:"));
+}
+
+#[test]
+fn help_hides_identity_environment_values() {
+    let output = Command::new(env!("CARGO_BIN_EXE_anda_cli"))
+        .env("ID_SECRET", "test-secret-marker")
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let text = stdout(&output);
+    assert!(text.contains("ID_SECRET"));
+    assert!(!text.contains("test-secret-marker"));
+}
+
+#[tokio::test]
+async fn default_identity_can_call_a_public_rpc_method() {
+    use anda_core::{RPCRequest, RPCResponse};
+    use axum::{Router, body::Bytes, http::HeaderMap, routing::post};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/default", listener.local_addr().unwrap());
+    let app = Router::new().route(
+        "/default",
+        post(|headers: HeaderMap, body: Bytes| async move {
+            assert!(!headers.contains_key("authorization"));
+            let req: RPCRequest = cbor2::from_slice(&body).unwrap();
+            assert_eq!(req.method, "ping");
+            let value = cbor2::to_canonical_vec(&"pong").unwrap();
+            cbor2::to_canonical_vec(&RPCResponse::Ok(value.into())).unwrap()
+        }),
+    );
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_anda_cli"))
+        .current_dir(std::env::temp_dir())
+        .env_remove("ID_SECRET")
+        .args(["rpc", "--endpoint", &endpoint, "--method", "ping"])
+        .output()
+        .await
+        .unwrap();
+    server.abort();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout(&output).contains("pong"));
+    assert_eq!(stdout(&output).matches("principal:").count(), 1);
 }
 
 #[test]

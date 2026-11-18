@@ -1540,7 +1540,7 @@ mod tests {
                 let failing = matches!(&signal, McpEventSignal::Events { events, .. } if !events.is_empty())
                     && self
                         .fail_events
-                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                        .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                         .is_ok();
                 let _ = self.signals.send(signal);
                 if failing {

@@ -29,7 +29,9 @@ The implementation provides MCP tools plus opt-in resource and elicitation APIs:
   racing callers do not spawn duplicate sessions.
 - Runtime add: callers can keep an `Arc<McpToolProvider>` after registering it
   with an engine, then call `add_server` to connect a new MCP server and expose
-  its tools without rebuilding the `Engine`.
+  its tools without rebuilding the `Engine`. If initial discovery fails or the
+  caller cancels the addition, the provider releases that registration so the
+  caller can retry with the same server ID.
 - Authorization: a Streamable HTTP server may use a static bearer token or
   OAuth 2.1. See [Authorization](#authorization).
 
@@ -355,6 +357,8 @@ excluded or app-only tool cannot fail its server. SSE budgets
 include raw comments within each event. rmcp still owns lifecycle negotiation,
 JSON-RPC decoding/routing, subscriptions and authentication; the byte/HTTP
 adapters enforce bounds before SDK decoding. Header/body errors omit raw bodies.
+The HTTP adapter decodes SSE with `sse-stream` 0.3 and moves the event name,
+data, ID and retry delay into the 0.2 event type required by rmcp 3.11.
 
 Discovery outputs are limited to 256 KiB; complete schemas that do not fit are
 omitted, and callers can select omitted tools by exact name. Accumulated
@@ -413,7 +417,7 @@ implement the client side of the experimental MCP Events extension
 (`events/list`, `events/poll`, `events/stream`, `events/subscribe`,
 `events/unsubscribe`). They share the server's session, credentials and budgets.
 
-- **Detection.** rmcp 3.5 drops `capabilities.events`, so `list_events` sends
+- **Detection.** rmcp's typed capabilities omit `capabilities.events`, so `list_events` sends
   `events/list` and returns `None` on "method not found". A server that ignores
   unknown methods is given 10 seconds. Event types over the description or schema
   limits are skipped.

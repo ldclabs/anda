@@ -274,6 +274,8 @@ async fn discovery_honors_accept_weights_wildcards_and_exclusions() {
         ("application/cbor;q=0, */*;q=1", Some(CONTENT_TYPE_JSON)),
         ("application/json;q=0, application/cbor;q=0", None),
         ("text/plain", None),
+        ("application/json+xml", None),
+        ("application/*+json", None),
         ("application/cbor;q=1.001", None),
     ];
     for path in [
@@ -931,7 +933,12 @@ async fn rpc_body_codec_follows_content_type() {
     let card: EngineCard = cbor2::from_slice(&res.unwrap()).unwrap();
     assert_eq!(card.id, id);
 
-    for content_type in [None, Some("text/plain"), Some("application/xml")] {
+    for content_type in [
+        None,
+        Some("text/plain"),
+        Some("application/xml"),
+        Some("application/json+xml"),
+    ] {
         let mut req = client
             .post(&url)
             .body(cbor2::to_canonical_vec(&information).unwrap());

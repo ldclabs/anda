@@ -1,9 +1,9 @@
 //! Command-line client for interacting with Anda engine servers.
 //!
-//! The binary can generate random material, make signed RPC calls, run agents,
+//! The binary can generate random material, make anonymous or signed RPC calls, run agents,
 //! and call tools against an `anda_engine_server` endpoint.
 
-use anda_core::{AgentInput, AgentOutput, BoxError, HttpFeatures, ToolInput, ToolOutput};
+use anda_core::{AgentInput, AgentOutput, BoxError, ToolInput, ToolOutput};
 use anda_web3_client::client::{Client as Web3Client, load_identity};
 use base64::{Engine, prelude::BASE64_URL_SAFE};
 use cbor2::Value;
@@ -19,19 +19,38 @@ struct Cli {
     host: String,
 
     /// Path to ICP identity pem file or 32 bytes identity secret in hex.
-    #[arg(long, env = "ID_SECRET", default_value = "Anonymous")]
+    #[arg(
+        long,
+        global = true,
+        env = "ID_SECRET",
+        hide_env_values = true,
+        default_value = "Anonymous"
+    )]
     id: String,
 
     /// Allow plain `http://` endpoints on non-loopback hosts.
     ///
-    /// Requests are signed with your identity, so over plain HTTP both the payload and the
-    /// authorization envelope are readable — and replayable — by anyone on the path. Loopback
-    /// endpoints are allowed without this flag so local development works out of the box.
+    /// Plain HTTP exposes the payload and any signed envelope to the network.
+    /// Loopback endpoints are allowed by default for local development.
     #[arg(long, global = true)]
     allow_http: bool,
 
     #[command(subcommand)]
     command: Option<Commands>,
+}
+
+impl Cli {
+    async fn rpc_client(&self, endpoint: &str) -> Result<Web3Client, BoxError> {
+        let identity = load_identity(&self.id)?;
+        let client = Web3Client::builder()
+            .with_ic_host(&self.host)
+            .with_identity(Arc::from(identity))
+            .with_allow_http(allow_http_for(endpoint, self.allow_http))
+            .build()
+            .await?;
+        println!("principal: {}", client.get_principal());
+        Ok(client)
+    }
 }
 
 /// Whether the client may use plain HTTP for `endpoint`.
@@ -44,31 +63,16 @@ fn allow_http_for(endpoint: &str, forced: bool) -> bool {
         return true;
     }
 
-    // Only the `http` scheme needs a decision; anything else is left to the client's own
-    // scheme validation.
-    let Some(rest) = endpoint.strip_prefix("http://") else {
+    let Ok(url) = url::Url::parse(endpoint) else {
         return false;
     };
-
-    // Authority runs up to the first `/`, `?`, or `#`; drop any userinfo and port.
-    let authority = rest
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or_default()
-        .rsplit('@')
-        .next()
-        .unwrap_or_default();
-    let host = match authority.strip_prefix('[') {
-        // IPv6 literal: `[::1]:8042`.
-        Some(v6) => v6.split(']').next().unwrap_or_default(),
-        None => authority.split(':').next().unwrap_or_default(),
-    };
-
-    host.eq_ignore_ascii_case("localhost")
-        || host == "::1"
-        || host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback())
+    url.scheme() == "http"
+        && match url.host() {
+            Some(url::Host::Domain("localhost")) => true,
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            _ => false,
+        }
 }
 
 /// CLI subcommands supported by `anda`.
@@ -76,7 +80,7 @@ fn allow_http_for(endpoint: &str, forced: bool) -> bool {
 pub enum Commands {
     /// Generate random bytes with the given length and format
     RandBytes {
-        /// Length of the random bytes, default is 32
+        /// Number of bytes to generate, capped at 1024.
         #[arg(short, long, default_value = "32")]
         len: usize,
         /// Output format: hex or base64, default is hex
@@ -88,11 +92,10 @@ pub enum Commands {
         ed25519: bool,
     },
 
-    /// make an signed RPC call to the endpoint with the given ICP identity, method and args.
-    /// The RPC response from the endpoint should be string.
-    /// Example: `anda_engine_cli rpc -i ./identity.pem -e 'https://andaicp.anda.bot/proposal'  -m start_x_bot`
+    /// Call an RPC method with CBOR-encoded arguments.
+    /// Example: `anda_cli rpc --id ./identity.pem -m information`
     Rpc {
-        /// Signed RPC endpoint URL.
+        /// RPC endpoint URL.
         #[arg(short, long, default_value = "http://127.0.0.1:8042/default")]
         endpoint: String,
 
@@ -189,9 +192,6 @@ fn format_ed25519_key_pair(bytes: [u8; 32], format: &str) -> (String, String) {
 async fn main() -> Result<(), BoxError> {
     dotenv::dotenv().ok();
     let cli = Cli::parse();
-    let identity = load_identity(&cli.id)?;
-    println!("principal: {}", identity.sender()?);
-
     match &cli.command {
         Some(Commands::RandBytes {
             len,
@@ -218,17 +218,10 @@ async fn main() -> Result<(), BoxError> {
             method,
             data,
         }) => {
-            let web3 = Web3Client::builder()
-                .with_ic_host(&cli.host)
-                .with_identity(Arc::new(identity))
-                .with_allow_http(allow_http_for(endpoint, cli.allow_http))
-                .build()
-                .await?;
-
-            println!("principal: {}", web3.get_principal());
+            let web3 = cli.rpc_client(endpoint).await?;
             let args = normalize_rpc_data(data)?;
 
-            let res: Value = web3.https_signed_rpc(endpoint, method, &args).await?;
+            let res: Value = web3.rpc(endpoint, method, &args).await?;
             println!("{:?}", res);
         }
 
@@ -237,17 +230,10 @@ async fn main() -> Result<(), BoxError> {
             name,
             prompt,
         }) => {
-            let web3 = Web3Client::builder()
-                .with_ic_host(&cli.host)
-                .with_identity(Arc::new(identity))
-                .with_allow_http(allow_http_for(endpoint, cli.allow_http))
-                .build()
-                .await?;
-
-            println!("principal: {}", web3.get_principal());
+            let web3 = cli.rpc_client(endpoint).await?;
 
             let res: AgentOutput = web3
-                .https_signed_rpc(endpoint, "agent_run", &(&agent_input(name, prompt),))
+                .rpc(endpoint, "agent_run", &(&agent_input(name, prompt),))
                 .await?;
             println!("{:?}", res);
         }
@@ -257,23 +243,16 @@ async fn main() -> Result<(), BoxError> {
             name,
             args,
         }) => {
-            let web3 = Web3Client::builder()
-                .with_ic_host(&cli.host)
-                .with_identity(Arc::new(identity))
-                .with_allow_http(allow_http_for(endpoint, cli.allow_http))
-                .build()
-                .await?;
-
-            println!("principal: {}", web3.get_principal());
+            let web3 = cli.rpc_client(endpoint).await?;
             let input = tool_input(name, args)?;
 
-            let res: ToolOutput<serde_json::Value> = web3
-                .https_signed_rpc(endpoint, "tool_call", &(&input,))
-                .await?;
+            let res: ToolOutput<serde_json::Value> =
+                web3.rpc(endpoint, "tool_call", &(&input,)).await?;
             println!("{}", serde_json::to_string_pretty(&res)?);
         }
 
         None => {
+            println!("principal: {}", load_identity(&cli.id)?.sender()?);
             println!("no command");
         }
     }
@@ -418,9 +397,11 @@ mod tests {
         // unflagged because the built-in endpoint defaults are loopback.
         for endpoint in [
             "http://127.0.0.1:8042/default",
+            "HTTP://localhost:8042/default",
             "http://localhost:8042/default",
             "http://LOCALHOST:8042/default",
             "http://[::1]:8042/default",
+            "http://[0:0:0:0:0:0:0:1]:8042/default",
             "http://127.0.0.1",
         ] {
             assert!(

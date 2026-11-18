@@ -19,15 +19,16 @@ jobs:
         run: echo "${{ secrets.GITHUB_TOKEN }}" | crane auth login ghcr.io -u "${{ github.actor }}" --password-stdin
       - name: Copy alpine
         shell: bash
+        env:
+          SYNC_TAG: ${{ inputs.sync_tag }}
         run: |
           set -euo pipefail
 
-          tag="${{ github.event.inputs.sync_tag }}"
-          src="docker.io/library/alpine:${tag}"
+          src="docker.io/library/alpine:${SYNC_TAG}"
           dst="ghcr.io/ldclabs/alpine"
 
-          crane copy "${src}" "${dst}:${tag}"
+          crane copy "${src}" "${dst}:${SYNC_TAG}"
 
-          if [[ "${tag}" != "latest" ]]; then
+          if [[ "${SYNC_TAG}" != "latest" ]]; then
             crane copy "${src}" "${dst}:latest"
           fi

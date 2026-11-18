@@ -31,7 +31,7 @@ impl ToolPresentation {
         if output.get("type").and_then(Json::as_str) != Some("ToolPresentation") {
             return None;
         }
-        serde_json::from_value(output.clone()).ok()
+        Self::deserialize(output).ok()
     }
 
     /// Encodes this view for provider-neutral persisted tool history.

@@ -1,4 +1,4 @@
-//! Middleware helpers for [`ServerBuilder`](crate::ServerBuilder).
+//! Middleware helpers for [`crate::ServerBuilder`].
 //!
 //! Callers can register arbitrary router middleware, request middleware, gzip
 //! compression, or a simple API-key guard without making the server builder

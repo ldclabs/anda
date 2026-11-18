@@ -8,7 +8,7 @@ use crate::{
     crypto, ecdsa_digest,
     request::{check_url, rpc_body, send_request},
 };
-use anda_core::{BoxError, BoxPinFut, HttpFeatures, cbor_rpc};
+use anda_core::{BoxError, BoxPinFut, HttpFeatures, cbor_rpc, http_rpc};
 use anda_engine::context::Web3ClientFeatures;
 use candid::{
     CandidType, Decode, Principal,
@@ -275,6 +275,22 @@ impl Client {
     /// Returns the principal of the client identity, resolved at build time.
     pub fn get_principal(&self) -> Principal {
         self.principal
+    }
+
+    /// Calls a CBOR-RPC endpoint with the configured identity. Anonymous clients
+    /// send a request without credentials. All other clients sign the request.
+    pub async fn rpc<T: DeserializeOwned>(
+        &self,
+        endpoint: &str,
+        method: &str,
+        args: impl Serialize + Send,
+    ) -> Result<T, BoxError> {
+        if self.principal == Principal::anonymous() {
+            let url = check_url(endpoint, self.allow_http)?;
+            Ok(http_rpc(&self.outer_http, url.as_str(), method, &args).await?)
+        } else {
+            self.https_signed_rpc(endpoint, method, args).await
+        }
     }
 
     /// Signs a message digest with the client identity.

@@ -98,6 +98,8 @@ Use `EngineBuilder` to configure an engine, then call `build(default_agent)` to 
 Agents receive `AgentCtx`; tools receive `BaseCtx`. Contexts carry caller identity, request metadata, cancellation tokens, scoped cache and storage, shared state, HTTP and canister features, and Web3 signing.
 
 Context namespaces are derived from agent and tool names so cache and object storage remain isolated between components.
+`Engine::ctx_with` and `Engine::base_ctx_with` apply the same engine ID,
+user-name and visibility checks as direct RPC execution.
 
 Subagent sessions are isolated by caller, host-created `SubAgentScope`, worker,
 and alias. Install the same scope clone to continue a root task across engine
@@ -331,6 +333,10 @@ subagents are not cancelled by removing their catalog entries; hosts own session
 ### Memory
 
 The `memory` module stores conversations, resources, artifacts, usage, steering messages, and follow-up messages. It uses AndaDB collections and exposes KIP-backed tools for persistent agent memory through the Cognitive Nexus.
+
+Conversation listings return a continuation cursor when the index contains an
+older page. Expiration removes whole hour buckets preceding the cutoff hour
+and propagates database errors to the caller.
 
 ### Hooks
 

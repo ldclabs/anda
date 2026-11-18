@@ -40,6 +40,17 @@ impl TestServer {
         ) -> axum::response::Response {
             state.requests.fetch_add(1, Ordering::SeqCst);
             if state.auth_fail.load(Ordering::SeqCst) {
+                if request["method"] == "tools/call" {
+                    // Gateways can return a JSON-RPC error without a challenge.
+                    return (
+                        axum::http::StatusCode::FORBIDDEN,
+                        HttpJson(json!({
+                            "jsonrpc": "2.0", "id": request["id"],
+                            "error": {"code": -32600, "message": "permission denied"}
+                        })),
+                    )
+                        .into_response();
+                }
                 return (
                     axum::http::StatusCode::UNAUTHORIZED,
                     [("www-authenticate", "Bearer error=\"invalid_token\"")],
@@ -85,7 +96,16 @@ impl TestServer {
                 }
                 _ => json!({}),
             };
-            HttpJson(json!({"jsonrpc":"2.0","id":request["id"],"result":result})).into_response()
+            let reply = json!({"jsonrpc":"2.0","id":request["id"],"result":result});
+            // Exercise both HTTP response formats through the SDK's live session.
+            if request["method"] == "resources/list" {
+                return (
+                    [("content-type", "Text/Event-Stream; charset=utf-8")],
+                    format!("event: message\ndata: {reply}\n\n"),
+                )
+                    .into_response();
+            }
+            HttpJson(reply).into_response()
         }
         let state = Arc::new(ServerState::default());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -133,6 +153,29 @@ async fn stale_routes_and_replaced_registrations_cannot_execute() {
             .contains("registration changed")
     );
     assert!(server.state.calls.lock().is_empty());
+}
+
+#[tokio::test]
+async fn cancelled_add_releases_the_id_and_session_for_retry() {
+    let server = TestServer::start().await;
+    let provider = McpToolProvider::new(vec![]).unwrap();
+    server.state.block_list.store(true, Ordering::SeqCst);
+    let add = {
+        let provider = provider.clone();
+        let config = server.config();
+        tokio::spawn(async move { provider.add_server(config).await })
+    };
+    tokio::time::timeout(Duration::from_secs(5), server.state.list_started.notified())
+        .await
+        .unwrap();
+    add.abort();
+    assert!(add.await.unwrap_err().is_cancelled());
+    assert!(!provider.contains_server("test"));
+    assert!(provider.inner.index.read().sessions.is_empty());
+    server.state.block_list.store(false, Ordering::SeqCst);
+    server.state.unblock_list.notify_one();
+    provider.add_server(server.config()).await.unwrap();
+    assert_eq!(provider.routes().len(), 1);
 }
 
 #[tokio::test]

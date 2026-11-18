@@ -31,20 +31,18 @@ pub(crate) fn rpc_body(method: &str, params: Vec<u8>) -> Result<Vec<u8>, BoxErro
 /// as trusted — the request is signed with the client identity before it is
 /// sent, so an attacker-controlled endpoint receives a valid signed request.
 pub(crate) fn check_url(url: &str, allow_http: bool) -> Result<reqwest::Url, BoxError> {
-    let parsed = reqwest::Url::parse(url).map_err(|err| format!("Invalid url {url:?}: {err}"))?;
+    let parsed = reqwest::Url::parse(url).map_err(|err| format!("Invalid url: {err}"))?;
     let scheme = parsed.scheme();
     let scheme_ok = scheme == "https" || (allow_http && scheme == "http");
     if !scheme_ok {
         let expected = if allow_http { "http or https" } else { "https" };
-        return Err(
-            format!("Invalid url {url:?}: scheme must be {expected}, got {scheme:?}").into(),
-        );
+        return Err(format!("Invalid url: scheme must be {expected}").into());
     }
     if !parsed.has_host() {
-        return Err(format!("Invalid url {url:?}: missing host").into());
+        return Err("Invalid url: missing host".into());
     }
     if !parsed.username().is_empty() || parsed.password().is_some() {
-        return Err(format!("Invalid url {url:?}: embedded userinfo is not allowed").into());
+        return Err("Invalid url: embedded userinfo is not allowed".into());
     }
     Ok(parsed)
 }

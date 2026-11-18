@@ -333,13 +333,10 @@ impl Codec {
         if mime.type_() != mime::APPLICATION {
             return None;
         }
-        let is = |name: &str| mime.subtype() == name || mime.suffix().is_some_and(|s| s == name);
-        if is("cbor") {
-            Some(Self::Cbor)
-        } else if is("json") {
-            Some(Self::Json)
-        } else {
-            None
+        match mime.suffix().unwrap_or_else(|| mime.subtype()).as_str() {
+            "cbor" => Some(Self::Cbor),
+            "json" => Some(Self::Json),
+            _ => None,
         }
     }
 
@@ -367,11 +364,12 @@ impl Codec {
                     },
                     None => 1000,
                 };
-                for (index, subtype) in ["json", "cbor"].iter().enumerate() {
-                    let specificity = match (range.type_().as_str(), range.subtype().as_str()) {
-                        ("*", "*") => 0,
-                        ("application", "*") => 1,
-                        ("application", actual) if actual == *subtype => 2,
+                for (index, media_type) in [CONTENT_TYPE_JSON, CONTENT_TYPE_CBOR].iter().enumerate()
+                {
+                    let specificity = match range.essence_str() {
+                        "*/*" => 0,
+                        "application/*" => 1,
+                        actual if actual == *media_type => 2,
                         _ => continue,
                     };
                     scores[index] = scores[index].max(Some((specificity, quality)));

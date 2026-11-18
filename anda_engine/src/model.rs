@@ -142,7 +142,9 @@ async fn read_error_body(response: reqwest::Response) -> Result<String, reqwest:
     let mut stream = response.bytes_stream();
     let mut body = Vec::new();
     while let Some(chunk) = stream.next().await {
-        body.extend_from_slice(&chunk?);
+        let chunk = chunk?;
+        let take = chunk.len().min(MAX_ERROR_BODY_BYTES + 1 - body.len());
+        body.extend_from_slice(&chunk[..take]);
         if body.len() > MAX_ERROR_BODY_BYTES {
             break;
         }
@@ -1157,8 +1159,6 @@ pub fn request_client_builder() -> reqwest::ClientBuilder {
         })
 }
 
-const SSE_DONE_MARKER: &[u8] = b"data: [DONE]";
-
 pub(crate) async fn read_completion_stream<T>(
     response: reqwest::Response,
     model: &str,
@@ -1169,7 +1169,7 @@ where
     let request_id = upstream_request_id(response.headers());
     let started = Instant::now();
     let mut body = Vec::new();
-    let mut scanned: usize = 0;
+    let mut line_start = 0;
     let mut stream = response.bytes_stream();
 
     while let Some(chunk) = stream.next().await {
@@ -1193,17 +1193,24 @@ where
                 body.len() + chunk.len(),
             ));
         }
+        let chunk_start = body.len();
         body.extend_from_slice(&chunk);
-        // Only scan the unscanned tail (with marker-sized overlap), so long
-        // streams are not rescanned from the start on every chunk.
-        let start = scanned.saturating_sub(SSE_DONE_MARKER.len());
-        if body_contains_sse_done(&body, start) {
-            return Ok((parse_streaming_json_events(&body, model)?, true));
+        for (i, byte) in chunk.iter().enumerate() {
+            if matches!(byte, b'\r' | b'\n') {
+                let end = chunk_start + i;
+                if is_sse_done_line(&body[line_start..end]) {
+                    return Ok((
+                        parse_streaming_json_events(&body[..line_start], model)?,
+                        true,
+                    ));
+                }
+                line_start = end + 1;
+            }
         }
-        scanned = body.len();
     }
 
-    Ok((parse_streaming_json_events(&body, model)?, false))
+    let done = is_sse_done_line(&body[line_start..]);
+    Ok((parse_streaming_json_events(&body, model)?, done))
 }
 
 #[cfg(test)]
@@ -1216,18 +1223,14 @@ async fn read_sse_json_events<T: DeserializeOwned>(
         .map(|(events, _)| events)
 }
 
-/// Returns true when a `data: [DONE]` line exists at or after `from`.
-///
-/// The marker must be anchored at the start of an SSE line (buffer start or a
-/// preceding `\n`). Generated content inside a JSON string can legitimately
-/// contain the marker text, and must not terminate the stream early.
-fn body_contains_sse_done(body: &[u8], from: usize) -> bool {
-    if from == 0 && body.starts_with(SSE_DONE_MARKER) {
-        return true;
-    }
-    body[from..]
-        .windows(SSE_DONE_MARKER.len() + 1)
-        .any(|window| window[0] == b'\n' && &window[1..] == SSE_DONE_MARKER)
+fn is_sse_done_line(line: &[u8]) -> bool {
+    let line = line.strip_prefix(b"\xef\xbb\xbf").unwrap_or(line);
+    matches!(line.trim_ascii_end(), b"data: [DONE]" | b"data:[DONE]")
+}
+
+fn sse_lines(body: &str) -> impl Iterator<Item = &str> {
+    // lines() handles LF and CRLF. A remaining CR is a standalone line ending.
+    body.lines().flat_map(|line| line.split('\r'))
 }
 
 fn parse_streaming_json_events<T>(body: &[u8], model: &str) -> Result<Vec<T>, BoxError>
@@ -1249,8 +1252,7 @@ where
     let mut data = String::new();
     let mut events = Vec::new();
 
-    for line in body.lines() {
-        let line = line.strip_suffix('\r').unwrap_or(line);
+    for line in sse_lines(body) {
         handle_sse_text_line(line, &mut data, &mut events, model)?;
     }
     flush_sse_data(&mut data, &mut events, model)?;
@@ -1259,7 +1261,7 @@ where
 }
 
 fn looks_like_sse(body: &str) -> bool {
-    body.lines().any(|line| {
+    sse_lines(body).any(|line| {
         let line = line.strip_prefix('\u{feff}').unwrap_or(line);
         line.starts_with("data:")
             || line.starts_with("event:")
@@ -1309,7 +1311,9 @@ where
     let event = serde_json::from_str::<T>(value).map_err(|err| {
         format!(
             "Invalid streaming completion event, model: {}, error: {}, body: {}",
-            model, err, value
+            model,
+            err,
+            error_body_excerpt(value.as_bytes())
         )
     })?;
     events.push(event);
@@ -1332,40 +1336,24 @@ where
         return Ok(events);
     }
 
-    match serde_json::from_str::<T>(value) {
-        Ok(event) => Ok(vec![event]),
-        Err(single_err) => match serde_json::from_str::<Vec<T>>(value) {
-            Ok(events) => Ok(events),
-            Err(array_err) => {
-                let mut events = Vec::new();
-                let mut saw_line = false;
-                for line in value.lines() {
-                    let line = line.trim();
-                    if line.is_empty() || line == "[DONE]" {
-                        continue;
-                    }
-                    saw_line = true;
-                    let event = serde_json::from_str::<T>(line).map_err(|line_err| {
-                        format!(
-                            "Invalid streaming completion event, model: {}, error: {}, body: {}",
-                            model, line_err, line
-                        )
-                    })?;
-                    events.push(event);
-                }
-
-                if saw_line {
-                    return Ok(events);
-                }
-
-                Err(format!(
-                    "Invalid streaming completion event, model: {}, error: {}; array error: {}, body: {}",
-                    model, single_err, array_err, value
-                )
-                .into())
-            }
-        },
+    if let Ok(event) = serde_json::from_str::<T>(value) {
+        return Ok(vec![event]);
     }
+
+    value
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && *line != "[DONE]")
+        .map(|line| {
+            serde_json::from_str(line).map_err(|err| {
+                format!(
+                    "Invalid streaming completion event, model: {model}, error: {err}, body: {}",
+                    error_body_excerpt(line.as_bytes())
+                )
+                .into()
+            })
+        })
+        .collect()
 }
 
 pub(crate) fn streaming_completion_request(
@@ -1979,19 +1967,43 @@ mod tests {
         assert_eq!(events, vec![serde_json::json!({"a": 1})]);
     }
 
+    #[tokio::test]
+    async fn streaming_reader_recognizes_complete_done_lines_across_chunks() {
+        for ending in ["\n", "\r\n", "\r"] {
+            let chunks = [
+                format!("data: {{\"a\":{ending}data: 1}}{ending}{ending}data:[DO"),
+                format!("NE]{ending}data: ignored trailing data"),
+            ];
+            let body = reqwest::Body::wrap_stream(futures::stream::iter(
+                chunks.into_iter().map(Ok::<_, std::io::Error>),
+            ));
+            let response = reqwest::Response::from(http::Response::new(body));
+            let (events, done) = read_completion_stream::<Json>(response, "test")
+                .await
+                .unwrap();
+            assert!(done);
+            assert_eq!(events, vec![serde_json::json!({"a": 1})]);
+        }
+        assert!(!is_sse_done_line(b"data: [DONE]suffix"));
+        let response = reqwest::Response::from(http::Response::new("data:[DONE]"));
+        assert!(
+            read_completion_stream::<Json>(response, "test")
+                .await
+                .unwrap()
+                .1
+        );
+    }
+
     #[test]
-    fn sse_done_detection_is_line_anchored() {
-        assert!(body_contains_sse_done(b"data: [DONE]\n\n", 0));
-        assert!(body_contains_sse_done(
-            b"data: {\"a\":1}\n\ndata: [DONE]\n\n",
-            0
-        ));
-        // The marker text inside generated JSON content must not terminate
-        // the stream.
-        assert!(!body_contains_sse_done(
-            b"data: {\"text\":\"sse ends with data: [DONE]\"}\n\n",
-            0
-        ));
+    fn invalid_streaming_event_diagnostics_are_bounded() {
+        let invalid = "x".repeat(MAX_ERROR_BODY_BYTES * 2);
+        for body in [format!("data: {invalid}\n\n"), invalid] {
+            let err = parse_streaming_json_events::<Json>(body.as_bytes(), "test")
+                .unwrap_err()
+                .to_string();
+            assert!(err.ends_with("… [truncated]"));
+            assert!(err.len() < MAX_ERROR_BODY_BYTES + 256);
+        }
     }
 
     #[tokio::test]

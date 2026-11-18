@@ -10,16 +10,18 @@
 //! - Integration with Anda's HTTP features
 //!
 //! # Usage
-//! ```rust,ignore
-//! let fetch_tool = FetchResourcesTool::new();
-//! // Manual invocation within an agent
-//! let content = FetchResourcesTool::fetch(ctx, "https://example.com/api/data").await?;
-//! // Or register with Engine for automatic invocation
+//! ```rust
+//! use anda_engine::{engine::Engine, extension::fetch::FetchWebResourcesTool};
+//! use std::sync::Arc;
+//!
+//! # #[tokio::main(flavor = "current_thread")]
+//! # async fn main() -> Result<(), anda_core::BoxError> {
 //! let engine = Engine::builder()
-//!     .with_name("MyEngine".to_string())
-//!     .register_tool(fetch_tool)?
-//!     .register_agent(my_agent, None)?
-//!     .build("default_agent".to_string())?;
+//!     .register_tool(Arc::new(FetchWebResourcesTool::new()))?
+//!     .empty().await?;
+//! # assert!(engine.tools(None).iter().any(|tool| tool.definition.name == FetchWebResourcesTool::NAME));
+//! # Ok(())
+//! # }
 //! ```
 
 use anda_core::{BoxError, FunctionDefinition, HttpFeatures, Resource, Tool, ToolOutput};
@@ -63,22 +65,18 @@ pub async fn validate_public_url(url: &str) -> Result<(), BoxError> {
         }
     }
 
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| format!("url {url:?} has no host"))?;
-
-    // IP literals are checked directly; hostnames are resolved and every resulting address is
-    // checked so a public name that maps to an internal address is rejected too.
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        return reject_non_public_ip(ip, url);
-    }
-
+    let host = match parsed.host() {
+        Some(url::Host::Ipv4(ip)) => return reject_non_public_ip(ip.into(), url),
+        Some(url::Host::Ipv6(ip)) => return reject_non_public_ip(ip.into(), url),
+        Some(url::Host::Domain(host)) => host,
+        None => return Err(format!("url {url:?} has no host").into()),
+    };
     let port = parsed.port_or_known_default().unwrap_or(0);
-    let addrs: Vec<_> = tokio::net::lookup_host((host, port))
+    let mut addrs = tokio::net::lookup_host((host, port))
         .await
         .map_err(|err| format!("failed to resolve host {host:?} (url: {url}): {err}"))?
-        .collect();
-    if addrs.is_empty() {
+        .peekable();
+    if addrs.peek().is_none() {
         return Err(format!("host {host:?} did not resolve to any address (url: {url})").into());
     }
     for addr in addrs {
@@ -498,6 +496,15 @@ mod tests {
             "text/plain; charset=utf-8".parse().unwrap(),
         );
         assert!(FetchWebResourcesTool::decode_text(&headers, &[0xFF]).is_none());
+    }
+
+    #[tokio::test]
+    async fn validates_ipv6_literals_without_dns() {
+        validate_public_url("https://[2606:4700:4700::1111]/")
+            .await
+            .unwrap();
+        let err = validate_public_url("http://[::1]/").await.unwrap_err();
+        assert!(err.to_string().contains("non-public address"));
     }
 
     #[tokio::test(flavor = "current_thread")]

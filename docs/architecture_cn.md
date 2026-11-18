@@ -164,7 +164,7 @@ Host -> Engine : agent_run(caller, input)
 Engine -> Engine : validate RequestMeta\nnormalize default agent
 Engine -> Guard : check_visibility(caller)
 Guard --> Engine : visibility accepted
-Engine -> Ctx : ctx_with(caller, agent, label, meta)
+Engine -> Ctx : child_with(caller, agent, label, meta)
 Engine -> Guard : on_agent_start(ctx, agent)
 Engine -> Agent : run(ctx, prompt, resources)
 Agent -> Ctx : completion(req, resources)
@@ -219,7 +219,7 @@ Host --> Caller : response
 - `AgentCtx` 是主要调度面。它暴露本地 tools、动态 tool providers、本地 agents 和 subagents。
 - `CompletionRunner` 是迭代式执行器。模型回合可以返回 tool calls；runner 执行它们，再把 tool outputs 回灌到下一轮模型请求。长任务 runner 可以把过长的历史压缩为 continuation handoff，并从摘要继续：待处理的 tool outputs 随历史一起被摘要；待处理的请求输入、排队的 follow-up/steering 以及 implicit context 则移交给替换 runner。压缩摘要验证成功后才提交状态，失败时原 runner 仍可重试；stream 在正常终态提交前处理等待期间追加的输入，某一步失败后即结束。
 - `tools_groups`、`tools_search` 和 `tools_select` 是 agents，不是旁路机制。`tools_groups` 返回当前可见 capability bundles 的紧凑目录；`tools_select` 可以把一个 group 展开成 schemas，发现到的 schemas 仍保留在 tool-output context 中，并压缩 conversation context 中重复的 schema payload。
-- `BaseCtx` 创建命名空间隔离的 child contexts。Agent 路径使用 `a_<agent>`，tool 路径使用 `t_<tool>`，store/cache 操作都在该 path 下解析。
+- `BaseCtx` 创建命名空间隔离的 child contexts。Agent 路径使用 `a_<agent>`，tool 路径使用 `t_<tool>`，store/cache 操作都在该 path 下解析。首次写入或初始化缓存值时，引擎才为该命名空间分配内存缓存。
 - `Models` 先按 label 路由，再回落到 primary/default model。provider 真实模型名留在 adapter 配置内部。
 - 对话历史有两套视图，这个区分是有约束意义的。`chat_history`（由 `ContentPart` 组成的 `Vec<Message>`）是 provider-neutral 的视图，用于持久化并跨越 RPC 边界。`raw_history`（`Vec<Json>`）原样保存 provider 自己的消息 JSON，存在的目的就是让每轮的不透明中间态 —— Anthropic 的 `thinking.signature`、Gemini 的 `thoughtSignature` —— 在一轮推理内不丢失，而不必把它们建模进 `ContentPart`。每轮 runner 把响应的 `raw_history` 追加到请求的 `raw_history` 并清空 `chat_history`；所有 adapter 都先发送 `raw_history`，再发送由 `chat_history` 转换出来的消息。engine 在 RPC 边界清空它，因此它的作用域仅限进程内的一轮推理。恢复的对话只能从 `chat_history` 重放，按设计就没有 provider 中间态 —— adapter 必须容忍这一点，而不是发出 provider 会拒绝的块。设置了 `set_transient_inline_data(true)` 的 runner 把内联附件字节限定在当前任务内：它们不会进入 `chat_history`；runner 进入空闲或任务被停止时，`CompletionFeaturesDyn::prune_inline_media` 会把 `raw_history` 中的它们替换为一段文字说明。
 - `SubAgentManager` 把持久化或临时 `SubAgent` 定义转成可调用的 `SA_<name>` agents。长任务 session 按 caller principal 和 session ID 隔离，通过使用一致 task ID 的 hooks 推送 progress 和 final output；stop/cancel 控制消息可以中断等待中的工作。

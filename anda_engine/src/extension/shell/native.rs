@@ -3,7 +3,7 @@
 //! This runtime launches commands on the host operating system and optionally
 //! streams long-running output through background hooks. It is intended for
 //! trusted environments by default. Opt into [`NativeRuntime::with_sandbox`]
-//! or supply an isolated [`Executor`](crate::extension::shell::Executor) when
+//! or supply an isolated [`Executor`] when
 //! the host must enforce process filesystem and network restrictions.
 
 use anda_core::{BoxError, StateFeatures, ToolOutput};

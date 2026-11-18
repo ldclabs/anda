@@ -531,9 +531,22 @@ where
             return definitions;
         }
 
+        let selected = names.map(|names| {
+            let mut keys: Vec<_> = names.iter().map(|name| name.to_ascii_lowercase()).collect();
+            keys.sort_unstable();
+            keys.dedup();
+            keys
+        });
         for provider in self.set.values() {
-            for mut definition in provider.definitions(names) {
+            for mut definition in provider.definitions(selected.as_deref()) {
                 definition.name.make_ascii_lowercase();
+                // A provider may return its whole snapshot. The filter also scopes public engine cards.
+                if selected
+                    .as_ref()
+                    .is_some_and(|keys| keys.binary_search(&definition.name).is_err())
+                {
+                    continue;
+                }
                 definitions
                     .entry(definition.name.clone())
                     .or_insert((definition, provider));

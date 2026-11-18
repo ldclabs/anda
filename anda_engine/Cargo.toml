@@ -51,8 +51,10 @@ serde-saphyr = { workspace = true }
 glob = { workspace = true }
 rmcp = { workspace = true }
 sse-stream = { workspace = true }
+rmcp-sse-stream = { workspace = true }
 thiserror = { workspace = true }
 unicode-segmentation = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }

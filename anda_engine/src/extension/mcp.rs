@@ -182,6 +182,20 @@ pub struct McpToolProvider {
     inner: Arc<McpToolProviderInner>,
 }
 
+struct PendingServer<'a> {
+    provider: &'a McpToolProvider,
+    registration: &'a Arc<Registration>,
+    published: bool,
+}
+
+impl Drop for PendingServer<'_> {
+    fn drop(&mut self) {
+        if !self.published {
+            self.provider.remove_registration(self.registration);
+        }
+    }
+}
+
 impl std::fmt::Debug for McpToolProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("McpToolProvider")
@@ -210,28 +224,28 @@ impl McpToolProvider {
     /// provider snapshot used by `tools_select`, `Engine::tools`, and tool calls
     /// without rebuilding the engine.
     ///
-    /// If the initial refresh fails, the server registration is rolled back so
-    /// callers do not observe a partially added server.
+    /// A failed or cancelled initial refresh rolls back this registration.
     ///
     /// [`Engine`]: crate::engine::Engine
     pub async fn add_server(&self, server: McpServerConfig) -> Result<(), BoxError> {
         let registration = self.insert_server(server)?;
+        let mut pending = PendingServer {
+            provider: self,
+            registration: &registration,
+            published: false,
+        };
         let refresh = async {
             let snapshot = self
                 .fetch_registration_snapshot(registration.clone(), true)
                 .await?;
             self.publish_snapshot(snapshot).await
         };
-        let result = tokio::select! {
+        tokio::select! {
             biased;
             _ = registration.cancelled.cancelled() => Err("MCP server removed during registration".into()),
             result = refresh => result,
-        };
-        if let Err(err) = result {
-            self.remove_registration(&registration);
-            return Err(err);
-        }
-
+        }?;
+        pending.published = true;
         Ok(())
     }
 
@@ -260,9 +274,8 @@ impl McpToolProvider {
     /// clear them separately (`store.clear(server_id)`) if removal should also
     /// drop stored access and refresh tokens.
     pub fn remove_server(&self, server_id: &str) -> bool {
-        let existed = self.contains_server(server_id);
-        self.remove_server_state(server_id);
-        existed
+        self.server_config(server_id)
+            .is_ok_and(|registration| self.remove_registration(&registration))
     }
 
     /// Returns whether a server id is currently registered.
@@ -1304,24 +1317,19 @@ impl McpToolProvider {
         Ok(registration)
     }
 
-    fn remove_registration(&self, expected: &Arc<Registration>) {
+    fn remove_registration(&self, expected: &Arc<Registration>) -> bool {
         let mut servers = self.inner.servers.write();
         if !servers
             .get(&expected.id)
             .is_some_and(|current| Arc::ptr_eq(current, expected))
         {
-            return;
+            return false;
         }
         servers.remove(&expected.id);
         expected.cancelled.cancel();
         self.inner.index.write().remove_server(&expected.id);
         self.inner.pending_auth.lock().remove(&expected.id);
-    }
-
-    fn remove_server_state(&self, server_id: &str) {
-        if let Ok(registration) = self.server_config(server_id) {
-            self.remove_registration(&registration);
-        }
+        true
     }
 }
 
