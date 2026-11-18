@@ -4,6 +4,66 @@ All notable changes to the Anda project will be documented in this file.
 
 ## [Unreleased]
 
+## [anda_core 0.17.2, anda_engine 0.17.5, anda_engine_server 0.17.1, anda_web3_client 0.18.0, anda_cli 0.17.1] — 2026-11-18
+
+### Changed — workspace
+
+- Upgrade `ic_cose` and `ic_cose_types` to `0.12` and `ic-oss-types` to
+  `1.4`. Unix PTY builds retain the Tokio `1.53.3` minimum.
+
+### Fixed — anda_core
+
+- Filter dynamic provider tool definitions by the requested names so public
+  engine cards include only exported tools.
+- Return HTTP RPC errors as soon as the diagnostic excerpt reaches its byte limit.
+
+### Changed — anda_engine
+
+- Upgrade `rmcp` to `3.11` and `parking_lot` to `0.13`. Decode MCP event
+  streams with `sse-stream` `0.3`.
+- Allocate each namespace cache on its first write or initialization.
+
+### Fixed — anda_engine
+
+- Roll back cancelled or failed MCP server additions so callers can retry with
+  the same ID. Preserve HTTP authentication failures and match complete media
+  types case-insensitively.
+- Apply the engine ID, username, and visibility checks when creating an agent
+  or tool context.
+- Recognize SSE `[DONE]` across chunks with LF, CRLF, or CR line endings.
+  Validate the event containing the marker and bound completion error excerpts.
+- Return a conversation cursor only when the index has another page and
+  propagate errors from expired-conversation cleanup. Normalize the namespace
+  for unfiltered object listings and honor the optional offset.
+- Validate public IPv6 literals without DNS when fetching web resources.
+
+### Fixed — anda_engine_server
+
+- Match complete media types during discovery content negotiation. Choose the
+  RPC request codec from the structured media type suffix when present.
+
+### Added — anda_web3_client
+
+- `Client::rpc` sends unsigned CBOR-RPC for an anonymous identity and signs
+  requests for other identities.
+
+### Changed — anda_web3_client
+
+- `Client` implements `CoseSDK` and `CanisterCaller` from `ic_cose` and
+  `ic_cose_types` `0.12`. Downstream code that imports either trait directly
+  should upgrade its COSE dependencies to `0.12` alongside the client.
+
+### Fixed — anda_web3_client
+
+- Omit the supplied URL from endpoint validation errors.
+
+### Changed — anda_cli
+
+- The CLI uses an anonymous identity by default for RPC. `--id` can be supplied
+  before or after a subcommand, and help hides the value of `ID_SECRET`.
+- `rand-bytes` runs without loading an identity. Loopback HTTP detection uses
+  the parsed URL and accepts normalized IPv6 loopback addresses.
+
 ## [anda_engine 0.17.4] — 2026-10-20
 
 ### Changed — anda_engine

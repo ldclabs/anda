@@ -27,12 +27,12 @@ Endpoints passed to the signed HTTP/RPC calls must be trusted: requests are sign
 Enable `client` in your dependency:
 
 ```toml
-anda_web3_client = { version = "0.17", features = ["client"] }
+anda_web3_client = { version = "0.18", features = ["client"] }
 ```
 
 Applications that import `CoseSDK` or `CanisterCaller` directly need matching
-versions of `ic_cose` and `ic_cose_types`. This checkout implements the traits
-from version 0.12 of both crates.
+versions of `ic_cose` and `ic_cose_types`. `anda_web3_client` 0.18 implements
+the traits from version 0.12 of both crates.
 
 Provide a persistent, securely generated 48-byte root secret when using key
 operations. Generate it once, keep it in your secret store, and reuse it across

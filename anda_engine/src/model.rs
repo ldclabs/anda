@@ -1199,10 +1199,8 @@ where
             if matches!(byte, b'\r' | b'\n') {
                 let end = chunk_start + i;
                 if is_sse_done_line(&body[line_start..end]) {
-                    return Ok((
-                        parse_streaming_json_events(&body[..line_start], model)?,
-                        true,
-                    ));
+                    // Include the marker so it is parsed with the rest of its SSE event.
+                    return Ok((parse_streaming_json_events(&body[..end], model)?, true));
                 }
                 line_start = end + 1;
             }
@@ -1919,6 +1917,20 @@ mod tests {
         assert_eq!(
             events,
             vec![serde_json::json!({"a": 1}), serde_json::json!({"b": 2})]
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_reader_rejects_done_within_a_data_event() {
+        let response = reqwest::Response::from(http::Response::new(
+            "data: {\"a\":1}\r\ndata: [DONE]\r\n\r\n",
+        ));
+        let err = read_completion_stream::<Json>(response, "test")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Invalid streaming completion event")
         );
     }
 

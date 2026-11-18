@@ -69,7 +69,8 @@ anda_cloud_cdk = "0.7"
 object_store = { version = "0.14" }
 parking_lot = "0.13"
 tokio-util = "0.7"
-tokio = { version = "1", features = ["full"] }
+# Unix PTY support uses AsyncFd::register, added in Tokio 1.53.3.
+tokio = { version = "1.53.3", features = ["full"] }
 structured-logger = "1"
 rand = "0.10"
 reqwest = { version = "0.13", features = [
