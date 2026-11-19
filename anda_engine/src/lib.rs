@@ -18,7 +18,7 @@
 
 use anda_core::Json;
 use candid::Principal;
-use chrono::prelude::*;
+use jiff::{SignedDuration, Timestamp, ZonedDateTime, tz::TimeZone};
 use rand::RngExt;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -66,13 +66,15 @@ where
 
 /// Returns the current UTC datetime in RFC 3339 format with millisecond precision.
 pub fn rfc3339_datetime_now() -> String {
-    Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    format!("{:.3}", Timestamp::now())
 }
 
-/// Converts a Unix timestamp in milliseconds to an RFC 3339 UTC datetime string.
+/// Converts Unix milliseconds to RFC 3339 in UTC, with a four-digit year.
 pub fn rfc3339_datetime(now_ms: u64) -> Option<String> {
-    let datetime = DateTime::<Utc>::from_timestamp_millis(now_ms as i64);
-    datetime.map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+    let elapsed = SignedDuration::from_millis(i64::try_from(now_ms).ok()?);
+    let epoch = jiff::civil::datetime(1970, 1, 1, 0, 0, 0, 0);
+    let datetime = epoch.checked_add(elapsed).ok()?;
+    Some(format!("{datetime:.3}Z"))
 }
 
 /// Sets the Unix timestamp in milliseconds for each JSON object in the vector.
@@ -100,9 +102,20 @@ pub fn json_convert_rfc3339_timestamp(mut vals: Vec<Json>) -> Vec<Json> {
 /// Converts a Unix timestamp in milliseconds to a local datetime string in the format "YYYY-MM-DD HH(AM/PM) ±TZ".
 /// Example: 1970-01-01 08AM +08:00
 pub fn local_date_hour(now_ms: u64) -> Option<String> {
-    let local_datetime: Option<DateTime<Local>> =
-        DateTime::<Utc>::from_timestamp_millis(now_ms as i64).map(|d| d.with_timezone(&Local));
-    local_datetime.map(|dt| dt.format("%Y-%m-%d %I%p %:z").to_string())
+    let elapsed = SignedDuration::from_millis(i64::try_from(now_ms).ok()?);
+    let timestamp = Timestamp::from_duration(elapsed).ok()?;
+    let local = timestamp.to_zoned_datetime(TimeZone::system());
+    Some(format_local_date_hour(&local))
+}
+
+fn format_local_date_hour(local: &ZonedDateTime) -> String {
+    let hour = local.strftime("%Y-%m-%d %I%p");
+    let offset = local.offset().seconds();
+    let sign = if offset < 0 { '-' } else { '+' };
+    // Historical zones can have second offsets. Keep the displayed offset at
+    // minute precision without changing the local clock time.
+    let minutes = (offset.unsigned_abs() + 30) / 60;
+    format!("{hour} {sign}{:02}:{:02}", minutes / 60, minutes % 60)
 }
 
 /// Returns the largest byte length `<= max_bytes` that falls on a grapheme-cluster boundary of
@@ -143,7 +156,6 @@ pub fn truncate_utf8_to_max_bytes(text: &mut String, max_bytes: usize) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::DateTime;
     use serde_json::json;
 
     #[test]
@@ -155,19 +167,27 @@ mod tests {
     #[test]
     fn rfc3339_datetime_now_is_valid_rfc3339() {
         let now = rfc3339_datetime_now();
-        let parsed = DateTime::parse_from_rfc3339(&now).expect("must be valid rfc3339 datetime");
-        assert_eq!(parsed.offset().local_minus_utc(), 0);
+        assert_eq!(now.len(), 24);
+        assert!(now.ends_with('Z'));
+        assert!(now.parse::<Timestamp>().is_ok());
     }
 
     #[test]
     fn rfc3339_datetime_handles_valid_and_invalid_timestamp() {
-        let invalid_ms = i64::MIN as u64;
-
         assert_eq!(
-            rfc3339_datetime(0),
-            Some("1970-01-01T00:00:00.000Z".to_string())
+            rfc3339_datetime(0).as_deref(),
+            Some("1970-01-01T00:00:00.000Z")
         );
-        assert_eq!(rfc3339_datetime(invalid_ms), None);
+        assert_eq!(
+            rfc3339_datetime(1_234).as_deref(),
+            Some("1970-01-01T00:00:01.234Z")
+        );
+        assert_eq!(
+            rfc3339_datetime(253_402_300_799_999).as_deref(),
+            Some("9999-12-31T23:59:59.999Z")
+        );
+        assert_eq!(rfc3339_datetime(253_402_300_800_000), None);
+        assert_eq!(rfc3339_datetime(u64::MAX), None);
     }
 
     #[test]
@@ -198,21 +218,25 @@ mod tests {
 
     #[test]
     fn local_date_hour_returns_expected_shape_and_none_for_invalid() {
-        let invalid_ms = i64::MIN as u64;
         let s = local_date_hour(0).expect("epoch should produce local datetime");
-        println!("Local datetime for epoch: {}", s);
-        // 1970-01-01 08AM +08:00
         let parts: Vec<&str> = s.split(' ').collect();
 
         assert_eq!(parts.len(), 3);
-        assert_eq!(parts[0], "1970-01-01");
+        assert!(parts[0].parse::<jiff::civil::Date>().is_ok());
         assert_eq!(parts[1].len(), 4);
         assert!(parts[1].ends_with("AM") || parts[1].ends_with("PM"));
         assert!(parts[1][..2].chars().all(|c| c.is_ascii_digit()));
         assert!(parts[2].starts_with('+') || parts[2].starts_with('-'));
         assert_eq!(parts[2].len(), 6);
 
-        assert_eq!(local_date_hour(invalid_ms), None);
+        assert_eq!(local_date_hour(u64::MAX), None);
+    }
+
+    #[test]
+    fn local_date_hour_rounds_historical_offsets_to_minutes() {
+        let offset = jiff::tz::Offset::from_seconds(-2_670).unwrap();
+        let local = Timestamp::UNIX_EPOCH.to_zoned_datetime(offset.to_time_zone());
+        assert_eq!(format_local_date_hour(&local), "1969-12-31 11PM -00:45");
     }
 
     #[test]

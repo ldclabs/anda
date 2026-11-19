@@ -6,6 +6,8 @@ tools, and any session/persistence state live in the [`anda_engine`](../anda_eng
 runtime; this crate only authenticates callers and forwards typed requests to
 the target engine.
 
+Use `anda_engine` 0.18 to construct the `Engine` values passed to this server.
+
 ## Features
 
 - **Multi-Engine Support**: Serve multiple Anda engine instances behind one

@@ -37,7 +37,7 @@ The crate has no default optional features.
 
 ```toml
 [dependencies]
-anda_engine = "0.17"
+anda_engine = "0.18"
 ```
 
 ## Quick Start
@@ -333,6 +333,10 @@ subagents are not cancelled by removing their catalog entries; hosts own session
 ### Memory
 
 The `memory` module stores conversations, resources, artifacts, usage, steering messages, and follow-up messages. It uses AndaDB collections and exposes KIP-backed tools for persistent agent memory through the Cognitive Nexus.
+
+The public memory API uses `anda_kip` and `anda_cognitive_nexus` 0.15. Update
+both dependencies alongside `anda_engine` 0.18 when passing their Rust types
+to or from the engine.
 
 Conversation listings return a continuation cursor when the index contains an
 older page. Expiration removes whole hour buckets preceding the cutoff hour

@@ -27,7 +27,7 @@ Endpoints passed to the signed HTTP/RPC calls must be trusted: requests are sign
 Enable `client` in your dependency:
 
 ```toml
-anda_web3_client = { version = "0.18", features = ["client"] }
+anda_web3_client = { version = "0.19", features = ["client"] }
 ```
 
 Applications that import `CoseSDK` or `CanisterCaller` directly need matching

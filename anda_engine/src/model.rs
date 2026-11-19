@@ -17,6 +17,7 @@ use anda_core::{
 };
 use arc_swap::ArcSwap;
 use futures_util::StreamExt;
+use jiff::{Timestamp, fmt::rfc2822::DateTimeParser};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
@@ -1073,10 +1074,8 @@ fn retry_after_duration(headers: &http::HeaderMap) -> Option<Duration> {
 
     // HTTP-date form, e.g. "Wed, 21 Oct 2026 07:28:00 GMT", common from
     // gateways and CDNs in front of model providers.
-    let when = chrono::DateTime::parse_from_rfc2822(value).ok()?;
-    (when.with_timezone(&chrono::Utc) - chrono::Utc::now())
-        .to_std()
-        .ok()
+    let when = DateTimeParser::new().parse_timestamp(value).ok()?;
+    Duration::try_from(when.duration_since(Timestamp::now())).ok()
 }
 
 fn log_completion_retry(model: &str, retry: usize) {
@@ -2105,20 +2104,28 @@ mod tests {
             Some(Duration::from_secs(42))
         );
 
-        let when = chrono::Utc::now() + chrono::Duration::seconds(90);
-        headers.insert(
-            http::header::RETRY_AFTER,
-            HeaderValue::from_str(&when.to_rfc2822()).unwrap(),
-        );
-        let parsed = retry_after_duration(&headers).expect("http-date should parse");
-        assert!(parsed <= Duration::from_secs(90));
-        assert!(parsed >= Duration::from_secs(80));
+        let now = Timestamp::now();
+        let future = now + Duration::from_secs(90);
+        let printer = jiff::fmt::rfc2822::DateTimePrinter::new();
+        for date in [
+            printer.timestamp_to_rfc9110_string(&future).unwrap(),
+            printer.timestamp_to_string(&future).unwrap(),
+        ] {
+            headers.insert(
+                http::header::RETRY_AFTER,
+                HeaderValue::from_str(&date).unwrap(),
+            );
+            let parsed = retry_after_duration(&headers).expect("date should parse");
+            assert!(parsed <= Duration::from_secs(90));
+            assert!(parsed >= Duration::from_secs(80));
+        }
 
         // A date in the past yields no delay hint.
-        let when = chrono::Utc::now() - chrono::Duration::seconds(90);
+        let past = now - Duration::from_secs(90);
+        let date = printer.timestamp_to_rfc9110_string(&past).unwrap();
         headers.insert(
             http::header::RETRY_AFTER,
-            HeaderValue::from_str(&when.to_rfc2822()).unwrap(),
+            HeaderValue::from_str(&date).unwrap(),
         );
         assert_eq!(retry_after_duration(&headers), None);
 

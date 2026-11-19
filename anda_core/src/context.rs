@@ -691,7 +691,7 @@ mod tests {
                 value.clone(),
                 ObjectMeta {
                     location: path.clone(),
-                    last_modified: chrono::Utc::now(),
+                    last_modified: std::time::SystemTime::now().into(),
                     size: value.len() as u64,
                     e_tag: version.e_tag,
                     version: version.version,

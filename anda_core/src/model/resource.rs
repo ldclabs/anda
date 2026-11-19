@@ -1,7 +1,7 @@
 use candid::Principal;
-use chrono::prelude::*;
 use ic_auth_types::{ByteArrayB64, ByteBufB64};
 use ic_cose_types::cose::sha3_256;
+use jiff::{Timestamp, tz::Offset};
 use serde::Serialize;
 
 use anda_db_schema::{Json, Map};
@@ -75,7 +75,7 @@ impl<'a> From<&'a Resource> for ResourceRef<'a> {
 /// receive `user` and `created_at` metadata.
 pub fn update_resources(user: &Principal, resources: Vec<Resource>) -> Vec<Resource> {
     let user = user.to_string();
-    let utc = Utc::now().to_rfc3339();
+    let utc = format_created_at(Timestamp::now());
     resources
         .into_iter()
         .map(|mut r| {
@@ -91,6 +91,18 @@ pub fn update_resources(user: &Principal, resources: Vec<Resource>) -> Vec<Resou
             r
         })
         .collect()
+}
+
+fn format_created_at(timestamp: Timestamp) -> String {
+    // Keep the fractional-second widths used in persisted resource metadata.
+    let nanos = timestamp.subsec_nanosecond().unsigned_abs();
+    let precision = match nanos {
+        0 => 0,
+        n if n.is_multiple_of(1_000_000) => 3,
+        n if n.is_multiple_of(1_000) => 6,
+        _ => 9,
+    };
+    format!("{:.precision$}", timestamp.display_with_offset(Offset::UTC))
 }
 
 /// Removes and returns resources matching any of the supported tags.
@@ -216,9 +228,26 @@ mod tests {
             new_meta
                 .get("created_at")
                 .and_then(|value| value.as_str())
-                .is_some_and(|value| DateTime::parse_from_rfc3339(value).is_ok())
+                .is_some_and(
+                    |value| value.ends_with("+00:00") && value.parse::<Timestamp>().is_ok()
+                )
         );
         assert_eq!(updated[1].hash, Some(sha3_256(&[1, 2, 3]).into()));
+    }
+
+    #[test]
+    fn created_at_retains_numeric_utc_offset_and_fractional_widths() {
+        for (nanos, expected) in [
+            (0, "1970-01-01T00:00:00+00:00"),
+            (100_000_000, "1970-01-01T00:00:00.100+00:00"),
+            (123_400_000, "1970-01-01T00:00:00.123400+00:00"),
+            (123_456_780, "1970-01-01T00:00:00.123456780+00:00"),
+        ] {
+            assert_eq!(
+                format_created_at(Timestamp::new(0, nanos).unwrap()),
+                expected
+            );
+        }
     }
 
     #[test]

@@ -4,6 +4,17 @@ All notable changes to the Anda project will be documented in this file.
 
 ## [Unreleased]
 
+## [anda_core 0.17.3, anda_engine 0.18.0, anda_engine_server 0.18.0, anda_web3_client 0.19.0, anda_cli 0.17.2] — 2026-11-19
+
+- Use Jiff for resource timestamps, UTC and local time formatting, and HTTP
+  `Retry-After` dates. Unix millisecond inputs outside the supported date range
+  return `None`.
+- Use `anda_kip` and `anda_cognitive_nexus` 0.15 and `ic-oss-types` 1.4.2.
+  Hosts passing KIP or Nexus types through the engine's public memory API
+  should update both dependencies to 0.15.
+- `anda_engine_server` 0.18 accepts `Engine` from `anda_engine` 0.18.
+  `anda_web3_client` 0.19 implements that engine's `Web3ClientFeatures` trait.
+
 ## [anda_core 0.17.2, anda_engine 0.17.5, anda_engine_server 0.17.1, anda_web3_client 0.18.0, anda_cli 0.17.1] — 2026-11-18
 
 ### Changed — workspace
