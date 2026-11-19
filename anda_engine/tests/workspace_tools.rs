@@ -950,6 +950,45 @@ async fn foreground_wait_completes_commands_and_hooks_only_see_background_ones()
     let ctx = context();
     let events = Arc::new(Events::default());
     ctx.set_state(ShellToolHook::new(events.clone()));
+    // Suspend the starting call after registration. Its wait expires while the
+    // supervisor is running, but it only gets to read the status after exit.
+    let command = runtime.execute_session(
+        ctx.clone(),
+        CommandArgs {
+            command: "sleep 0.1; exit 7".into(),
+            yield_time_ms: Some(10),
+            ..Default::default()
+        },
+        Default::default(),
+    );
+    tokio::pin!(command);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let sessions = runtime
+                .interact_session(
+                    ctx.clone(),
+                    SessionArgs {
+                        action: SessionAction::List,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap()
+                .sessions;
+            match sessions.first() {
+                None => assert!(futures::poll!(&mut command).is_pending()),
+                Some(session) if session.state == CommandState::Exited => break,
+                Some(_) => (),
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(command.await.unwrap().exit_code, Some(7));
+    assert_eq!(events.start.load(Ordering::SeqCst), 0);
+    assert_eq!(events.end.load(Ordering::SeqCst), 0);
+
     // Early output must not end the foreground wait before the process exits.
     let output = runtime
         .execute_session(

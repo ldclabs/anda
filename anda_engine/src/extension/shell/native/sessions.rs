@@ -81,6 +81,7 @@ struct Entry {
     input: TokioMutex<Option<Input>>,
     interaction: TokioMutex<(usize, usize)>,
     changed: Notify,
+    running_reply: Notify,
     log: Arc<TokioMutex<Log>>,
 }
 
@@ -277,6 +278,7 @@ impl NativeRuntime {
             input: TokioMutex::new(input),
             interaction: TokioMutex::new((0, 0)),
             changed: Notify::new(),
+            running_reply: Notify::new(),
             log,
         });
         reservation.insert(entry.clone());
@@ -299,8 +301,6 @@ impl NativeRuntime {
         } else {
             args.yield_time_ms.unwrap_or(10_000).min(30_000)
         };
-        // Shared by the foreground wait and the supervisor: like the legacy shell,
-        // hooks only see commands still running once this wait has elapsed.
         let foreground_deadline = tokio::time::Instant::now() + Duration::from_millis(wait);
         let output_budget = budget(args.max_output_bytes, limits);
         let cancellation = ctx.cancellation_token();
@@ -323,9 +323,7 @@ impl NativeRuntime {
             let status = loop {
                 tokio::select! {
                     biased;
-                    // First, so a command the foreground reported as running always
-                    // pairs this start with the end event below.
-                    _ = tokio::time::sleep_until(foreground_deadline), if !backgrounded => {
+                    _ = task.running_reply.notified(), if !backgrounded => {
                         backgrounded = true;
                         interval.reset();
                         let handle = BackgroundHandle::new(&task.id, task.token.clone());
@@ -403,11 +401,10 @@ impl NativeRuntime {
             guard.disarm();
             if !backgrounded {
                 if !reported_running {
-                    // The foreground call already returned this result to the caller.
+                    // The terminal status is available to the starting call.
                     return;
                 }
-                // The process exited before this task first ran, yet the foreground
-                // reported it running: its caller still needs the start and end events.
+                // The caller selected Running while the supervisor was finishing.
                 let handle = BackgroundHandle::new(&task.id, task.token.clone());
                 let _ = tokio::time::timeout(Duration::from_secs(2), start(handle)).await;
             }
@@ -450,6 +447,7 @@ impl NativeRuntime {
             let mut status = entry.status.lock();
             if status.state == CommandState::Running {
                 status.reported_running = true;
+                entry.running_reply.notify_one();
             }
             status.clone()
         };
