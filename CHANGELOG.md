@@ -4,6 +4,17 @@ All notable changes to the Anda project will be documented in this file.
 
 ## [Unreleased]
 
+## [anda_engine 0.18.1] — 2026-11-20
+
+- Hosts can install a `RequestToolCatalog` to expose a provider for one
+  request, filter tool and agent definitions during discovery and direct
+  lookup, and enforce execution policy on calls.
+- Tools can use `CallableDispatch` to make nested calls with the same
+  allowlist, discovery state, and resource pool as the current runner round.
+- Hosts can pass an approved `McpToolRoute` and a cancellation token to
+  `McpToolProvider::call_route_with_cancellation`. Before dispatch, the
+  provider verifies the tool name, original registration, and tool definition.
+
 ## [anda_core 0.17.3, anda_engine 0.18.0, anda_engine_server 0.18.0, anda_web3_client 0.19.0, anda_cli 0.17.2] — 2026-11-19
 
 - Use Jiff for resource timestamps, UTC and local time formatting, and HTTP
