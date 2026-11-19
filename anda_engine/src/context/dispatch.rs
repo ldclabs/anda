@@ -397,6 +397,16 @@ mod tests {
         assert_eq!(definitions.len(), 1);
         assert_eq!(definitions[0].name, "scoped_read");
         assert!(ctx.tool_definitions(Some(&[])).is_empty());
+        assert!(
+            ctx.tool_definitions(None)
+                .iter()
+                .all(|def| !def.name.eq_ignore_ascii_case("scoped_hidden"))
+        );
+        assert!(
+            ctx.agent_definitions(None)
+                .iter()
+                .all(|def| !def.name.eq_ignore_ascii_case("echo_agent"))
+        );
         let groups = ctx.tool_groups();
         let group = groups.iter().find(|group| group.id == "scope").unwrap();
         assert_eq!(group.members, ["scoped_read", "scoped_wait"]);

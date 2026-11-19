@@ -401,6 +401,9 @@ impl AgentContext for AgentCtx {
                 definitions.push(definition);
             }
         }
+        if let Some(catalog) = self.base.get_state::<RequestToolCatalog>() {
+            definitions.retain(|d| catalog.is_visible(&self.base, &d.name));
+        }
         definitions
     }
 
@@ -458,6 +461,9 @@ impl AgentContext for AgentCtx {
                 .into_iter()
                 .map(|d| d.name_with_prefix(SUB_AGENT_PREFIX)),
         );
+        if let Some(catalog) = self.base.get_state::<RequestToolCatalog>() {
+            defs.retain(|d| catalog.is_visible(&self.base, &d.name));
+        }
         defs
     }
 
@@ -503,9 +509,6 @@ impl AgentContext for AgentCtx {
 
         extend_unique(self.tool_definitions(names), &mut definitions);
         extend_unique(self.agent_definitions(names), &mut definitions);
-        if let Some(catalog) = self.base.get_state::<RequestToolCatalog>() {
-            definitions.retain(|d| catalog.is_visible(&self.base, &d.name));
-        }
 
         definitions
     }
