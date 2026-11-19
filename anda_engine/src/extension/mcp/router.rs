@@ -275,7 +275,7 @@ pub struct McpToolRoute {
     pub definition: FunctionDefinition,
     /// Original MCP definition, including untrusted annotations and output schema.
     pub tool: rmcp::model::Tool,
-    /// Registration identity; changes when a server is removed and registered again.
+    /// Process-wide registration identity; changes when a server is registered again.
     pub server_generation: u64,
     /// Catalog revision from which this route was published.
     pub catalog_revision: u64,

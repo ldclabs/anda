@@ -29,10 +29,12 @@ pub(super) struct Registration {
 }
 
 impl Registration {
-    pub fn new(config: McpServerConfig, generation: u64) -> Self {
+    pub fn new(config: McpServerConfig) -> Self {
+        // Reviewed routes can outlive a provider instance.
+        static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
         Self {
             config,
-            generation,
+            generation: NEXT_GENERATION.fetch_add(1, Ordering::Relaxed),
             connect: Mutex::new(()),
             refresh: Arc::new(Mutex::new(())),
             catalog: RwLock::new(()),

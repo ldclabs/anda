@@ -58,7 +58,8 @@ pub struct BaseCtx {
     pub(crate) caller: Principal,
     pub(crate) path: Path,
     pub(crate) cancellation_token: CancellationToken,
-    pub(crate) start_at: Instant,
+    // The shared start instant also identifies the request across child contexts.
+    start_at: Arc<Instant>,
     pub(crate) depth: u8,
     pub(crate) web3: Arc<Web3SDK>,
     pub(crate) state: Arc<RwLock<Extensions>>,
@@ -98,7 +99,7 @@ impl BaseCtx {
             caller,
             path: Path::default(),
             cancellation_token,
-            start_at: Instant::now(),
+            start_at: Arc::new(Instant::now()),
             cache: Arc::new(CacheService::new(CACHE_MAX_CAPACITY)),
             store,
             web3,
@@ -115,7 +116,13 @@ impl BaseCtx {
     /// * `agent` - Agent namespace that owns the child context.
     /// * `path` - New path for the child context.
     pub(crate) fn child(&self, agent: String, path: String) -> Result<Self, BoxError> {
-        self.scoped_child(self.caller, agent, path, self.meta.clone(), self.start_at)
+        self.scoped_child(
+            self.caller,
+            agent,
+            path,
+            self.meta.clone(),
+            self.start_at.clone(),
+        )
     }
 
     /// Creates a child context with additional user and caller information.
@@ -138,7 +145,7 @@ impl BaseCtx {
         path: String,
         meta: RequestMeta,
     ) -> Result<Self, BoxError> {
-        self.scoped_child(caller, agent, path, meta, Instant::now())
+        self.scoped_child(caller, agent, path, meta, Arc::new(Instant::now()))
     }
 
     fn scoped_child(
@@ -147,7 +154,7 @@ impl BaseCtx {
         agent: String,
         mut path: String,
         meta: RequestMeta,
-        start_at: Instant,
+        start_at: Arc<Instant>,
     ) -> Result<Self, BoxError> {
         path.make_ascii_lowercase();
         let path = Path::parse(path)?;
@@ -190,6 +197,10 @@ impl BaseCtx {
         let mut child = self.with_caller(self.caller);
         child.cancellation_token = self.cancellation_token.child_token();
         child
+    }
+
+    pub(super) fn shares_request(&self, other: &Self) -> bool {
+        self.caller == other.caller && Arc::ptr_eq(&self.start_at, &other.start_at)
     }
 
     /// Returns a cloned typed value from this context's extension state.

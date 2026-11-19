@@ -27,7 +27,7 @@ use anda_core::{
     CacheFeatures, CacheStoreFeatures, CancellationToken, CompletionFeatures, CompletionRequest,
     FunctionDefinition, HttpFeatures, Json, KeysFeatures, ObjectMeta, Path, PutMode, PutResult,
     RequestMeta, Resource, StateFeatures, StoreFeatures, ToolGroup, ToolInput, ToolOutput,
-    ToolProviderSet, ToolSet,
+    ToolProvider, ToolProviderSet, ToolSet,
 };
 use candid::Principal;
 use serde::{Serialize, de::DeserializeOwned};
@@ -40,6 +40,7 @@ use std::{
 
 use super::{
     base::BaseCtx,
+    dispatch::RequestToolCatalog,
     runner::{CompletionRunner, CompletionStream},
 };
 use crate::{
@@ -236,19 +237,52 @@ impl AgentCtx {
         }
     }
 
-    fn request_provider(&self) -> Option<Arc<dyn anda_core::ToolProvider<BaseCtx>>> {
+    fn request_provider(&self) -> Option<Arc<dyn ToolProvider<BaseCtx>>> {
         self.base
-            .get_state::<super::RequestToolCatalog>()?
+            .get_state::<RequestToolCatalog>()?
             .0
             .provider(&self.base)
     }
 
-    pub(crate) fn has_tool_lowercase(&self, lowercase_name: &str) -> bool {
+    fn has_registered_tool_lowercase(&self, lowercase_name: &str) -> bool {
         self.tools.contains_lowercase(lowercase_name)
             || self.tool_providers.contains_lowercase(lowercase_name)
+    }
+
+    pub(crate) fn has_tool_lowercase(&self, lowercase_name: &str) -> bool {
+        self.has_registered_tool_lowercase(lowercase_name)
             || self
                 .request_provider()
                 .is_some_and(|p| p.contains_lowercase(lowercase_name))
+    }
+
+    pub(super) fn scoped_tool_definitions(
+        &self,
+        names: Option<&[String]>,
+    ) -> Vec<FunctionDefinition> {
+        if matches!(names, Some([])) {
+            return Vec::new();
+        }
+        let Some(provider) = self.request_provider() else {
+            return Vec::new();
+        };
+        let selected = names.map(|names| {
+            let mut names: Vec<_> = names.iter().map(|name| name.to_ascii_lowercase()).collect();
+            names.sort_unstable();
+            names.dedup();
+            names
+        });
+        let mut definitions = provider.definitions(selected.as_deref());
+        let mut seen = BTreeSet::new();
+        definitions.retain_mut(|def| {
+            def.name.make_ascii_lowercase();
+            selected
+                .as_ref()
+                .is_none_or(|names| names.binary_search(&def.name).is_ok())
+                && !self.has_registered_tool_lowercase(&def.name)
+                && seen.insert(def.name.clone())
+        });
+        definitions
     }
 
     /// Returns the capability groups exposed to discovery.
@@ -272,16 +306,6 @@ impl AgentCtx {
             merge_visible_group(&mut groups, group, &static_names);
         }
 
-        let agent_names: BTreeMap<String, String> = self
-            .agents
-            .iter()
-            .filter(|(name, _)| visible_names.insert(name.to_string()))
-            .map(|(name, agent)| (name.to_string(), agent.name()))
-            .collect();
-        for group in self.agents.groups() {
-            merge_visible_group(&mut groups, group, &agent_names);
-        }
-
         let scoped = self.request_provider();
         for provider in self
             .tool_providers
@@ -293,7 +317,7 @@ impl AgentCtx {
             for definition in provider.definitions(None) {
                 let lowercase = definition.name.to_ascii_lowercase();
                 if visible_names.insert(lowercase.clone()) {
-                    provider_names.insert(lowercase, definition.name);
+                    provider_names.insert(lowercase.clone(), lowercase);
                 }
             }
 
@@ -302,12 +326,22 @@ impl AgentCtx {
             }
         }
 
-        let policy = self.base.get_state::<super::RequestToolCatalog>();
+        let agent_names: BTreeMap<String, String> = self
+            .agents
+            .iter()
+            .filter(|(name, _)| visible_names.insert(name.to_string()))
+            .map(|(name, agent)| (name.to_string(), agent.name()))
+            .collect();
+        for group in self.agents.groups() {
+            merge_visible_group(&mut groups, group, &agent_names);
+        }
+
+        let policy = self.base.get_state::<RequestToolCatalog>();
         groups
             .into_values()
             .filter_map(|mut g| {
                 if let Some(policy) = &policy {
-                    g.members.retain(|n| policy.0.visible(&self.base, n));
+                    g.members.retain(|n| policy.is_visible(&self.base, n));
                 }
                 (!g.members.is_empty()).then_some(g)
             })
@@ -357,11 +391,12 @@ impl AgentContext for AgentCtx {
         let mut definitions = self.tools.definitions(names);
         let mut seen: BTreeSet<String> =
             BTreeSet::from_iter(definitions.iter().map(|d| d.name.to_ascii_lowercase()));
-        for definition in self.tool_providers.definitions(names).into_iter().chain(
-            self.request_provider()
-                .into_iter()
-                .flat_map(|p| p.definitions(names)),
-        ) {
+        for definition in self
+            .tool_providers
+            .definitions(names)
+            .into_iter()
+            .chain(self.scoped_tool_definitions(names))
+        {
             if seen.insert(definition.name.to_ascii_lowercase()) {
                 definitions.push(definition);
             }
@@ -375,20 +410,21 @@ impl AgentContext for AgentCtx {
         prefixed_name: &str,
         resources: &mut Vec<Resource>,
     ) -> Vec<Resource> {
+        if resources.is_empty() {
+            return Vec::new();
+        }
         if self.tools.contains(prefixed_name) {
             return self.tools.select_resources(prefixed_name, resources);
         }
 
-        if !self
-            .tool_providers
-            .contains_lowercase(&prefixed_name.to_ascii_lowercase())
+        let name = prefixed_name.to_ascii_lowercase();
+        if !self.tool_providers.contains_lowercase(&name)
             && let Some(provider) = self.request_provider()
-            && provider.contains_lowercase(&prefixed_name.to_ascii_lowercase())
+            && provider.contains_lowercase(&name)
         {
-            return provider.select_resources(prefixed_name, resources);
+            return provider.select_resources(&name, resources);
         }
-        self.tool_providers
-            .select_resources(prefixed_name, resources)
+        self.tool_providers.select_resources(&name, resources)
     }
 
     /// Retrieves definitions for available agents.
@@ -467,8 +503,8 @@ impl AgentContext for AgentCtx {
 
         extend_unique(self.tool_definitions(names), &mut definitions);
         extend_unique(self.agent_definitions(names), &mut definitions);
-        if let Some(catalog) = self.base.get_state::<super::RequestToolCatalog>() {
-            definitions.retain(|d| catalog.0.visible(&self.base, &d.name));
+        if let Some(catalog) = self.base.get_state::<RequestToolCatalog>() {
+            definitions.retain(|d| catalog.is_visible(&self.base, &d.name));
         }
 
         definitions
@@ -482,17 +518,19 @@ impl AgentContext for AgentCtx {
     ///
     /// # Returns
     /// Tuple containing the result string and a boolean indicating if further processing is needed
-    async fn tool_call(&self, input: ToolInput<Json>) -> Result<ToolOutput<Json>, BoxError> {
+    async fn tool_call(&self, mut input: ToolInput<Json>) -> Result<ToolOutput<Json>, BoxError> {
+        input.name.make_ascii_lowercase();
+        if !RequestToolCatalog::permits_execution(&self.base, &input.name) {
+            return Err(format!("tool {} is not permitted for this agent", input.name).into());
+        }
         let ctx = self.child_base(&input.name)?;
-        if let Some(tool) = self.tools.get(&input.name) {
+        if let Some(tool) = self.tools.get_lowercase(&input.name) {
             return tool.call(ctx, input.args, input.resources).await;
         }
 
-        if !self
-            .tool_providers
-            .contains_lowercase(&input.name.to_ascii_lowercase())
+        if !self.tool_providers.contains_lowercase(&input.name)
             && let Some(provider) = self.request_provider()
-            && provider.contains_lowercase(&input.name.to_ascii_lowercase())
+            && provider.contains_lowercase(&input.name)
         {
             return provider.call(ctx, input).await;
         }
@@ -512,6 +550,9 @@ impl AgentContext for AgentCtx {
     ) -> impl Future<Output = Result<AgentOutput, BoxError>> + Send {
         let ctx = self;
         Box::pin(async move {
+            if !RequestToolCatalog::permits_execution(&ctx.base, &input.name) {
+                return Err(format!("agent {} is not permitted for this agent", input.name).into());
+            }
             // Prefixed names route to subagents first; on a miss they fall
             // through to the local agent lookup so that local agents whose
             // names happen to start with the routing prefix stay reachable.

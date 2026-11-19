@@ -125,7 +125,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
@@ -1192,13 +1192,16 @@ impl McpToolProvider {
     }
 
     /// Executes the exact route reviewed by the host, including its registration
-    /// generation and definition. Revalidates the route before invoking the server.
+    /// generation and definition. The input name must match the route from this provider.
     pub async fn call_route_with_cancellation(
         &self,
         route: McpToolRoute,
         input: ToolInput<Json>,
         cancellation: CancellationToken,
     ) -> Result<ToolOutput<Json>, BoxError> {
+        if !route.name.eq_ignore_ascii_case(&input.name) {
+            return Err("MCP tool input does not match the reviewed route".into());
+        }
         let config = self.server_config(&route.server_id)?;
         if route.server_generation != config.generation {
             return Err("MCP server registration changed; select the tool again".into());
@@ -1313,8 +1316,7 @@ impl McpToolProvider {
             .into());
         }
 
-        let generation = self.inner.next_generation.fetch_add(1, Ordering::SeqCst);
-        let registration = Arc::new(Registration::new(server, generation));
+        let registration = Arc::new(Registration::new(server));
         servers.insert(server_id, registration.clone());
         Ok(registration)
     }
@@ -1506,13 +1508,8 @@ impl McpToolProviderBuilder {
                 )
                 .into());
             }
-            servers.insert(
-                server.id.clone(),
-                Arc::new(Registration::new(server, servers.len() as u64 + 1)),
-            );
+            servers.insert(server.id.clone(), Arc::new(Registration::new(server)));
         }
-
-        let next_generation = AtomicU64::new(servers.len() as u64 + 1);
 
         let credential_store = self
             .credential_store
@@ -1523,7 +1520,6 @@ impl McpToolProviderBuilder {
                 name,
                 tool_prefix,
                 servers: RwLock::new(servers),
-                next_generation,
                 index: RwLock::new(McpToolIndex::default()),
                 credential_store,
                 elicitation_handler: self.elicitation_handler,
@@ -1548,7 +1544,6 @@ struct McpToolProviderInner {
     name: String,
     tool_prefix: String,
     servers: RwLock<BTreeMap<String, Arc<Registration>>>,
-    next_generation: AtomicU64,
     index: RwLock<McpToolIndex>,
     /// Application-supplied persistence for OAuth credentials, keyed by server.
     credential_store: Arc<dyn McpCredentialStore>,
@@ -2837,6 +2832,46 @@ done
         assert_eq!(output.is_error, Some(false));
 
         let _ = std::fs::remove_file(script_path);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reviewed_routes_require_the_original_registration_and_input_name() {
+        let script = write_fake_server("reviewed_route", DISCOVER_SERVER);
+        let server = McpServerConfig::stdio("test", script.to_string_lossy().to_string());
+        let first = McpToolProvider::new(vec![server.clone()]).unwrap();
+        first.refresh().await.unwrap();
+        let second = McpToolProvider::new(Vec::new()).unwrap();
+        second.add_server(server).await.unwrap();
+        let route = first.routes().remove(0);
+
+        let mismatch = first
+            .call_route_with_cancellation(
+                route.clone(),
+                ToolInput::new("other_tool".into(), json!({})),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            mismatch
+                .to_string()
+                .contains("does not match the reviewed route")
+        );
+
+        let input = ToolInput::new(route.name.clone(), json!({}));
+        let foreign = second
+            .call_route_with_cancellation(route.clone(), input.clone(), CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(foreign.to_string().contains("registration changed"));
+        let output = first
+            .call_route_with_cancellation(route, input, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(output.is_error, Some(false));
+
+        let _ = std::fs::remove_file(script);
     }
 
     #[cfg(unix)]

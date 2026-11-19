@@ -22,6 +22,10 @@ pub const TOOLS_SELECT_NAME: &str = "tools_select";
 /// Built-in name for listing capability groups (the group directory).
 pub const TOOLS_GROUPS_NAME: &str = "tools_groups";
 
+pub(super) fn observes_discovery(name: &str) -> bool {
+    name.eq_ignore_ascii_case(TOOLS_SELECT_NAME) || name.eq_ignore_ascii_case(TOOLS_SEARCH_NAME)
+}
+
 /// Arguments for [`ToolsSearch`].
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ToolsSearchArgs {
@@ -127,7 +131,7 @@ fn discovery_view(ctx: &AgentCtx, selected: &ToolsOutput) -> Result<Json, BoxErr
 pub struct DiscoveredTools {
     definitions: BTreeMap<String, FunctionDefinition>,
     known_names: BTreeSet<String>,
-    scoped_revisions: BTreeMap<String, String>,
+    scoped_revisions: BTreeMap<String, Option<String>>,
     selection_counts: BTreeMap<String, usize>,
     merge: Option<bool>,
 }
@@ -162,9 +166,16 @@ impl DiscoveredTools {
     /// are ignored. In probe mode (`None`), a repeated `tools_select` of the
     /// same name flips the policy to `Some(true)`.
     pub fn observe_output(&mut self, tool_name: &str, output: &Json) {
-        if !tool_name.eq_ignore_ascii_case(TOOLS_SELECT_NAME)
-            && !tool_name.eq_ignore_ascii_case(TOOLS_SEARCH_NAME)
-        {
+        self.observe_scoped(tool_name, output, &BTreeMap::new());
+    }
+
+    pub(super) fn observe_scoped(
+        &mut self,
+        tool_name: &str,
+        output: &Json,
+        scoped_revisions: &BTreeMap<String, Option<String>>,
+    ) {
+        if !observes_discovery(tool_name) {
             return;
         }
 
@@ -199,6 +210,11 @@ impl DiscoveredTools {
             // The model saw this schema in the discovery output, so it stays callable even
             // when the accumulated request-merge budget below cannot retain it.
             self.known_names.insert(key.clone());
+            if let Some(revision) = scoped_revisions.get(&key) {
+                self.scoped_revisions.insert(key.clone(), revision.clone());
+            } else {
+                self.scoped_revisions.remove(&key);
+            }
             if count_selection {
                 let count = self
                     .selection_counts
@@ -234,36 +250,18 @@ impl DiscoveredTools {
         }
     }
 
-    pub(super) fn observe_scoped(&mut self, ctx: &super::BaseCtx, name: &str, output: &Json) {
-        self.observe_output(name, output);
-        if !(name.eq_ignore_ascii_case(TOOLS_SELECT_NAME)
-            || name.eq_ignore_ascii_case(TOOLS_SEARCH_NAME))
-        {
-            return;
-        }
-        if let Some(catalog) = ctx.get_state::<super::RequestToolCatalog>() {
-            for item in output["tools"].as_array().into_iter().flatten() {
-                if let Some(name) = item["name"].as_str()
-                    && self.known_names.contains(name)
-                    && let Some(version) = catalog.0.revision(ctx, name)
-                {
-                    self.scoped_revisions.insert(name.to_owned(), version);
-                }
-            }
-        }
-    }
-
     pub(super) fn refresh_scoped(&mut self, ctx: &super::BaseCtx) {
         if self.scoped_revisions.is_empty() {
             return;
         }
         let catalog = ctx.get_state::<super::RequestToolCatalog>();
+        let provider = catalog.as_ref().and_then(|c| c.0.provider(ctx));
         self.scoped_revisions.retain(|name, revision| {
-            if catalog
-                .as_ref()
-                .and_then(|c| c.0.revision(ctx, name))
-                .as_ref()
-                == Some(revision)
+            if let Some(catalog) = &catalog
+                && catalog.0.revision(ctx, name) == *revision
+                && provider
+                    .as_ref()
+                    .is_some_and(|p| p.contains_lowercase(name))
             {
                 return true;
             }

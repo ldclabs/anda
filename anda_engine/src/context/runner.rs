@@ -16,18 +16,21 @@ use anda_core::{
 use futures_util::Stream;
 use serde_json::json;
 use std::{
-    collections::{BTreeSet, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
 };
+use tokio::sync::Mutex;
 
 use super::compaction::{
     self, COMPACT_CONTEXT_TOOL, COMPACTION_CONTINUE_PROMPT, CompactContextArgs, CompactionState,
     SelfCompaction, TurnInput,
 };
+use super::dispatch::{RequestToolCatalog, callable_allowed};
 use super::tool::DiscoveredTools;
-use crate::context::{AgentCtx, CallableDispatch, strip_routing_prefix};
-use crate::{model::Model, rfc3339_datetime, unix_ms};
+use crate::context::{AgentCtx, CallableDispatch};
+use crate::{extension::note::NoteTool, model::Model, rfc3339_datetime, unix_ms};
 
 pub static COMPACTION_PROMPT: &str = r#"
 Compress the current conversation into a concise continuation handoff. This is not a final answer to the user. Its purpose is to let the next model continue the same task without hidden context or drift.
@@ -52,7 +55,7 @@ pub struct CompletionRunner {
     ctx: AgentCtx,
     req: CompletionRequest,
     model: Model,
-    resources: Vec<Resource>,
+    resources: Arc<Mutex<Vec<Resource>>>,
     chat_history: Vec<Message>,
     /// Conversation the caller seeded `req.chat_history` with, kept verbatim.
     ///
@@ -78,6 +81,8 @@ pub struct CompletionRunner {
     last_output: Option<AgentOutput>,
     discovered: DiscoveredTools,
     allowed_callables: Option<BTreeSet<String>>,
+    // Explicit offers sourced from the request provider, including ones since removed.
+    scoped_offers: BTreeSet<String>,
     done: bool,
     unbound: bool,
     /// Keeps inline attachment bytes out of the accumulated history; see
@@ -102,12 +107,12 @@ impl CompletionRunner {
         model: Model,
         resources: Vec<Resource>,
     ) -> Self {
-        Self {
+        let mut runner = Self {
             ctx,
             history_prefix: req.chat_history.clone(),
             req,
             model,
-            resources,
+            resources: Arc::new(Mutex::new(resources)),
             chat_history: Vec::new(),
             tool_calls: Vec::new(),
             total_usage: Usage::default(),
@@ -124,13 +129,16 @@ impl CompletionRunner {
             last_output: None,
             discovered: DiscoveredTools::default(),
             allowed_callables: None,
+            scoped_offers: BTreeSet::new(),
             done: false,
             unbound: false,
             transient_inline_data: false,
             self_compaction: None,
             history_tools: None,
             turns: 0,
-        }
+        };
+        runner.track_scoped_offers();
+        runner
     }
 
     // Every real inference (including handoff) goes through the same admission/accounting point.
@@ -326,6 +334,7 @@ impl CompletionRunner {
                 self.req.tools.push(tool);
             }
         }
+        self.track_scoped_offers();
     }
 
     /// Sets the discovered-tool merge policy.
@@ -420,18 +429,11 @@ impl CompletionRunner {
     /// filters on — so the prefix is stripped before matching. Both spellings are accepted,
     /// since a caller may reasonably whitelist either.
     fn is_callable_allowed(&self, name_lowercase: &str) -> bool {
-        match &self.allowed_callables {
-            None => true,
-            Some(allowed) => {
-                if allowed.contains(name_lowercase) || self.discovered.contains(name_lowercase) {
-                    return true;
-                }
-
-                strip_routing_prefix(name_lowercase).is_some_and(|unprefixed| {
-                    allowed.contains(unprefixed) || self.discovered.contains(unprefixed)
-                })
-            }
-        }
+        callable_allowed(
+            self.allowed_callables.as_ref(),
+            &self.discovered,
+            name_lowercase,
+        )
     }
 
     /// Queue a steering message to interrupt the agent mid-run.
@@ -624,6 +626,29 @@ impl CompletionRunner {
     pub fn set_tools(&mut self, tools: Vec<FunctionDefinition>) {
         self.req.tools = tools;
         self.discovered.reset_definitions();
+        self.scoped_offers.clear();
+        self.track_scoped_offers();
+    }
+
+    fn scoped_offer_definitions(&self) -> BTreeMap<String, FunctionDefinition> {
+        let names: Vec<_> = self
+            .req
+            .tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect();
+        self.ctx
+            .scoped_tool_definitions(Some(&names))
+            .into_iter()
+            .map(|tool| (tool.name.clone(), tool))
+            .collect()
+    }
+
+    fn track_scoped_offers(&mut self) {
+        if self.ctx.base.get_state::<RequestToolCatalog>().is_some() {
+            self.scoped_offers
+                .extend(self.scoped_offer_definitions().into_keys());
+        }
     }
 
     /// Accumulate usage from an intermediate step into the runner's total usage.
@@ -997,11 +1022,13 @@ impl CompletionRunner {
         let mut runner = self
             .ctx
             .clone()
-            .completion_iter(req, std::mem::take(&mut self.resources))
+            .completion_iter(req, Vec::new())
             .reserve_chat_history(restored_history);
         runner.set_unbound(self.unbound);
         runner.transient_inline_data = self.transient_inline_data;
         // `self` is finalized above, so its remaining state moves into the replacement runner.
+        runner.resources = std::mem::take(&mut self.resources);
+        runner.scoped_offers.append(&mut self.scoped_offers);
         runner.discovered = std::mem::take(&mut self.discovered);
         runner.follow_up_message = std::mem::take(&mut self.follow_up_message);
         runner.steering_message = std::mem::take(&mut self.steering_message);
@@ -1129,9 +1156,9 @@ impl CompletionRunner {
             self.ctx.clone(),
             self.allowed_callables.clone(),
             self.discovered.clone(),
-            std::mem::take(&mut self.resources),
+            self.resources.clone(),
         );
-        let base = self.ctx.base.clone();
+        let round_guard = dispatch.cancellation.clone().drop_guard();
         for tool in tool_calls {
             let tool_name = tool.name.to_ascii_lowercase();
 
@@ -1148,33 +1175,24 @@ impl CompletionRunner {
                 continue;
             }
 
-            // Enforce the execution-time allowlist before dispatching. The model
-            // can emit any name (including one injected via untrusted tool
-            // output); without this check the runner would route it to any
-            // registered callable, bypassing a subagent's tool whitelist.
-            if !self.is_callable_allowed(&tool_name) {
-                let output = tool_error(format!(
-                    "tool {} is not permitted for this agent",
-                    tool.name
-                ));
-                tool_call_futs.push(Box::pin(async move { (tool, output) }));
-                continue;
-            }
-
             let mut call = dispatch.clone();
             call.call_id = tool.call_id.clone();
-            let base = base.clone();
+            let prepared = call
+                .prepare_call(&self.ctx.base, tool.name.clone(), tool.args.clone())
+                .await;
             tool_call_futs.push(Box::pin(async move {
-                let output = call
-                    .call(&base, tool.name.clone(), tool.args.clone())
-                    .await
-                    .unwrap_or_else(|err| tool_error(err.to_string()));
+                let output = match prepared {
+                    Ok(run) => run.await,
+                    Err(err) => Err(err),
+                }
+                .unwrap_or_else(|err| tool_error(err.to_string()));
                 (tool, output)
             }));
         }
 
         let results = futures::future::join_all(tool_call_futs).await;
-        (self.resources, self.discovered) = dispatch.finish().await;
+        drop(round_guard);
+        self.discovered = dispatch.take_discovered();
         for (mut tool, mut res) in results {
             let mut usage = res.usage.clone();
             // usage.requests originally counts internal calls; reset it to 1 so it
@@ -1262,7 +1280,11 @@ impl CompletionRunner {
         let generated = self.generated_history();
         let mut history = Vec::with_capacity(self.history_prefix.len() + generated.len() + 1);
         history.extend_from_slice(&self.history_prefix);
-        history.extend(self.note_context.iter().cloned());
+        if let Some(note) = &self.note_context
+            && self.catalog_permits_note_context()
+        {
+            history.push(note.clone());
+        }
         history.extend_from_slice(generated);
         history
     }
@@ -1291,9 +1313,18 @@ impl CompletionRunner {
         self.req.role = None;
     }
 
+    fn catalog_permits_note_context(&self) -> bool {
+        let base = &self.ctx.base;
+        base.get_state::<RequestToolCatalog>()
+            .is_none_or(|catalog| {
+                catalog.is_visible(base, NoteTool::NAME)
+                    && catalog.0.executable(base, NoteTool::NAME)
+            })
+    }
+
     /// Loads the note index into the request once per runner, ahead of its first user turn.
     async fn load_note_context(&mut self) -> Result<(), BoxError> {
-        use crate::extension::note::{NoteContextConfig, NoteTool, load_note_summary};
+        use crate::extension::note::{NoteContextConfig, load_note_summary};
 
         if self.note_context_loaded {
             return Ok(());
@@ -1307,6 +1338,7 @@ impl CompletionRunner {
                 .iter()
                 .any(|tool| tool.name.eq_ignore_ascii_case(NoteTool::NAME))
             && self.is_callable_allowed(NoteTool::NAME)
+            && self.catalog_permits_note_context()
             && let Some(config) = self.ctx.base.get_state::<NoteContextConfig>()
             && let Some(text) = load_note_summary(&self.ctx, &config).await?
         {
@@ -1323,6 +1355,34 @@ impl CompletionRunner {
         }
         self.note_context_loaded = true;
         Ok(())
+    }
+
+    fn prepare_request_tools(&mut self, req: &mut CompletionRequest) {
+        let base = &self.ctx.base;
+        let catalog = base.get_state::<RequestToolCatalog>();
+        if let Some(catalog) = &catalog {
+            let current = self.scoped_offer_definitions();
+            self.scoped_offers.extend(current.keys().cloned());
+            req.tools.retain_mut(|definition| {
+                let name = definition.name.to_ascii_lowercase();
+                if !self.scoped_offers.contains(&name) {
+                    return true;
+                }
+                let Some(current) = current.get(&name) else {
+                    return false;
+                };
+                if catalog.0.revision(base, &name).is_some() {
+                    definition.clone_from(current);
+                }
+                true
+            });
+        }
+
+        self.discovered.refresh_scoped(base);
+        self.merge_discovered_tools_into_request(req);
+        if let Some(catalog) = catalog {
+            req.tools.retain(|def| catalog.is_visible(base, &def.name));
+        }
     }
 
     async fn inner_next(&mut self) -> Result<Option<AgentOutput>, BoxError> {
@@ -1388,26 +1448,7 @@ impl CompletionRunner {
             }
             req.chat_history.push(note);
         }
-        self.discovered.refresh_scoped(&self.ctx.base);
-        self.merge_discovered_tools_into_request(&mut req);
-        if let Some(catalog) = self.ctx.base.get_state::<super::RequestToolCatalog>() {
-            req.tools.retain_mut(|definition| {
-                let base = &self.ctx.base;
-                if !catalog.0.visible(base, &definition.name) {
-                    return false;
-                }
-                if catalog.0.revision(base, &definition.name).is_some() {
-                    let Some(current) = catalog.0.provider(base).and_then(|p| {
-                        p.definitions(Some(std::slice::from_ref(&definition.name)))
-                            .pop()
-                    }) else {
-                        return false;
-                    };
-                    *definition = current;
-                }
-                true
-            });
-        }
+        self.prepare_request_tools(&mut req);
         if let Some(state) = &self.self_compaction
             && !req
                 .tools
