@@ -10,9 +10,8 @@
 //! [`AgentCtx::completion_stream`](super::AgentCtx::completion_stream).
 
 use anda_core::{
-    AgentContext, AgentInput, AgentOutput, BoxError, BoxPinFut, CompletionRequest, ContentPart,
-    FunctionDefinition, Json, Message, ModelEffort, Resource, StateFeatures, ToolCall, ToolInput,
-    ToolOutput, Usage,
+    AgentOutput, BoxError, BoxPinFut, CompletionRequest, ContentPart, FunctionDefinition, Json,
+    Message, ModelEffort, Resource, StateFeatures, ToolCall, ToolOutput, Usage,
 };
 use futures_util::Stream;
 use serde_json::json;
@@ -27,9 +26,7 @@ use super::compaction::{
     SelfCompaction, TurnInput,
 };
 use super::tool::DiscoveredTools;
-use crate::context::{
-    AgentCtx, SUB_AGENT_PREFIX, strip_prefix_ignore_ascii_case, strip_routing_prefix,
-};
+use crate::context::{AgentCtx, CallableDispatch, strip_routing_prefix};
 use crate::{model::Model, rfc3339_datetime, unix_ms};
 
 pub static COMPACTION_PROMPT: &str = r#"
@@ -750,6 +747,7 @@ impl CompletionRunner {
         state.context_note(!user_turn, used, incoming, window)
     }
 
+    #[cfg(test)]
     fn add_discovered_tools_from_output(&mut self, tool_name: &str, output: &Json) {
         self.discovered.observe_output(tool_name, output);
     }
@@ -1127,6 +1125,13 @@ impl CompletionRunner {
 
         let mut tool_call_futs: Vec<BoxPinFut<(ToolCall, ToolOutput<Json>)>> =
             Vec::with_capacity(tool_calls.len());
+        let dispatch = CallableDispatch::new(
+            self.ctx.clone(),
+            self.allowed_callables.clone(),
+            self.discovered.clone(),
+            std::mem::take(&mut self.resources),
+        );
+        let base = self.ctx.base.clone();
         for tool in tool_calls {
             let tool_name = tool.name.to_ascii_lowercase();
 
@@ -1156,69 +1161,21 @@ impl CompletionRunner {
                 continue;
             }
 
-            if self.ctx.has_tool_lowercase(&tool_name) {
-                let ctx = self.ctx.clone();
-                let input = ToolInput {
-                    name: tool.name.clone(),
-                    args: tool.args.clone(),
-                    resources: self
-                        .ctx
-                        .select_tool_resources(&tool.name, &mut self.resources)
-                        .await,
-                    meta: None,
-                };
-                tool_call_futs.push(Box::pin(async move {
-                    let output = match ctx.tool_call(input).await {
-                        Ok(output) => output,
-                        // The tool call failed, but we must not abort the whole conversation:
-                        // surface the error so the LLM can try to correct it and continue.
-                        Err(err) => tool_error(format!("tool call failed: {err}")),
-                    };
-                    (tool, output)
-                }));
-            } else if self.ctx.agents.contains_lowercase(&tool_name)
-                || strip_prefix_ignore_ascii_case(&tool_name, SUB_AGENT_PREFIX).is_some()
-            {
-                // Subagents consume structured controls such as `session`, `model`, and
-                // `effort`, so preserve their full argument object. Plain string args and
-                // normal agents keep the historical prompt behavior.
-                let prompt = if let Some(args) = tool.args.as_str() {
-                    args.to_string()
-                } else if let Some(args) = tool.args.as_object()
-                    && args.len() == 1
-                    && let Some(prompt) = args.get("prompt").and_then(|v| v.as_str())
-                {
-                    prompt.to_string()
-                } else {
-                    serde_json::to_string(&tool.args).unwrap_or_else(|_| tool.args.to_string())
-                };
-
-                let ctx = self.ctx.clone();
-                let input = AgentInput {
-                    name: tool.name.clone(),
-                    prompt,
-                    resources: self
-                        .ctx
-                        .select_agent_resources(&tool.name, &mut self.resources)
-                        .await,
-                    ..Default::default()
-                };
-                tool_call_futs.push(Box::pin(async move {
-                    let output = match ctx.agent_run(input).await {
-                        Ok(output) => output.into_tool_output(),
-                        // The agent run failed, but we must not abort the whole conversation:
-                        // surface the error so the LLM can try to correct it and continue.
-                        Err(err) => tool_error(format!("agent run failed: {err}")),
-                    };
-                    (tool, output)
-                }));
-            } else {
-                let output = tool_error(format!("tool call failed: {} not found", tool.name));
-                tool_call_futs.push(Box::pin(async move { (tool, output) }));
-            }
+            let mut call = dispatch.clone();
+            call.call_id = tool.call_id.clone();
+            let base = base.clone();
+            tool_call_futs.push(Box::pin(async move {
+                let output = call
+                    .call(&base, tool.name.clone(), tool.args.clone())
+                    .await
+                    .unwrap_or_else(|err| tool_error(err.to_string()));
+                (tool, output)
+            }));
         }
 
-        for (mut tool, mut res) in futures::future::join_all(tool_call_futs).await {
+        let results = futures::future::join_all(tool_call_futs).await;
+        (self.resources, self.discovered) = dispatch.finish().await;
+        for (mut tool, mut res) in results {
             let mut usage = res.usage.clone();
             // usage.requests originally counts internal calls; reset it to 1 so it
             // represents this single model-triggered invocation, keeping per-tool call
@@ -1230,7 +1187,6 @@ impl CompletionRunner {
                 .accumulate(&usage);
             self.accumulate_tools_usage(&res.tools_usage);
             self.accumulate(&res.usage);
-            self.add_discovered_tools_from_output(&tool.name, &res.output);
             self.compact_discovery_tool_output_for_context(&tool.name, &mut res.output);
 
             // Every call needs an output, even a failed one.
@@ -1432,7 +1388,26 @@ impl CompletionRunner {
             }
             req.chat_history.push(note);
         }
+        self.discovered.refresh_scoped(&self.ctx.base);
         self.merge_discovered_tools_into_request(&mut req);
+        if let Some(catalog) = self.ctx.base.get_state::<super::RequestToolCatalog>() {
+            req.tools.retain_mut(|definition| {
+                let base = &self.ctx.base;
+                if !catalog.0.visible(base, &definition.name) {
+                    return false;
+                }
+                if catalog.0.revision(base, &definition.name).is_some() {
+                    let Some(current) = catalog.0.provider(base).and_then(|p| {
+                        p.definitions(Some(std::slice::from_ref(&definition.name)))
+                            .pop()
+                    }) else {
+                        return false;
+                    };
+                    *definition = current;
+                }
+                true
+            });
+        }
         if let Some(state) = &self.self_compaction
             && !req
                 .tools
@@ -1731,7 +1706,8 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
-    use super::{CompletionRunner, SUB_AGENT_PREFIX};
+    use super::CompletionRunner;
+    use crate::context::SUB_AGENT_PREFIX;
     use crate::context::base::BaseCtx;
     use crate::context::test_fixtures::*;
     use crate::{

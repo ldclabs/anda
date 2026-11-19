@@ -84,6 +84,32 @@ fn bounded_discovery(mut output: ToolsOutput) -> ToolsOutput {
     output
 }
 
+/// Encodes the public schema and optional language hints under one byte budget.
+fn discovery_view(ctx: &AgentCtx, selected: &ToolsOutput) -> Result<Json, BoxError> {
+    let mut output = serde_json::to_value(selected)?;
+    if let Some(catalog) = ctx.base.get_state::<super::RequestToolCatalog>() {
+        let mut remaining =
+            MAX_DISCOVERY_BYTES.saturating_sub(serde_json::to_vec(&output)?.len() + 32);
+        let mut interfaces = serde_json::Map::new();
+        for def in &selected.tools {
+            if def.parameters.as_object().is_some_and(|p| p.is_empty()) {
+                continue;
+            }
+            if let Some(hint) = catalog.0.interface(&ctx.base, def) {
+                let bytes = serde_json::to_vec(&hint)?.len() + def.name.len() + 5;
+                if bytes <= remaining {
+                    interfaces.insert(def.name.clone(), hint.into());
+                    remaining -= bytes;
+                }
+            }
+        }
+        if !interfaces.is_empty() {
+            output["python_interfaces"] = interfaces.into();
+        }
+    }
+    Ok(output)
+}
+
 /// Runner-side state and policy for tool discovery.
 ///
 /// Owns everything the completion runner must otherwise know about the
@@ -101,6 +127,7 @@ fn bounded_discovery(mut output: ToolsOutput) -> ToolsOutput {
 pub struct DiscoveredTools {
     definitions: BTreeMap<String, FunctionDefinition>,
     known_names: BTreeSet<String>,
+    scoped_revisions: BTreeMap<String, String>,
     selection_counts: BTreeMap<String, usize>,
     merge: Option<bool>,
 }
@@ -125,6 +152,7 @@ impl DiscoveredTools {
     pub fn reset_definitions(&mut self) {
         self.definitions.clear();
         self.known_names.clear();
+        self.scoped_revisions.clear();
         self.selection_counts.clear();
     }
 
@@ -206,6 +234,46 @@ impl DiscoveredTools {
         }
     }
 
+    pub(super) fn observe_scoped(&mut self, ctx: &super::BaseCtx, name: &str, output: &Json) {
+        self.observe_output(name, output);
+        if !(name.eq_ignore_ascii_case(TOOLS_SELECT_NAME)
+            || name.eq_ignore_ascii_case(TOOLS_SEARCH_NAME))
+        {
+            return;
+        }
+        if let Some(catalog) = ctx.get_state::<super::RequestToolCatalog>() {
+            for item in output["tools"].as_array().into_iter().flatten() {
+                if let Some(name) = item["name"].as_str()
+                    && self.known_names.contains(name)
+                    && let Some(version) = catalog.0.revision(ctx, name)
+                {
+                    self.scoped_revisions.insert(name.to_owned(), version);
+                }
+            }
+        }
+    }
+
+    pub(super) fn refresh_scoped(&mut self, ctx: &super::BaseCtx) {
+        if self.scoped_revisions.is_empty() {
+            return;
+        }
+        let catalog = ctx.get_state::<super::RequestToolCatalog>();
+        self.scoped_revisions.retain(|name, revision| {
+            if catalog
+                .as_ref()
+                .and_then(|c| c.0.revision(ctx, name))
+                .as_ref()
+                == Some(revision)
+            {
+                return true;
+            }
+            self.known_names.remove(name);
+            self.definitions.remove(name);
+            self.selection_counts.remove(name);
+            false
+        });
+    }
+
     /// Adds discovered definitions to the request tool list when merging is on.
     pub fn merge_into_request(&self, req: &mut CompletionRequest) {
         if self.merge != Some(true) || self.definitions.is_empty() {
@@ -279,10 +347,14 @@ impl DiscoveredTools {
             })
             .collect::<Vec<_>>();
 
+        let interfaces = output.get_mut("python_interfaces").map(Json::take);
         *output = json!({
             "tools": tools,
             "total_tools": tools_output.total_tools,
         });
+        if let Some(interfaces) = interfaces {
+            output["python_interfaces"] = interfaces;
+        }
         if !tools_output.groups.is_empty() {
             output["groups"] = json!(tools_output.groups);
         }
@@ -431,7 +503,7 @@ impl Agent<AgentCtx> for ToolsSearch {
         rt.groups = relevant_groups(ctx.tool_groups(), &rt.tools);
         let rt = bounded_discovery(rt);
         Ok(AgentOutput {
-            content: serde_json::to_string(&rt)?,
+            content: serde_json::to_string(&discovery_view(&ctx, &rt)?)?,
             ..Default::default()
         })
     }
@@ -655,12 +727,14 @@ impl Agent<AgentCtx> for ToolsSelect {
         };
 
         let groups = relevant_groups(all_groups, &tool_definitions);
+        let selected = bounded_discovery(ToolsOutput {
+            tools: tool_definitions,
+            groups,
+            total_tools,
+        });
+        let output = discovery_view(&ctx, &selected)?;
         Ok(AgentOutput {
-            content: serde_json::to_string(&bounded_discovery(ToolsOutput {
-                tools: tool_definitions,
-                groups,
-                total_tools,
-            }))?,
+            content: serde_json::to_string(&output)?,
             usage,
             ..Default::default()
         })

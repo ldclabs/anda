@@ -185,6 +185,13 @@ impl BaseCtx {
         }
     }
 
+    /// A separately cancellable host operation in the same request and identity.
+    pub fn cancellable_child(&self) -> Self {
+        let mut child = self.with_caller(self.caller);
+        child.cancellation_token = self.cancellation_token.child_token();
+        child
+    }
+
     /// Returns a cloned typed value from this context's extension state.
     pub fn get_state<T>(&self) -> Option<T>
     where

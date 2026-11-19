@@ -1191,7 +1191,9 @@ impl McpToolProvider {
             .await
     }
 
-    async fn call_route_with_cancellation(
+    /// Executes the exact route reviewed by the host, including its registration
+    /// generation and definition. Revalidates the route before invoking the server.
+    pub async fn call_route_with_cancellation(
         &self,
         route: McpToolRoute,
         input: ToolInput<Json>,

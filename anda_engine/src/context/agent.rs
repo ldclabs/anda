@@ -236,9 +236,19 @@ impl AgentCtx {
         }
     }
 
+    fn request_provider(&self) -> Option<Arc<dyn anda_core::ToolProvider<BaseCtx>>> {
+        self.base
+            .get_state::<super::RequestToolCatalog>()?
+            .0
+            .provider(&self.base)
+    }
+
     pub(crate) fn has_tool_lowercase(&self, lowercase_name: &str) -> bool {
         self.tools.contains_lowercase(lowercase_name)
             || self.tool_providers.contains_lowercase(lowercase_name)
+            || self
+                .request_provider()
+                .is_some_and(|p| p.contains_lowercase(lowercase_name))
     }
 
     /// Returns the capability groups exposed to discovery.
@@ -272,7 +282,13 @@ impl AgentCtx {
             merge_visible_group(&mut groups, group, &agent_names);
         }
 
-        for (_, provider) in self.tool_providers.iter() {
+        let scoped = self.request_provider();
+        for provider in self
+            .tool_providers
+            .iter()
+            .map(|(_, provider)| provider)
+            .chain(scoped.iter())
+        {
             let mut provider_names = BTreeMap::new();
             for definition in provider.definitions(None) {
                 let lowercase = definition.name.to_ascii_lowercase();
@@ -286,7 +302,16 @@ impl AgentCtx {
             }
         }
 
-        groups.into_values().collect()
+        let policy = self.base.get_state::<super::RequestToolCatalog>();
+        groups
+            .into_values()
+            .filter_map(|mut g| {
+                if let Some(policy) = &policy {
+                    g.members.retain(|n| policy.0.visible(&self.base, n));
+                }
+                (!g.members.is_empty()).then_some(g)
+            })
+            .collect()
     }
 
     /// Creates a completion runner for iterative processing of completion requests.
@@ -332,7 +357,11 @@ impl AgentContext for AgentCtx {
         let mut definitions = self.tools.definitions(names);
         let mut seen: BTreeSet<String> =
             BTreeSet::from_iter(definitions.iter().map(|d| d.name.to_ascii_lowercase()));
-        for definition in self.tool_providers.definitions(names) {
+        for definition in self.tool_providers.definitions(names).into_iter().chain(
+            self.request_provider()
+                .into_iter()
+                .flat_map(|p| p.definitions(names)),
+        ) {
             if seen.insert(definition.name.to_ascii_lowercase()) {
                 definitions.push(definition);
             }
@@ -350,6 +379,14 @@ impl AgentContext for AgentCtx {
             return self.tools.select_resources(prefixed_name, resources);
         }
 
+        if !self
+            .tool_providers
+            .contains_lowercase(&prefixed_name.to_ascii_lowercase())
+            && let Some(provider) = self.request_provider()
+            && provider.contains_lowercase(&prefixed_name.to_ascii_lowercase())
+        {
+            return provider.select_resources(prefixed_name, resources);
+        }
         self.tool_providers
             .select_resources(prefixed_name, resources)
     }
@@ -430,6 +467,9 @@ impl AgentContext for AgentCtx {
 
         extend_unique(self.tool_definitions(names), &mut definitions);
         extend_unique(self.agent_definitions(names), &mut definitions);
+        if let Some(catalog) = self.base.get_state::<super::RequestToolCatalog>() {
+            definitions.retain(|d| catalog.0.visible(&self.base, &d.name));
+        }
 
         definitions
     }
@@ -448,6 +488,14 @@ impl AgentContext for AgentCtx {
             return tool.call(ctx, input.args, input.resources).await;
         }
 
+        if !self
+            .tool_providers
+            .contains_lowercase(&input.name.to_ascii_lowercase())
+            && let Some(provider) = self.request_provider()
+            && provider.contains_lowercase(&input.name.to_ascii_lowercase())
+        {
+            return provider.call(ctx, input).await;
+        }
         self.tool_providers.call(ctx, input).await
     }
 

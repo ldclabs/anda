@@ -101,6 +101,13 @@ Context namespaces are derived from agent and tool names so cache and object sto
 `Engine::ctx_with` and `Engine::base_ctx_with` apply the same engine ID,
 user-name and visibility checks as direct RPC execution.
 
+A host can install `RequestToolCatalog` in the request's `BaseCtx` to expose a
+scoped provider, filter discovery and check execution policy. Tools composing
+other calls can retrieve `CallableDispatch` from their own context and pass
+that context to `call`. The runner shares its resource pool and discovery
+state with those calls. The composing tool can include their usage and
+artifacts in its own output.
+
 Subagent sessions are isolated by caller, host-created `SubAgentScope`, worker,
 and alias. Install the same scope clone to continue a root task across engine
 entry contexts. Use `get_session_in_scope` and `session_details_in_scope` for

@@ -10,6 +10,7 @@ Source map:
 
 - [`engine.rs`](../anda_engine/src/engine.rs): top-level `Engine`, `EngineBuilder`, exported APIs, management checks, hooks, challenge signing.
 - [`context/agent.rs`](../anda_engine/src/context/agent.rs): `AgentCtx`, local and subagent routing.
+- [`context/dispatch.rs`](../anda_engine/src/context/dispatch.rs) shares a runner round's allowlist, discovery state and resources with host-composed calls.
 - [`context/runner.rs`](../anda_engine/src/context/runner.rs): `CompletionRunner`, `CompletionStream`, queued input and compaction.
 - [`context/compaction.rs`](../anda_engine/src/context/compaction.rs): agent-initiated compaction: `SelfCompaction`, the intrinsic `compact_context` call, admission and context-usage notes.
 - [`context/base.rs`](../anda_engine/src/context/base.rs): `BaseCtx`, scoped state, cache, store, keys, HTTP, signed RPC, cancellation.

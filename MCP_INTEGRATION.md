@@ -327,9 +327,12 @@ remain outside this repository layer:
 Every server registration has an identity and cancellation token. Catalog
 fetches are serialized through publication, and published routes carry a
 revision plus the original MCP `Tool` (annotations, output schema and metadata).
-Calls refresh dirty catalogs and validate their captured identity/definition
-before execution. Publication waits for calls already using that catalog;
-removal cancels the registration and prevents in-flight fetches from publishing.
+A host can keep the `McpToolRoute` shown for approval and pass it to
+`McpToolProvider::call_route_with_cancellation` with the original input and
+cancellation token. Dispatch refreshes dirty catalogs and rechecks the
+captured registration and tool definition before execution. Publication waits
+for calls already using that catalog. Removal cancels the registration and
+prevents in-flight fetches from publishing.
 Disconnect retires the session: calls already sent may finish, but queued calls
 cannot begin on retired credentials. A reconnect refreshes the live catalog.
 
